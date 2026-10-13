@@ -956,7 +956,6 @@ llama_memory_kvmem::llama_memory_kvmem(
     type_v_ = params.type_v;
     v_trans_ = !cparams.flash_attn;
     method_ = kvmem_current_execution().params.method;
-    score_agg_ = kvmem_current_execution().params.score_agg == 1 ? 1 : 0;
     query_begin_ = kvmem_current_execution().params.query_begin;
     query_end_ = kvmem_current_execution().params.query_end;
     force_pos_ = kvmem_current_execution().params.force_pos;
@@ -4283,13 +4282,16 @@ void llama_memory_kvmem::score_retrieval() {
         qn_ok[il] = 1;
     }
 
-    // ActKV Sec. 7.1 Alg. 3 step 8: aggregate over the query heads of a GQA group
-    // with MAX, not with the folded mean. The mean cancels out a head that
-    // matches strongly against heads that do not; taking the max keeps the
-    // best-matching head's score, which is what identifies an action-critical
-    // entry. It costs g times more dot products, so it stays opt-in
-    // (--kvmem-score-agg max); the default remains the cheap folded mean.
-    const bool agg_max = score_agg_ == 1 && n_head_kv_ > 0;
+    // GQA aggregation: the folded mean probe, per KV head. ActKV Sec. 7.1
+    // Alg. 3 step 8 instead takes the MAX over a group's query heads. That
+    // variant was implemented and measured on the ninfer backend's 40-needle /
+    // 256k test, where it REGRESSED recall from 39/40 to 28/40 and decayed
+    // progressively from round 6 rather than failing randomly: a per-head max
+    // is dominated by whichever head happens to peak, and the noisier score
+    // compounds through the LRFU keep score until action-critical blocks lose
+    // their slots. The max path and its --kvmem-score-agg option were removed
+    // here too, so both backends rank identically. See
+    // docs/actkv-section56-wiring-record.md section 5.
 
     for (uint32_t b = 0; b < nblk; ++b) {
         if (!raw_->has_block(b)) {
@@ -4306,35 +4308,14 @@ void llama_memory_kvmem::score_retrieval() {
             const float * qn_l = qn[il].data();
             for (uint32_t h = 0; h < n_head_kv_; ++h) {
                 const float * kh = mk.data() + static_cast<size_t>(h) * n_embd_head_;
-                if (agg_max) {
-                    // max over the query heads of this GQA group
-                    float best = -1.0e30f;
-                    for (uint32_t gi = 0; gi < g; ++gi) {
-                        const uint32_t qh_i = h * g + gi;
-                        if (qh_i >= n_head_) {
-                            break;
-                        }
-                        const float * q = q_sum_[il].data() + static_cast<size_t>(qh_i) * n_embd_head_;
-                        float dot = 0, nq = 0, nk = 0;
-                        for (uint32_t d = 0; d < n_embd_head_; ++d) {
-                            dot += q[d] * kh[d];
-                            nq += q[d] * q[d];
-                            nk += kh[d] * kh[d];
-                        }
-                        const float c = dot / (std::sqrt(nq) * std::sqrt(nk) + 1e-6f);
-                        if (c > best) best = c;
-                    }
-                    layer += static_cast<double>(best);
-                } else {
-                    const float * qh = qn_l + static_cast<size_t>(h) * n_embd_head_;
-                    float dot = 0, nq = 0, nk = 0;
-                    for (uint32_t d = 0; d < n_embd_head_; ++d) {
-                        dot += qh[d] * kh[d];
-                        nq += qh[d] * qh[d];
-                        nk += kh[d] * kh[d];
-                    }
-                    layer += dot / (std::sqrt(nq) * std::sqrt(nk) + 1e-6f);
+                const float * qh = qn_l + static_cast<size_t>(h) * n_embd_head_;
+                float dot = 0, nq = 0, nk = 0;
+                for (uint32_t d = 0; d < n_embd_head_; ++d) {
+                    dot += qh[d] * kh[d];
+                    nq += qh[d] * qh[d];
+                    nk += kh[d] * kh[d];
                 }
+                layer += dot / (std::sqrt(nq) * std::sqrt(nk) + 1e-6f);
             }
             acc += layer / static_cast<double>(std::max(1u, n_head_kv_));
             nlay++;

@@ -64,6 +64,25 @@ float token_confidence(const float * logits, int n, int k) {
     return static_cast<float>(-acc / static_cast<double>(ntop));
 }
 
+float token_confidence_from_logprobs(const float * log_probs, int n) {
+    if (log_probs == nullptr || n <= 0) {
+        return std::numeric_limits<float>::quiet_NaN();
+    }
+    double acc = 0.0;
+    int used = 0;
+    for (int j = 0; j < n; ++j) {
+        const float v = log_probs[j];
+        // The gather fills unused slots with -inf; a NaN would poison the mean.
+        if (!std::isfinite(v)) continue;
+        acc += static_cast<double>(v);
+        ++used;
+    }
+    if (used == 0) {
+        return std::numeric_limits<float>::quiet_NaN();
+    }
+    return static_cast<float>(-acc / static_cast<double>(used));
+}
+
 KvMemConfidenceMonitor::KvMemConfidenceMonitor(KvMemConfidenceConfig cfg)
     : cfg_(cfg) {
     if (cfg_.pool_size == 0) cfg_.pool_size = 1;
@@ -162,6 +181,73 @@ double KvMemConfidenceMonitor::slope() const {
 
 bool KvMemConfidenceMonitor::should_increase_budget() const {
     return ready() && slope() < 0.0;
+}
+
+KvMemConfidenceBudget::KvMemConfidenceBudget(KvMemConfidenceBudgetConfig cfg,
+                                             KvMemConfidenceConfig monitor_cfg)
+    : cfg_(cfg), monitor_(monitor_cfg) {
+    if (cfg_.round_tokens == 0) cfg_.round_tokens = 1;
+    if (cfg_.upper_tokens < cfg_.start_tokens) cfg_.upper_tokens = cfg_.start_tokens;
+    if (!(cfg_.scale_up > 1.0f)) cfg_.scale_up = 1.0f;
+    // Round the start up so the very first round is already a legal page multiple.
+    tokens_ = round_up(cfg_.start_tokens);
+    if (tokens_ > cfg_.upper_tokens) tokens_ = cfg_.upper_tokens;
+}
+
+uint32_t KvMemConfidenceBudget::round_up(uint32_t tokens) const {
+    const uint32_t g = cfg_.round_tokens;
+    if (tokens == 0) return 0;
+    return ((tokens + g - 1) / g) * g;
+}
+
+void KvMemConfidenceBudget::observe(double token_conf) {
+    // A NaN would poison every pooled minimum containing it and make the slope NaN,
+    // which compares false against < 0 and would silently disable growth.
+    if (!(token_conf == token_conf)) return;
+    monitor_.observe(token_conf);
+}
+
+uint32_t KvMemConfidenceBudget::advance_round(uint64_t round_key) {
+    // Idempotent per round: a re-entered boundary must not consume two rounds.
+    if (round_key != 0) {
+        if (round_key_seen_ && last_round_key_ == round_key) {
+            return tokens_;
+        }
+        last_round_key_ = round_key;
+        round_key_seen_ = true;
+    }
+    ++rounds_;
+    if (tokens_ == 0 || tokens_ >= cfg_.upper_tokens) {
+        return tokens_;  // policy disabled, or already at the ceiling
+    }
+    if (!monitor_.should_increase_budget()) {
+        return tokens_;
+    }
+    // Rate limit: one growth per cooldown window. Without this a persistent negative
+    // slope grows the budget on every consecutive round and races to the ceiling.
+    if (grew_ && rounds_ - last_growth_round_ < cfg_.cooldown_rounds) {
+        return tokens_;
+    }
+    const double scaled = static_cast<double>(tokens_) * static_cast<double>(cfg_.scale_up);
+    uint32_t next = scaled >= static_cast<double>(cfg_.upper_tokens)
+        ? cfg_.upper_tokens
+        : round_up(static_cast<uint32_t>(scaled));
+    if (next <= tokens_) {
+        // scale_up is close to 1 or the rounding was flat: take one step so a
+        // non-trivial scale_up still makes progress.
+        next = std::min(cfg_.upper_tokens, round_up(tokens_ + cfg_.round_tokens));
+    }
+    if (next <= tokens_) {
+        return tokens_;
+    }
+    tokens_ = next;
+    ++growths_;
+    last_growth_round_ = rounds_;
+    grew_ = true;
+    // The negative slope that justified this growth is now stale; clear the window so
+    // the same evidence cannot immediately justify the next step.
+    monitor_.reset();
+    return tokens_;
 }
 
 } // namespace kvmem

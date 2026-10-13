@@ -19,26 +19,22 @@ struct MeanKeyQueryView {
     uint32_t kv_heads = 0;
 };
 
-// ActKV (arXiv:2609.31395, Sec. 7.1 Alg. 3 step 8): how the query heads of one
-// GQA group are combined while scoring a block.
-//   Mean — the historical folded probe (sum over the group, then normalize).
-//          A head that matches strongly is cancelled by heads that do not.
-//   Max  — keep the group's best-matching head (--kvmem-score-agg max). This is
-//          what identifies an action-critical entry, at g x the dot products.
-enum class MeanKeyGroupReduce : uint8_t {
-    Mean = 0,
-    Max  = 1,
-};
-
 // Mean Q over query rows and each GQA group, cosine with each block's mean K,
 // averaged across KV heads and participating layers. FP32 dot/norm operations
 // and epsilon 1e-6 preserve the existing llama product adapter's host policy.
 // This is selection math only: it mutates no payload, frontier or residency.
 //
-// `group_reduce` selects the GQA aggregation. The default (Mean) keeps every
-// existing caller byte-identical, including the ninfer backend patch.
+// GQA aggregation is the folded mean, and only that. ActKV Alg. 3 step 8 takes
+// the MAX across a group's query heads; that variant was implemented and
+// measured on the 40-needle / 256k test, where it REGRESSED recall from 39/40
+// to 28/40 (same-turn) and decayed progressively from round 6 instead of
+// failing randomly. The per-head max is dominated by whichever head happens to
+// peak, which makes the score noisier; fed into the LRFU keep score
+// (KS_t = lambda*KS_{t-1} + hit*score) that noise compounds across rounds and
+// evicts action-critical blocks. Mean aggregation is both faster (1x rather
+// than g x dot products) and measurably more accurate here, so the option is
+// gone rather than left as a footgun. See
+// docs/actkv-section56-wiring-record.md section 5.
 std::vector<double> mean_key_retrieval_scores(const RawKvStore& keys, uint32_t blocks,
-                                               MeanKeyQueryView query,
-                                               MeanKeyGroupReduce group_reduce =
-                                                   MeanKeyGroupReduce::Mean);
+                                               MeanKeyQueryView query);
 } // namespace kvmem
