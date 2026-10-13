@@ -2,9 +2,11 @@
 
   该技术来自 https://arxiv.org/pdf/2609.31395
   由中国科学技术大学提出
+  
   在[kvmem@](https://github.com/kvmem/kvmem-llama.cpp)基础开发，通过actkv技术，弥补kvmem在200K以上的上下文中出现的幻觉，工具调用等问题。
   
-  该技术目前仍处于实验阶段，通过本地多轮测试验证，确认该技术有效，其他个人项目可在本项目基础扩展，开发，actkv技术属于中国科学技术大学其团队。
+  该技术目前仍处于实验阶段，通过本地多轮测试验证，确认该技术有效，其他个人项目可在本项目基础扩展，开发。actkv技术属于中国科学技术大学其团队。
+  
   本git项目仅提供参考，不作为标准。
 ------------------------------------------------------------------------------------------------------------------------------------
 
@@ -18,10 +20,11 @@
   --spec mtp --draft-tokens 4 --ngram-draft-tokens 31 --adaptive-mtp ^
   --vision --vision-residency cpu --vision-max-merged 256 ^
   --default-reasoning-effort medium  --default-thinking-budget 16384
-
+  
 ---
   --kvmem-action-lrfu 为开启actkv  
   --vision --vision-residency cpu   --vision-max-merged 256 cpu运算需使用256，gpu可改为1024
+
 ---
 
 # 262144 上下文 KVMem + ActKV 召回与速度实测报告
