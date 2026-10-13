@@ -27,6 +27,31 @@
 
 ---
 
+v1.2更新
+
+1，合并上游ninfer dflash2，模型要求gguf低于10G，否则16G显卡转换后无法运行。
+
+2，更新gguf转换ninfer工具，现在支持dfalsh2模型合并，视觉模型支持q8。
+
+3，修复了部分bug。
+
+---
+
+dflash2启动命令
+
+  --port 18200 ^
+  --max-context 262144 --kvmem-recent-tokens 1024 ^
+  --prefill-chunk 256 ^
+  --kvmem-budget 36864 --kvmem-gen-reserve 16384 --kvmem-host-mib 12288 ^
+  --kvmem-action-lrfu --model-id ninfer-27b ^
+  --kv-dtype rk8v4  --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
+  --spec mtp --draft-tokens 5 --ngram-draft-tokens 31 --adaptive-mtp ^
+  --vision --vision-residency cpu --vision-max-merged 256 ^
+  --default-reasoning-effort xhigh  --default-thinking-budget 53248
+  
+  ---
+
+
 # 262144 上下文 KVMem + ActKV 召回与速度实测报告
 
 **测试日期**：2026-10-11
