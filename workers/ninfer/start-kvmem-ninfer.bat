@@ -39,20 +39,35 @@ REM          lambda -> 1  pure frequency (working set freezes)
 REM      The keep score is clamped at 0 and two scoring passes inside one round
 REM      no longer decay the pool twice. Remove all three flags to revert.
 REM
-REM  (2) GQA head aggregation      --kvmem-score-agg max
-REM      ActKV Alg. 3 step 8: take the MAX attention over a GQA group's query
-REM      heads instead of the folded mean probe. Better recall on multi-topic
-REM      queries; cost is g x (g = n_head / n_head_kv) on the once-per-turn
-REM      scoring pass, NOT per token. Change "max" to "mean" to revert.
+REM  (2) GQA head aggregation      --kvmem-score-agg   [max REMOVED, mean only]
+REM      ActKV Alg. 3 step 8 says MAX across a GQA group's query heads. It was
+REM      implemented faithfully and then MEASURED on the 40-needle / 256k test:
+REM          mean  39/40 same-turn, 39/40 final, 40 tool calls, 81 total
+REM          max   28/40 same-turn, 32/40 final,  1 recovery,   68 total
+REM      The max run decays progressively from round 6 (3/3 -> 2/3 -> 1/3)
+REM      instead of failing randomly, so the mechanism is cumulative: a per-head
+REM      max is dominated by whichever head happens to peak, which makes the
+REM      LRFU keep score noisier and lets action-critical blocks lose their
+REM      slots over successive rounds.
+REM      The option is therefore GONE, not merely defaulted: passing
+REM      "--kvmem-score-agg max" is now a startup error. GQA aggregation is
+REM      always the folded mean (which is also g x cheaper).
+REM      See docs/actkv-section56-wiring-record.md section 5.
 REM
-REM  (3) Confidence-driven budget  --kvmem-conf-*   [NOT ported / off]
-REM      The ActKV monitor was dead code upstream (never called, budget never
-REM      grew). The class is ported and unit-tested, but it is NOT wired into
-REM      the generation loop, so there is no --kvmem-conf-* flag here yet.
+REM  (3) Confidence-driven budget  --kvmem-conf-*   [WIRED, off by default]
+REM      ActKV Sec. 6 Alg. 2. Token confidence T_i = -(1/k)*sum log P_i is read
+REM      from the engine's existing top-k logprob gather (k = 20, the paper's
+REM      value), min-pooled over w=64 tokens at stride 8, bottom 10% fitted to
+REM      a line, and the budget is raised by scale_up=1.75 when that slope is
+REM      negative. Growth is checked ONCE PER COMPRESSION ROUND, not per token.
+REM      It never shrinks, and it is capped at --kvmem-budget (the physical
+REM      pool is allocated for B+R at startup), so enabling it cannot change
+REM      the device KV layout. Add --kvmem-conf-budget to turn it on; see
+REM      --kvmem-conf-* in --help for the tuning knobs.
 REM
 REM  An invalid ActKV value is rejected at startup, e.g.
 REM      --kvmem-lrfu-lambda 1.5      -> "must be in (0, 1)"
-REM      --kvmem-score-agg bogus      -> "must be mean or max"
+REM      --kvmem-score-agg max        -> "was removed: it regressed recall"
 REM --------------------------------------------------------------------
 REM  ninfer differs from the llama.cpp backend (docs/multi-backend-differences.md):
 REM    * page/block size is FIXED at 64 tokens (llama.cpp defaults to 128), so B,
@@ -157,12 +172,12 @@ cd /d "%BIN%"
   --port 18200 ^
   --max-context 262144 --kvmem-recent-tokens 1024 ^
   --prefill-chunk 256 ^
-  --kvmem-budget 36864 --kvmem-gen-reserve 16384 --kvmem-host-mib 12288 --device-profile off ^
+  --kvmem-budget 36864 --kvmem-gen-reserve 16384 --kvmem-host-mib 12288 ^
   --kvmem-action-lrfu --model-id ninfer-27b ^
-  --kv-dtype int8 --temperature 1.0 --top-p 0.95 ^
-  --spec mtp --draft-tokens 4 --ngram-draft-tokens 31 --adaptive-mtp ^
-  --vision --vision-residency cpu --vision-max-merged 1024 ^
-  --default-reasoning-effort medium --default-thinking-budget 16384
+  --kv-dtype rk8v4  --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
+  --spec mtp --draft-tokens 5 --ngram-draft-tokens 31 --adaptive-mtp ^
+  --vision --vision-residency cpu --vision-max-merged 256 ^
+  --default-reasoning-effort xhigh  --default-thinking-budget 53248
  
 set "RC=%ERRORLEVEL%"
 echo.

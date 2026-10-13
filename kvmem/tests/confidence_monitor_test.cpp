@@ -242,6 +242,223 @@ static void test_token_confidence_skips_masked_tokens() {
     CHECK(std::fabs(tm - tp) < 1e-3f);
 }
 
+// --- KvMemConfidenceBudget (Sec. 6.2, round-gated) -------------------------
+
+using kvmem::KvMemConfidenceBudget;
+using kvmem::KvMemConfidenceBudgetConfig;
+
+// The budget must be inert until the confidence trend is actually negative.
+static void test_budget_grows_only_on_negative_slope() {
+    KvMemConfidenceBudgetConfig cfg;
+    cfg.start_tokens = 4096;
+    cfg.upper_tokens = 36864;
+    cfg.scale_up = 1.75f;
+    cfg.cooldown_rounds = 1;
+    KvMemConfidenceConfig mon;
+    mon.pool_size = 8;
+    mon.stride = 1;
+    mon.bottom_frac = 1.0f;
+    mon.min_pool = 4;
+    KvMemConfidenceBudget b(cfg, mon);
+    CHECK(b.tokens() == 4096);
+    // Confidence RISES (a good allocation): every round keeps the budget.
+    for (int r = 0; r < 20; ++r) {
+        for (int i = 0; i < 8; ++i) b.observe(10.0 + r);
+        CHECK(b.advance_round() == 4096);
+    }
+    CHECK(b.growths() == 0);
+}
+
+// The regression this class exists for: a persistent negative slope must NOT grow
+// the budget on every round. Upstream, per-token scaling reached the ceiling in a
+// handful of tokens.
+static void test_budget_is_rate_limited_per_round() {
+    KvMemConfidenceBudgetConfig cfg;
+    cfg.start_tokens = 4096;
+    cfg.upper_tokens = 36864;
+    cfg.scale_up = 1.75f;
+    cfg.cooldown_rounds = 4;
+    KvMemConfidenceConfig mon;
+    mon.pool_size = 8;
+    mon.stride = 1;
+    mon.bottom_frac = 1.0f;
+    mon.min_pool = 4;
+    KvMemConfidenceBudget b(cfg, mon);
+    // Confidence decays hard and forever; the slope stays negative throughout.
+    for (int r = 0; r < 40; ++r) {
+        for (int i = 0; i < 8; ++i) b.observe(100.0 - 20.0 * r - i);
+        b.advance_round();
+    }
+    // One growth per cooldown window bounds the total number of growths. An
+    // ungated policy would grow every round (4 steps of 1.75x reach the ceiling
+    // from 4096), so 40 rounds cannot produce more than ~10 growths here.
+    CHECK(b.growths() <= 40 / cfg.cooldown_rounds + 1);
+
+    // The gate must actually bind: within one cooldown window a persistently
+    // negative slope produces exactly one growth, not one per round.
+    KvMemConfidenceBudget c(cfg, mon);
+    for (int i = 0; i < 8; ++i) c.observe(100.0 - i);
+    c.advance_round();                 // first growth
+    const uint32_t after_first = c.tokens();
+    for (int r = 0; r < cfg.cooldown_rounds - 1; ++r) {
+        for (int i = 0; i < 8; ++i) c.observe(-100.0);   // slope stays negative
+        CHECK(c.advance_round() == after_first);          // held by the cooldown
+    }
+    CHECK(c.growths() == 1);
+    // An ungated policy would already have saturated the ceiling here.
+    CHECK(after_first < cfg.upper_tokens);
+}
+
+static void test_budget_never_exceeds_upper() {
+    KvMemConfidenceBudgetConfig cfg;
+    cfg.start_tokens = 4096;
+    cfg.upper_tokens = 8192;
+    cfg.scale_up = 10.0f;   // a single step would overshoot
+    cfg.cooldown_rounds = 1;
+    KvMemConfidenceConfig mon;
+    mon.pool_size = 8;
+    mon.stride = 1;
+    mon.bottom_frac = 1.0f;
+    mon.min_pool = 4;
+    KvMemConfidenceBudget b(cfg, mon);
+    for (int r = 0; r < 50; ++r) {
+        for (int i = 0; i < 8; ++i) b.observe(100.0 - 20.0 * r - i);
+        const uint32_t t = b.advance_round();
+        CHECK(t <= cfg.upper_tokens);
+    }
+    CHECK(b.tokens() == 8192);
+}
+
+// Sec. 6.2: recovery retains the current budget -- it never shrinks.
+static void test_budget_never_shrinks() {
+    KvMemConfidenceBudgetConfig cfg;
+    cfg.start_tokens = 4096;
+    cfg.upper_tokens = 36864;
+    cfg.cooldown_rounds = 1;
+    KvMemConfidenceConfig mon;
+    mon.pool_size = 8;
+    mon.stride = 1;
+    mon.bottom_frac = 1.0f;
+    mon.min_pool = 4;
+    KvMemConfidenceBudget b(cfg, mon);
+    for (int i = 0; i < 8; ++i) b.observe(100.0 - i);
+    const uint32_t grew = b.advance_round();
+    CHECK(grew > 4096);
+    uint32_t previous = grew;
+    // Confidence recovers strongly; the budget must hold, not fall back.
+    for (int r = 0; r < 20; ++r) {
+        for (int i = 0; i < 8; ++i) b.observe(500.0 + r);
+        const uint32_t t = b.advance_round();
+        CHECK(t >= previous);
+        previous = t;
+    }
+    CHECK(b.tokens() >= grew);
+}
+
+static void test_budget_disabled_when_start_zero() {
+    KvMemConfidenceBudgetConfig cfg;
+    cfg.start_tokens = 0;
+    cfg.upper_tokens = 36864;
+    KvMemConfidenceBudget b(cfg);
+    for (int r = 0; r < 10; ++r) {
+        for (int i = 0; i < 8; ++i) b.observe(-100.0);
+        CHECK(b.advance_round() == 0);
+    }
+    CHECK(b.growths() == 0);
+}
+
+static void test_budget_rounds_to_granularity() {
+    KvMemConfidenceBudgetConfig cfg;
+    cfg.start_tokens = 4097;   // not a multiple of 64
+    cfg.upper_tokens = 36864;
+    cfg.round_tokens = 64;
+    KvMemConfidenceBudget b(cfg);
+    CHECK(b.tokens() == 4160);  // rounded up to a whole page
+}
+
+// A NaN would poison the pooled minimum and make the slope NaN, which compares
+// false against < 0 and silently disables growth for the rest of the trace.
+static void test_budget_ignores_nan() {
+    KvMemConfidenceBudgetConfig cfg;
+    cfg.start_tokens = 4096;
+    cfg.upper_tokens = 36864;
+    cfg.cooldown_rounds = 1;
+    KvMemConfidenceConfig mon;
+    mon.pool_size = 8;
+    mon.stride = 1;
+    mon.bottom_frac = 1.0f;
+    mon.min_pool = 4;
+    KvMemConfidenceBudget b(cfg, mon);
+    for (int i = 0; i < 8; ++i) b.observe(100.0 - i);
+    b.observe(std::numeric_limits<double>::quiet_NaN());
+    const uint32_t t = b.advance_round();
+    CHECK(t > 4096);  // the good samples still drove a growth
+}
+
+// --- token_confidence_from_logprobs() -------------------------------------
+
+// The ninfer gather emits top_values = s[v] - lse = log P(v). This entry point
+// must agree with the raw-logit path on the same distribution.
+static void test_logprobs_match_token_confidence() {
+    const float logits[4] = {1.0f, 0.5f, 0.0f, -1.0f};
+    const float t_logits = kvmem::token_confidence(logits, 4, 3);
+    // log P for the top 3, computed independently.
+    const double mx = 1.0;
+    double z = 0.0;
+    for (int i = 0; i < 4; ++i) z += std::exp(static_cast<double>(logits[i]) - mx);
+    const double lse = mx + std::log(z);
+    const float logp[3] = {
+        static_cast<float>(1.0 - lse), static_cast<float>(0.5 - lse),
+        static_cast<float>(0.0 - lse)};
+    const float t_logp = kvmem::token_confidence_from_logprobs(logp, 3);
+    CHECK(std::fabs(t_logits - t_logp) < 1e-3f);
+}
+
+static void test_logprobs_rejects_bad_input() {
+    CHECK(std::isnan(kvmem::token_confidence_from_logprobs(nullptr, 4)));
+    CHECK(std::isnan(kvmem::token_confidence_from_logprobs(nullptr, 0)));
+    // The gather fills unused slots with -inf when fewer than k tokens remain.
+    const float mostly_unused[4] = {-0.5f, -std::numeric_limits<float>::infinity(),
+                                    -std::numeric_limits<float>::infinity(),
+                                    -std::numeric_limits<float>::infinity()};
+    const float t = kvmem::token_confidence_from_logprobs(mostly_unused, 4);
+    CHECK(std::isfinite(t));
+    CHECK(std::fabs(t - 0.5f) < 1e-4f);  // only the one finite slot is averaged
+    const float all_inf[2] = {-std::numeric_limits<float>::infinity(),
+                              -std::numeric_limits<float>::infinity()};
+    CHECK(std::isnan(kvmem::token_confidence_from_logprobs(all_inf, 2)));
+}
+
+// A re-entered boundary (async prepare publishing and retrying, or a
+// preview/apply pair) must not consume two rounds or grow twice from the same
+// evidence.
+static void test_budget_round_key_is_idempotent() {
+    KvMemConfidenceBudgetConfig cfg;
+    cfg.start_tokens = 4096;
+    cfg.upper_tokens = 36864;
+    cfg.cooldown_rounds = 1;
+    KvMemConfidenceConfig mon;
+    mon.pool_size = 8;
+    mon.stride = 1;
+    mon.bottom_frac = 1.0f;
+    mon.min_pool = 4;
+    KvMemConfidenceBudget b(cfg, mon);
+    for (int i = 0; i < 8; ++i) b.observe(100.0 - i);
+    const uint32_t first = b.advance_round(4096);
+    CHECK(first > 4096);
+    CHECK(b.rounds() == 1);
+    CHECK(b.growths() == 1);
+    // Same key: no new round, no new growth.
+    for (int i = 0; i < 3; ++i) {
+        CHECK(b.advance_round(4096) == first);
+        CHECK(b.rounds() == 1);
+        CHECK(b.growths() == 1);
+    }
+    // A new key is a new round.
+    b.advance_round(8192);
+    CHECK(b.rounds() == 2);
+}
+
 int main() {
     test_token_confidence_one_hot_is_zero();
     test_token_confidence_uniform_is_log_n();
@@ -250,6 +467,16 @@ int main() {
     test_token_confidence_is_shift_invariant();
     test_token_confidence_rejects_bad_input();
     test_token_confidence_skips_masked_tokens();
+    test_logprobs_match_token_confidence();
+    test_logprobs_rejects_bad_input();
+    test_budget_grows_only_on_negative_slope();
+    test_budget_is_rate_limited_per_round();
+    test_budget_never_exceeds_upper();
+    test_budget_never_shrinks();
+    test_budget_disabled_when_start_zero();
+    test_budget_rounds_to_granularity();
+    test_budget_ignores_nan();
+    test_budget_round_key_is_idempotent();
     test_decreasing_tail_grows_budget();
     test_increasing_tail_keeps_budget();
     test_min_pooling_is_flat_until_window_slides();

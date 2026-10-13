@@ -21,7 +21,11 @@ $args = @(
   '--kvmem-budget','36864','--kvmem-gen-reserve','16384'
 )
 if ($Mode -eq 'on') {
-  $args += @('--kvmem-action-lrfu','--kvmem-lrfu-lambda','0.50','--kvmem-lrfu-top-frac','0.90','--kvmem-score-agg','max')
+  # GQA aggregation is the folded mean and is no longer configurable: the max
+  # variant was measured on the 40-needle / 256k test and regressed recall from
+  # 39/40 to 28/40 (docs/actkv-section56-wiring-record.md section 5). Passing
+  # --kvmem-score-agg max is now an error, so it is not passed here.
+  $args += @('--kvmem-action-lrfu','--kvmem-lrfu-lambda','0.50','--kvmem-lrfu-top-frac','0.90')
 }
 $args += @(
   '-ctk','q8_0','-ctv','q8_0','--spec-type','draft-mtp','--spec-draft-n-max','3','--spec-kv-dtype','f16',

@@ -42,7 +42,9 @@ struct llama_kvmem_params {
     bool     action_lrfu;          // --kvmem-action-lrfu
     float    lrfu_lambda;          // --kvmem-lrfu-lambda; <= 0 → 0.50 (paper)
     float    lrfu_top_frac;        // --kvmem-lrfu-top-frac; <= 0 → 0.90 (paper)
-    int32_t  score_agg;            // --kvmem-score-agg: 0 mean (default), 1 max
+    // GQA aggregation is the folded mean and is no longer configurable. The
+    // --kvmem-score-agg max variant regressed the 40-needle / 256k recall from
+    // 39/40 to 28/40, so the option and its max path were removed.
 };
 
 // Call before llama_init_from_model. A null pointer resets to defaults

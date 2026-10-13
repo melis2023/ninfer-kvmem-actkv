@@ -42,7 +42,8 @@ static void print_usage(const char * argv0) {
             "  --kvmem-action-lrfu        ActKV action-oriented LRFU retention (default off)\n"
             "  --kvmem-lrfu-lambda F      LRFU decay lambda, 0 < F < 1 (default 0.50)\n"
             "  --kvmem-lrfu-top-frac F    hit fraction kept per round, 0 < F <= 1 (default 0.90)\n"
-            "  --kvmem-score-agg NAME     GQA query aggregation: mean | max (default mean)\n"
+            "  --kvmem-score-agg NAME     accepted for compatibility: only \"mean\" is valid\n"
+            "                             (the max variant was removed; it regressed recall)\n"
             "  --kvmem-query-last N       last N prompt tokens are the retrieval query (default 64)\n"
             "  --kvmem-force-substr S     force-select the block containing substring S\n"
             "  --kvmem-gpu-ratio R        cap slot pool at this fraction of GPU VRAM (default 0.50)\n"
@@ -180,7 +181,15 @@ int main(int argc, char ** argv) {
         } else if (eq(arg, "--kvmem-lrfu-top-frac")) {
             kparams.lrfu_top_frac = std::strtof(need(arg), nullptr);
         } else if (eq(arg, "--kvmem-score-agg")) {
-            kparams.score_agg = eq(need(arg), "max") ? 1 : 0;
+            // GQA aggregation is always the folded mean now. The max variant
+            // regressed the 40-needle / 256k recall from 39/40 to 28/40, so it
+            // is refused rather than silently ignored.
+            if (eq(need(arg), "max")) {
+                fprintf(stderr, "--kvmem-score-agg max was removed: it regressed recall "
+                                "(39/40 -> 28/40). GQA aggregation is the folded mean; "
+                                "drop the flag.\n");
+                return 1;
+            }
         } else if (eq(arg, "--kvmem-query-last")) {
             query_last = std::atoi(need(arg));
         } else if (eq(arg, "--kvmem-force-substr")) {

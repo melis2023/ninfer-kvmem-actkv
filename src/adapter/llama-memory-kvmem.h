@@ -459,9 +459,6 @@ private:
     bool keep_selected_ = false;
     bool prefill_capture_ = true;
     int32_t method_ = 0;
-    // ActKV GQA aggregation for the query side of retrieval scoring:
-    // 0 = folded mean (historical), 1 = max over the group's query heads.
-    int32_t score_agg_ = 0;
     int32_t query_begin_ = -1;
     int32_t query_end_ = -1;
     int32_t force_pos_ = -1;
