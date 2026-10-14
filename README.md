@@ -35,6 +35,12 @@ v1.2更新
 
 3，修复了部分bug。
 
+4,修复bonsai2模型加载无法运行的问题
+
+bonsai2模型地址
+https://huggingface.co/WaveCut/Ternary-Bonsai-2-27B-NInfer-v3/tree/main
+使用mtp加载，无dflash，显存占用小于12G，具体性能可自行测试，如出现加载后乱码，核对模型的md5，避免断点下载导致的数据缺失。
+
 ---
 
 dflash2启动命令
