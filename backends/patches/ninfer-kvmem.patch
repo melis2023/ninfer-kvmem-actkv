@@ -1,5 +1,36 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index a07024f0..acddfcbf 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -64,6 +64,26 @@ jobs:
+               -o test_host_kv_clamp
+           ./test_host_kv_clamp
+ 
++  cxx20-libcxx:
++    name: C++20 text and resource contracts (libc++)
++    runs-on: ubuntu-24.04
++    steps:
++      - uses: actions/checkout@v5
++      - name: Install libc++
++        run: sudo apt-get update && sudo apt-get install -y clang libc++-dev libc++abi-dev
++      - name: Compile text sources and test copy-on-write state
++        run: |
++          clang++ -std=c++20 -stdlib=libc++ -fsyntax-only -DUTF8PROC_STATIC \
++            -Isrc -Iinclude -Ithird_party -Ithird_party/llama-jinja \
++            -Ithird_party/xgrammar/include -Ithird_party/xgrammar/3rdparty/dlpack/include \
++            src/text/*.cpp
++          clang++ -std=c++20 -stdlib=libc++ -O2 -Isrc -Ithird_party \
++            src/text/unique_strings.cpp tests/text/test_unique_strings.cpp -o unique_strings_test
++          ./unique_strings_test
++          clang++ -std=c++20 -stdlib=libc++ -Wall -Wextra -Werror -Isrc -Iinclude \
++            tests/host/test_checkpoint_recovery_impact.cpp -o checkpoint_recovery_impact_test
++          ./checkpoint_recovery_impact_test
++
+   linux-scripts:
+     name: Linux launcher and downloader guard
+     runs-on: ubuntu-latest
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 5b22dd7..0f127e5 100644
+index 5b22dd78..0f127e5a 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -158,7 +158,13 @@ if(MSVC)
@@ -62,7 +93,7 @@ index 5b22dd7..0f127e5 100644
  # --- Subdirectories ----------------------------------------------------------
  add_subdirectory(src)
 diff --git a/TODO.md b/TODO.md
-index f7bf1a8..f597aa2 100644
+index f7bf1a80..f597aa26 100644
 --- a/TODO.md
 +++ b/TODO.md
 @@ -4735,12 +4735,11 @@ shape the entries described.
@@ -84,7 +115,7 @@ index f7bf1a8..f597aa2 100644
  - [x] **The shipped `-maxctx` launchers ask for a host-KV pin they cannot have. Closed 2026-09-09 —
        by documenting it, because the behaviour is right and the flag is not.**
 diff --git a/apps/cli/main.cpp b/apps/cli/main.cpp
-index db7512f..40288f5 100644
+index db7512fd..40288f58 100644
 --- a/apps/cli/main.cpp
 +++ b/apps/cli/main.cpp
 @@ -358,6 +358,9 @@ int main(int argc, char** argv) {
@@ -110,7 +141,7 @@ index db7512f..40288f5 100644
          engine_options.diagnostic_observer = ninfer::product::engine_diagnostic_observer(logger);
  
 diff --git a/apps/cli/options.cpp b/apps/cli/options.cpp
-index 4e7adbb..196868b 100644
+index 4e7adbb1..196868bc 100644
 --- a/apps/cli/options.cpp
 +++ b/apps/cli/options.cpp
 @@ -1,4 +1,5 @@
@@ -233,7 +264,7 @@ index 4e7adbb..196868b 100644
  
      const bool has_prompt   = !options.prompt.empty();
 diff --git a/apps/cli/options.h b/apps/cli/options.h
-index f615842..303e2a4 100644
+index f6158429..303e2a4b 100644
 --- a/apps/cli/options.h
 +++ b/apps/cli/options.h
 @@ -51,6 +51,10 @@ struct Options {
@@ -248,7 +279,7 @@ index f615842..303e2a4 100644
      bool prefill_a8     = true;
      bool prefill_cublas = false;
 diff --git a/apps/serve/main.cpp b/apps/serve/main.cpp
-index cd72229..4560e99 100644
+index cd72229d..4560e990 100644
 --- a/apps/serve/main.cpp
 +++ b/apps/serve/main.cpp
 @@ -275,6 +275,11 @@ int main(int argc, char** argv) {
@@ -286,7 +317,7 @@ index cd72229..4560e99 100644
                  ninfer::serve::ModelDefinition{.id = ninfer::serve::resolve_public_model_id(
                                                     options, first->load_summary().model_name),
 diff --git a/docs/cli.md b/docs/cli.md
-index ff62f7a..2f424c7 100644
+index ff62f7a4..2f424c71 100644
 --- a/docs/cli.md
 +++ b/docs/cli.md
 @@ -236,7 +236,7 @@ The table lists executable defaults. The examples above select INT8 KV and MTP3.
@@ -309,7 +340,7 @@ index ff62f7a..2f424c7 100644
  | `--prefill-cublas` | hand wide prefill GEMMs to cuBLAS: a large prefill speedup for a small perplexity cost, and it wants a larger `--prefill-chunk` to pay (see [performance](performance.md)) | off |
 diff --git a/docs/kvmem-dflash-gate.md b/docs/kvmem-dflash-gate.md
 new file mode 100644
-index 0000000..378df4e
+index 00000000..378df4ed
 --- /dev/null
 +++ b/docs/kvmem-dflash-gate.md
 @@ -0,0 +1,117 @@
@@ -431,7 +462,7 @@ index 0000000..378df4e
 +(flat names use `__` for path separators). The gates alone can be reverted by restoring the
 +predicate `(ordinary || fixed_mtp || adaptive_mtp)` in both validators.
 diff --git a/docs/maintainer/engine-architecture.md b/docs/maintainer/engine-architecture.md
-index e1d5497..d18fa9b 100644
+index e1d54975..d18fa9bf 100644
 --- a/docs/maintainer/engine-architecture.md
 +++ b/docs/maintainer/engine-architecture.md
 @@ -573,7 +573,7 @@ live KV 与 State 的 lane；未启用时每个 prefill unit 只多一次 relaxe
@@ -444,7 +475,7 @@ index e1d5497..d18fa9b 100644
    allocator（每个 plane 绑定一个 rank）、一个 Scheduler 和一个 commit 序列。embedding、head、round state、
    sampling 和 MTP 留在 rank 0，residual 经 `StageLink` 逐 stage 传递并由最后一个 stage 送回。KV 容量取各设备
 diff --git a/docs/maintainer/paged-kv-cache.md b/docs/maintainer/paged-kv-cache.md
-index 6f63bd3..da1b169 100644
+index 6f63bd3e..da1b169a 100644
 --- a/docs/maintainer/paged-kv-cache.md
 +++ b/docs/maintainer/paged-kv-cache.md
 @@ -781,3 +781,204 @@ Exact model state 和 backend mathematics 见
@@ -653,7 +684,7 @@ index 6f63bd3..da1b169 100644
 +MTP/ngram, restoration and cancellation evidence is in the
 +[fast-prefill report](../../../../docs/fast-prefill-admission-validation-20261006.md).
 diff --git a/docs/maintainer/pipeline-parallel-plan.md b/docs/maintainer/pipeline-parallel-plan.md
-index 72026fc..0f2ce5b 100644
+index 72026fc3..0f2ce5b8 100644
 --- a/docs/maintainer/pipeline-parallel-plan.md
 +++ b/docs/maintainer/pipeline-parallel-plan.md
 @@ -20,9 +20,9 @@ each stage read its weights once per micro-batch and win nothing.
@@ -711,7 +742,7 @@ index 72026fc..0f2ce5b 100644
    engine synchronizes after each chunk, so at any moment one stage is busy. Overlapping stages needs
    micro-chunks inside a chunk (later stages start on micro-chunk 0 while stage 0 runs micro-chunk 1);
 diff --git a/docs/ngram.md b/docs/ngram.md
-index 73bc3e4..a2a01e1 100644
+index 73bc3e46..a2a01e1e 100644
 --- a/docs/ngram.md
 +++ b/docs/ngram.md
 @@ -36,14 +36,24 @@ another. The minimum match defaults to 12 and its supported range is 4..64.
@@ -742,7 +773,7 @@ index 73bc3e4..a2a01e1 100644
  
  A round in which at least one row has a copy proposal is a copy round and verifies at the ngram
 diff --git a/docs/serving.md b/docs/serving.md
-index 6207ab0..5f28708 100644
+index 6207ab0c..c95cbf48 100644
 --- a/docs/serving.md
 +++ b/docs/serving.md
 @@ -313,14 +313,34 @@ asking for raw JSON without Markdown fences and retaining tools for information
@@ -788,7 +819,27 @@ index 6207ab0..5f28708 100644
  
  Only normal completed final-content responses guarantee a complete JSON document satisfying the supported
  schema. Token/context limits, cancellation, transport failure, or generation errors can leave a
-@@ -749,7 +769,11 @@ The endpoint supports:
+@@ -679,6 +699,19 @@ they advance during a long request rather than at its completion, and their rati
+ | `ninfer:context_cache_exhausted_requests_total` | counter | requests failed because the context cache had no placement for them |
+ | `ninfer:engine_recoveries_total` | counter | host-side worker failures the Engine survived instead of latching unavailable |
+ | `ninfer:uptime_seconds` | gauge | seconds since the Engine became ready |
++| `ninfer:waiting_cancelled_requests_total` | counter | requests the client cancelled while they waited for admission (Qwen3.5 cores, as are the five series below) |
++| `ninfer:waiting_expired_requests_total` | counter | requests that reached `--pending-timeout-ms` before admission |
++| `ninfer:waiting_abandoned_seconds_total` | counter | time those cancelled and expired requests had waited |
++| `ninfer:cancelled_prefills_total` | counter | requests cancelled while their prompt prefilled |
++| `ninfer:cancelled_prefill_computed_tokens_total` | counter | prompt tokens those requests had computed |
++| `ninfer:cancelled_prefills_salvaged_total` | counter | cancelled prefills the context cache kept at the point they reached, so the retry resumes there |
++| `ninfer:context_selections_total{source}` | counter | admissions by the context-cache source they started from: `root` (a miss, prefilled from token zero), `private_endpoint`, `private_turn_closure`, `private_response_replay`, `private_long_anchor`, `shared_stable_prefix`; the hit rate is 1 - root / all |
++| `ninfer:context_pressure_events_total{event}` | counter | what pressure planning did to inactive owners: `private_owner_evicted`, `private_owner_degraded`, `shared_owner_evicted`, `shared_owner_degraded`, `checkpoint_dropped` |
++| `ninfer:context_pressure_searches_total{result}` | counter | pressure planning searches: `started`, `budget_exhausted`, `maximal_fallback` |
++| `ninfer:context_transfer_bytes_total{object,direction}` | counter | context-cache bytes moved between Device and Host: `object` `state`, `main_kv` or `backend_kv`, `direction` `d2h` or `h2d` |
++| `ninfer:context_transfer_seconds_total` | counter | time admissions waited for context-cache transfers |
++| `ninfer:context_historical_fork_hits_total` | counter | admissions that forked a historical checkpoint instead of the latest endpoint |
++| `ninfer:context_occupancy{pool}` | gauge | `device_state_slots`, `host_state_slots`, `device_main_kv_pages`, `device_backend_kv_pages`, `host_kv_bytes` in use |
+ 
+ ### WebUI
+ 
+@@ -749,7 +782,11 @@ The endpoint supports:
  - string content and ordered text/refusal parts; adjacent parts are preserved without inserted
    separators, and empty wire content remains an empty turn;
  - User `image_url` parts, tool-result `image_url` parts used by compatible clients, and the User
@@ -801,7 +852,7 @@ index 6207ab0..5f28708 100644
  - nonnegative `max_completion_tokens` and the legacy `max_tokens` spelling; zero performs prompt
    processing without generation; llama.cpp's `-1` ("no limit", the WebUI's default) and omitting
    both apply the [default output limit](#default-output-limit);
-@@ -776,11 +800,10 @@ The endpoint supports:
+@@ -776,11 +813,10 @@ The endpoint supports:
  - function tools and free-form `custom` tools, the latter served to the model as a
    single-string-input function under the caller's own tool name so callers that dispatch by name
    keep working;
@@ -817,7 +868,7 @@ index 6207ab0..5f28708 100644
  - assistant tool-call history, tool-result messages, and legacy function-call history;
  - the top-level `reasoning_effort` field, where the `default` and `auto` aliases resolve to the
    server-configured level;
-@@ -793,8 +816,8 @@ The endpoint supports:
+@@ -793,8 +829,8 @@ The endpoint supports:
  Options whose observable behavior the Engine cannot provide are rejected when they request that
  behavior. This includes JSON constrained output on a server without `--structured-output` (unless
  it runs with `--unconstrained-response-format`), nonzero `logit_bias`, audio/file input or audio
@@ -828,7 +879,7 @@ index 6207ab0..5f28708 100644
  Each capability rejection identifies the affected field and the guarantee NInfer cannot provide.
  The vLLM/llama.cpp constrained-decoding extensions (`grammar`, `structured_outputs`, `guided_json`,
  `guided_regex`, `guided_choice`, and `guided_grammar`) are rejected explicitly instead of being
-@@ -1256,8 +1279,8 @@ wire response contains typed `output` Items.
+@@ -1256,8 +1292,8 @@ wire response contains typed `output` Items.
  | `thinking_budget` | NInfer extension: positive per-request [thinking cap](#openai-chat-completions), or `null`; rejected by input token count, which does not generate |
  | `text.format` | `text`, `json_object`, or flat `json_schema`; see [structured output](#structured-output) |
  | `tools` | direct function definitions or namespace groups containing function definitions; see below |
@@ -839,7 +890,7 @@ index 6207ab0..5f28708 100644
  | `max_tool_calls` | non-negative integer accepted as a hosted-tool no-op; NInfer does not execute hosted tools |
  | `truncation` | omitted or `disabled`; overlong input fails instead of silently dropping Items |
  | `top_logprobs` | integer in `[0,20]`; a nonzero value also asks for [token log probabilities](#token-log-probabilities) |
-@@ -1283,7 +1306,7 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
+@@ -1283,7 +1319,7 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
  | `input_text` | message content part containing string `text` |
  | `output_text` | assistant-message replay part containing string `text` |
  | `refusal` | assistant-message replay part; its text enters assistant history |
@@ -848,7 +899,7 @@ index 6207ab0..5f28708 100644
  | `input_video` | NInfer extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
  | `reasoning` | raw replay Item with `reasoning_text` content; summary/encrypted metadata may accompany raw text but cannot replace it |
  | `function_call` | completed assistant call with optional `id` and namespace, plus required `call_id`, `name`, and JSON-object string `arguments` |
-@@ -1308,7 +1331,12 @@ An `input_text`, `input_image`, or tool-result part may carry
+@@ -1308,7 +1344,12 @@ An `input_text`, `input_image`, or tool-result part may carry
  boundaries; they affect reuse opportunities, not prompt identity or output semantics. String
  message status/phase metadata is accepted but has no Qwen prompt representation.
  
@@ -862,7 +913,7 @@ index 6207ab0..5f28708 100644
  reasoning text, partial tool Items, and other Item/content types are not supported. HTTP media URLs
  stored in a response chain are fetched again when that chain is continued; use data URIs when the
  historical media bytes must be immutable.
-@@ -1352,28 +1380,14 @@ NInfer renders these definitions in the Qwen prompt and parses model output into
+@@ -1352,28 +1393,14 @@ NInfer renders these definitions in the Qwen prompt and parses model output into
  `function_call` output Items. Each output has a protocol Item `id` (`fc_...`) and a distinct
  `call_id` (`call_...`). The client executes the function and sends a `function_call_output` Item in
  a later request. Only functions in the current effective tool set can become structured calls;
@@ -896,7 +947,7 @@ index 6207ab0..5f28708 100644
  
  ### Response object and usage
  
-@@ -1576,16 +1590,11 @@ protocol-validated value to the selected template, substituting the nearest valu
+@@ -1576,16 +1603,11 @@ protocol-validated value to the selected template, substituting the nearest valu
  accepts as described above. `output_config.format` accepts `{"type":"json_schema","schema":{...}}`,
  enforced strictly (see [Structured output](#structured-output)); Count Tokens ignores it.
  
@@ -918,7 +969,7 @@ index 6207ab0..5f28708 100644
  `is_error:true` explicitly in the model prompt. For a visible Assistant tool-use turn, the next
  User turn must provide exactly one leading result for every declared ID; valid results are matched
  by ID and normalized to call order. A history that begins with results remains valid as a truncated
-@@ -1733,7 +1742,7 @@ The table lists executable defaults. The startup example selects a long-context
+@@ -1733,7 +1755,7 @@ The table lists executable defaults. The startup example selects a long-context
  | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `600000` |
  | `--recover-invariant-failures` | a broken internal invariant in the Engine worker fails the active and materializing requests and leaves the waiting ones queued, as recovery from out of memory does, instead of failing the Engine; eight consecutive recoveries without a completed unit still fail it | off |
  | `--prefill-chunk N` | text-prefill chunk | `1024` |
@@ -927,7 +978,7 @@ index 6207ab0..5f28708 100644
  | `--log-stats-interval-ms N` | aggregate throughput report interval; `0` disables it | `5000` |
  | `--log-colours on\|off` | `on` colours the console log's levels and gives every statistic of the operational lines a stable colour; `off` keeps the log plain; a redirected stderr is always plain | levels coloured on a console |
  | `--log-stats-panel on\|off` | pin the session statistics panel beneath the console log on an interactive terminal | off |
-@@ -1764,8 +1773,8 @@ The table lists executable defaults. The startup example selects a long-context
+@@ -1764,8 +1786,8 @@ The table lists executable defaults. The startup example selects a long-context
  | `--lm-head-draft` | optimized proposal head | off |
  | `--adaptive-mtp` | MTP only: each round verifies 3..`--draft-tokens` drafts, the width favored by the drafts' measured survival and the measured round cost; see [Adaptive MTP](#adaptive-mtp) | off |
  | `--mtp-attention-window N` | MTP only: the draft head attends to the first 64 keys and the newest `N` before its query; verification keeps full attention; see [MTP attention window](#mtp-attention-window) | `0` (whole history) |
@@ -939,7 +990,7 @@ index 6207ab0..5f28708 100644
  | `--ngram-archive-mib N` | RAM archive that keeps finished requests' copy sources for later requests naming the same `X-NInfer-Draft-Session` | `0` (off) |
  | `--ngram-session-mib N` | per-session share of that archive, 1 MiB up to the archive size | `128` |
 diff --git a/docs/weight-conversion.md b/docs/weight-conversion.md
-index b27d2a6..8b1b424 100644
+index b27d2a68..8b1b4240 100644
 --- a/docs/weight-conversion.md
 +++ b/docs/weight-conversion.md
 @@ -63,7 +63,8 @@ The built-in recipes are ordinary Python functions in
@@ -986,7 +1037,7 @@ index b27d2a6..8b1b424 100644
  `qwen3_8_27b_gguf` ([`gguf_blocks.py`](../tools/convert/gguf_blocks.py)) imports a Qwen3.8-27B GGUF
 diff --git a/include/ninfer/ops/token_sums.h b/include/ninfer/ops/token_sums.h
 new file mode 100644
-index 0000000..c958ba0
+index 00000000..c958ba04
 --- /dev/null
 +++ b/include/ninfer/ops/token_sums.h
 @@ -0,0 +1,19 @@
@@ -1010,7 +1061,7 @@ index 0000000..c958ba0
 +                std::uint32_t block_tokens, Tensor& output, cudaStream_t stream);
 +} // namespace ninfer::ops
 diff --git a/include/ninfer/types.h b/include/ninfer/types.h
-index 0d7f7ab..e043c30 100644
+index 0d7f7ab4..30cf4edd 100644
 --- a/include/ninfer/types.h
 +++ b/include/ninfer/types.h
 @@ -133,8 +133,9 @@ struct SpeculativeOptions {
@@ -1262,8 +1313,25 @@ index 0d7f7ab..e043c30 100644
      // Actual prompt tokens evaluated by prefill; reused checkpoint-prefix tokens are excluded.
      std::uint64_t computed_prefill_tokens = 0;
      // Tokens committed by decode rounds; the first token emitted by prefill is excluded.
+@@ -1615,6 +1777,16 @@ struct RuntimeStats {
+     std::uint32_t last_selected_frontier_tokens      = 0;
+     // Aborted requests whose live state was published as a continuation endpoint.
+     std::uint64_t salvaged_continuations = 0;
++    // Requests that left the queue without being admitted, and the time they had waited: the
++    // client gave up (cancelled) or the pending timeout fired (expired).
++    std::uint64_t waiting_cancelled_requests = 0;
++    std::uint64_t waiting_expired_requests   = 0;
++    double waiting_abandoned_seconds         = 0.0;
++    // Requests cancelled while their prompt prefilled, the prompt tokens they had computed, and
++    // how many of them the context cache salvaged so a retry resumes where they stopped.
++    std::uint64_t cancelled_prefills                = 0;
++    std::uint64_t cancelled_prefill_computed_tokens = 0;
++    std::uint64_t cancelled_prefills_salvaged       = 0;
+ 
+     std::uint64_t state_moves     = 0;
+     std::uint64_t state_forks     = 0;
 diff --git a/src/artifact/binder.cpp b/src/artifact/binder.cpp
-index 5c37361..e0fec93 100644
+index 5c373619..e0fec937 100644
 --- a/src/artifact/binder.cpp
 +++ b/src/artifact/binder.cpp
 @@ -124,6 +124,9 @@ void Binder::evict_device(ObjectHandle object, std::uint32_t rank) {
@@ -1348,7 +1416,7 @@ index 5c37361..e0fec93 100644
      std::sort(pinned.begin(), pinned.end(), [&](std::size_t a, std::size_t b) {
          return *demands_[a].pinned_order < *demands_[b].pinned_order;
 diff --git a/src/artifact/binder.h b/src/artifact/binder.h
-index 59c1574..4abf267 100644
+index 59c15748..4abf2677 100644
 --- a/src/artifact/binder.h
 +++ b/src/artifact/binder.h
 @@ -19,6 +19,9 @@ struct ParameterReference {
@@ -1379,7 +1447,7 @@ index 59c1574..4abf267 100644
          std::vector<std::byte> host_data;
      };
 diff --git a/src/artifact/materializer.cpp b/src/artifact/materializer.cpp
-index 84fb065..fe69cd0 100644
+index 84fb0657..fe69cd0d 100644
 --- a/src/artifact/materializer.cpp
 +++ b/src/artifact/materializer.cpp
 @@ -312,6 +312,15 @@ const WeightParent& MaterializedArtifact::host_parent(ObjectHandle handle) const
@@ -1443,7 +1511,7 @@ index 84fb065..fe69cd0 100644
      const UploadTotals upload = upload_device_objects(reader, plan.device_objects,
                                                        out.arena_bases(), device, observer, phase,
 diff --git a/src/artifact/materializer.h b/src/artifact/materializer.h
-index 05129ea..b619f63 100644
+index 05129ead..b619f63e 100644
 --- a/src/artifact/materializer.h
 +++ b/src/artifact/materializer.h
 @@ -9,6 +9,7 @@
@@ -1480,7 +1548,7 @@ index 05129ea..b619f63 100644
          std::optional<WeightParent> host;
          std::vector<std::byte> host_data;
 diff --git a/src/artifact/views.cpp b/src/artifact/views.cpp
-index 81d2b09..f70178f 100644
+index 81d2b09c..f70178f9 100644
 --- a/src/artifact/views.cpp
 +++ b/src/artifact/views.cpp
 @@ -12,7 +12,9 @@ WeightView bind_view(const ParameterReference& reference,
@@ -1495,7 +1563,7 @@ index 81d2b09..f70178f 100644
                                   ? materialized.pinned_parent(part.object)
                                   : materialized.host_parent(part.object);
 diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
-index 879cd03..51a5d26 100644
+index 879cd03f..51a5d262 100644
 --- a/src/core/CMakeLists.txt
 +++ b/src/core/CMakeLists.txt
 @@ -1,5 +1,7 @@
@@ -1517,7 +1585,7 @@ index 879cd03..51a5d26 100644
    target_link_libraries(ninfer_core PUBLIC d3d12 dxgi)
  endif()
 diff --git a/src/core/arena.cu b/src/core/arena.cu
-index b0029af..05bf94c 100644
+index b0029af8..05bf94c9 100644
 --- a/src/core/arena.cu
 +++ b/src/core/arena.cu
 @@ -1,4 +1,5 @@
@@ -1666,7 +1734,7 @@ index b0029af..05bf94c 100644
      size_ = other.size_;
  
 diff --git a/src/core/arena.h b/src/core/arena.h
-index 713e28f..73d8173 100644
+index 713e28f9..73d8173a 100644
 --- a/src/core/arena.h
 +++ b/src/core/arena.h
 @@ -6,10 +6,13 @@
@@ -1708,7 +1776,7 @@ index 713e28f..73d8173 100644
  
  using WorkspaceArena = DeviceArena;
 diff --git a/src/core/decode_graph.cpp b/src/core/decode_graph.cpp
-index c934aa5..9039546 100644
+index c934aa50..029b9bae 100644
 --- a/src/core/decode_graph.cpp
 +++ b/src/core/decode_graph.cpp
 @@ -2,6 +2,7 @@
@@ -1719,18 +1787,37 @@ index c934aa5..9039546 100644
  
  #include <cstdio>
  #include <stdexcept>
-@@ -124,6 +125,9 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
+@@ -124,11 +125,23 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
  
      cudaGraphExecUpdateResultInfo result{};
      const cudaError_t err = cudaGraphExecUpdate(exec_, definition.graph_, &result);
+-    if (err != cudaSuccess || result.result != cudaGraphExecUpdateSuccess) {
+-        throw std::runtime_error(
+-            "CUDA Graph executable update failed: " + std::string(cudaGetErrorName(err)) +
+-            " (update result " + std::to_string(static_cast<int>(result.result)) + ")");
+-    }
 +    // Strict startup may retry a CUDA allocation failure, but a topology incompatibility is
 +    // still fatal. Preserve the original combined error on the driver-default route.
 +    if (err != cudaSuccess && core::current_resident_memory()) { CUDA_CHECK(err); }
-     if (err != cudaSuccess || result.result != cudaGraphExecUpdateSuccess) {
-         throw std::runtime_error(
-             "CUDA Graph executable update failed: " + std::string(cudaGetErrorName(err)) +
++    if (err == cudaSuccess && result.result == cudaGraphExecUpdateSuccess) { return; }
++
++    // Folding a new definition in place is only a fast path: the driver must reconcile the two
++    // graphs node for node. It cannot across a changed node count, and some architectures
++    // (e.g. sm_120) decline an otherwise updateable node. Rebuild the executable from the new
++    // definition instead of failing the engine. The executable still represents exactly
++    // `definition`, so every caller is unaffected apart from the one-off instantiation cost.
++    std::fprintf(stderr,
++                 "CUDA Graph update declined (%s, result %d, node %p); rebuilding executable\n",
++                 cudaGetErrorName(err), static_cast<int>(result.result),
++                 reinterpret_cast<const void*>(result.errorNode));
++    std::fflush(stderr);
++    (void)cudaGetLastError(); // drop any sticky error the declined update may have left behind
++    instantiate(definition);
+ }
+ 
+ void DecodeGraphExecutable::upload(cudaStream_t stream) {
 diff --git a/src/core/device.cu b/src/core/device.cu
-index f7845f7..fb88c44 100644
+index f7845f7b..fb88c44d 100644
 --- a/src/core/device.cu
 +++ b/src/core/device.cu
 @@ -1,4 +1,5 @@
@@ -1769,7 +1856,7 @@ index f7845f7..fb88c44 100644
  
  int memory_device(const void* pointer) {
 diff --git a/src/core/device.h b/src/core/device.h
-index e684873..86281fc 100644
+index e684873a..86281fc3 100644
 --- a/src/core/device.h
 +++ b/src/core/device.h
 @@ -17,6 +17,17 @@
@@ -1792,7 +1879,7 @@ index e684873..86281fc 100644
  #define CUDA_CHECK(expr) ::ninfer::cuda_check((expr), #expr, __FILE__, __LINE__)
 diff --git a/src/core/resident_memory.cpp b/src/core/resident_memory.cpp
 new file mode 100644
-index 0000000..d6a2421
+index 00000000..d6a2421b
 --- /dev/null
 +++ b/src/core/resident_memory.cpp
 @@ -0,0 +1,552 @@
@@ -2350,7 +2437,7 @@ index 0000000..d6a2421
 +} // namespace ninfer::core
 diff --git a/src/core/resident_memory.h b/src/core/resident_memory.h
 new file mode 100644
-index 0000000..0729dd6
+index 00000000..0729dd6d
 --- /dev/null
 +++ b/src/core/resident_memory.h
 @@ -0,0 +1,85 @@
@@ -2441,7 +2528,7 @@ index 0000000..0729dd6
 +} // namespace ninfer::core
 diff --git a/src/core/resident_scan.cu b/src/core/resident_scan.cu
 new file mode 100644
-index 0000000..5b15a12
+index 00000000..5b15a125
 --- /dev/null
 +++ b/src/core/resident_scan.cu
 @@ -0,0 +1,43 @@
@@ -2489,7 +2576,7 @@ index 0000000..5b15a12
 +
 +} // namespace ninfer::core
 diff --git a/src/core/stage_link.cu b/src/core/stage_link.cu
-index 0951dcd..a9c7fc8 100644
+index 0951dcdc..a9c7fc88 100644
 --- a/src/core/stage_link.cu
 +++ b/src/core/stage_link.cu
 @@ -12,6 +12,10 @@ namespace {
@@ -2504,7 +2591,7 @@ index 0951dcd..a9c7fc8 100644
                               ": " + cudaGetErrorString(err));
  }
 diff --git a/src/models/CMakeLists.txt b/src/models/CMakeLists.txt
-index 45dcd87..c3dea37 100644
+index 45dcd87a..c3dea378 100644
 --- a/src/models/CMakeLists.txt
 +++ b/src/models/CMakeLists.txt
 @@ -7,7 +7,8 @@ add_library(ninfer_model_runtime STATIC)
@@ -2518,7 +2605,7 @@ index 45dcd87..c3dea37 100644
  include(qwen3_5/loading_sources.cmake)
  include(qwen3_5/frontend_sources.cmake)
 diff --git a/src/models/qwen3_5/execution/attention.cpp b/src/models/qwen3_5/execution/attention.cpp
-index 4533e7c..87445e2 100644
+index 4533e7c6..87445e2b 100644
 --- a/src/models/qwen3_5/execution/attention.cpp
 +++ b/src/models/qwen3_5/execution/attention.cpp
 @@ -5,6 +5,7 @@
@@ -2581,7 +2668,7 @@ index 4533e7c..87445e2 100644
                normalized_key, stream);
  }
 diff --git a/src/models/qwen3_5/execution/attention.h b/src/models/qwen3_5/execution/attention.h
-index f690a93..1d60a13 100644
+index f690a931..1d60a13a 100644
 --- a/src/models/qwen3_5/execution/attention.h
 +++ b/src/models/qwen3_5/execution/attention.h
 @@ -3,6 +3,7 @@
@@ -2602,7 +2689,7 @@ index f690a93..1d60a13 100644
  
  } // namespace ninfer::models::qwen3_5::execution
 diff --git a/src/models/qwen3_5/execution/draft.cpp b/src/models/qwen3_5/execution/draft.cpp
-index 442dd05..db22928 100644
+index 442dd05e..db229289 100644
 --- a/src/models/qwen3_5/execution/draft.cpp
 +++ b/src/models/qwen3_5/execution/draft.cpp
 @@ -587,6 +587,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
@@ -2624,7 +2711,7 @@ index 442dd05..db22928 100644
          TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
 diff --git a/src/models/qwen3_5/execution/memory_statistics.h b/src/models/qwen3_5/execution/memory_statistics.h
 new file mode 100644
-index 0000000..0c2e986
+index 00000000..0c2e986b
 --- /dev/null
 +++ b/src/models/qwen3_5/execution/memory_statistics.h
 @@ -0,0 +1,50 @@
@@ -2679,7 +2766,7 @@ index 0000000..0c2e986
 +};
 +} // namespace ninfer::models::qwen3_5::execution
 diff --git a/src/models/qwen3_5/execution/text.cpp b/src/models/qwen3_5/execution/text.cpp
-index a72ef55..e3778a0 100644
+index a72ef55a..e3778a03 100644
 --- a/src/models/qwen3_5/execution/text.cpp
 +++ b/src/models/qwen3_5/execution/text.cpp
 @@ -928,9 +928,23 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase
@@ -2857,7 +2944,7 @@ index a72ef55..e3778a0 100644
                                                                                  ar_visible};
                          mtp_forward_ar_step(prev_token, io_.mtp->ar_hidden, ar_position,
 diff --git a/src/models/qwen3_5/execution/text.h b/src/models/qwen3_5/execution/text.h
-index 6e271e9..667f87e 100644
+index 6e271e97..667f87ee 100644
 --- a/src/models/qwen3_5/execution/text.h
 +++ b/src/models/qwen3_5/execution/text.h
 @@ -1,4 +1,5 @@
@@ -2895,7 +2982,7 @@ index 6e271e9..667f87e 100644
      const ops::CausalAttentionExecutionEnvelope* active_causal_attention_envelope_ = nullptr;
      std::int32_t active_sequence_batch_                                            = 0;
 diff --git a/src/models/qwen3_5/execution/vision.cpp b/src/models/qwen3_5/execution/vision.cpp
-index 0737fe5..83c5dba 100644
+index 0737fe5c..83c5dba3 100644
 --- a/src/models/qwen3_5/execution/vision.cpp
 +++ b/src/models/qwen3_5/execution/vision.cpp
 @@ -676,6 +676,28 @@ VisionOverlayWindowStats VisionPrefillSession::overlay_stats() const noexcept {
@@ -2928,7 +3015,7 @@ index 0737fe5..83c5dba 100644
      for (const std::uint32_t item_index : encoded_payloads_pending_release_) {
          if (item_index >= prompt_.media_payloads.size()) { std::terminate(); }
 diff --git a/src/models/qwen3_5/execution/vision.h b/src/models/qwen3_5/execution/vision.h
-index fc92d1b..783a581 100644
+index fc92d1b8..783a581d 100644
 --- a/src/models/qwen3_5/execution/vision.h
 +++ b/src/models/qwen3_5/execution/vision.h
 @@ -109,6 +109,8 @@ public:
@@ -2941,7 +3028,7 @@ index fc92d1b..783a581 100644
      [[nodiscard]] double elapsed_seconds() const;
  
 diff --git a/src/models/qwen3_5/execution/workspace.h b/src/models/qwen3_5/execution/workspace.h
-index dbc8d09..1d4eab4 100644
+index dbc8d092..1d4eab4f 100644
 --- a/src/models/qwen3_5/execution/workspace.h
 +++ b/src/models/qwen3_5/execution/workspace.h
 @@ -26,7 +26,7 @@ struct TextPrefillRoots {
@@ -2971,7 +3058,7 @@ index dbc8d09..1d4eab4 100644
      return out;
  }
 diff --git a/src/models/qwen3_5/frontend/chat_template.cpp b/src/models/qwen3_5/frontend/chat_template.cpp
-index 1bdf3ef..b8b058a 100644
+index 1bdf3ef3..b8b058a9 100644
 --- a/src/models/qwen3_5/frontend/chat_template.cpp
 +++ b/src/models/qwen3_5/frontend/chat_template.cpp
 @@ -42,6 +42,10 @@ struct ContentSource {
@@ -3069,7 +3156,7 @@ index 1bdf3ef..b8b058a 100644
          if (!message_blocks[i]) continue;
          const auto& block = layout.messages[*message_blocks[i]];
 diff --git a/src/models/qwen3_5/frontend/chat_template.h b/src/models/qwen3_5/frontend/chat_template.h
-index b9e8ffc..a8c6619 100644
+index b9e8ffc1..a8c6619b 100644
 --- a/src/models/qwen3_5/frontend/chat_template.h
 +++ b/src/models/qwen3_5/frontend/chat_template.h
 @@ -104,6 +104,14 @@ struct ChatRenderOptions {
@@ -3101,7 +3188,7 @@ index b9e8ffc..a8c6619 100644
      std::vector<MediaPlaceholderByteSpec> media_placeholders;
      std::vector<MediaTokenRunByteSpec> media_token_runs;
 diff --git a/src/models/qwen3_5/frontend/frontend.cpp b/src/models/qwen3_5/frontend/frontend.cpp
-index 71bd1b0..a5318f5 100644
+index 71bd1b04..a5318f5d 100644
 --- a/src/models/qwen3_5/frontend/frontend.cpp
 +++ b/src/models/qwen3_5/frontend/frontend.cpp
 @@ -13,6 +13,7 @@
@@ -3237,7 +3324,7 @@ index 71bd1b0..a5318f5 100644
  
  const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }
 diff --git a/src/models/qwen3_5/frontend/frontend.h b/src/models/qwen3_5/frontend/frontend.h
-index 8584a84..32dcc1a 100644
+index 8584a840..32dcc1ad 100644
 --- a/src/models/qwen3_5/frontend/frontend.h
 +++ b/src/models/qwen3_5/frontend/frontend.h
 @@ -107,7 +107,8 @@ public:
@@ -3251,7 +3338,7 @@ index 8584a84..32dcc1a 100644
      [[nodiscard]] const ModelSamplingDefaults& sampling_defaults() const noexcept;
      // Publishes the resolved long-anchor count. Startup builds the frontend before the sequence
 diff --git a/src/models/qwen3_5/frontend/output_session.cpp b/src/models/qwen3_5/frontend/output_session.cpp
-index eb9c405..eb51ce9 100644
+index eb9c4055..eb51ce96 100644
 --- a/src/models/qwen3_5/frontend/output_session.cpp
 +++ b/src/models/qwen3_5/frontend/output_session.cpp
 @@ -437,7 +437,8 @@ public:
@@ -3367,7 +3454,7 @@ index eb9c405..eb51ce9 100644
      };
  }
 diff --git a/src/models/qwen3_5/frontend/output_session.h b/src/models/qwen3_5/frontend/output_session.h
-index 86572b5..e0b567c 100644
+index 86572b54..e0b567c3 100644
 --- a/src/models/qwen3_5/frontend/output_session.h
 +++ b/src/models/qwen3_5/frontend/output_session.h
 @@ -73,6 +73,8 @@ public:
@@ -3380,7 +3467,7 @@ index 86572b5..e0b567c 100644
                                                            std::uint32_t total_budget_remaining);
      [[nodiscard]] runtime::OutputDecision preview_terminal(FinishReason reason);
 diff --git a/src/models/qwen3_5/frontend/prepared_prompt.h b/src/models/qwen3_5/frontend/prepared_prompt.h
-index 4eae32c..79eac5b 100644
+index 4eae32ca..79eac5bc 100644
 --- a/src/models/qwen3_5/frontend/prepared_prompt.h
 +++ b/src/models/qwen3_5/frontend/prepared_prompt.h
 @@ -162,6 +162,14 @@ struct PreparedPromptData {
@@ -3407,7 +3494,7 @@ index 4eae32c..79eac5b 100644
      PrepareStats prepare;
      std::string graft_name;
 diff --git a/src/models/qwen3_5/frontend/processor.cpp b/src/models/qwen3_5/frontend/processor.cpp
-index 6c89c25..f5c66c9 100644
+index 6c89c252..f5c66c9d 100644
 --- a/src/models/qwen3_5/frontend/processor.cpp
 +++ b/src/models/qwen3_5/frontend/processor.cpp
 @@ -576,6 +576,14 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
@@ -3499,7 +3586,7 @@ index 6c89c25..f5c66c9 100644
      output.cache_boundaries            = std::move(encoded.cache_boundaries);
      stats.prompt_tokens                = output.input_ids.size();
 diff --git a/src/models/qwen3_5/frontend/processor.h b/src/models/qwen3_5/frontend/processor.h
-index 762bd71..1ce17f3 100644
+index 762bd710..1ce17f30 100644
 --- a/src/models/qwen3_5/frontend/processor.h
 +++ b/src/models/qwen3_5/frontend/processor.h
 @@ -112,6 +112,10 @@ struct ProcessedInput {
@@ -3524,7 +3611,7 @@ index 762bd71..1ce17f3 100644
      std::vector<std::uint32_t> rewrite_execution_frontiers;
      std::vector<std::optional<std::uint32_t>> message_boundaries;
 diff --git a/src/models/qwen3_5/frontend/tool_call_parser.cpp b/src/models/qwen3_5/frontend/tool_call_parser.cpp
-index edd48f8..be9f2ea 100644
+index edd48f80..be9f2ea0 100644
 --- a/src/models/qwen3_5/frontend/tool_call_parser.cpp
 +++ b/src/models/qwen3_5/frontend/tool_call_parser.cpp
 @@ -307,6 +307,8 @@ Contract::Tool compile_tool_contract(const Json& definition) {
@@ -3643,7 +3730,7 @@ index edd48f8..be9f2ea 100644
          parse_qwen_tool_call_output(tool_region_, max_tool_name_length_, *contract_);
      if (forced_ && parsed.diagnostics.fallback_reason != FallbackReason::None) {
 diff --git a/src/models/qwen3_5/frontend/tool_call_parser.h b/src/models/qwen3_5/frontend/tool_call_parser.h
-index a5a2c9c..126b0c0 100644
+index a5a2c9ce..126b0c0b 100644
 --- a/src/models/qwen3_5/frontend/tool_call_parser.h
 +++ b/src/models/qwen3_5/frontend/tool_call_parser.h
 @@ -36,7 +36,9 @@ struct ToolCallOutputContract {
@@ -3688,7 +3775,7 @@ index a5a2c9c..126b0c0 100644
      std::string content;
 diff --git a/src/models/qwen3_5/frontend/tool_contract.cpp b/src/models/qwen3_5/frontend/tool_contract.cpp
 new file mode 100644
-index 0000000..512c2af
+index 00000000..512c2af5
 --- /dev/null
 +++ b/src/models/qwen3_5/frontend/tool_contract.cpp
 @@ -0,0 +1,295 @@
@@ -3989,7 +4076,7 @@ index 0000000..512c2af
 +} // namespace ninfer::models::qwen3_5::frontend
 diff --git a/src/models/qwen3_5/frontend/tool_grammar.cpp b/src/models/qwen3_5/frontend/tool_grammar.cpp
 new file mode 100644
-index 0000000..f4e3cc8
+index 00000000..f4e3cc8e
 --- /dev/null
 +++ b/src/models/qwen3_5/frontend/tool_grammar.cpp
 @@ -0,0 +1,81 @@
@@ -4076,7 +4163,7 @@ index 0000000..f4e3cc8
 +} // namespace ninfer::models::qwen3_5::frontend
 diff --git a/src/models/qwen3_5/frontend/tool_grammar.h b/src/models/qwen3_5/frontend/tool_grammar.h
 new file mode 100644
-index 0000000..cf03619
+index 00000000..cf036192
 --- /dev/null
 +++ b/src/models/qwen3_5/frontend/tool_grammar.h
 @@ -0,0 +1,5 @@
@@ -4086,7 +4173,7 @@ index 0000000..cf03619
 +std::string tool_grammar(const ToolCallOutputContract&, const StructuredOutputOptions&);
 +}
 diff --git a/src/models/qwen3_5/frontend_sources.cmake b/src/models/qwen3_5/frontend_sources.cmake
-index 84751e8..045368b 100644
+index 84751e8c..045368b7 100644
 --- a/src/models/qwen3_5/frontend_sources.cmake
 +++ b/src/models/qwen3_5/frontend_sources.cmake
 @@ -8,4 +8,8 @@ target_sources(ninfer_model_runtime PRIVATE
@@ -4099,7 +4186,7 @@ index 84751e8..045368b 100644
 +target_include_directories(ninfer_model_runtime PRIVATE ${PROJECT_SOURCE_DIR}/third_party/xgrammar/cpp)
 +target_link_libraries(ninfer_model_runtime PRIVATE ninfer_xgrammar)
 diff --git a/src/models/qwen3_5/load.cpp b/src/models/qwen3_5/load.cpp
-index 04b2f44..762e9e5 100644
+index 04b2f443..762e9e50 100644
 --- a/src/models/qwen3_5/load.cpp
 +++ b/src/models/qwen3_5/load.cpp
 @@ -58,14 +58,6 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options) {
@@ -4134,7 +4221,7 @@ index 04b2f44..762e9e5 100644
      std::vector<StageBudget> budgets;
      budgets.reserve(free_bytes.size());
 diff --git a/src/models/qwen3_5/load/bindings.h b/src/models/qwen3_5/load/bindings.h
-index 376d715..46bab79 100644
+index 376d715c..46bab790 100644
 --- a/src/models/qwen3_5/load/bindings.h
 +++ b/src/models/qwen3_5/load/bindings.h
 @@ -58,10 +58,12 @@ private:
@@ -4151,7 +4238,7 @@ index 376d715..46bab79 100644
  
  [[nodiscard]] AttentionWeights bind_attention(Bindings& bindings, const TextConfig& config,
 diff --git a/src/models/qwen3_5/load/prepare.cpp b/src/models/qwen3_5/load/prepare.cpp
-index 15deca6..400b233 100644
+index 15deca6b..400b2333 100644
 --- a/src/models/qwen3_5/load/prepare.cpp
 +++ b/src/models/qwen3_5/load/prepare.cpp
 @@ -200,6 +200,24 @@ void Bindings::evict(WeightId id, std::uint32_t rank) {
@@ -4203,7 +4290,7 @@ index 15deca6..400b233 100644
  
  bool Bindings::transcode(WeightId id, QType target, std::string_view option) {
 diff --git a/src/models/qwen3_5/program/context.h b/src/models/qwen3_5/program/context.h
-index 0014a8c..49b1022 100644
+index 0014a8c6..49b10225 100644
 --- a/src/models/qwen3_5/program/context.h
 +++ b/src/models/qwen3_5/program/context.h
 @@ -45,6 +45,7 @@ struct ExecutionCore {
@@ -4239,7 +4326,7 @@ index 0014a8c..49b1022 100644
      ops::ContextAttentionExecutionEnvelope full;
  };
 diff --git a/src/models/qwen3_5/program/context_work.cpp b/src/models/qwen3_5/program/context_work.cpp
-index c799d3e..7a7e9e1 100644
+index c799d3e3..7a7e9e12 100644
 --- a/src/models/qwen3_5/program/context_work.cpp
 +++ b/src/models/qwen3_5/program/context_work.cpp
 @@ -307,12 +307,11 @@ execution::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint3
@@ -4260,7 +4347,7 @@ index c799d3e..7a7e9e1 100644
  }
  
 diff --git a/src/models/qwen3_5/program/context_work.h b/src/models/qwen3_5/program/context_work.h
-index 38e479f..87ea820 100644
+index 38e479f7..87ea820c 100644
 --- a/src/models/qwen3_5/program/context_work.h
 +++ b/src/models/qwen3_5/program/context_work.h
 @@ -77,6 +77,9 @@ execution::MtpCausalAttentionEnvelopes mtp_causal_attention_envelopes(std::uint3
@@ -4275,7 +4362,7 @@ index 38e479f..87ea820 100644
  
  } // namespace ninfer::models::qwen3_5::detail
 diff --git a/src/models/qwen3_5/program/decode.cpp b/src/models/qwen3_5/program/decode.cpp
-index 0b02d06..7460286 100644
+index 0b02d06b..74602865 100644
 --- a/src/models/qwen3_5/program/decode.cpp
 +++ b/src/models/qwen3_5/program/decode.cpp
 @@ -42,6 +42,7 @@ auto ordinary_batch_body(OrdinaryBatchContext& state, std::int32_t batch_size,
@@ -4660,7 +4747,7 @@ index 0b02d06..7460286 100644
      request.pending   = {};
      return timing.finish();
 diff --git a/src/models/qwen3_5/program/graphs.cpp b/src/models/qwen3_5/program/graphs.cpp
-index c1cd1f6..640f413 100644
+index c1cd1f60..640f413e 100644
 --- a/src/models/qwen3_5/program/graphs.cpp
 +++ b/src/models/qwen3_5/program/graphs.cpp
 @@ -245,6 +245,8 @@ void ProgramImpl::prepare_graphs() {
@@ -4860,7 +4947,7 @@ index c1cd1f6..640f413 100644
                  }
              }
 diff --git a/src/models/qwen3_5/program/planning/pressure.cpp b/src/models/qwen3_5/program/planning/pressure.cpp
-index 328a7bc..99b8a32 100644
+index 328a7bc0..99b8a32f 100644
 --- a/src/models/qwen3_5/program/planning/pressure.cpp
 +++ b/src/models/qwen3_5/program/planning/pressure.cpp
 @@ -2651,6 +2651,21 @@ bool ProgramImpl::isolated_request_feasible(const RequestBasePlan& base) const n
@@ -4886,7 +4973,7 @@ index 328a7bc..99b8a32 100644
  bool ProgramImpl::persistent_backfill_safe(
      const RequestBasePlan& blocked_head, const AdmissionCandidate& candidate,
 diff --git a/src/models/qwen3_5/program/planning/request_plan.cpp b/src/models/qwen3_5/program/planning/request_plan.cpp
-index 9811b10..9bb747f 100644
+index 9811b10e..9bb747fc 100644
 --- a/src/models/qwen3_5/program/planning/request_plan.cpp
 +++ b/src/models/qwen3_5/program/planning/request_plan.cpp
 @@ -5,6 +5,7 @@
@@ -5027,7 +5114,7 @@ index 9811b10..9bb747f 100644
      std::uint64_t vision_patches = 0;
      if (plan.vision) {
 diff --git a/src/models/qwen3_5/program/planning/startup.cpp b/src/models/qwen3_5/program/planning/startup.cpp
-index 2413356..a7bc854 100644
+index 24133567..6be5268a 100644
 --- a/src/models/qwen3_5/program/planning/startup.cpp
 +++ b/src/models/qwen3_5/program/planning/startup.cpp
 @@ -133,7 +133,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
@@ -5124,7 +5211,21 @@ index 2413356..a7bc854 100644
                                              plan.features.vision ? tokens : 0,
                                              plan.features.host_staged_vision());
      };
-@@ -979,19 +1021,26 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
+@@ -493,8 +535,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
+                     execution::ffn_workspace_bytes(block.ffn, first, last, false,
+                                                    phase == TextPhase::Verify, wide_verification));
+         }
++        // A prompt chunk projects only its last column through the head; a verify round projects
++        // every column.
+         if (!plan.causal_scoring) {
+-            linear_scratch(layout, parameters.text.output_head, first, last);
++            const std::int32_t head_last = phase == TextPhase::Prefill ? 1 : last;
++            linear_scratch(layout, parameters.text.output_head, std::min(first, head_last),
++                           head_last);
+         }
+     };
+     const auto mtp_post_mixer = [&](WorkspaceLayoutBuilder& layout, int first, int last) {
+@@ -979,19 +1025,26 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
                                      " pipeline stages but " + std::to_string(device.size()) +
                                      " devices are attached");
      }
@@ -5158,7 +5259,7 @@ index 2413356..a7bc854 100644
              throw std::invalid_argument("kv_capacity must be at least max_context");
          }
          const std::uint32_t requested_pages = page_count(options.kv_capacity.explicit_tokens);
-@@ -1072,6 +1121,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
+@@ -1072,6 +1125,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
      auto impl                 = std::make_unique<SequencePlanImpl>();
      impl->parameters          = inputs.parameters;
      impl->capacity            = inputs.capacity;
@@ -5167,7 +5268,7 @@ index 2413356..a7bc854 100644
      impl->main_page_groups    = main_page_groups;
      impl->kv_capacity         = static_cast<std::uint32_t>(checked_i32(
          static_cast<std::uint64_t>(main_page_groups) * static_cast<std::uint32_t>(kPagedKVPageSize),
-@@ -1143,7 +1194,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
+@@ -1143,7 +1198,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
          if (impl->speculative_backend == SpeculativeBackend::None) {
              impl->graph_allowance_bytes = checked_mul(
                  graph_topology_allowance(
@@ -5176,7 +5277,7 @@ index 2413356..a7bc854 100644
                      [](GraphExecutionProfile) { return 12ULL * kMiB; },
                      "ordinary graph allowance"),
                  impl->max_concurrency, "ordinary exact-b graph allowance");
-@@ -1152,7 +1203,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
+@@ -1152,7 +1207,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
              // rounds one more at the ngram window for every batch size they admit.
              const auto family_allowance = [&](std::uint32_t verify_window) {
                  const auto profiles =
@@ -5185,7 +5286,7 @@ index 2413356..a7bc854 100644
                                         attention_geometry, impl->kv_storage);
                  return graph_topology_allowance(
                      profiles,
-@@ -1342,6 +1393,7 @@ ops::RopeYarn planned_rope_yarn(const execution::Parameters& parameters,
+@@ -1342,6 +1397,7 @@ ops::RopeYarn planned_rope_yarn(const execution::Parameters& parameters,
  std::uint32_t effective_prefill_chunk(const execution::Parameters& parameters,
                                        const EngineOptions& options) {
      const std::uint32_t requested = std::min(options.prefill_chunk, options.max_context);
@@ -5193,7 +5294,7 @@ index 2413356..a7bc854 100644
      static const bool align = [] {
          const char* value = std::getenv("NINFER_PREFILL_ALIGN");
          return value == nullptr || value[0] != '0';
-@@ -1385,7 +1437,9 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
+@@ -1385,7 +1441,9 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
          .context_cache              = options.context_cache,
          .resident_main_pages        = resident_main_pages,
      };
@@ -5205,7 +5306,7 @@ index 2413356..a7bc854 100644
      const std::uint64_t minimum_pages64 =
          static_cast<std::uint64_t>(std::max(logical_pages, inputs.max_concurrency)) +
 diff --git a/src/models/qwen3_5/program/planning/startup.h b/src/models/qwen3_5/program/planning/startup.h
-index f825e58..32af3bf 100644
+index f825e588..32af3bf9 100644
 --- a/src/models/qwen3_5/program/planning/startup.h
 +++ b/src/models/qwen3_5/program/planning/startup.h
 @@ -35,6 +35,20 @@ struct DFlashPersistentLayout {
@@ -5256,7 +5357,7 @@ index f825e58..32af3bf 100644
      std::uint32_t main_page_groups          = 0;
      std::uint32_t max_concurrency           = 1;
 diff --git a/src/models/qwen3_5/program/prefill.cpp b/src/models/qwen3_5/program/prefill.cpp
-index 059f132..25325e5 100644
+index 059f132f..25325e53 100644
 --- a/src/models/qwen3_5/program/prefill.cpp
 +++ b/src/models/qwen3_5/program/prefill.cpp
 @@ -52,6 +52,7 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
@@ -5656,7 +5757,7 @@ index 059f132..25325e5 100644
          timing.begin_wait();
          try {
 diff --git a/src/models/qwen3_5/program/prefix_identity.h b/src/models/qwen3_5/program/prefix_identity.h
-index d19092a..ead8dde 100644
+index d19092ae..ead8ddee 100644
 --- a/src/models/qwen3_5/program/prefix_identity.h
 +++ b/src/models/qwen3_5/program/prefix_identity.h
 @@ -49,6 +49,7 @@ public:
@@ -5668,7 +5769,7 @@ index d19092a..ead8dde 100644
      std::array<std::vector<std::int32_t>, 3> positions_;
      std::vector<VisionItem> vision_items_;
 diff --git a/src/models/qwen3_5/program/program.cpp b/src/models/qwen3_5/program/program.cpp
-index 438fe95..1d9bdc9 100644
+index 438fe951..1d9bdc98 100644
 --- a/src/models/qwen3_5/program/program.cpp
 +++ b/src/models/qwen3_5/program/program.cpp
 @@ -437,6 +437,15 @@ DeviceSnapshot::Stats Program::resume_device_state(DeviceSnapshot& snapshot) {
@@ -5698,7 +5799,7 @@ index 438fe95..1d9bdc9 100644
  bool Program::hybrid_prefix_cache() const noexcept { return impl_->hybrid_prefix_cache(); }
  
 diff --git a/src/models/qwen3_5/program/program.h b/src/models/qwen3_5/program/program.h
-index d3c6067..29d2303 100644
+index d3c60670..29d23036 100644
 --- a/src/models/qwen3_5/program/program.h
 +++ b/src/models/qwen3_5/program/program.h
 @@ -851,6 +851,7 @@ struct PrefillProgress {
@@ -5733,7 +5834,7 @@ index d3c6067..29d2303 100644
      // Hybrid prefix cache mode (ContextCacheMode::Hybrid). Admission runs as the same context
      // transaction the Engine drives for Legacy materialization: quote, reserve, then
 diff --git a/src/models/qwen3_5/program/program_impl.cpp b/src/models/qwen3_5/program/program_impl.cpp
-index ddd6cb4..60446eb 100644
+index ddd6cb47..60446eb4 100644
 --- a/src/models/qwen3_5/program/program_impl.cpp
 +++ b/src/models/qwen3_5/program/program_impl.cpp
 @@ -1,3 +1,4 @@
@@ -5958,7 +6059,7 @@ index ddd6cb4..60446eb 100644
      out.max_context     = capacity;
      out.kv_capacity     = kv_capacity;
 diff --git a/src/models/qwen3_5/program/program_impl.h b/src/models/qwen3_5/program/program_impl.h
-index b82aeb3..d698df0 100644
+index b82aeb3f..d698df0f 100644
 --- a/src/models/qwen3_5/program/program_impl.h
 +++ b/src/models/qwen3_5/program/program_impl.h
 @@ -5,6 +5,12 @@
@@ -6353,7 +6454,7 @@ index b82aeb3..d698df0 100644
      [[nodiscard]] qwen3_5::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
  };
 diff --git a/src/models/qwen3_5/program/round_buffers.cpp b/src/models/qwen3_5/program/round_buffers.cpp
-index df8be40..a3e3200 100644
+index df8be40d..a3e3200e 100644
 --- a/src/models/qwen3_5/program/round_buffers.cpp
 +++ b/src/models/qwen3_5/program/round_buffers.cpp
 @@ -124,6 +124,7 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
@@ -6383,7 +6484,7 @@ index df8be40..a3e3200 100644
          ingress_tensor(offsetof(DFlashDecodeIngress, context_frontiers), DType::I32, {batch});
      proposal_extents =
 diff --git a/src/models/qwen3_5/program/round_buffers.h b/src/models/qwen3_5/program/round_buffers.h
-index e0cbd44..60d46bc 100644
+index e0cbd446..60d46bc9 100644
 --- a/src/models/qwen3_5/program/round_buffers.h
 +++ b/src/models/qwen3_5/program/round_buffers.h
 @@ -40,6 +40,7 @@ struct RoundStateSpec {
@@ -6440,7 +6541,7 @@ index e0cbd44..60d46bc 100644
      Tensor proposal_extents;
      Tensor target_valid_columns;
 diff --git a/src/models/qwen3_5/program/speculative/mtp.cpp b/src/models/qwen3_5/program/speculative/mtp.cpp
-index 7e2d63c..8828469 100644
+index 7e2d63cf..8828469b 100644
 --- a/src/models/qwen3_5/program/speculative/mtp.cpp
 +++ b/src/models/qwen3_5/program/speculative/mtp.cpp
 @@ -31,6 +31,7 @@ void mtp_bridge_and_propose(PrefillContext& state, const Tensor& next_token,
@@ -6461,7 +6562,7 @@ index 7e2d63c..8828469 100644
                                       .licensed_tokens         = licensed_tokens,
                                       .licensed_counts         = licensed_counts,
 diff --git a/src/models/qwen3_5/program/speculative/target_verification.cpp b/src/models/qwen3_5/program/speculative/target_verification.cpp
-index 6624ef8..db9046a 100644
+index 6624ef8f..db9046a5 100644
 --- a/src/models/qwen3_5/program/speculative/target_verification.cpp
 +++ b/src/models/qwen3_5/program/speculative/target_verification.cpp
 @@ -12,6 +12,7 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
@@ -6473,7 +6574,7 @@ index 6624ef8..db9046a 100644
          card.target_verify_batch(frame.ids, frame.cache_positions, frame.rope_positions,
                                   frame.valid_columns, frame.kv_table_rows, frame.state_source_slots,
 diff --git a/src/models/qwen3_5/program/storage/context.cpp b/src/models/qwen3_5/program/storage/context.cpp
-index 9085edc..5111e16 100644
+index 9085edcc..5111e16b 100644
 --- a/src/models/qwen3_5/program/storage/context.cpp
 +++ b/src/models/qwen3_5/program/storage/context.cpp
 @@ -6,6 +6,8 @@
@@ -6600,7 +6701,7 @@ index 9085edc..5111e16 100644
      sequence.dflash_context_frontier = 0;
 diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
 new file mode 100644
-index 0000000..213a540
+index 00000000..213a5405
 --- /dev/null
 +++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
 @@ -0,0 +1,1570 @@
@@ -8176,7 +8277,7 @@ index 0000000..213a540
 +} // namespace ninfer::models::qwen3_5::detail
 diff --git a/src/models/qwen3_5/program/storage/memory_statistics.cpp b/src/models/qwen3_5/program/storage/memory_statistics.cpp
 new file mode 100644
-index 0000000..03b1b7d
+index 00000000..03b1b7d2
 --- /dev/null
 +++ b/src/models/qwen3_5/program/storage/memory_statistics.cpp
 @@ -0,0 +1,217 @@
@@ -8398,7 +8499,7 @@ index 0000000..03b1b7d
 +}
 +} // namespace ninfer::models::qwen3_5::detail
 diff --git a/src/models/qwen3_5/program/storage/state_store.h b/src/models/qwen3_5/program/storage/state_store.h
-index 4b55fec..d649126 100644
+index 4b55fec4..d6491269 100644
 --- a/src/models/qwen3_5/program/storage/state_store.h
 +++ b/src/models/qwen3_5/program/storage/state_store.h
 @@ -184,6 +184,19 @@ public:
@@ -8422,7 +8523,7 @@ index 4b55fec..d649126 100644
          Object& object       = require_copied_destination(handle);
          object.content_epoch = next_epoch();
 diff --git a/src/models/qwen3_5/program/transactions/commit.cpp b/src/models/qwen3_5/program/transactions/commit.cpp
-index 0280b9f..e20e1ba 100644
+index 0280b9f5..e20e1ba0 100644
 --- a/src/models/qwen3_5/program/transactions/commit.cpp
 +++ b/src/models/qwen3_5/program/transactions/commit.cpp
 @@ -49,6 +49,7 @@ PrefillProgress ProgramImpl::wrap_prefill(std::uint32_t lane, runtime::PrefillSt
@@ -8532,7 +8633,7 @@ index 0280b9f..e20e1ba 100644
      out.timings     = request.timings;
      out.speculative = std::move(request.speculative_stats);
 diff --git a/src/models/qwen3_5/program/transactions/materialization.cpp b/src/models/qwen3_5/program/transactions/materialization.cpp
-index 22b2009..fd4c3af 100644
+index 22b20094..fd4c3af3 100644
 --- a/src/models/qwen3_5/program/transactions/materialization.cpp
 +++ b/src/models/qwen3_5/program/transactions/materialization.cpp
 @@ -341,11 +341,14 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
@@ -8574,7 +8675,7 @@ index 22b2009..fd4c3af 100644
      if (const auto* transaction = std::get_if<MaterializationTransaction>(&context_transaction_)) {
          submitted = transaction->transfer_submitted;
 diff --git a/src/models/qwen3_5/program_sources.cmake b/src/models/qwen3_5/program_sources.cmake
-index 9d19d56..b6f6f9f 100644
+index 9d19d569..b6f6f9fe 100644
 --- a/src/models/qwen3_5/program_sources.cmake
 +++ b/src/models/qwen3_5/program_sources.cmake
 @@ -17,6 +17,8 @@ target_sources(ninfer_model_runtime PRIVATE
@@ -8587,7 +8688,7 @@ index 9d19d56..b6f6f9f 100644
    "${CMAKE_CURRENT_LIST_DIR}/program/storage/session_snapshot.cpp"
    "${CMAKE_CURRENT_LIST_DIR}/program/transactions/commit.cpp"
 diff --git a/src/ops/CMakeLists.txt b/src/ops/CMakeLists.txt
-index 1a52554..c3a64d9 100644
+index 1a52554e..c3a64d9c 100644
 --- a/src/ops/CMakeLists.txt
 +++ b/src/ops/CMakeLists.txt
 @@ -21,6 +21,7 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
@@ -8598,8 +8699,285 @@ index 1a52554..c3a64d9 100644
  include("${CMAKE_CURRENT_LIST_DIR}/attn_input_proj/sources.cmake")
  include("${CMAKE_CURRENT_LIST_DIR}/candidate_selector/sources.cmake")
  include("${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize/sources.cmake")
+diff --git a/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_a8.cu b/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_a8.cu
+index d0bc774e..855db319 100644
+--- a/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_a8.cu
++++ b/src/ops/attn_input_proj/q4_q5/q4_q5_attn_input_a8.cu
+@@ -40,7 +40,7 @@ void launch_range(const Weight& weight, const std::int8_t* codes, const __half*
+                   __nv_bfloat16* dst, std::int32_t dst_rows, cudaStream_t stream) {
+     constexpr int BN       = a8::kWarpsN * NT * 8;
+     const std::size_t smem = a8::shared_bytes<Codec, 1, NT, Rows>(kHidden);
+-    const dim3 grid(row_count / Rows::kRowsPerBlock, tokens / BN);
++    const dim3 grid(row_count / Rows::kRowsPerBlock, a8::padded_tokens(tokens) / BN);
+     auto* kernel = a8::a8_mma_kernel<Codec, kHidden, 1, NT, Rows, a8::StoreEpilogue>;
+     if (smem > 48 * 1024) {
+         configure_cuda_device_once([&] {
+@@ -94,7 +94,7 @@ std::size_t q4_q5_attn_input_a8_workspace_capacity_bytes(std::int32_t min_tokens
+     if (min_tokens <= 0 || max_tokens < min_tokens) {
+         throw std::invalid_argument("q4_q5 attn_input a8 workspace: invalid token interval");
+     }
+-    return a8::activation_workspace_bytes(kHidden, max_tokens);
++    return a8::padded_activation_workspace_bytes(kHidden, max_tokens);
+ }
+ 
+ void q4_q5_attn_input_a8_launch(const Tensor& x, const Weight& query_key, const Weight& gate_value,
+@@ -105,15 +105,16 @@ void q4_q5_attn_input_a8_launch(const Tensor& x, const Weight& query_key, const
+         throw std::invalid_argument("q4_q5 attn_input a8: unsupported profile");
+     }
+ 
+-    auto scope             = workspace.scope();
+-    const DeviceSpan codes = workspace.alloc_bytes(static_cast<std::size_t>(tokens) * kHidden);
+-    const DeviceSpan scales = workspace.alloc_bytes(
+-        static_cast<std::size_t>(tokens) * (kHidden / a8::kGroup) * sizeof(__half));
++    const std::int32_t columns = a8::padded_tokens(tokens);
++    auto scope                 = workspace.scope();
++    const DeviceSpan codes     = workspace.alloc_bytes(static_cast<std::size_t>(columns) * kHidden);
++    const DeviceSpan scales    = workspace.alloc_bytes(static_cast<std::size_t>(columns) *
++                                                       (kHidden / a8::kGroup) * sizeof(__half));
+ 
+     auto* code_data  = reinterpret_cast<std::int8_t*>(codes.data);
+     auto* scale_data = reinterpret_cast<__half*>(scales.data);
+ 
+-    switch (a8::token_tile(tokens, 512)) {
++    switch (a8::token_tile(columns, 512)) {
+     case 512:
+         launch_all<16>(x, query_key, gate_value, tokens, code_data, scale_data, q, gate, k, v,
+                        stream);
+diff --git a/src/ops/common/rowsplit_a8_mma.cuh b/src/ops/common/rowsplit_a8_mma.cuh
+index d88dd483..bddfb37a 100644
+--- a/src/ops/common/rowsplit_a8_mma.cuh
++++ b/src/ops/common/rowsplit_a8_mma.cuh
+@@ -556,6 +556,39 @@ template <class Codec, int MT, int NT, class RowMap>
+     return 0;
+ }
+ 
++// The padded width a ragged T runs at: the GEMM's grid covers it, while the quantizer and the
++// epilogues cover T alone. Every column tile streams the whole weight, and a wider tile costs less
++// per column: on the RTX 3090 one 128-, 256- and 512-column tile of the text layers take
++// 1 : 1.4 : 2.2 (ninfer_linear_bench, 2026-09-22), so 300 tokens run as one 512-column tile (2.2)
++// rather than three of 128 (3.0), and 600 as three of 256 rather than five of 128. A prompt chunk
++// aligned to the attention grid (1,152 tokens on 72 SMs) runs as three 512-column tiles.
++[[nodiscard]] inline std::int32_t padded_tokens(std::int32_t tokens) {
++    struct Tile {
++        std::int32_t columns;
++        std::int32_t cost; // tenths of a 128-column tile
++    };
++
++    constexpr Tile kTiles[] = {{128, 10}, {256, 14}, {512, 22}};
++    std::int32_t best       = 0;
++    std::int32_t best_cost  = 0;
++    for (const Tile& tile : kTiles) {
++        const std::int32_t count = (tokens + tile.columns - 1) / tile.columns;
++        const std::int32_t cost  = count * tile.cost;
++        if (best == 0 || cost < best_cost) {
++            best      = count * tile.columns;
++            best_cost = cost;
++        }
++    }
++    return best;
++}
++
++// The activation planes for every T in [1, max_tokens] at its padded width: padded_tokens never
++// exceeds the next multiple of 512.
++[[nodiscard]] inline std::size_t padded_activation_workspace_bytes(std::int32_t input_rows,
++                                                                   std::int32_t max_tokens) {
++    return activation_workspace_bytes(input_rows, (max_tokens + 511) / 512 * 512);
++}
++
+ [[nodiscard]] inline bool tokens_supported(std::int32_t tokens) {
+     return tokens >= 128 && tokens % 128 == 0;
+ }
+diff --git a/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_a8.cu b/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_a8.cu
+index 176ff02d..4abded7a 100644
+--- a/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_a8.cu
++++ b/src/ops/gdn_input_proj/q4_q5/q4_q5_gdn_input_a8.cu
+@@ -47,7 +47,7 @@ void launch_range(const Weight& weight, const std::int8_t* codes, const __half*
+                   a8::StoreEpilogue epilogue, cudaStream_t stream) {
+     constexpr int BN       = a8::kWarpsN * NT * 8;
+     const std::size_t smem = a8::shared_bytes<Codec, 1, NT, Rows>(kHidden);
+-    const dim3 grid(row_count / Rows::kRowsPerBlock, tokens / BN);
++    const dim3 grid(row_count / Rows::kRowsPerBlock, a8::padded_tokens(tokens) / BN);
+     auto* kernel = a8::a8_mma_kernel<Codec, kHidden, 1, NT, Rows, a8::StoreEpilogue>;
+     if (smem > 48 * 1024) {
+         configure_cuda_device_once([&] {
+@@ -98,7 +98,7 @@ std::size_t q4_q5_gdn_input_a8_workspace_capacity_bytes(std::int32_t min_tokens,
+     if (min_tokens <= 0 || max_tokens < min_tokens) {
+         throw std::invalid_argument("q4_q5 gdn_input a8 workspace: invalid token interval");
+     }
+-    return a8::activation_workspace_bytes(kHidden, max_tokens);
++    return a8::padded_activation_workspace_bytes(kHidden, max_tokens);
+ }
+ 
+ void q4_q5_gdn_input_a8_launch(const Tensor& x, const Weight& qk, const Weight& value_z, Tensor& qkv,
+@@ -108,18 +108,18 @@ void q4_q5_gdn_input_a8_launch(const Tensor& x, const Weight& qk, const Weight&
+         throw std::invalid_argument("q4_q5 gdn_input a8: unsupported profile");
+     }
+ 
+-    auto scope = workspace.scope();
+-    const DeviceSpan codes =
+-        workspace.alloc_bytes(static_cast<std::size_t>(tokens) * kHidden);
+-    const DeviceSpan scales = workspace.alloc_bytes(
+-        static_cast<std::size_t>(tokens) * (kHidden / a8::kGroup) * sizeof(__half));
++    const std::int32_t columns = a8::padded_tokens(tokens);
++    auto scope                 = workspace.scope();
++    const DeviceSpan codes     = workspace.alloc_bytes(static_cast<std::size_t>(columns) * kHidden);
++    const DeviceSpan scales    = workspace.alloc_bytes(static_cast<std::size_t>(columns) *
++                                                       (kHidden / a8::kGroup) * sizeof(__half));
+ 
+     auto* code_data  = reinterpret_cast<std::int8_t*>(codes.data);
+     auto* scale_data = reinterpret_cast<__half*>(scales.data);
+     auto* qkv_data   = static_cast<__nv_bfloat16*>(qkv.data);
+     auto* z_data     = static_cast<__nv_bfloat16*>(z.data);
+ 
+-    switch (a8::token_tile(tokens, 512)) {
++    switch (a8::token_tile(columns, 512)) {
+     case 512:
+         launch_all<16>(x, qk, value_z, tokens, code_data, scale_data, qkv_data, z_data, stream);
+         return;
+diff --git a/src/ops/linear/t2/t2_a8.cu b/src/ops/linear/t2/t2_a8.cu
+index 222ba48b..178e2461 100644
+--- a/src/ops/linear/t2/t2_a8.cu
++++ b/src/ops/linear/t2/t2_a8.cu
+@@ -31,29 +31,6 @@ namespace a8 = rowsplit_a8;
+ 
+ using Rows = a8::ContiguousRows<1>;
+ 
+-// The padded width a ragged T runs at. Every column tile streams the whole weight, and a wider
+-// tile costs less per column: on the RTX 3090 one 128-, 256- and 512-column tile of the text layers
+-// take 1 : 1.4 : 2.2 (ninfer_linear_bench, 2026-09-22), so 300 tokens run as one 512-column tile
+-// (2.2) rather than three of 128 (3.0), and 600 as three of 256 rather than five of 128.
+-std::int32_t padded_tokens(std::int32_t tokens) {
+-    struct Tile {
+-        std::int32_t columns;
+-        std::int32_t cost; // tenths of a 128-column tile
+-    };
+-
+-    constexpr Tile kTiles[] = {{128, 10}, {256, 14}, {512, 22}};
+-    std::int32_t best       = 0;
+-    std::int32_t best_cost  = 0;
+-    for (const Tile& tile : kTiles) {
+-        const std::int32_t count = (tokens + tile.columns - 1) / tile.columns;
+-        const std::int32_t cost  = count * tile.cost;
+-        if (best == 0 || cost < best_cost) {
+-            best      = count * tile.columns;
+-            best_cost = cost;
+-        }
+-    }
+-    return best;
+-}
+ 
+ // NINFER_T2_A8_TILE=off keeps the shared rowsplit_a8_mma.cuh GEMM on the prefill route.
+ bool prefill_tile() {
+@@ -265,7 +242,7 @@ void gemm(const Weight& w, Epilogue epilogue, std::int32_t tokens, const std::in
+           const __half* scales, cudaStream_t stream) {
+     constexpr int BN       = a8::kWarpsN * NT * 8;
+     const std::size_t smem = a8::shared_bytes<a8::T2Codec, 1, NT, Rows>(kCols);
+-    const dim3 grid(w.n / Rows::kRowsPerBlock, padded_tokens(tokens) / BN);
++    const dim3 grid(w.n / Rows::kRowsPerBlock, a8::padded_tokens(tokens) / BN);
+     auto* kernel = a8::a8_mma_kernel<a8::T2Codec, kCols, 1, NT, Rows, Epilogue>;
+     if (smem > 48 * 1024) {
+         configure_cuda_device_once([&] {
+@@ -284,7 +261,7 @@ void gemm(const Weight& w, Epilogue epilogue, std::int32_t tokens, const std::in
+ template <class F>
+ void dispatch(std::int32_t input_rows, std::int32_t tokens, F&& f) {
+     const auto by_tile = [&]<std::int32_t kCols>() {
+-        switch (a8::token_tile(padded_tokens(tokens), 512)) {
++        switch (a8::token_tile(a8::padded_tokens(tokens), 512)) {
+         case 512:
+             f.template operator()<kCols, 16>();
+             return;
+@@ -442,8 +419,7 @@ std::size_t t2_a8_activation_bytes(std::int32_t input_rows, std::int32_t max_tok
+                 round(columns * static_cast<std::size_t>(input_rows / T2PrefillI8::kGroupK) *
+                       sizeof(__half));
+     } else if (max_tokens >= t2_a8_min_tokens()) {
+-        // padded_tokens never exceeds the next multiple of 512, whatever T in [1, max_tokens].
+-        bytes = a8::activation_workspace_bytes(input_rows, (max_tokens + 511) / 512 * 512);
++        bytes = a8::padded_activation_workspace_bytes(input_rows, max_tokens);
+     }
+     const SmallBand band = small_band();
+     if (band.lo <= band.hi && max_tokens >= band.lo) {
+@@ -477,8 +453,7 @@ std::size_t t2_a8_activation_bytes(std::int32_t input_rows, std::int32_t max_tok
+                                                                        T2PrefillI8::kGroupK) *
+                                               sizeof(__half)));
+         } else if (widest_tile != 0) {
+-            bytes = std::max(bytes, a8::activation_workspace_bytes(
+-                                        input_rows, (widest_tile + 511) / 512 * 512));
++            bytes = std::max(bytes, a8::padded_activation_workspace_bytes(input_rows, widest_tile));
+         }
+     }
+     return bytes;
+@@ -497,8 +472,9 @@ bool t2_a8_layout_activations(WorkspaceLayoutBuilder& layout, std::int32_t input
+     const bool tile          = taken == Route::Prefill && prefill_tile();
+     const std::size_t groups = static_cast<std::size_t>(input_rows) /
+                                (tile ? T2PrefillI8::kGroupK : a8::kGroup);
+-    const std::size_t columns = static_cast<std::size_t>(
+-        taken == Route::SmallT ? tokens : tile ? tile_columns(tokens) : padded_tokens(tokens));
++    const std::size_t columns = static_cast<std::size_t>(taken == Route::SmallT ? tokens
++                                                         : tile ? tile_columns(tokens)
++                                                                : a8::padded_tokens(tokens));
+     const std::size_t scale_columns =
+         taken == Route::SmallT ? static_cast<std::size_t>(kT2I8MaxColumns) : columns;
+     (void)layout.alloc_bytes(columns * static_cast<std::size_t>(input_rows));
+@@ -549,7 +525,7 @@ T2A8Activations t2_a8_quantize(const Tensor& x, WorkspaceArena& workspace, cudaS
+         });
+         return {code_data, scale_data, tokens, input_rows};
+     }
+-    const std::size_t columns = static_cast<std::size_t>(padded_tokens(tokens));
++    const std::size_t columns = static_cast<std::size_t>(a8::padded_tokens(tokens));
+     const DeviceSpan codes  = workspace.alloc_bytes(columns * static_cast<std::size_t>(input_rows));
+     const DeviceSpan scales = workspace.alloc_bytes(
+         columns * (static_cast<std::size_t>(input_rows) / a8::kGroup) * sizeof(__half));
+diff --git a/src/ops/linear_swiglu/q4a8/a8_linear_add.cu b/src/ops/linear_swiglu/q4a8/a8_linear_add.cu
+index c592f059..f5e47867 100644
+--- a/src/ops/linear_swiglu/q4a8/a8_linear_add.cu
++++ b/src/ops/linear_swiglu/q4a8/a8_linear_add.cu
+@@ -39,7 +39,7 @@ void launch(const Tensor& x, const Weight& down, Tensor& residual, std::int32_t
+     CUDA_CHECK(cudaGetLastError());
+ 
+     const std::size_t smem = a8::shared_bytes<Codec, 1, NT, Rows>(kCols);
+-    const dim3 grid(kRows / Rows::kRowsPerBlock, tokens / BN);
++    const dim3 grid(kRows / Rows::kRowsPerBlock, a8::padded_tokens(tokens) / BN);
+     auto* kernel = a8::a8_mma_kernel<Codec, kCols, 1, NT, Rows, a8::ResidualAddEpilogue>;
+     if (smem > 48 * 1024) {
+         configure_cuda_device_once([&] {
+@@ -58,7 +58,7 @@ void launch(const Tensor& x, const Weight& down, Tensor& residual, std::int32_t
+ template <class Codec, std::int32_t kCols>
+ void launch_for_tile(const Tensor& x, const Weight& down, Tensor& residual, std::int32_t tokens,
+                      std::int8_t* codes, __half* scales, cudaStream_t stream) {
+-    switch (a8::token_tile(tokens, 512)) {
++    switch (a8::token_tile(a8::padded_tokens(tokens), 512)) {
+     case 512:
+         launch<Codec, kCols, 16>(x, down, residual, tokens, codes, scales, stream);
+         return;
+@@ -102,7 +102,7 @@ std::size_t a8_add_workspace_capacity_bytes(std::int32_t input_rows, std::int32_
+     if (input_rows != kDownCols && input_rows != kMixerCols) {
+         throw std::invalid_argument("a8 add workspace: unregistered input width");
+     }
+-    return a8::activation_workspace_bytes(input_rows, max_tokens);
++    return a8::padded_activation_workspace_bytes(input_rows, max_tokens);
+ }
+ 
+ void a8_add_launch(const Tensor& x, const Weight& down, Tensor& residual, WorkspaceArena& workspace,
+@@ -112,12 +112,11 @@ void a8_add_launch(const Tensor& x, const Weight& down, Tensor& residual, Worksp
+         throw std::invalid_argument("a8 add: unsupported profile");
+     }
+ 
+-    auto scope = workspace.scope();
+-    const DeviceSpan codes =
+-        workspace.alloc_bytes(static_cast<std::size_t>(tokens) * static_cast<std::size_t>(down.k));
+-    const DeviceSpan scales =
+-        workspace.alloc_bytes(static_cast<std::size_t>(tokens) *
+-                              (static_cast<std::size_t>(down.k) / a8::kGroup) * sizeof(__half));
++    const auto columns      = static_cast<std::size_t>(a8::padded_tokens(tokens));
++    auto scope              = workspace.scope();
++    const DeviceSpan codes  = workspace.alloc_bytes(columns * static_cast<std::size_t>(down.k));
++    const DeviceSpan scales = workspace.alloc_bytes(
++        columns * (static_cast<std::size_t>(down.k) / a8::kGroup) * sizeof(__half));
+     auto* code_data  = reinterpret_cast<std::int8_t*>(codes.data);
+     auto* scale_data = reinterpret_cast<__half*>(scales.data);
+ 
 diff --git a/src/ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast.cu b/src/ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast.cu
-index a37cb7b..0572a5e 100644
+index a37cb7b5..0572a5e5 100644
 --- a/src/ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast.cu
 +++ b/src/ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast.cu
 @@ -41,14 +41,14 @@ void launch_fast_for(const Tensor& q, const Tensor& positions, const Tensor* val
@@ -8625,14 +9003,14 @@ index a37cb7b..0572a5e 100644
                  static_cast<float2*>(partials.stats.data));
 diff --git a/src/ops/token_sums/sources.cmake b/src/ops/token_sums/sources.cmake
 new file mode 100644
-index 0000000..e8211fb
+index 00000000..e8211fb8
 --- /dev/null
 +++ b/src/ops/token_sums/sources.cmake
 @@ -0,0 +1 @@
 +target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/token_sums.cu")
 diff --git a/src/ops/token_sums/token_sums.cu b/src/ops/token_sums/token_sums.cu
 new file mode 100644
-index 0000000..c1c560f
+index 00000000..c1c560f9
 --- /dev/null
 +++ b/src/ops/token_sums/token_sums.cu
 @@ -0,0 +1,70 @@
@@ -8708,7 +9086,7 @@ index 0000000..c1c560f
 +} // namespace ninfer::ops
 diff --git a/src/product/cuda_memory_options.h b/src/product/cuda_memory_options.h
 new file mode 100644
-index 0000000..62725f5
+index 00000000..62725f57
 --- /dev/null
 +++ b/src/product/cuda_memory_options.h
 @@ -0,0 +1,68 @@
@@ -8781,7 +9159,7 @@ index 0000000..62725f5
 +
 +} // namespace ninfer::product
 diff --git a/src/runtime/contract/request.h b/src/runtime/contract/request.h
-index e47e8d0..5cc761d 100644
+index e47e8d08..5cc761d8 100644
 --- a/src/runtime/contract/request.h
 +++ b/src/runtime/contract/request.h
 @@ -26,9 +26,12 @@ struct ResolvedExecutionOptions {
@@ -8797,8 +9175,36 @@ index e47e8d0..5cc761d 100644
      ResolvedExecutionOptions execution;
      StopPolicy stop;
      OutputOptions output;
+diff --git a/src/runtime/contract/resources.h b/src/runtime/contract/resources.h
+index 02fff966..d086f9ab 100644
+--- a/src/runtime/contract/resources.h
++++ b/src/runtime/contract/resources.h
+@@ -3,6 +3,7 @@
+ #include "runtime/contract/request.h"
+ #include "core/transfer_work.h"
+ #include "core/wide_math.h"
++#include <algorithm>
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
+@@ -287,8 +288,13 @@ struct PressureCheckpointRecoveryImpact {
+     bool survives = true;
+ 
+     [[nodiscard]] friend constexpr bool
+-    operator==(const PressureCheckpointRecoveryImpact&,
+-               const PressureCheckpointRecoveryImpact&) noexcept = default;
++    operator==(const PressureCheckpointRecoveryImpact& left,
++               const PressureCheckpointRecoveryImpact& right) noexcept {
++        return left.owner == right.owner && left.checkpoint == right.checkpoint &&
++               left.survives == right.survives &&
++               std::equal(left.target_recovery_work.begin(), left.target_recovery_work.end(),
++                          right.target_recovery_work.begin(), right.target_recovery_work.end());
++    }
+ };
+ 
+ struct PressureCheckpointOutcome {
 diff --git a/src/runtime/engine/context_cache/resource_manager.h b/src/runtime/engine/context_cache/resource_manager.h
-index 294d68f..227f6d6 100644
+index 294d68f5..68a8cc1b 100644
 --- a/src/runtime/engine/context_cache/resource_manager.h
 +++ b/src/runtime/engine/context_cache/resource_manager.h
 @@ -373,6 +373,9 @@ public:
@@ -8811,8 +9217,39 @@ index 294d68f..227f6d6 100644
          std::optional<LaneId> destination;
          for (std::uint32_t lane = 0; lane < lane_count_; ++lane) {
              if (lanes_[lane] == LogicalLaneState::Free) {
+@@ -492,18 +495,23 @@ public:
+                     continue;
+                 }
+                 if (*incoming != index.key) {
++                    if (!cdbg) { continue; }
+                     // Own-session guard: a re-touch probes every stored slot, so a
+                     // *different* session's response naturally mismatches a slot it does
+                     // not own. Label those XSESSION-MISMATCH so they are not mistaken for a
+-                    // real key-match failure of the re-touch's own checkpoint.
+-                    const CatalogEntry& probe_entry = catalog_[index.slot];
+-                    const bool own_session =
+-                        probe_entry.session && base.context_cache().session_key &&
+-                        *probe_entry.session == *base.context_cache().session_key;
++                    // real key-match failure of the re-touch's own checkpoint. A shared
++                    // entry's slot numbers the shared catalogue, which keeps no session.
++                    const char* label = "SHARED-MISMATCH";
++                    if (!index.shared) {
++                        const CatalogEntry& probe_entry = catalog_[index.slot];
++                        label = probe_entry.session && base.context_cache().session_key &&
++                                        *probe_entry.session == *base.context_cache().session_key
++                                    ? "DIGEST-MISMATCH"
++                                    : "XSESSION-MISMATCH";
++                    }
+                     cdbg_log("[candgen] priv SKIP slot=%u %s frontier=%u "
+                              "in=(%llx,%llx) st=(%llx,%llx)\n",
+-                             index.slot, own_session ? "DIGEST-MISMATCH" : "XSESSION-MISMATCH",
+-                             index.key.frontier,
++                             index.slot, label, index.key.frontier,
+                              static_cast<unsigned long long>(incoming->digests[0]),
+                              static_cast<unsigned long long>(incoming->digests[1]),
+                              static_cast<unsigned long long>(index.key.digests[0]),
 diff --git a/src/runtime/engine/engine.cpp b/src/runtime/engine/engine.cpp
-index 2ed9abd..af00edc 100644
+index 2ed9abd7..af00edcb 100644
 --- a/src/runtime/engine/engine.cpp
 +++ b/src/runtime/engine/engine.cpp
 @@ -43,17 +43,6 @@ DeviceContext initialize_device(const EngineOptions& options) {
@@ -8931,7 +9368,7 @@ index 2ed9abd..af00edc 100644
  
  bool Engine::is_available() const {
 diff --git a/src/runtime/engine/engine_core.h b/src/runtime/engine/engine_core.h
-index 33abd54..2c037be 100644
+index 33abd540..6f484ca8 100644
 --- a/src/runtime/engine/engine_core.h
 +++ b/src/runtime/engine/engine_core.h
 @@ -3,6 +3,7 @@
@@ -8993,7 +9430,7 @@ index 33abd54..2c037be 100644
              }
          }
          return cancelled;
-@@ -1547,6 +1560,13 @@ private:
+@@ -1547,12 +1560,25 @@ private:
              if (!request->sequence || !request->lane || request->lane->value != lane) {
                  throw std::logic_error("active cancellation has no sequence binding");
              }
@@ -9007,7 +9444,42 @@ index 33abd54..2c037be 100644
              (void)request->output.preview_terminal(FinishReason::Cancelled);
              auto aborted = resources_.abort(*instance_.program, *request->lane, *request->sequence);
              request->generation_timings = aborted.timings;
-@@ -1926,6 +1946,15 @@ private:
+             request->speculative_stats  = std::move(aborted.speculative);
+             if (aborted.salvaged) { ++cumulative_stats_.salvaged_continuations; }
+-            if (scheduler_.owns_prefill_lane(lane)) { scheduler_.clear_prefill_lane(lane); }
++            if (scheduler_.owns_prefill_lane(lane)) {
++                ++cumulative_stats_.cancelled_prefills;
++                cumulative_stats_.cancelled_prefill_computed_tokens +=
++                    request->computed_prompt_tokens;
++                if (aborted.salvaged) { ++cumulative_stats_.cancelled_prefills_salvaged; }
++                scheduler_.clear_prefill_lane(lane);
++            }
+             append_output(request, commit_output(*request));
+             finish_engine_phase(boundary, EngineHostPhase::Boundary);
+             // Free the slot and publish the post-release snapshot before waking the caller so
+@@ -1584,8 +1610,19 @@ private:
+             }
+             have_pending = !pending_.empty();
+         }
+-        for (const auto& request : cancelled) { scheduler_.on_waiting_removed(request->id); }
+-        for (const auto& request : expired) { scheduler_.on_waiting_removed(request->id); }
++        const auto removed = Clock::now();
++        for (const auto& request : cancelled) {
++            ++cumulative_stats_.waiting_cancelled_requests;
++            cumulative_stats_.waiting_abandoned_seconds +=
++                std::chrono::duration<double>(removed - request->submitted).count();
++            scheduler_.on_waiting_removed(request->id);
++        }
++        for (const auto& request : expired) {
++            ++cumulative_stats_.waiting_expired_requests;
++            cumulative_stats_.waiting_abandoned_seconds +=
++                std::chrono::duration<double>(removed - request->submitted).count();
++            scheduler_.on_waiting_removed(request->id);
++        }
+         try {
+             for (const auto& request : cancelled) { complete_detached_cancelled(request); }
+             for (const auto& request : expired) {
+@@ -1926,6 +1963,15 @@ private:
                               typename ModelContract::PrefillProgress&& progress,
                               const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
          EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
@@ -9023,7 +9495,7 @@ index 33abd54..2c037be 100644
          ++cumulative_stats_.host_work.prefill_units;
          ++request->host_timing.prefill_units;
          cumulative_stats_.computed_prefill_tokens += progress.processed_prompt_tokens;
-@@ -1980,11 +2009,21 @@ private:
+@@ -1980,11 +2026,21 @@ private:
      [[nodiscard]] std::optional<std::uint32_t> runnable_prefill_lane() const {
          return scheduler_.select_runnable_prefill_lane(max_concurrency_, [&](std::uint32_t lane) {
              const auto& request = slots_[lane];
@@ -9046,7 +9518,7 @@ index 33abd54..2c037be 100644
      void run_prefill_step(const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
          nvtx::ScopedRange prefill_range(nvtx::Name::Prefill, nvtx::Category::Prefill);
          EnginePhaseScope setup(*this, EngineHostPhase::CommitOutput);
-@@ -2000,18 +2039,22 @@ private:
+@@ -2000,18 +2056,22 @@ private:
          }
          setup.finish();
          ProgramCallScope program_call(*this);
@@ -9081,7 +9553,7 @@ index 33abd54..2c037be 100644
      }
  
      [[nodiscard]] FifoSnapshot pending_snapshot() const {
-@@ -2038,6 +2081,7 @@ private:
+@@ -2038,6 +2098,7 @@ private:
  
      void ensure_base_plan(const std::shared_ptr<Request>& request) {
          if (!request->base_plan) {
@@ -9089,7 +9561,7 @@ index 33abd54..2c037be 100644
              std::array<std::uint32_t, 2> anchors{};
              std::size_t anchor_count = 0;
              if constexpr (kLegacyContextCache) {
-@@ -2622,7 +2666,8 @@ private:
+@@ -2622,7 +2683,8 @@ private:
                  const OutputDecision decision =
                      request->output.preview_control(tokens, request->budget->remaining());
                  if (decision.accepted_tokens != membership.row_stride || decision.finished() ||
@@ -9099,7 +9571,7 @@ index 33abd54..2c037be 100644
                      (decision.prefix_execution_split_after &&
                       (*decision.prefix_execution_split_after == 0 ||
                        *decision.prefix_execution_split_after > decision.accepted_tokens))) {
-@@ -2668,7 +2713,8 @@ private:
+@@ -2668,7 +2730,8 @@ private:
              cumulative_stats_.committed_decode_tokens += membership.row_stride;
              auto timing = record_committed_output(request, membership.row_stride);
              append_output(request, commit_output(*request), std::move(timing));
@@ -9109,7 +9581,7 @@ index 33abd54..2c037be 100644
          }
          publish_runtime_stats();
      }
-@@ -2926,18 +2972,36 @@ private:
+@@ -2926,18 +2989,36 @@ private:
          published_residency_ = std::move(status);
      }
  
@@ -9147,7 +9619,7 @@ index 33abd54..2c037be 100644
                      }
                  }
                  if (stopping_) {
-@@ -2973,8 +3037,19 @@ private:
+@@ -2973,8 +3054,19 @@ private:
                  continue;
              }
              try {
@@ -9167,7 +9639,7 @@ index 33abd54..2c037be 100644
                  const bool have_pending       = expire_pending_requests();
                  // A pure queue wait changes no state that would publish, so the waits /stats
                  // reports are refreshed here.
-@@ -2999,6 +3074,7 @@ private:
+@@ -2999,6 +3091,7 @@ private:
                          previous_unit_was_decode,
                          instance_.program->has_context_transaction()) &&
                      consume_admission_check()) {
@@ -9175,7 +9647,7 @@ index 33abd54..2c037be 100644
                      (void)try_admit_one();
                      membership = scheduler_.build_round_membership(slots_, max_concurrency_);
                  }
-@@ -3008,8 +3084,34 @@ private:
+@@ -3008,8 +3101,34 @@ private:
                  // not reinterpret an already-issued unit with a later atomic read.
                  const auto cancelled_at_unit_start = snapshot_cancellations();
                  cancel_active_requests(cancelled_at_unit_start, boundary);
@@ -9212,7 +9684,7 @@ index 33abd54..2c037be 100644
                  if (!control_membership.empty()) {
                      set_host_work_class(HostWorkClass::Control);
                      finish_engine_phase(boundary, EngineHostPhase::Boundary);
-@@ -3020,6 +3122,25 @@ private:
+@@ -3020,6 +3139,25 @@ private:
                  }
                  membership = scheduler_.build_round_membership(slots_, max_concurrency_);
  
@@ -9238,7 +9710,7 @@ index 33abd54..2c037be 100644
                  const std::uint64_t prefill_mask = scheduler_.prefill_lane_mask();
                  for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
                      if ((prefill_mask & (1ULL << lane)) != 0 &&
-@@ -3140,6 +3261,7 @@ private:
+@@ -3140,6 +3278,7 @@ private:
      const std::uint32_t max_context_;
      const bool structured_output_;
      const std::uint32_t max_concurrency_;
@@ -9247,7 +9719,7 @@ index 33abd54..2c037be 100644
      const bool branch_anchors_;
      const bool endpoint_anchors_;
 diff --git a/src/runtime/engine/kv_capacity.cpp b/src/runtime/engine/kv_capacity.cpp
-index 9850bbd..bc30fb4 100644
+index 9850bbd4..bc30fb48 100644
 --- a/src/runtime/engine/kv_capacity.cpp
 +++ b/src/runtime/engine/kv_capacity.cpp
 @@ -222,4 +222,63 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
@@ -9315,7 +9787,7 @@ index 9850bbd..bc30fb4 100644
 +
  } // namespace ninfer::runtime
 diff --git a/src/runtime/engine/kv_capacity.h b/src/runtime/engine/kv_capacity.h
-index c056b1f..5332603 100644
+index c056b1f5..5332603b 100644
 --- a/src/runtime/engine/kv_capacity.h
 +++ b/src/runtime/engine/kv_capacity.h
 @@ -16,4 +16,13 @@ resolve_kv_capacity(const KvCapacityPolicy& policy, const SequenceCapacityCurve&
@@ -9333,7 +9805,7 @@ index c056b1f..5332603 100644
 +
  } // namespace ninfer::runtime
 diff --git a/src/runtime/engine/model_instance.cpp b/src/runtime/engine/model_instance.cpp
-index b4bb644..2af7138 100644
+index b4bb6440..2af71389 100644
 --- a/src/runtime/engine/model_instance.cpp
 +++ b/src/runtime/engine/model_instance.cpp
 @@ -8,6 +8,7 @@
@@ -9804,7 +10276,7 @@ index b4bb644..2af7138 100644
      const auto& stats = instance->model->storage_stats();
      LoadSummary summary;
 diff --git a/src/runtime/engine/model_instance.h b/src/runtime/engine/model_instance.h
-index cd7f87b..53c6ada 100644
+index cd7f87b0..53c6adac 100644
 --- a/src/runtime/engine/model_instance.h
 +++ b/src/runtime/engine/model_instance.h
 @@ -6,6 +6,7 @@
@@ -9825,7 +10297,7 @@ index cd7f87b..53c6ada 100644
      const models::qwen3_5::execution::Parameters parameters;
      models::qwen3_5::Frontend frontend;
 diff --git a/src/runtime/engine/qwen4_exp_core.cpp b/src/runtime/engine/qwen4_exp_core.cpp
-index 8a2ae2b..b5d2e4b 100644
+index 8a2ae2b3..b5d2e4bb 100644
 --- a/src/runtime/engine/qwen4_exp_core.cpp
 +++ b/src/runtime/engine/qwen4_exp_core.cpp
 @@ -339,7 +339,7 @@ struct Qwen4ExpCore::Impl {
@@ -9847,7 +10319,7 @@ index 8a2ae2b..b5d2e4b 100644
      request->prompt                           = std::move(prompt);
      request->options                          = std::move(options);
 diff --git a/src/runtime/engine/request_record.h b/src/runtime/engine/request_record.h
-index b9c3e6b..c95d71d 100644
+index b9c3e6ba..c95d71dd 100644
 --- a/src/runtime/engine/request_record.h
 +++ b/src/runtime/engine/request_record.h
 @@ -140,11 +140,11 @@ struct RequestRecord {
@@ -9876,7 +10348,7 @@ index b9c3e6b..c95d71d 100644
      bool lease_shortfall_reported         = false;
      EngineRequestState post_capture_state = EngineRequestState::Prefill;
 diff --git a/src/runtime/engine/scheduler.h b/src/runtime/engine/scheduler.h
-index d5aca8e..596cb2c 100644
+index d5aca8ee..596cb2c3 100644
 --- a/src/runtime/engine/scheduler.h
 +++ b/src/runtime/engine/scheduler.h
 @@ -174,7 +174,8 @@ public:
@@ -9910,7 +10382,7 @@ index d5aca8e..596cb2c 100644
              membership.sequences[membership.size] = *request->sequence;
 diff --git a/src/runtime/speculative_limits.h b/src/runtime/speculative_limits.h
 new file mode 100644
-index 0000000..c21dbb5
+index 00000000..c21dbb50
 --- /dev/null
 +++ b/src/runtime/speculative_limits.h
 @@ -0,0 +1,18 @@
@@ -9933,7 +10405,7 @@ index 0000000..c21dbb5
 +
 +} // namespace ninfer::runtime
 diff --git a/src/serve/anthropic_messages_request.cpp b/src/serve/anthropic_messages_request.cpp
-index 20ef6e2..d6bea8d 100644
+index 20ef6e25..d6bea8d3 100644
 --- a/src/serve/anthropic_messages_request.cpp
 +++ b/src/serve/anthropic_messages_request.cpp
 @@ -784,6 +784,7 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
@@ -9990,7 +10462,7 @@ index 20ef6e2..d6bea8d 100644
  
 diff --git a/src/serve/cuda_residency_json.h b/src/serve/cuda_residency_json.h
 new file mode 100644
-index 0000000..ab62379
+index 00000000..ab62379e
 --- /dev/null
 +++ b/src/serve/cuda_residency_json.h
 @@ -0,0 +1,23 @@
@@ -10018,7 +10490,7 @@ index 0000000..ab62379
 +
 +} // namespace ninfer::serve
 diff --git a/src/serve/generation_service.cpp b/src/serve/generation_service.cpp
-index 30ecf02..a5c6678 100644
+index 30ecf02b..a5c66784 100644
 --- a/src/serve/generation_service.cpp
 +++ b/src/serve/generation_service.cpp
 @@ -56,6 +56,11 @@ ApiError request_error_to_api_error(const ninfer::RequestError& exception) {
@@ -10085,7 +10557,7 @@ index 30ecf02..a5c6678 100644
              .deadline     = deadline,
              .cancellation = CancellationView(is_cancelled),
 diff --git a/src/serve/http_server.cpp b/src/serve/http_server.cpp
-index f078f6b..1908dd6 100644
+index f078f6b2..1908dd60 100644
 --- a/src/serve/http_server.cpp
 +++ b/src/serve/http_server.cpp
 @@ -4,6 +4,7 @@
@@ -10144,7 +10616,7 @@ index f078f6b..1908dd6 100644
  
 diff --git a/src/serve/kvmem_status_json.h b/src/serve/kvmem_status_json.h
 new file mode 100644
-index 0000000..d48cc92
+index 00000000..d48cc929
 --- /dev/null
 +++ b/src/serve/kvmem_status_json.h
 @@ -0,0 +1,25 @@
@@ -10174,7 +10646,7 @@ index 0000000..d48cc92
 +}
 +} // namespace ninfer::serve
 diff --git a/src/serve/load_report.cpp b/src/serve/load_report.cpp
-index 3870cb4..cb71e1b 100644
+index 3870cb4f..cb71e1b6 100644
 --- a/src/serve/load_report.cpp
 +++ b/src/serve/load_report.cpp
 @@ -1,4 +1,6 @@
@@ -10201,7 +10673,7 @@ index 3870cb4..cb71e1b 100644
          .interval_seconds = std::isfinite(sample.uptime_seconds) ? sample.uptime_seconds : 0.0,
          .computed_prefill_tokens = stats.computed_prefill_tokens,
 diff --git a/src/serve/openai_chat_request.cpp b/src/serve/openai_chat_request.cpp
-index c8277d4..10dde59 100644
+index c8277d41..10dde595 100644
 --- a/src/serve/openai_chat_request.cpp
 +++ b/src/serve/openai_chat_request.cpp
 @@ -265,19 +265,7 @@ ninfer::product::media_acquire::Source parse_media_url(const Json& part, const c
@@ -10324,7 +10796,7 @@ index c8277d4..10dde59 100644
      parse_messages(body, limits.assistant_prefill, output.generation);
      parse_stop(body, output.generation);
 diff --git a/src/serve/openai_common.cpp b/src/serve/openai_common.cpp
-index 2dcb454..bf08c46 100644
+index 2dcb4548..bf08c466 100644
 --- a/src/serve/openai_common.cpp
 +++ b/src/serve/openai_common.cpp
 @@ -137,6 +137,19 @@ bool parse_openai_prompt_cache_breakpoint(const RequestJson& value, std::string_
@@ -10348,7 +10820,7 @@ index 2dcb454..bf08c46 100644
      auto require_string_hint = [&](const char* field, std::optional<std::size_t> maximum = {}) {
          if (!body.contains(field) || body.at(field).is_null()) { return; }
 diff --git a/src/serve/openai_common.h b/src/serve/openai_common.h
-index ab01274..d792752 100644
+index ab01274c..d7927525 100644
 --- a/src/serve/openai_common.h
 +++ b/src/serve/openai_common.h
 @@ -30,6 +30,11 @@ struct OpenAIPromptCachePolicy {
@@ -10364,7 +10836,7 @@ index ab01274..d792752 100644
  // execution, hosted file search and the like. NInfer has no executor for any of them, and a client
  // never waits on one itself, so declaring one is silently dropped rather than failing the request:
 diff --git a/src/serve/openai_responses_request.cpp b/src/serve/openai_responses_request.cpp
-index 3ba42f0..444aec6 100644
+index 3ba42f01..444aec61 100644
 --- a/src/serve/openai_responses_request.cpp
 +++ b/src/serve/openai_responses_request.cpp
 @@ -134,15 +134,7 @@ ninfer::product::media_acquire::Source parse_image_source(const Json& part) {
@@ -10483,7 +10955,7 @@ index 3ba42f0..444aec6 100644
                                                                    "truncation"};
      const auto& allowed = create ? create_fields : count_fields;
 diff --git a/src/serve/request.h b/src/serve/request.h
-index 89246fe..76e77b7 100644
+index 89246fed..76e77b7d 100644
 --- a/src/serve/request.h
 +++ b/src/serve/request.h
 @@ -88,6 +88,7 @@ struct ToolDefinition {
@@ -10511,7 +10983,7 @@ index 89246fe..76e77b7 100644
      // exactly one callable tool. Empty leaves the choice to the model.
      std::string forced_name;
 diff --git a/src/serve/request_log.cpp b/src/serve/request_log.cpp
-index e9c5298..78c6dee 100644
+index e9c52989..78c6dee5 100644
 --- a/src/serve/request_log.cpp
 +++ b/src/serve/request_log.cpp
 @@ -1,4 +1,6 @@
@@ -10553,7 +11025,7 @@ index e9c5298..78c6dee 100644
               {"workspace", arena_json(memory.workspace)},
               {"vision_workspace", vision_workspace_json(memory.vision_workspace)},
 diff --git a/src/serve/request_validation.cpp b/src/serve/request_validation.cpp
-index 9b67a8d..cccc0b2 100644
+index 9b67a8de..cccc0b25 100644
 --- a/src/serve/request_validation.cpp
 +++ b/src/serve/request_validation.cpp
 @@ -19,6 +19,14 @@ namespace ninfer::serve {
@@ -10572,7 +11044,7 @@ index 9b67a8d..cccc0b2 100644
      if (!object.contains(key) || object.at(key).is_null()) { return std::nullopt; }
      const RequestJson& value = object.at(key);
 diff --git a/src/serve/request_validation.h b/src/serve/request_validation.h
-index 44457ed..a7aac55 100644
+index 44457ed0..a7aac55d 100644
 --- a/src/serve/request_validation.h
 +++ b/src/serve/request_validation.h
 @@ -27,6 +27,8 @@ std::optional<std::string> parse_graft_field(const RequestJson& body);
@@ -10584,8 +11056,145 @@ index 44457ed..a7aac55 100644
  [[nodiscard]] bool valid_tool_name(std::string_view name, std::size_t maximum_length) noexcept;
  
  // An optional `post_thinking` object: temperature (up to `max_temperature`), top_p, top_k, min_p,
+diff --git a/src/serve/serve_metrics.cpp b/src/serve/serve_metrics.cpp
+index 0c6ffc6e..bae357d4 100644
+--- a/src/serve/serve_metrics.cpp
++++ b/src/serve/serve_metrics.cpp
+@@ -1,7 +1,9 @@
+ #include "serve/serve_metrics.h"
+ 
+ #include <cmath>
++#include <cstdint>
+ #include <cstdio>
++#include <string>
+ 
+ namespace ninfer::serve {
+ namespace {
+@@ -18,6 +20,96 @@ double ratio(double numerator, double denominator) {
+     return denominator > 0.0 ? numerator / denominator : 0.0;
+ }
+ 
++// A labelled family: one HELP/TYPE header, then one sample per label set.
++void append_family(std::string& out, const char* name, const char* type, const char* help) {
++    out.append("# HELP ").append(name).append(" ").append(help).append("\n");
++    out.append("# TYPE ").append(name).append(" ").append(type).append("\n");
++}
++
++void append_sample(std::string& out, const char* name, const std::string& labels,
++                   std::uint64_t value) {
++    char text[32];
++    std::snprintf(text, sizeof(text), "%llu", static_cast<unsigned long long>(value));
++    out.append(name).append("{").append(labels).append("} ").append(text).append("\n");
++}
++
++// The context cache's Engine counters. Selections count admissions by the source they started
++// from: `root` is a miss (a prefill from token zero), every other source a reuse, so the hit rate
++// is 1 - root / all. Pressure events are what planning did to inactive owners to make room.
++void append_context_cache(std::string& out, const ninfer::RuntimeStats& stats) {
++    const char* selections = "ninfer:context_selections_total";
++    append_family(out, selections, "counter",
++                  "Admissions by the context-cache source they started from; root is a miss.");
++    append_sample(out, selections, "source=\"root\"", stats.root_selections);
++    append_sample(out, selections, "source=\"private_endpoint\"",
++                  stats.private_endpoint_selections);
++    append_sample(out, selections, "source=\"private_turn_closure\"",
++                  stats.private_turn_closure_selections);
++    append_sample(out, selections, "source=\"private_response_replay\"",
++                  stats.private_response_replay_selections);
++    append_sample(out, selections, "source=\"private_long_anchor\"",
++                  stats.private_long_anchor_selections);
++    append_sample(out, selections, "source=\"shared_stable_prefix\"",
++                  stats.shared_stable_prefix_selections);
++
++    const char* pressure = "ninfer:context_pressure_events_total";
++    append_family(out, pressure, "counter",
++                  "What pressure planning did to inactive context-cache owners.");
++    append_sample(out, pressure, "event=\"private_owner_evicted\"",
++                  stats.pressure_private_owners_evicted);
++    append_sample(out, pressure, "event=\"private_owner_degraded\"",
++                  stats.pressure_private_owners_degraded);
++    append_sample(out, pressure, "event=\"shared_owner_evicted\"",
++                  stats.pressure_shared_owners_evicted);
++    append_sample(out, pressure, "event=\"shared_owner_degraded\"",
++                  stats.pressure_shared_owners_degraded);
++    append_sample(out, pressure, "event=\"checkpoint_dropped\"",
++                  stats.pressure_checkpoints_dropped);
++
++    const char* searches = "ninfer:context_pressure_searches_total";
++    append_family(out, searches, "counter", "Pressure planning searches by how they ended.");
++    append_sample(out, searches, "result=\"started\"", stats.pressure_searches);
++    append_sample(out, searches, "result=\"budget_exhausted\"",
++                  stats.pressure_search_budget_exhaustions);
++    append_sample(out, searches, "result=\"maximal_fallback\"",
++                  stats.pressure_maximal_fallback_selections);
++
++    const char* transfers = "ninfer:context_transfer_bytes_total";
++    append_family(out, transfers, "counter",
++                  "Context-cache bytes moved between Device and Host, by object and direction.");
++    const auto transfer = [&](const char* object, const char* direction, std::uint64_t bytes) {
++        append_sample(out, transfers,
++                      std::string("object=\"") + object + "\",direction=\"" + direction + "\"",
++                      bytes);
++    };
++    transfer("state", "d2h", stats.state_d2h_bytes);
++    transfer("state", "h2d", stats.state_h2d_bytes);
++    transfer("main_kv", "d2h", stats.main_kv_d2h_bytes);
++    transfer("main_kv", "h2d", stats.main_kv_h2d_bytes);
++    transfer("backend_kv", "d2h", stats.backend_kv_d2h_bytes);
++    transfer("backend_kv", "h2d", stats.backend_kv_h2d_bytes);
++    append(out, "ninfer:context_transfer_seconds_total", "counter",
++           "Time admissions waited for context-cache transfers.",
++           stats.actual_context_transfer_seconds);
++    append(out, "ninfer:context_historical_fork_hits_total", "counter",
++           "Admissions that forked a historical checkpoint instead of the latest endpoint.",
++           static_cast<double>(stats.historical_fork_hits));
++
++    const char* occupancy = "ninfer:context_occupancy";
++    append_family(out, occupancy, "gauge",
++                  "Context-cache occupancy by pool: state slots and KV pages on the Device, state "
++                  "slots and KV bytes on the Host.");
++    append_sample(out, occupancy, "pool=\"device_state_slots\"",
++                  stats.device_state_occupied_slots);
++    append_sample(out, occupancy, "pool=\"host_state_slots\"", stats.host_state_occupied_slots);
++    append_sample(out, occupancy, "pool=\"device_main_kv_pages\"",
++                  stats.device_main_kv_occupied_pages);
++    append_sample(out, occupancy, "pool=\"device_backend_kv_pages\"",
++                  stats.device_backend_kv_occupied_pages);
++    append_sample(out, occupancy, "pool=\"host_kv_bytes\"",
++                  static_cast<std::uint64_t>(stats.host_kv_occupied_bytes));
++}
++
+ } // namespace
+ 
+ void ServeMetrics::record_done(const GenerationOutcome& outcome) {
+@@ -118,6 +210,25 @@ std::string ServeMetrics::render(const LoadCapacity& capacity, const LoadSample&
+            static_cast<double>(stats.engine_recoveries));
+     append(out, "ninfer:uptime_seconds", "gauge", "Seconds since the Engine became ready.",
+            sample.uptime_seconds);
++    append(out, "ninfer:waiting_cancelled_requests_total", "counter",
++           "Requests the client cancelled while they waited for admission.",
++           static_cast<double>(stats.waiting_cancelled_requests));
++    append(out, "ninfer:waiting_expired_requests_total", "counter",
++           "Requests that reached the pending timeout before admission.",
++           static_cast<double>(stats.waiting_expired_requests));
++    append(out, "ninfer:waiting_abandoned_seconds_total", "counter",
++           "Time cancelled and expired requests had waited before they left the queue.",
++           stats.waiting_abandoned_seconds);
++    append(out, "ninfer:cancelled_prefills_total", "counter",
++           "Requests cancelled while their prompt prefilled.",
++           static_cast<double>(stats.cancelled_prefills));
++    append(out, "ninfer:cancelled_prefill_computed_tokens_total", "counter",
++           "Prompt tokens those requests had computed when they were cancelled.",
++           static_cast<double>(stats.cancelled_prefill_computed_tokens));
++    append(out, "ninfer:cancelled_prefills_salvaged_total", "counter",
++           "Cancelled prefills the context cache kept, so a retry resumes where they stopped.",
++           static_cast<double>(stats.cancelled_prefills_salvaged));
++    append_context_cache(out, stats);
+     return out;
+ }
+ 
 diff --git a/src/serve/serve_options.cpp b/src/serve/serve_options.cpp
-index 64933ec..163327c 100644
+index 64933ec1..163327ce 100644
 --- a/src/serve/serve_options.cpp
 +++ b/src/serve/serve_options.cpp
 @@ -1,4 +1,6 @@
@@ -11104,7 +11713,7 @@ index 64933ec..163327c 100644
  }
  
 diff --git a/src/serve/serve_options.h b/src/serve/serve_options.h
-index a8bb9f3..6b9b1d6 100644
+index a8bb9f3a..6b9b1d61 100644
 --- a/src/serve/serve_options.h
 +++ b/src/serve/serve_options.h
 @@ -19,6 +19,8 @@ inline constexpr std::size_t kDefaultResponseStoreRecords = 1024;
@@ -11135,7 +11744,7 @@ index a8bb9f3..6b9b1d6 100644
      // device memory.
      ModelSuspendOptions suspend;
 diff --git a/src/serve/translate.cpp b/src/serve/translate.cpp
-index 4b33594..01d1ee9 100644
+index 4b335940..01d1ee98 100644
 --- a/src/serve/translate.cpp
 +++ b/src/serve/translate.cpp
 @@ -119,7 +119,7 @@ resolve_post_thinking_overrides(const std::optional<SamplingParams>& request,
@@ -11221,7 +11830,7 @@ index 4b33594..01d1ee9 100644
          (request.uses_tools() || request.has_tool_history());
      options.output.tool_name_max_length = static_cast<std::uint32_t>(request.tool_name_max_length);
 diff --git a/src/text/structured_output.cpp b/src/text/structured_output.cpp
-index 491e297..34cbdcf 100644
+index 491e2970..34cbdcf8 100644
 --- a/src/text/structured_output.cpp
 +++ b/src/text/structured_output.cpp
 @@ -391,4 +391,32 @@ StructuredCompiler::compile(const StructuredOutputOptions& options,
@@ -11258,7 +11867,7 @@ index 491e297..34cbdcf 100644
 +}
  } // namespace ninfer::text
 diff --git a/src/text/structured_output.h b/src/text/structured_output.h
-index f5c78a1..9b8ec97 100644
+index f5c78a17..9b8ec97b 100644
 --- a/src/text/structured_output.h
 +++ b/src/text/structured_output.h
 @@ -39,6 +39,10 @@ public:
@@ -11273,20 +11882,22 @@ index f5c78a1..9b8ec97 100644
      struct Impl;
      std::unique_ptr<Impl> impl_;
 diff --git a/src/text/unique_strings.cpp b/src/text/unique_strings.cpp
-index 59ef9fd..596321b 100644
+index 59ef9fdc..5802dc6d 100644
 --- a/src/text/unique_strings.cpp
 +++ b/src/text/unique_strings.cpp
-@@ -495,7 +495,7 @@ struct Parser {
+@@ -495,7 +495,9 @@ struct Parser {
                             std::find(r.domain.values.begin(), r.domain.values.end(), *string_value) == r.domain.values.end();
                  });
                  if (parent.rules.empty()) return false;
 -                if (!parent.seen.unique()) parent.seen = std::make_shared<std::unordered_set<std::string>>(*parent.seen);
-+                if (parent.seen.use_count() != 1) parent.seen = std::make_shared<std::unordered_set<std::string>>(*parent.seen);
++                if (parent.seen.use_count() != 1) {
++                    parent.seen = std::make_shared<std::unordered_set<std::string>>(*parent.seen);
++                }
                  parent.seen->insert(*string_value);
              }
              ++parent.count;
 diff --git a/tests/CMakeLists.txt b/tests/CMakeLists.txt
-index e50c356..8aa38ac 100644
+index e50c3564..8aa38acc 100644
 --- a/tests/CMakeLists.txt
 +++ b/tests/CMakeLists.txt
 @@ -8,10 +8,21 @@ include(cmake/ProductTests.cmake)
@@ -11420,7 +12031,7 @@ index e50c356..8aa38ac 100644
 +ninfer_finalize_bundle(ninfer_kvmem_nvfp4_tests)
 +ninfer_stage_runtime_dlls(ninfer_kvmem_nvfp4_tests)
 diff --git a/tests/README.md b/tests/README.md
-index da721c5..82d4876 100644
+index da721c59..82d4876c 100644
 --- a/tests/README.md
 +++ b/tests/README.md
 @@ -351,6 +351,107 @@ boundary preservation. `--concurrency 8 --draft-tokens 15 --modes dflash2` exerc
@@ -11675,7 +12286,7 @@ index da721c5..82d4876 100644
 +and more decode row-rounds than decode rounds; exact token/byte/resource checks remain unchanged.
 +See the [fast-prefill report](../../../docs/fast-prefill-admission-validation-20261006.md).
 diff --git a/tests/artifact/test_materialization.cpp b/tests/artifact/test_materialization.cpp
-index 4fcd61b..7cccc59 100644
+index 4fcd61b2..7cccc59f 100644
 --- a/tests/artifact/test_materialization.cpp
 +++ b/tests/artifact/test_materialization.cpp
 @@ -10,6 +10,7 @@
@@ -11793,7 +12404,7 @@ index 4fcd61b..7cccc59 100644
          ninfer::test::materialization_cuda_errors(device);
  #else
 diff --git a/tests/artifact/writer_interop.py b/tests/artifact/writer_interop.py
-index bab48b4..fa53426 100644
+index bab48b4b..fa53426a 100644
 --- a/tests/artifact/writer_interop.py
 +++ b/tests/artifact/writer_interop.py
 @@ -9,6 +9,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -11826,8 +12437,33 @@ index bab48b4..fa53426 100644
  
  
  if __name__ == "__main__":
+diff --git a/tests/cmake/RuntimeTests.cmake b/tests/cmake/RuntimeTests.cmake
+index b2a21434..a5865238 100644
+--- a/tests/cmake/RuntimeTests.cmake
++++ b/tests/cmake/RuntimeTests.cmake
+@@ -4,11 +4,20 @@ ninfer_add_test(ninfer_admission_policy_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/
+ ninfer_add_test(ninfer_context_cost_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_context_cost.cpp"
+   LIBRARIES ninfer_runtime_support ninfer::json)
+ 
++ninfer_add_test(ninfer_checkpoint_recovery_impact_test
++  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../host/test_checkpoint_recovery_impact.cpp")
++
+ ninfer_add_test(ninfer_slot_spill_guard_test
+   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_slot_spill_guard.cpp")
+ 
+ ninfer_add_test(ninfer_resource_manager_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_resource_manager.cpp"
+   LIBRARIES ninfer_runtime_support)
++# Bounds-checked containers: a slot read from the wrong catalogue (issue #39) aborts here instead of
++# reading past the end of a vector.
++if(NOT MSVC)
++  target_compile_definitions(ninfer_resource_manager_test PRIVATE
++    _GLIBCXX_ASSERTIONS _LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_FAST)
++endif()
+ 
+ ninfer_add_test(ninfer_kv_capacity_test SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_kv_capacity.cpp"
+   LIBRARIES ninfer_runtime_support)
 diff --git a/tests/convert/test_gguf_blocks.py b/tests/convert/test_gguf_blocks.py
-index 5e8f824..4f33551 100644
+index 5e8f824d..4f335513 100644
 --- a/tests/convert/test_gguf_blocks.py
 +++ b/tests/convert/test_gguf_blocks.py
 @@ -1,5 +1,8 @@
@@ -11951,7 +12587,7 @@ index 5e8f824..4f33551 100644
 +        actual = source.rows(0, 48).view(torch.int16).numpy().view(np.uint16)
 +        assert np.array_equal(actual, expected)
 diff --git a/tests/convert/test_ternary.py b/tests/convert/test_ternary.py
-index 53fe913..c890d64 100644
+index 53fe9130..c890d64f 100644
 --- a/tests/convert/test_ternary.py
 +++ b/tests/convert/test_ternary.py
 @@ -1,31 +1,36 @@
@@ -11999,7 +12635,7 @@ index 53fe913..c890d64 100644
          words = source.read_encoded(2, 7)
 diff --git a/tests/experimental/active_kv_ssd.cpp b/tests/experimental/active_kv_ssd.cpp
 new file mode 100644
-index 0000000..7c09881
+index 00000000..7c098813
 --- /dev/null
 +++ b/tests/experimental/active_kv_ssd.cpp
 @@ -0,0 +1,144 @@
@@ -12149,7 +12785,7 @@ index 0000000..7c09881
 +}
 diff --git a/tests/experimental/kvmem_test_options.h b/tests/experimental/kvmem_test_options.h
 new file mode 100644
-index 0000000..15f672d
+index 00000000..15f672dc
 --- /dev/null
 +++ b/tests/experimental/kvmem_test_options.h
 @@ -0,0 +1,68 @@
@@ -12223,7 +12859,7 @@ index 0000000..15f672d
 +} // namespace ninfer::test
 diff --git a/tests/experimental/memory_concurrency.cpp b/tests/experimental/memory_concurrency.cpp
 new file mode 100644
-index 0000000..d948bc6
+index 00000000..d948bc69
 --- /dev/null
 +++ b/tests/experimental/memory_concurrency.cpp
 @@ -0,0 +1,303 @@
@@ -12532,7 +13168,7 @@ index 0000000..d948bc6
 +}
 diff --git a/tests/experimental/memory_disk.cpp b/tests/experimental/memory_disk.cpp
 new file mode 100644
-index 0000000..425ec07
+index 00000000..425ec07c
 --- /dev/null
 +++ b/tests/experimental/memory_disk.cpp
 @@ -0,0 +1,133 @@
@@ -12671,7 +13307,7 @@ index 0000000..425ec07
 +}
 diff --git a/tests/experimental/memory_ngram.cpp b/tests/experimental/memory_ngram.cpp
 new file mode 100644
-index 0000000..266e258
+index 00000000..266e2585
 --- /dev/null
 +++ b/tests/experimental/memory_ngram.cpp
 @@ -0,0 +1,366 @@
@@ -13043,7 +13679,7 @@ index 0000000..266e258
 +}
 diff --git a/tests/experimental/memory_sessions.cpp b/tests/experimental/memory_sessions.cpp
 new file mode 100644
-index 0000000..19aff9f
+index 00000000..19aff9f6
 --- /dev/null
 +++ b/tests/experimental/memory_sessions.cpp
 @@ -0,0 +1,124 @@
@@ -13173,7 +13809,7 @@ index 0000000..19aff9f
 +}
 diff --git a/tests/experimental/memory_vision.cpp b/tests/experimental/memory_vision.cpp
 new file mode 100644
-index 0000000..1f564cc
+index 00000000..1f564cc1
 --- /dev/null
 +++ b/tests/experimental/memory_vision.cpp
 @@ -0,0 +1,285 @@
@@ -13464,7 +14100,7 @@ index 0000000..1f564cc
 +}
 diff --git a/tests/experimental/migration_concurrency.cpp b/tests/experimental/migration_concurrency.cpp
 new file mode 100644
-index 0000000..7313dd7
+index 00000000..7313dd74
 --- /dev/null
 +++ b/tests/experimental/migration_concurrency.cpp
 @@ -0,0 +1,81 @@
@@ -13551,7 +14187,7 @@ index 0000000..7313dd7
 +}
 diff --git a/tests/experimental/p1_engine.cpp b/tests/experimental/p1_engine.cpp
 new file mode 100644
-index 0000000..86ba972
+index 00000000..86ba9726
 --- /dev/null
 +++ b/tests/experimental/p1_engine.cpp
 @@ -0,0 +1,99 @@
@@ -13656,7 +14292,7 @@ index 0000000..86ba972
 +}
 diff --git a/tests/experimental/p1_options.cpp b/tests/experimental/p1_options.cpp
 new file mode 100644
-index 0000000..4c22bee
+index 00000000..4c22bee8
 --- /dev/null
 +++ b/tests/experimental/p1_options.cpp
 @@ -0,0 +1,428 @@
@@ -14090,7 +14726,7 @@ index 0000000..4c22bee
 +}
 diff --git a/tests/experimental/p1_payload.cpp b/tests/experimental/p1_payload.cpp
 new file mode 100644
-index 0000000..9ee7f8b
+index 00000000..9ee7f8bf
 --- /dev/null
 +++ b/tests/experimental/p1_payload.cpp
 @@ -0,0 +1,93 @@
@@ -14189,7 +14825,7 @@ index 0000000..9ee7f8b
 +}
 diff --git a/tests/experimental/p1_rope.cpp b/tests/experimental/p1_rope.cpp
 new file mode 100644
-index 0000000..317a92b
+index 00000000..317a92b9
 --- /dev/null
 +++ b/tests/experimental/p1_rope.cpp
 @@ -0,0 +1,18 @@
@@ -14213,7 +14849,7 @@ index 0000000..317a92b
 +}
 diff --git a/tests/experimental/p1_sparse.cpp b/tests/experimental/p1_sparse.cpp
 new file mode 100644
-index 0000000..8e2a3a7
+index 00000000..8e2a3a70
 --- /dev/null
 +++ b/tests/experimental/p1_sparse.cpp
 @@ -0,0 +1,176 @@
@@ -14395,7 +15031,7 @@ index 0000000..8e2a3a7
 +}
 diff --git a/tests/experimental/p4_history.cpp b/tests/experimental/p4_history.cpp
 new file mode 100644
-index 0000000..3839c80
+index 00000000..3839c807
 --- /dev/null
 +++ b/tests/experimental/p4_history.cpp
 @@ -0,0 +1,444 @@
@@ -14845,7 +15481,7 @@ index 0000000..3839c80
 +}
 diff --git a/tests/experimental/p4_quality.cpp b/tests/experimental/p4_quality.cpp
 new file mode 100644
-index 0000000..f23ad55
+index 00000000..f23ad556
 --- /dev/null
 +++ b/tests/experimental/p4_quality.cpp
 @@ -0,0 +1,155 @@
@@ -15006,7 +15642,7 @@ index 0000000..f23ad55
 +}
 diff --git a/tests/experimental/p4_retrieval.cpp b/tests/experimental/p4_retrieval.cpp
 new file mode 100644
-index 0000000..6ddb10e
+index 00000000..6ddb10ec
 --- /dev/null
 +++ b/tests/experimental/p4_retrieval.cpp
 @@ -0,0 +1,67 @@
@@ -15079,7 +15715,7 @@ index 0000000..6ddb10e
 +}
 diff --git a/tests/experimental/ssd_failure.cpp b/tests/experimental/ssd_failure.cpp
 new file mode 100644
-index 0000000..b33dd01
+index 00000000..b33dd013
 --- /dev/null
 +++ b/tests/experimental/ssd_failure.cpp
 @@ -0,0 +1,264 @@
@@ -15349,7 +15985,7 @@ index 0000000..b33dd01
 +#endif
 diff --git a/tests/experimental/token_sums.cpp b/tests/experimental/token_sums.cpp
 new file mode 100644
-index 0000000..d464e42
+index 00000000..d464e426
 --- /dev/null
 +++ b/tests/experimental/token_sums.cpp
 @@ -0,0 +1,114 @@
@@ -15467,8 +16103,57 @@ index 0000000..d464e42
 +        return 1;
 +    }
 +}
+diff --git a/tests/host/test_checkpoint_recovery_impact.cpp b/tests/host/test_checkpoint_recovery_impact.cpp
+new file mode 100644
+index 00000000..2c830b5e
+--- /dev/null
++++ b/tests/host/test_checkpoint_recovery_impact.cpp
+@@ -0,0 +1,43 @@
++#include "runtime/contract/resources.h"
++
++#include <array>
++
++using ninfer::runtime::CheckpointRecoveryAlternativeWork;
++using ninfer::runtime::PressureCheckpointRecoveryImpact;
++
++constexpr bool recovery_impacts_compare_values() {
++    const std::array alternatives{
++        CheckpointRecoveryAlternativeWork{.prefill = {.tokens = 10}},
++        CheckpointRecoveryAlternativeWork{.prefill = {.tokens = 20}},
++    };
++    auto independent = alternatives;
++    const PressureCheckpointRecoveryImpact left{
++        .owner = {7}, .checkpoint = {.frontier = 42}, .target_recovery_work = alternatives};
++    auto right = left;
++    right.target_recovery_work = independent;
++    if (left != right) { return false; }
++    independent[0].prefill.tokens = 11;
++    if (left == right) { return false; }
++    independent = alternatives;
++    independent[1].transfers[0].copy_operations = 1;
++    if (left == right) { return false; }
++    right = left;
++    right.target_recovery_work = std::span(alternatives).first(1);
++    if (left == right) { return false; }
++    right = left;
++    right.owner.value = 8;
++    if (left == right) { return false; }
++    right = left;
++    right.checkpoint.frontier = 43;
++    if (left == right) { return false; }
++    right = left;
++    right.survives = false;
++    if (left == right) { return false; }
++    return PressureCheckpointRecoveryImpact{} == PressureCheckpointRecoveryImpact{};
++}
++
++static_assert(recovery_impacts_compare_values());
++
++int main() {
++    return recovery_impacts_compare_values() ? 0 : 1;
++}
 diff --git a/tests/models/qwen3_5/test_engine_stages_real.cpp b/tests/models/qwen3_5/test_engine_stages_real.cpp
-index 08e0238..46a9d98 100644
+index 08e0238a..46a9d98e 100644
 --- a/tests/models/qwen3_5/test_engine_stages_real.cpp
 +++ b/tests/models/qwen3_5/test_engine_stages_real.cpp
 @@ -100,6 +100,7 @@ bool flag(const char* name) {
@@ -15525,7 +16210,7 @@ index 08e0238..46a9d98 100644
              while (first < want.size() && first < got.size() && want[first] == got[first]) { ++first; }
              std::cerr << "  first difference at token " << first << '\n';
 diff --git a/tests/models/qwen3_5/test_frontend.cpp b/tests/models/qwen3_5/test_frontend.cpp
-index f558929..05fcb5a 100644
+index f5589293..05fcb5a0 100644
 --- a/tests/models/qwen3_5/test_frontend.cpp
 +++ b/tests/models/qwen3_5/test_frontend.cpp
 @@ -349,7 +349,7 @@ ninfer::PromptInput image_input() {
@@ -15751,7 +16436,7 @@ index f558929..05fcb5a 100644
 +    }
  }
 diff --git a/tests/models/qwen3_5/test_loading.cpp b/tests/models/qwen3_5/test_loading.cpp
-index 5210c7c..94a61a6 100644
+index 5210c7c6..94a61a64 100644
 --- a/tests/models/qwen3_5/test_loading.cpp
 +++ b/tests/models/qwen3_5/test_loading.cpp
 @@ -2,6 +2,7 @@
@@ -15817,7 +16502,7 @@ index 5210c7c..94a61a6 100644
          std::cout << "model config, binding, resources and Use checks passed\n";
 diff --git a/tests/models/qwen3_5/test_tool_constraints.cpp b/tests/models/qwen3_5/test_tool_constraints.cpp
 new file mode 100644
-index 0000000..3e7fc9e
+index 00000000..3e7fc9e5
 --- /dev/null
 +++ b/tests/models/qwen3_5/test_tool_constraints.cpp
 @@ -0,0 +1,145 @@
@@ -15967,7 +16652,7 @@ index 0000000..3e7fc9e
 +    return 0;
 +} catch (const std::exception& e) { std::cerr << e.what()<<"\n"; return 1; }
 diff --git a/tests/ops/linear/test_gguf.cpp b/tests/ops/linear/test_gguf.cpp
-index f5c564d..a218135 100644
+index f5c564d4..a218135e 100644
 --- a/tests/ops/linear/test_gguf.cpp
 +++ b/tests/ops/linear/test_gguf.cpp
 @@ -17,13 +17,17 @@
@@ -16128,7 +16813,7 @@ index f5c564d..a218135 100644
                            << '\n';
                  failures += f;
 diff --git a/tests/ops/softmax_attention/causal_cache.cpp b/tests/ops/softmax_attention/causal_cache.cpp
-index 4c652d2..585b51e 100644
+index 4c652d21..585b51e8 100644
 --- a/tests/ops/softmax_attention/causal_cache.cpp
 +++ b/tests/ops/softmax_attention/causal_cache.cpp
 @@ -4331,6 +4331,13 @@ int run_softmax_attention_dflash2_tests() {
@@ -16146,7 +16831,7 @@ index 4c652d2..585b51e 100644
      if (cuda_unavailable()) {
          std::cout << "SKIP: no usable CUDA device\n";
 diff --git a/tests/ops/softmax_attention/main.cpp b/tests/ops/softmax_attention/main.cpp
-index d691a5b..1522693 100644
+index d691a5bd..15226932 100644
 --- a/tests/ops/softmax_attention/main.cpp
 +++ b/tests/ops/softmax_attention/main.cpp
 @@ -9,6 +9,7 @@ int run_softmax_attention_int8_prompt_tests();
@@ -16177,7 +16862,7 @@ index d691a5b..1522693 100644
          return 2;
      }
 diff --git a/tests/test_cli_options.cpp b/tests/test_cli_options.cpp
-index 374f657..849ed35 100644
+index 374f657c..849ed35c 100644
 --- a/tests/test_cli_options.cpp
 +++ b/tests/test_cli_options.cpp
 @@ -2,6 +2,7 @@
@@ -16281,7 +16966,7 @@ index 374f657..849ed35 100644
          for (unsigned width = 0; width <= 63; ++width) {
              const auto mixed =
 diff --git a/tests/test_context_cache_defaults.cpp b/tests/test_context_cache_defaults.cpp
-index 1217c4d..f5a0028 100644
+index 1217c4d7..f5a00280 100644
 --- a/tests/test_context_cache_defaults.cpp
 +++ b/tests/test_context_cache_defaults.cpp
 @@ -69,6 +69,84 @@ int main() {
@@ -16370,7 +17055,7 @@ index 1217c4d..f5a0028 100644
      // distinct shared-prefix candidates on its own: four explicit markers plus the engine's
      // tool/leading-instruction/full-prompt automatic candidates. The default
 diff --git a/tests/test_kv_cache_ranks.cpp b/tests/test_kv_cache_ranks.cpp
-index 4202802..18aae4d 100644
+index 4202802d..18aae4d5 100644
 --- a/tests/test_kv_cache_ranks.cpp
 +++ b/tests/test_kv_cache_ranks.cpp
 @@ -19,12 +19,14 @@
@@ -16488,7 +17173,7 @@ index 4202802..18aae4d 100644
      std::cout << "multi-rank kv pool matches the single-rank pool\n";
      return 0;
 diff --git a/tests/test_kv_capacity.cpp b/tests/test_kv_capacity.cpp
-index 7284d51..695db76 100644
+index 7284d51c..695db764 100644
 --- a/tests/test_kv_capacity.cpp
 +++ b/tests/test_kv_capacity.cpp
 @@ -1,6 +1,7 @@
@@ -16589,7 +17274,7 @@ index 7284d51..695db76 100644
      return failures == 0 ? 0 : 1;
  }
 diff --git a/tests/test_openai_responses.cpp b/tests/test_openai_responses.cpp
-index 970f13e..5675f59 100644
+index 970f13e2..5675f599 100644
 --- a/tests/test_openai_responses.cpp
 +++ b/tests/test_openai_responses.cpp
 @@ -288,6 +288,43 @@ int test_reasoning_encrypted_content_request() {
@@ -16668,7 +17353,7 @@ index 970f13e..5675f59 100644
      failures += test_contiguous_assistant_items();
      failures += test_response_output_history_round_trip();
 diff --git a/tests/test_openai_schema.cpp b/tests/test_openai_schema.cpp
-index 357cf53..f8fb42f 100644
+index 357cf533..f8fb42fc 100644
 --- a/tests/test_openai_schema.cpp
 +++ b/tests/test_openai_schema.cpp
 @@ -701,9 +701,27 @@ int test_messages_and_media() {
@@ -16726,10 +17411,18 @@ index 357cf53..f8fb42f 100644
      failures += test_graft_extension();
      failures += test_thinking_budget_extension();
 diff --git a/tests/test_resource_manager.cpp b/tests/test_resource_manager.cpp
-index e31cb8b..3b8720d 100644
+index e31cb8bd..db0dd60d 100644
 --- a/tests/test_resource_manager.cpp
 +++ b/tests/test_resource_manager.cpp
-@@ -722,6 +722,10 @@ public:
+@@ -6,6 +6,7 @@
+ #include <atomic>
+ #include <chrono>
+ #include <cstdint>
++#include <cstdlib>
+ #include <cstdio>
+ #include <iostream>
+ #include <map>
+@@ -722,6 +723,10 @@ public:
      [[nodiscard]] bool isolated_request_feasible(const FakeRequestBasePlan& base) const noexcept {
          return base.isolated_feasible;
      }
@@ -16740,7 +17433,7 @@ index e31cb8b..3b8720d 100644
  
      // Tokens a prompt shares with an owner's ledger: matched_tokens[id] when the content keys
      // agree, else zero.
-@@ -2820,16 +2824,16 @@ void test_endpoint_anchor_frontier_keeps_a_matched_endpoint_far_above_its_anchor
+@@ -2820,16 +2825,16 @@ void test_endpoint_anchor_frontier_keeps_a_matched_endpoint_far_above_its_anchor
      FakeManager near_manager = make_manager(1, 2);
      FakeProgram near_program;
      near_program.finish_long_anchor_frontiers = {4096 - kEndpointAnchorMinimumGainTokens + 1};
@@ -16763,7 +17456,7 @@ index e31cb8b..3b8720d 100644
      require(far_manager.endpoint_anchor_frontier(near_program, prompt) == 4096U,
              "an endpoint a full minimum gain above an anchor was not anchored");
  }
-@@ -3192,6 +3196,18 @@ void test_admission_waits_for_program_boundary() {
+@@ -3192,6 +3197,18 @@ void test_admission_waits_for_program_boundary() {
      require(program.finish_calls == 2, "retry admission damaged the already active request");
  }
  
@@ -16782,7 +17475,54 @@ index e31cb8b..3b8720d 100644
  void test_retained_source_is_protected_until_terminal() {
      FakeManager manager = make_manager(2, 3);
      FakeProgram program;
-@@ -5496,6 +5512,7 @@ int main() {
+@@ -4957,6 +4974,46 @@ void test_escape_hatch_ranks_shared_prefixes_with_private_owners() {
+             "rung destroyed a shared prefix whose eviction the admission did not need");
+ }
+ 
++// NINFER_MAT_DEBUG on or off for the admission inspections that follow.
++void set_materialization_trace(bool on) {
++#ifdef _WIN32
++    _putenv_s("NINFER_MAT_DEBUG", on ? "1" : "");
++#else
++    if (on) {
++        setenv("NINFER_MAT_DEBUG", "1", 1);
++    } else {
++        unsetenv("NINFER_MAT_DEBUG");
++    }
++#endif
++}
++
++void test_mismatching_shared_prefixes_beyond_the_private_catalog() {
++    // A shared prefix-index entry's slot numbers the shared catalog. With more shared slots than
++    // private ones, a prompt whose key differs from every catalogued shared prefix must be
++    // admitted without consulting the private catalog at those slots, traced or not (issue #39:
++    // an access violation on admission). The test target checks container bounds.
++    FakeManager manager = make_manager(1, 1, 4);
++    FakeProgram program;
++    std::uint64_t order = 1;
++    for (const std::uint32_t digest : {71U, 72U, 73U}) {
++        publish_shared_prefix(manager, program, digest, order++, digest,
++                              ninfer::SharedCandidateEvidence::DefaultAutomatic);
++    }
++    for (const bool trace : {false, true}) {
++        set_materialization_trace(trace);
++        auto inspection =
++            manager.inspect(program, FakePreparedPrompt{99}, make_base(99), order);
++        require(inspection.choice.has_value(),
++                "a prompt matching no shared prefix produced no admission choice");
++        require(inspection.choice->summary().prefix_reuse_path !=
++                    PrefixReusePath::SharedStablePrefix,
++                "a prompt reused a shared prefix whose key it does not match");
++    }
++    set_materialization_trace(false);
++    require_shared_reuse(manager, program, 72, order, true,
++                         "a matching prompt no longer reuses its shared prefix");
++}
++
+ void test_automatic_shared_capture_reclaims_oldest_catalog_entry() {
+     FakeManager manager = make_manager(1, 4, 2);
+     FakeProgram program;
+@@ -5496,6 +5553,7 @@ int main() {
               test_read_only_and_declared_boundary_reuse_retain_the_source);
      run_test("read-only request leaves the catalog unchanged",
               test_read_only_request_leaves_the_catalog_unchanged);
@@ -16790,8 +17530,59 @@ index e31cb8b..3b8720d 100644
      run_test("retained source protection", test_retained_source_is_protected_until_terminal);
      run_test("admission waits for Program boundary", test_admission_waits_for_program_boundary);
      run_test("session publication order", test_session_publication_order_controls_tied_source);
+@@ -5579,6 +5637,8 @@ int main() {
+              test_escape_hatch_sacrifices_oldest_first_and_demotes_the_rest);
+     run_test("escape hatch ranks shared prefixes with private owners",
+              test_escape_hatch_ranks_shared_prefixes_with_private_owners);
++    run_test("mismatching shared prefixes beyond the private catalog",
++             test_mismatching_shared_prefixes_beyond_the_private_catalog);
+     run_test("shared capture seal failure skips instead of throwing",
+              test_shared_capture_seal_failure_skips_instead_of_throwing);
+     run_test("automatic reclaim picks the least recently used entry",
+diff --git a/tests/test_serve_metrics.cpp b/tests/test_serve_metrics.cpp
+index 70d93be4..bf3db837 100644
+--- a/tests/test_serve_metrics.cpp
++++ b/tests/test_serve_metrics.cpp
+@@ -50,6 +50,13 @@ int main() {
+     sample.stats.waiting_requests              = 2;
+     sample.stats.reused_prompt_tokens          = 700;
+     sample.stats.engine_recoveries             = 1;
++    sample.stats.root_selections               = 3;
++    sample.stats.private_endpoint_selections   = 9;
++    sample.stats.pressure_checkpoints_dropped  = 4;
++    sample.stats.main_kv_h2d_bytes             = 1 << 20;
++    sample.stats.host_state_occupied_slots     = 6;
++    sample.stats.waiting_expired_requests      = 2;
++    sample.stats.cancelled_prefills_salvaged   = 1;
+ 
+     ServeMetrics metrics;
+     GenerationOutcome outcome;
+@@ -99,6 +106,23 @@ int main() {
+                           values.at("ninfer:reused_prompt_tokens_total") == 700.0 &&
+                           values.at("ninfer:engine_recoveries_total") == 1.0,
+                       "ninfer series accumulate reuse, speculation and recoveries");
++    const auto at = [&](const char* series) { return values.at(series); };
++    failures += check(at("ninfer:context_selections_total{source=\"root\"}") == 3.0 &&
++                          at("ninfer:context_selections_total"
++                             "{source=\"private_endpoint\"}") == 9.0 &&
++                          at("ninfer:context_pressure_events_total"
++                             "{event=\"checkpoint_dropped\"}") == 4.0 &&
++                          at("ninfer:context_transfer_bytes_total"
++                             "{object=\"main_kv\",direction=\"h2d\"}") == 1048576.0 &&
++                          at("ninfer:context_occupancy{pool=\"host_state_slots\"}") == 6.0 &&
++                          body.find("# TYPE ninfer:context_selections_total counter") !=
++                              std::string::npos &&
++                          body.find("# TYPE ninfer:context_occupancy gauge") != std::string::npos,
++                      "context-cache selections, pressure, transfers and occupancy are exported");
++    failures += check(at("ninfer:waiting_expired_requests_total") == 2.0 &&
++                          at("ninfer:waiting_cancelled_requests_total") == 0.0 &&
++                          at("ninfer:cancelled_prefills_salvaged_total") == 1.0,
++                      "abandoned and cancelled requests are counted");
+ 
+     const auto empty = samples(ServeMetrics{}.render(LoadCapacity{}, LoadSample{}));
+     failures += check(empty.at("llamacpp:predicted_tokens_seconds") == 0.0 &&
 diff --git a/tests/test_serve_options.cpp b/tests/test_serve_options.cpp
-index 095812a..869c637 100644
+index 095812ac..869c6371 100644
 --- a/tests/test_serve_options.cpp
 +++ b/tests/test_serve_options.cpp
 @@ -2,9 +2,12 @@
@@ -17369,7 +18160,7 @@ index 095812a..869c637 100644
 +    }
 +}
 diff --git a/third_party/xgrammar/CMakeLists.txt b/third_party/xgrammar/CMakeLists.txt
-index 7a116b0..d9ec022 100644
+index 7a116b01..d9ec0225 100644
 --- a/third_party/xgrammar/CMakeLists.txt
 +++ b/third_party/xgrammar/CMakeLists.txt
 @@ -13,6 +13,7 @@ add_library(ninfer_xgrammar STATIC
@@ -17381,7 +18172,7 @@ index 7a116b0..d9ec022 100644
    cpp/regex_converter.cc
    cpp/structural_tag.cc
 diff --git a/third_party/xgrammar/cpp/json_schema_converter_ext.cc b/third_party/xgrammar/cpp/json_schema_converter_ext.cc
-index 23b03e8..4604331 100644
+index 23b03e83..4604331f 100644
 --- a/third_party/xgrammar/cpp/json_schema_converter_ext.cc
 +++ b/third_party/xgrammar/cpp/json_schema_converter_ext.cc
 @@ -4,6 +4,8 @@
@@ -17526,7 +18317,7 @@ index 23b03e8..4604331 100644
          ByteString(xml_wrapper_.key_wrapper_prefix),
          key_pattern_expr,
 diff --git a/third_party/xgrammar/cpp/json_schema_converter_ext.h b/third_party/xgrammar/cpp/json_schema_converter_ext.h
-index 1386225..52bd8b2 100644
+index 1386225d..52bd8b2b 100644
 --- a/third_party/xgrammar/cpp/json_schema_converter_ext.h
 +++ b/third_party/xgrammar/cpp/json_schema_converter_ext.h
 @@ -88,6 +88,8 @@ class XMLToolCallingConverter : public JSONSchemaConverter {
@@ -17540,7 +18331,7 @@ index 1386225..52bd8b2 100644
        const ObjectSpec& spec, const std::string& rule_name, bool dummy_need_braces = false
 diff --git a/third_party/xgrammar/cpp/json_string_grammar.cc b/third_party/xgrammar/cpp/json_string_grammar.cc
 new file mode 100644
-index 0000000..21d1336
+index 00000000..21d1336c
 --- /dev/null
 +++ b/third_party/xgrammar/cpp/json_string_grammar.cc
 @@ -0,0 +1,447 @@
@@ -17993,7 +18784,7 @@ index 0000000..21d1336
 +}  // namespace xgrammar
 diff --git a/third_party/xgrammar/cpp/json_string_grammar.h b/third_party/xgrammar/cpp/json_string_grammar.h
 new file mode 100644
-index 0000000..f6fb5b5
+index 00000000..f6fb5b54
 --- /dev/null
 +++ b/third_party/xgrammar/cpp/json_string_grammar.h
 @@ -0,0 +1,26 @@
@@ -18024,7 +18815,7 @@ index 0000000..f6fb5b5
 +}  // namespace xgrammar
 +#endif
 diff --git a/tools/convert/gguf_blocks.py b/tools/convert/gguf_blocks.py
-index 52035bc..8f02057 100644
+index 52035bc6..8f020576 100644
 --- a/tools/convert/gguf_blocks.py
 +++ b/tools/convert/gguf_blocks.py
 @@ -1,10 +1,12 @@
@@ -18150,7 +18941,7 @@ index 52035bc..8f02057 100644
  
  
 diff --git a/tools/convert/ternary.py b/tools/convert/ternary.py
-index 204dda3..66a2c33 100644
+index 204dda38..66a2c338 100644
 --- a/tools/convert/ternary.py
 +++ b/tools/convert/ternary.py
 @@ -157,7 +157,10 @@ def validate(gguf: GGUFFile) -> None:
