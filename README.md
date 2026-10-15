@@ -15,7 +15,7 @@
   --max-context 262144 --kvmem-recent-tokens 1024 ^
   --prefill-chunk 256 ^
   --kvmem-budget 36864 --kvmem-gen-reserve 16384 --kvmem-host-mib 12288 ^
-  --kvmem-action-lrfu --model-id ninfer-27b ^
+  --kvmem-action-lrfu --kvmem-protect-semantics --model-id ninfer-27b ^
   --kv-dtype int8  --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
   --spec mtp --draft-tokens 4 --ngram-draft-tokens 31 --adaptive-mtp ^
   --vision --vision-residency cpu --vision-max-merged 256 ^
@@ -23,6 +23,7 @@
   
 ---
   --kvmem-action-lrfu 为开启actkv  
+  --kvmem-protect-semantics 为开启 ActKV 语义保护（v1.3 起改为"按需救援"，上限 25% 窗口，不需要额外参数）
   --vision --vision-residency cpu   --vision-max-merged 256 cpu运算需使用256，gpu可改为1024
 
 ---
@@ -43,13 +44,46 @@ https://huggingface.co/WaveCut/Ternary-Bonsai-2-27B-NInfer-v3/tree/main
 
 ---
 
+v1.3更新
+
+1，ActKV 语义保护（--kvmem-protect-semantics）由"先占预算的硬钉住"改为**按需救援**：先照常按检索分选页，只把这轮被丢掉的保护页（前导 system/developer 块 + 最后一条 user 消息）按检索分从高到低救回来，上限 = 窗口页数的 25%（硬编码，没有新增参数）。被检索本来就留下的保护页一分预算都不花。旧语义在超长 user 消息上会把整个 576 页窗口填满（mandatory == selected == 576 页），没有一页留给打分，实测损失约 9% decode。
+
+262k 上下文 / 33 针 NIAH，同一台机器、同一份模型的三组对照：
+
+| 语义 | 召回 | 工具轮 decode 中位 | MTP 接受率 |
+|---|---|---|---|
+| 全保护（旧语义） | 33/33 | 77.4 tok/s | 62.8% |
+| 关闭保护 | 33/33 | 84.7 tok/s | 61.8% |
+| **限额 25%（现行）** | **33/33** | **90.4 tok/s** | 61.6% |
+
+2，删除一批"测过才知道没用"的参数。传它们现在是**启动报错**，错误信息里直接写清原因和实测数据：
+
+| 已删除 | 原因 |
+|---|---|
+| `--kvmem-query-union` / `--kvmem-action-region` | 动作探针从未激活（本 chat 模板的 tool_calls 不产生输出区） |
+| `--kvmem-score-agg` | GQA 恒为折叠均值；max 曾把 40 针召回从 39/40 打到 28/40 |
+| `--kvmem-conf-*` | 静态 B+R 池存不下省出的显存；40/40 → 17/40 换约 15% 轮时 |
+| `--kvmem-aav-*` | 论文 §5.1 的 AAV 是诊断（`KVMEM_AAV_TRACE=1`），不是保留策略 |
+
+3，修掉两处"静默失效"：--kvmem-sink-tokens 给 1~63（会被悄悄取整成一页）、--kvmem-lrfu-lambda / --kvmem-lrfu-top-frac 没配 --kvmem-action-lrfu（等于没接上任何东西），现在都是启动报错。
+
+4，新增诊断环境变量 KVMEM_PROTECT_TRACE=1：每个压缩轮打印一行 protected / dropped_by_retrieval / rescued。rescued=0 说明保护页本来就没被丢，这种情况开关开不开都一样。
+
+5，修复 Windows 中文环境下 ninja 依赖缺失的构建缺陷（**建议重新构建**）。CMake 4.3 把 cl.exe 的 /showIncludes 前缀按错误编码写进 rules.ninja，导致 ninja 对**所有 C++ 对象**记录空依赖（CUDA 对象不受影响）。后果不是"编得慢"而是"编错"：改一个头文件只重编 CUDA 单元、C++ 单元不重编，同一个类出现两种成员布局并被链进同一个二进制（曾表现为读越界崩溃，以及只加 --kvmem-budget 就报 conf 预算错误）。现已在 build-backends.ps1 里固定该前缀（与 llama.cpp 的 build.ps1 一致），详见 docs/kvmem-header-rebuild-trap.md。
+
+6，重生成 backends/patches/ninfer-kvmem.patch 与 backends/versions.json（188 个文件，patch_sha256 2a5176d8、patched_tree 020d9a33），python scripts/prepare-backends.py --backend ninfer --check 恢复 "ninfer: 8319e8f51247 + ninfer-kvmem.patch ready"。
+
+7，以上改动只涉及 ActKV 保留策略与构建，召回口径不变：33/33、跨工具 14/14、80 次工具调用全部通过。
+
+---
+
 dflash2启动命令
 
   --port 18200 ^
   --max-context 262144 --kvmem-recent-tokens 1024 ^
   --prefill-chunk 256 ^
   --kvmem-budget 36864 --kvmem-gen-reserve 16384 --kvmem-host-mib 12288 ^
-  --kvmem-action-lrfu --model-id ninfer-27b ^
+  --kvmem-action-lrfu --kvmem-protect-semantics --model-id ninfer-27b ^
   --kv-dtype rk8v4  --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
   --spec mtp --draft-tokens 5 --ngram-draft-tokens 31 --adaptive-mtp ^
   --vision --vision-residency cpu --vision-max-merged 256 ^
@@ -74,7 +108,7 @@ dflash2启动命令
 | KV 量化 | **int8** |
 | KV 池 | `budget 36864` + `gen_reserve 16384` = **53248 token**（832 页 × 64 token） |
 | ActKV | **开启**（`--kvmem-action-lrfu`、λ=0.50、top-frac=0.90） |
-| score-agg | `mean` |
+| GQA 聚合 | 折叠 `mean`（`--kvmem-score-agg` 已在 v1.3 删除，恒为 mean） |
 | recent-tokens | 1024 |
 | 推测解码 | MTP draft 4 + ngram 31 + adaptive |
 | max-context | **262144** |
