@@ -30,6 +30,13 @@ namespace kvmem {
 
 enum class KvTier : uint8_t { GPU = 0, CPU = 1, SSD = 2 };
 
+// ActKV (arXiv:2609.31395, Sec. 5.1) AAV access pattern, read from
+// KvMemBlock::access_ring. The paper separates entries that are hit every round
+// (continuous), hit in some rounds but not others (intermittent), hit once
+// (cold) and never hit since they appeared (silent). Intermittent is the class
+// the paper's protection exists for.
+enum class KvAavClass : uint8_t { Silent = 0, Cold = 1, Intermittent = 2, Continuous = 3 };
+
 // Metadata for one context block, spanning all attention layers (a token range
 // has KV in every attention layer). Physical storage handles per tier are
 // added in the tiering task (#41); v1 tracks logical placement + remap state.
@@ -58,17 +65,47 @@ struct KvMemBlock {
     uint64_t remap_abs_delta = 0;   // sum(abs(to_base-from_base)) since raw rebuild
     bool     in_working_set = false;
 
-    // Cumulative attention quality (built-in top-k selection signal, #40).
+    // Cumulative attention quality (built-in top-k selection signal, #40). This
+    // is the CONTENT signal: the one-shot retrieval score (Retrieval method) or
+    // the window-local H2O heat. The ActKV keep score never writes it, so media
+    // constraint (constrain_media) and diagnostics keep reading the content
+    // signal even while the LRFU keep score drives the working set.
     double   attn_score = 0.0;
     double   profile_score = 0.0;    // window-local cumulative attention heat
     double   retrieval_score = 0.0;  // global retrieval score
 
     // ActKV (arXiv:2609.31395, Sec. 5.2 Alg. 1) action-oriented keep score:
     //   KS_t = lambda * KS_{t-1} + (top-p hit ? retrieval_t : 0)
-    // Non-negative by construction. When KvMemStoreConfig::action_lrfu is on the
-    // selector ranks with attn_score, which carries this value; retrieval_score
-    // keeps the one-shot score for diagnostics and the quota selector.
+    // Non-negative by construction. Committed only at commit_lrfu() in deferred
+    // mode, so it is the persistent value and never the per-round ranking value.
     double   lrfu_score = 0.0;
+
+    // The ranking signal pick_topk_blocks / the quota fill sort by. Exactly one
+    // source writes it per round, so no writer can silently clobber another
+    // (docs/a9-deferred-lrfu-regression.md, lesson 1: "the ranking signal and the
+    // persistent score must be named and built separately"):
+    //   Retrieval method -> retrieval_score
+    //   H2O method       -> profile_score
+    //   LRFU immediate   -> the new keep score KS
+    //   LRFU deferred    -> the PROVISIONAL KS for this round; lrfu_score still
+    //                       holds the committed value until commit_lrfu.
+    double   select_score = 0.0;
+
+    // ActKV (arXiv:2609.31395, Sec. 5.1) AAV access pattern: one hit bit per
+    // compression round, most recent in bit 0, plus saturating counters. The
+    // paper's finding is that continuous entries are the most common but carry
+    // the least attention per access, while intermittent entries contribute
+    // strongly and discontinuously -- so eviction driven by the current round's
+    // preference can drop entries that matter again later.
+    //
+    // Advanced by record_access only for the diagnostic, so the default path
+    // carries the fields untouched. Nothing in the selection path reads them:
+    // aav_class_of and the trace turn them into a class, and that class has no
+    // policy attached. The paper's AAV is an analysis (its Fig. 6) used to
+    // motivate the single global lambda, not a switch -- treating a class as a
+    // second decay factor freezes the working set and costs recall.
+    uint16_t access_ring = 0;
+    uint16_t access_rounds = 0;         // rounds observed since the block appeared
 
     uint32_t orig_pos_end() const { return orig_pos_start + n_tokens; }
 };
@@ -137,7 +174,7 @@ struct NativeResidencyPlan {
 
 // Which signal ranks the middle (non-sink/recent) blocks each reselection.
 // All three feed the SAME pick_topk_blocks (sink + recent windows are always
-// kept); they differ only in what writes attn_score:
+// kept); they differ only in what writes select_score:
 //   Retrieval — global content-frame similarity to the current query; re-ranks
 //               ALL historical blocks each interval and CAN resurrect a block
 //               already dropped from the window (Quest/InfLLM-style). Default.
@@ -269,6 +306,34 @@ struct KvMemStoreConfig {
     // that cannot report a selection leave it off and keep the score-only rule.
     bool   deferred_lrfu = false;    // --kvmem-lrfu-deferred
 
+    // Advance the AAV access ring. This is the DIAGNOSTIC only: the serve sets it
+    // from KVMEM_AAV_TRACE so the ring and the trace line exist for analysis, and
+    // callers that want the ring without the environment variable (tests) set it
+    // directly. It never changes a retention decision -- the paper's Sec. 5.1
+    // classifies access patterns to justify one global lambda, and gives no
+    // per-class decay.
+    bool aav_trace = false;
+
+    // Cross-page normalization of the one-shot retrieval score
+    // (--kvmem-retrieval-temp). 0 = off, which keeps the historical raw-cosine
+    // scale byte-identical to before this option existed.
+    //
+    // The retrieval_method note below calls MeanK a softmax over pages; with the
+    // raw cosine that is not what runs, and the two terms the keep score folds
+    // are not commensurable -- KS is an unbounded accumulator while the score is
+    // in [-1, 1]. After a few rounds lambda * KS dominates, which is the failure
+    // the provisional-KS comment in set_retrieval_scores describes: the round's
+    // own evidence stops moving the ranking, and a block written this round
+    // cannot outrank the incumbents. Softmax makes the score a mass (mean 1/N
+    // over the positively scored blocks) and the temperature is then the
+    // exchange rate between accumulated memory and this round's evidence.
+    //
+    // Only positively scored blocks carry mass, so the "no hit from page age
+    // alone" rule is unchanged, and softmax is order-preserving, so the
+    // within-round selection and the percentile hit mask are unchanged too.
+    // What moves is only the weight the evidence carries inside KS_t.
+    float  retrieval_temperature = 0.0f;  // --kvmem-retrieval-temp
+
     KvMemMethod select_method = KvMemMethod::Retrieval; // --kvmem-method
     KvMemSelectPolicy select_policy = KvMemSelectPolicy::TopK;
     KvMemRetrievalMethod retrieval_method = KvMemRetrievalMethod::MeanK;
@@ -361,6 +426,12 @@ public:
     uint32_t total_tokens() const { return total_tokens_; }
     const std::vector<KvMemBlock> &blocks() const { return blocks_; }
 
+    // AAV class of a resident block (ActKV Sec. 5.1). Diagnostics only: the
+    // paper's classification describes access patterns and motivates the single
+    // global lambda; no policy consumes it. Public so the trace and the tests
+    // read the same rule.
+    KvAavClass aav_class_of(uint32_t block_id) const;
+
     // Block that owns original token position `pos`, or -1 if none.
     int32_t block_id_containing(uint32_t pos) const;
 
@@ -380,18 +451,10 @@ public:
     // is a no-op (returns empty).
     std::vector<KvMemDroppedBlock> truncate_to(uint32_t token_pos);
 
-    // Capacity of the semantic selection budget. `select_budget` is the
-    // configured hard upper bound; a non-zero runtime value narrows one
-    // request/frozen branch without changing pressure-prefill capacity or any
-    // allocation made at configure time.
-    uint32_t select_budget_tokens() const {
-        return runtime_select_budget_ != 0
-            ? runtime_select_budget_ : cfg_.select_budget;
-    }
-    uint32_t runtime_select_budget_tokens() const {
-        return runtime_select_budget_;
-    }
-    void set_runtime_select_budget(uint32_t tokens);
+    // Capacity of the semantic selection budget, in tokens. The ActKV Sec. 6 adaptive
+    // budget used to narrow this per compression round through a runtime override; that
+    // policy was removed (see serve_options.cpp), so the configured value is the answer.
+    uint32_t select_budget_tokens() const { return cfg_.select_budget; }
     uint32_t budget_blocks() const {
         return select_budget_tokens() / cfg_.block_tokens;
     }
@@ -467,8 +530,10 @@ public:
     //
     // ActKV: when KvMemStoreConfig::action_lrfu is on, this ALSO folds the
     // one-shot score into the temporal keep score (Alg. 1) and publishes KS as
-    // attn_score, so every backend that only calls this entry point (llama.cpp
-    // and ninfer alike) gets the same action-oriented ranking. `round_id`
+    // select_score, so every backend that only calls this entry point (llama.cpp
+    // and ninfer alike) gets the same action-oriented ranking. attn_score keeps
+    // the one-shot content signal (constrain_media reads it, never KS).
+    // `round_id`
     // identifies the compression round: a repeat with the same id is a no-op
     // that still republishes KS, so preview/apply passes stay consistent.
     //
@@ -555,6 +620,13 @@ private:
         const std::vector<uint32_t> & mandatory, uint32_t budget, bool recency) const;
     std::vector<uint32_t> pick_topk_ungrouped(const std::vector<uint32_t> & mandatory) const;
     std::vector<uint32_t> pick_prefill_ungrouped(const std::vector<uint32_t> & mandatory) const;
+    // --kvmem-retrieval-temp: returns `scores` unchanged when the option is off,
+    // otherwise a probability mass over the positively scored blocks.
+    const std::vector<double> & normalized_retrieval_scores(const std::vector<double> & scores);
+    // AAV bookkeeping: advances the per-block access ring from this round's
+    // selection. A no-op unless the diagnostic is enabled (cfg.aav_trace or
+    // KVMEM_AAV_TRACE).
+    void record_access(const std::vector<uint32_t> & selected);
     std::vector<std::pair<uint32_t, uint32_t>> media_ranges_;
 public:
     void set_media_ranges(std::vector<std::pair<uint32_t, uint32_t>> ranges) { media_ranges_ = std::move(ranges); }
@@ -564,7 +636,6 @@ public:
     }
 private:
     KvMemStoreConfig cfg_;
-    uint32_t runtime_select_budget_ = 0;
     std::vector<KvMemBlock> blocks_;
     uint32_t total_tokens_ = 0;  // total appended context length
     // Last compression round whose ActKV keep-score update was applied.
@@ -577,6 +648,18 @@ private:
     std::vector<double> lrfu_pending_scores_;
     uint64_t lrfu_pending_round_ = 0;
     bool     lrfu_pending_ = false;
+    // --kvmem-retrieval-temp scratch. Reused so a scored chunk does not allocate.
+    std::vector<double> retrieval_scratch_;
+    // AAV diagnostic state. Only advanced while KVMEM_AAV_TRACE is set, so the
+    // default path carries the fields but never touches them.
+    uint64_t aav_last_round_ = 0;   // last token frontier seen (repeat guard)
+    uint64_t aav_rows_ = 0;         // traced rows -- the monotone round number
+    bool     aav_round_seen_ = false;
+    // Last four selections as sorted id sets, for Jaccard. Sets, not bitmaps: the
+    // block table grows every round, so equal-length comparisons are never equal.
+    std::vector<uint32_t> aav_history_[4];
+    uint32_t aav_history_next_ = 0;
+    uint32_t aav_history_count_ = 0;
 };
 
 } // namespace kvmem

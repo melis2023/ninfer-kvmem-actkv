@@ -5,13 +5,15 @@
 #include <limits>
 #include <map>
 #include <set>
+#include <string>
+#include <string_view>
 #include <tuple>
 #include <utility>
 
 namespace kvmem {
 namespace {
-[[noreturn]] void fail(MemoryErrorCode code, const char * message) {
-    throw MemoryError(code, message);
+[[noreturn]] void fail(MemoryErrorCode code, std::string_view message) {
+    throw MemoryError(code, std::string(message));
 }
 uint64_t add(uint64_t a, uint64_t b) {
     if (b > std::numeric_limits<uint64_t>::max() - a)
@@ -188,8 +190,25 @@ WorkingSetPlan plan_working_set(const MemoryDescriptor & d, const MemorySnapshot
     plan.host_payload_bytes_required = mul(host_records, d.layout.record_bytes);
     if (plan.next.visible_tokens > budget.selected_tokens ||
         plan.device_tokens_required > budget.device_tokens ||
-        plan.host_payload_bytes_required > budget.host_payload_bytes)
-        fail(MemoryErrorCode::BudgetExceeded, "selection/reserve/host payload budget exceeded");
+        plan.host_payload_bytes_required > budget.host_payload_bytes) {
+        // Name every term: the three bounds fail for very different reasons (a selector that
+        // returned too many blocks, a reserve that no longer fits the device window, or a host
+        // archive that outgrew H). A bare "budget exceeded" cannot be acted on from the log.
+        fail(MemoryErrorCode::BudgetExceeded,
+            "selection/reserve/host payload budget exceeded: visible " +
+                std::to_string(plan.next.visible_tokens) + "/" +
+                std::to_string(budget.selected_tokens) + ", device " +
+                std::to_string(plan.device_tokens_required) + "/" +
+                std::to_string(budget.device_tokens) + ", host " +
+                std::to_string(plan.host_payload_bytes_required) + "/" +
+                std::to_string(budget.host_payload_bytes) + " bytes (record " +
+                std::to_string(d.layout.record_bytes) + ", blocks " +
+                std::to_string(s.blocks.size()) + ", chosen " +
+                std::to_string(plan.next.blocks.size()) + ", evicted " +
+                std::to_string(plan.evict.size()) + ", spilled " +
+                std::to_string(plan.spill.size()) + ", host records " +
+                std::to_string(host_records) + ")");
+    }
     return plan;
 }
 

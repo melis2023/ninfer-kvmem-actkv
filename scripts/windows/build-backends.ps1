@@ -10,6 +10,7 @@ param(
     [string[]]$CMakeArgs = @(),
     [switch]$ConfigureOnly,
     [switch]$BuildOnly,
+    [switch]$SkipMsvcIncludePrefix,
     [switch]$DryRun
 )
 $ErrorActionPreference = 'Stop'
@@ -41,7 +42,7 @@ $plans = foreach ($name in $backends) {
         $configure += @("-DCMAKE_CUDA_COMPILER=$CudaPath/bin/nvcc.exe", "-DCUDAToolkit_ROOT=$CudaPath")
     }
     $configure += $CMakeArgs
-    @{ backend = $name; configure = $configure
+    @{ backend = $name; configure = $configure; dir = $build
        build = @('--build', $build, '--parallel', "$Jobs") + $target }
 }
 if ($DryRun) { $plans | ConvertTo-Json -Depth 5; return }
@@ -53,6 +54,63 @@ if (!$env:VSCMD_VER) {
     & (Join-Path $vs 'Common7/Tools/Launch-VsDevShell.ps1') -Arch amd64 -HostArch amd64 -SkipAutomaticLocation
 }
 if ($CudaPath) { $env:PATH = "$CudaPath/bin;$CudaPath/bin/x64;$env:PATH" }
+
+# Pin the MSVC include-dependency prefix instead of letting CMake detect it.
+#
+# cl.exe prints /showIncludes in the system language, and CMake 4.3 stores the
+# prefix it detects double-encoded: on a Chinese install rules.ninja gets the
+# UTF-8 bytes of "注意: 包含文件:" decoded as the ANSI code page and re-encoded, so
+# the value matches nothing cl ever prints. ninja then records an EMPTY
+# dependency list for every C++ object while CUDA objects keep theirs (nvcc emits
+# a depfile), which makes the build wrong rather than slow: a header edit
+# recompiles the CUDA translation units and leaves the C++ ones alone, so one
+# class has two member layouts inside a single link. That is how
+# docs/kvmem-header-rebuild-trap.md's crash happened (a KvMemStore member read
+# past the end of an object sized by an older layout), and how adding one float
+# to ninfer::KvmemOptions made --kvmem-budget alone fail startup validation.
+#
+# The prefix is read from the compiler rather than hardcoded per language, exactly
+# as scripts/windows/build.ps1 already does for the llama.cpp backend; this script
+# was missing it. CMake takes CMAKE_CL_SHOWINCLUDES_PREFIX over a
+# CMAKE_USER_MAKE_RULES_OVERRIDE file, which survives every reconfigure.
+if (!$SkipMsvcIncludePrefix) {
+    $probeDir = Join-Path ([IO.Path]::GetTempPath()) ("kvmem-msvc-probe-" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $probeDir | Out-Null
+    # cl.exe emits /showIncludes as UTF-8 whatever the console code page is, and native
+    # output was observed arriving here already mojibake: Windows PowerShell 5.1 decodes
+    # it with the ANSI code page unless the console output encoding says otherwise. Pin
+    # UTF-8 for the probe so the detected prefix does not depend on the caller's console.
+    $previousOutputEncoding = [Console]::OutputEncoding
+    [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+    try {
+        [IO.File]::WriteAllText((Join-Path $probeDir 'kvmem-msvc-probe.h'), '', [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText((Join-Path $probeDir 'probe.cpp'),
+            "#include `"kvmem-msvc-probe.h`"`nint main(){return 0;}`n", [Text.UTF8Encoding]::new($false))
+        $probeLines = & cl /nologo /showIncludes /c (Join-Path $probeDir 'probe.cpp') "/Fo$(Join-Path $probeDir 'probe.obj')" 2>&1
+        if ($LASTEXITCODE -ne 0) { throw "MSVC include-prefix probe failed: $probeLines" }
+        $includePrefix = $null
+        foreach ($line in $probeLines) {
+            if ("$line" -match '^(.+?)[A-Za-z]:[\\/].*kvmem-msvc-probe\.h$') {
+                $includePrefix = $Matches[1].TrimEnd() + ' '
+                break
+            }
+        }
+        if (!$includePrefix) { throw 'Cannot detect the MSVC include dependency prefix' }
+    } finally {
+        [Console]::OutputEncoding = $previousOutputEncoding
+        Remove-Item -LiteralPath $probeDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $escapedPrefix = $includePrefix.Replace('\', '\\').Replace('"', '\"')
+    Write-Verbose "MSVC include prefix: '$includePrefix'"
+    foreach ($plan in $plans) {
+        New-Item -ItemType Directory -Force -Path $plan.dir | Out-Null
+        $rulesOverride = Join-Path $plan.dir 'kvmem-msvc-rules.cmake'
+        [IO.File]::WriteAllText($rulesOverride,
+            "set(CMAKE_CL_SHOWINCLUDES_PREFIX `"$escapedPrefix`")`n", [Text.UTF8Encoding]::new($false))
+        $plan.configure += "-DCMAKE_USER_MAKE_RULES_OVERRIDE=$rulesOverride"
+    }
+}
+
 foreach ($plan in $plans) {
     if ($plan.backend -ne 'core') {
         & $Python (Join-Path $source 'scripts/prepare-backends.py') --backend $plan.backend
