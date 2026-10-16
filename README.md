@@ -2,7 +2,8 @@
 
 项目作用
 
-基于 kvmem@（https://github.com/kvmem/kvmem-llama.cpp）与 ActKV 技术开发：
+基于 https://github.com/kvmem/kvmem-llama.cpp
+与 ActKV 技术开发：
 
 - **KVMem**：把长上下文稀疏化成固定窗口（`budget` 选取历史页 B + `gen_reserve` 追加工作区 R）+ Host/磁盘归档，用一个固定大小的注意力窗口换取 200K～262K 的可用上下文。
 - **ActKV**（arXiv:2609.31395，中国科学技术大学提出）https://arxiv.org/pdf/2609.31395
