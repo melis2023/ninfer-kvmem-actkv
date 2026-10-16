@@ -1,0 +1,1948 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KVMem·NINFER 启动台</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Rajdhani:wght@500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<script>
+/* 主题引导：必须在样式应用前执行，避免刷新时先闪一下其它主题。
+   默认亮色（白色 UI）；一旦用户手动切换过，就以本地保存的选择为准。 */
+(function () {
+  try {
+    var saved = localStorage.getItem("kvmem-launcher-theme");
+    var theme = (saved === "light" || saved === "dark") ? saved : "light";
+    document.documentElement.setAttribute("data-theme", theme);
+  } catch (e) {
+    document.documentElement.setAttribute("data-theme", "light");
+  }
+})();
+</script>
+<style>
+/* ============================================================
+   主题变量 —— 亮色（白色）为默认；<html data-theme="dark"> 切换为暗色。
+   所有颜色都走变量，切换主题无需改任何选择器。
+   把亮色放在 :root 上，即使 JS 被禁用也仍是白色界面。
+   ============================================================ */
+:root{
+  color-scheme:light;
+  --bg:#f2f5fa; --bg2:#e9eef6;
+  --panel:#ffffff; --panel2:#ffffff; --inset:#f6f8fc;
+  --line:rgba(24,52,92,.12); --line2:rgba(24,52,92,.22);
+  --txt:#16202e; --dim:#4c5c72; --faint:#7d8ca0;
+  --cyan:#0b93c9; --amber:#c4791a; --green:#12975a; --red:#d4384b; --violet:#7250d8;
+  --disp:"Rajdhani","Microsoft YaHei","Segoe UI",sans-serif;
+  --mono:"JetBrains Mono","Consolas","Microsoft YaHei",monospace;
+
+  --bg-glow:rgba(11,147,201,.09);
+  --bg-grid:rgba(24,52,92,.035);
+  --scroll:rgba(24,52,92,.22);
+  --head-a:rgba(255,255,255,.97); --head-b:rgba(255,255,255,.88);
+
+  --off:#b9c4d4; --off-ring:rgba(24,52,92,.06);
+  --shadow-panel:0 10px 26px rgba(24,52,92,.10);
+  --accent-fade:rgba(11,147,201,.07);
+
+  --btn-a:#ffffff; --btn-b:#eef2f8;
+  --btn-p-a:#e2f4fd; --btn-p-b:#d1ecf9;
+  --btn-d-a:#fdeaec; --btn-d-b:#fbd8dc;
+  --card-a:#ffffff; --card-b:#f8fafd;
+  --shadow-card:0 8px 18px rgba(24,52,92,.10);
+  --track:#dde4ee; --knob:#8e9cb0;
+  --focus-ring:rgba(11,147,201,.14);
+  --bd-cy:rgba(11,147,201,.45); --bd-cy2:rgba(11,147,201,.38);
+  --bd-cy3:rgba(11,147,201,.6); --bd-ok:rgba(18,151,90,.35);
+  --bd-bad:rgba(212,56,75,.35); --sw-on:rgba(11,147,201,.18);
+  --sw-on-bd:rgba(11,147,201,.55); --glow-cy:rgba(11,147,201,.14);
+
+  --cmd-fg:#0b6f9c; --val-fg:#16202e; --tval-fg:#14568c;
+  --flash-fg:#062a3d; --flash-glow:rgba(11,147,201,.55);
+  --hchip-bg:rgba(24,52,92,.05); --hchip-fg:#16202e;
+  --tag-v-bg:rgba(114,80,216,.10); --tag-v-bd:rgba(114,80,216,.30); --tag-v-fg:#5b3fc0;
+  --tag-cy-fg:#0a7fae; --tag-am-fg:#a5640f;
+  --lv-bg:rgba(11,147,201,.10); --lv-bd:rgba(11,147,201,.30); --lv-fg:#0a7fae;
+  --lv-am-fg:#a5640f; --lv-gr-fg:#0f7f4c;
+  --am-bg:rgba(196,121,26,.10); --am-bd:rgba(196,121,26,.30);
+  --gr-bg:rgba(18,151,90,.10); --gr-bd:rgba(18,151,90,.30);
+  --toast-bg:#ffffff; --toast-fg:#14568c; --toast-bd:rgba(11,147,201,.5);
+  --toast-shadow:0 12px 30px rgba(24,52,92,.18); --toast-bad-fg:#b32636;
+}
+
+/* ---------- 暗色主题 ---------- */
+[data-theme="dark"]{
+  color-scheme:dark;
+  --bg:#05070b; --bg2:#070a10;
+  --panel:#0b0f16; --panel2:#0d121c; --inset:#080c13;
+  --line:rgba(125,180,255,.10); --line2:rgba(125,180,255,.20);
+  --txt:#d7e3f4; --dim:#8fa2bd; --faint:#5b6d89;
+  --cyan:#3fd8ff; --amber:#ffb454; --green:#3ee089; --red:#ff5d6c; --violet:#9d7bff;
+
+  --bg-glow:rgba(63,216,255,.07);
+  --bg-grid:rgba(125,180,255,.028);
+  --scroll:rgba(125,180,255,.18);
+  --head-a:rgba(7,10,16,.96); --head-b:rgba(7,10,16,.86);
+
+  --off:#44506a; --off-ring:rgba(125,180,255,.06);
+  --shadow-panel:0 10px 30px rgba(0,0,0,.35);
+  --accent-fade:rgba(63,216,255,.05);
+
+  --btn-a:#111a2a; --btn-b:#0c1220;
+  --btn-p-a:#0e2c40; --btn-p-b:#0a2033;
+  --btn-d-a:#3a1220; --btn-d-b:#280d18;
+  --card-a:#0d1320; --card-b:#0a0f18;
+  --shadow-card:0 8px 20px rgba(0,0,0,.35);
+  --track:#141c2b; --knob:#5c6f88;
+  --focus-ring:rgba(63,216,255,.10);
+  --bd-cy:rgba(63,216,255,.5); --bd-cy2:rgba(63,216,255,.45);
+  --bd-cy3:rgba(63,216,255,.7); --bd-ok:rgba(62,224,137,.45);
+  --bd-bad:rgba(255,93,108,.5); --sw-on:rgba(63,216,255,.22);
+  --sw-on-bd:rgba(63,216,255,.65); --glow-cy:rgba(63,216,255,.12);
+
+  --cmd-fg:#9fd8ff; --val-fg:#dfeaff; --tval-fg:#bfe4ff;
+  --flash-fg:#ffffff; --flash-glow:rgba(63,216,255,.9);
+  --hchip-bg:rgba(125,180,255,.06); --hchip-fg:#dfeaff;
+  --tag-v-bg:rgba(157,123,251,.12); --tag-v-bd:rgba(157,123,251,.35); --tag-v-fg:#b8a1ff;
+  --tag-cy-fg:#7fd9ff; --tag-am-fg:#ffcf8f;
+  --lv-bg:rgba(63,216,255,.08); --lv-bd:rgba(63,216,255,.30); --lv-fg:#8fdcff;
+  --lv-am-fg:#ffcf8f; --lv-gr-fg:#7fe9b0;
+  --am-bg:rgba(255,180,84,.10); --am-bd:rgba(255,180,84,.35);
+  --gr-bg:rgba(62,224,137,.08); --gr-bd:rgba(62,224,137,.35);
+  --toast-bg:#101b2e; --toast-fg:#bfe4ff; --toast-bd:rgba(63,216,255,.55);
+  --toast-shadow:0 12px 34px rgba(0,0,0,.5); --toast-bad-fg:#ffb9c1;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  background:var(--bg); color:var(--txt);
+  font-family:var(--disp); font-size:14px;
+  background-image:
+    radial-gradient(1100px 500px at 50% -180px, var(--bg-glow), transparent 60%),
+    repeating-linear-gradient(0deg, transparent 0 39px, var(--bg-grid) 39px 40px),
+    repeating-linear-gradient(90deg, transparent 0 39px, var(--bg-grid) 39px 40px);
+  transition:background-color .35s, color .35s;
+}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-thumb{background:var(--scroll);border-radius:6px}
+::-webkit-scrollbar-track{background:transparent}
+
+/* ---------- header ---------- */
+header{
+  position:sticky;top:0;z-index:50;
+  display:flex;align-items:center;justify-content:space-between;gap:16px;
+  padding:12px 22px;
+  background:linear-gradient(180deg, var(--head-a), var(--head-b));
+  border-bottom:1px solid var(--line2);
+  backdrop-filter:blur(6px);
+  transition:background .35s, border-color .35s;
+}
+.brand{display:flex;align-items:center;gap:14px;min-width:0}
+.led{
+  width:12px;height:12px;border-radius:50%;flex:none;
+  background:var(--off); box-shadow:0 0 0 3px var(--off-ring);
+  transition:background .4s, box-shadow .4s;
+}
+.led.ok{background:var(--green);box-shadow:0 0 12px rgba(62,224,137,.8),0 0 0 3px rgba(62,224,137,.15);animation:pulse 2s infinite}
+.led.busy{background:var(--amber);box-shadow:0 0 12px rgba(255,180,84,.8),0 0 0 3px rgba(255,180,84,.15);animation:pulse 1s infinite}
+.led.err{background:var(--red);box-shadow:0 0 12px rgba(255,93,108,.8),0 0 0 3px rgba(255,93,108,.15)}
+.led.off{background:var(--off)}
+@keyframes pulse{50%{opacity:.55}}
+.t1{font-size:19px;font-weight:700;letter-spacing:.14em;text-transform:uppercase;white-space:nowrap}
+.t1 .sep{color:var(--cyan);margin:0 6px}
+.t2{font-size:11px;color:var(--faint);letter-spacing:.22em;margin-top:1px}
+.chips{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.chip{
+  display:flex;align-items:center;gap:7px;
+  border:1px solid var(--line);border-radius:7px;
+  background:var(--inset);padding:6px 11px;
+  font-family:var(--mono);font-size:12px;color:var(--dim);
+  transition:border-color .25s;
+}
+.chip:hover{border-color:var(--line2)}
+.chip b{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--txt)}
+.chip.c-decode b{color:var(--cyan)} .chip.c-prefill b{color:var(--amber)} .chip.c-mtp b{color:var(--green)}
+.chip .tag{font-size:10px;letter-spacing:.14em;color:var(--faint)}
+
+/* ---------- layout ---------- */
+main{max-width:1560px;margin:0 auto;padding:20px 22px 8px;display:flex;flex-direction:column;gap:16px}
+.row3{display:grid;grid-template-columns:330px 1fr 330px;gap:16px}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media (max-width:1250px){ .row3{grid-template-columns:1fr 1fr} .row3 #p1{grid-column:1/-1} .row2{grid-template-columns:1fr} }
+@media (max-width:820px){ .row3{grid-template-columns:1fr} header{flex-direction:column;align-items:flex-start} .chips{justify-content:flex-start} }
+
+/* ---------- panel ---------- */
+.panel{
+  position:relative;
+  background:linear-gradient(180deg, var(--panel2), var(--panel));
+  border:1px solid var(--line);border-radius:10px;
+  box-shadow:var(--shadow-panel);
+  opacity:0;transform:translateY(10px);
+  animation:rise .5s cubic-bezier(.2,.7,.3,1) forwards;
+  transition:background .35s, border-color .35s, box-shadow .35s;
+}
+.panel:nth-of-type(1){animation-delay:.03s}.panel:nth-of-type(2){animation-delay:.09s}.panel:nth-of-type(3){animation-delay:.15s}
+@keyframes rise{to{opacity:1;transform:none}}
+.panel::before{
+  content:"";position:absolute;top:0;left:14px;right:14px;height:2px;border-radius:2px;
+  background:linear-gradient(90deg, var(--cyan), var(--accent-fade) 55%, transparent);
+  opacity:.65;
+}
+.ph{
+  display:flex;align-items:baseline;gap:10px;
+  padding:13px 16px 11px;border-bottom:1px solid var(--line);
+}
+.pno{font-family:var(--mono);font-size:11px;color:var(--cyan);letter-spacing:.2em}
+.pt{font-size:15px;font-weight:700;letter-spacing:.1em}
+.psub{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--faint);letter-spacing:.12em;text-align:right}
+.pbody{padding:14px 16px 16px}
+
+/* ---------- buttons ---------- */
+.btn{
+  font-family:var(--disp);font-size:14px;font-weight:700;letter-spacing:.08em;
+  border:1px solid var(--line2);border-radius:8px;
+  background:linear-gradient(180deg,var(--btn-a),var(--btn-b));
+  color:var(--txt);padding:10px 14px;cursor:pointer;
+  transition:transform .15s, border-color .2s, box-shadow .2s, opacity .2s, background .35s;
+}
+.btn:hover:not(:disabled){transform:translateY(-1px);border-color:var(--cyan);box-shadow:0 6px 18px var(--glow-cy)}
+.btn:active:not(:disabled){transform:translateY(0)}
+.btn:disabled{opacity:.38;cursor:not-allowed}
+.btn.primary{background:linear-gradient(180deg,var(--btn-p-a),var(--btn-p-b));border-color:var(--bd-cy);color:var(--cyan)}
+.btn.danger{background:linear-gradient(180deg,var(--btn-d-a),var(--btn-d-b));border-color:var(--bd-bad);color:var(--red)}
+.btn.danger:hover:not(:disabled){border-color:var(--red);box-shadow:0 6px 18px rgba(255,93,108,.14)}
+.btn.sm{padding:6px 10px;font-size:12px}
+.btnrow{display:flex;gap:10px}
+.btnrow .btn{flex:1}
+
+/* ---------- kv table ---------- */
+.kv{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px}
+.kv td{padding:6px 2px;border-bottom:1px solid var(--line);vertical-align:middle}
+.kv td:first-child{color:var(--faint);font-size:11px;letter-spacing:.08em;width:34%}
+.kv td:last-child{word-break:break-all}
+.kv .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:7px;vertical-align:1px}
+.kv .dot.ok{background:var(--green);box-shadow:0 0 8px rgba(62,224,137,.7)}
+.kv .dot.bad{background:var(--faint)}
+.kv .dot.busy{background:var(--amber)}
+.msg{
+  min-height:34px;margin:12px 0 4px;padding:9px 12px;border-radius:7px;
+  font-family:var(--mono);font-size:12px;line-height:1.5;
+  background:var(--inset);border:1px solid var(--line);color:var(--dim);
+  transition:border-color .3s,color .3s;
+}
+.msg.good{border-color:var(--bd-ok);color:var(--green)}
+.msg.bad{border-color:var(--bd-bad);color:var(--red)}
+.cmdline{
+  margin-top:12px;padding:10px 12px;border-radius:7px;
+  background:var(--inset);border:1px solid var(--line);
+  font-family:var(--mono);font-size:11.5px;line-height:1.7;color:var(--cmd-fg);
+  word-break:break-all;white-space:pre-wrap;
+}
+.cmdline b{color:var(--cyan);font-weight:700}
+
+/* ---------- 参数 Tab 页签 ---------- */
+.tabs{
+  display:flex;gap:4px;flex-wrap:wrap;
+  border-bottom:1px solid var(--line);margin-bottom:12px;
+}
+.tab{
+  font-family:var(--disp);font-size:12.5px;font-weight:700;letter-spacing:.04em;
+  padding:7px 12px 8px;border:1px solid transparent;border-bottom:none;
+  border-radius:7px 7px 0 0;background:transparent;color:var(--dim);
+  cursor:pointer;margin-bottom:-1px;position:relative;
+  transition:color .2s, background .2s, border-color .2s;
+  white-space:nowrap;
+}
+.tab:hover{color:var(--cyan);background:var(--inset)}
+.tab.on{
+  color:var(--cyan);background:var(--inset);
+  border-color:var(--line);border-bottom:1px solid var(--inset);
+}
+.tab.on::after{
+  content:"";position:absolute;left:10px;right:10px;top:-1px;height:2px;border-radius:2px;
+  background:var(--cyan);
+}
+.tabpane{display:none}
+.tabpane.on{display:block;animation:rise .28s cubic-bezier(.2,.7,.3,1)}
+.tabpane .grouph:first-child{margin-top:0}
+.opsbar{margin-top:14px;padding-top:12px;border-top:1px solid var(--line);display:flex;gap:10px;flex-wrap:wrap}
+
+/* ---------- form ---------- */
+.grouph{
+  display:flex;align-items:center;gap:10px;margin:14px 0 8px;
+  font-size:11px;font-weight:700;letter-spacing:.22em;color:var(--faint);
+}
+.grouph:first-child{margin-top:2px}
+.grouph::after{content:"";flex:1;height:1px;background:var(--line)}
+.frow{display:flex;align-items:center;gap:10px;margin:7px 0}
+.frow .fl{width:158px;flex:none;line-height:1.25}
+.frow .fl .zh{font-size:13px;color:var(--txt)}
+.frow .fl .flag{display:block;font-family:var(--mono);font-size:10px;color:var(--faint);letter-spacing:.04em}
+.frow input[type=text],.frow input[type=number]{
+  flex:1;min-width:0;
+  background:var(--inset);border:1px solid var(--line);border-radius:7px;
+  color:var(--txt);font-family:var(--mono);font-size:12px;
+  padding:8px 10px;outline:none;transition:border-color .2s, box-shadow .2s;
+}
+.frow input:focus{border-color:var(--bd-cy3);box-shadow:0 0 0 3px var(--focus-ring)}
+.frow input::placeholder{color:var(--faint)}
+.frow .wide{flex:1}
+/* 下拉菜单（取值受限于服务端支持的枚举） */
+.selwrap{position:relative;flex:1;min-width:0;display:flex}
+.selwrap::after{
+  content:"";position:absolute;right:13px;top:50%;width:6px;height:6px;
+  border-right:1.5px solid var(--faint);border-bottom:1.5px solid var(--faint);
+  transform:translateY(-70%) rotate(45deg);pointer-events:none;
+}
+.frow select{
+  flex:1;min-width:0;width:100%;appearance:none;-webkit-appearance:none;
+  background:var(--inset);border:1px solid var(--line);border-radius:7px;
+  color:var(--txt);font-family:var(--mono);font-size:12px;
+  padding:8px 32px 8px 10px;outline:none;cursor:pointer;
+  transition:border-color .2s, box-shadow .2s, background-color .35s, color .35s;
+}
+.frow select:hover{border-color:var(--line2)}
+.frow select:focus{border-color:var(--bd-cy3);box-shadow:0 0 0 3px var(--focus-ring)}
+.frow select option{background:var(--panel);color:var(--txt)}
+/* 取值约束提示（跟在 flag 后面） */
+.lim{font-style:normal;color:var(--dim);letter-spacing:0}
+.frow input:invalid{border-color:var(--bd-bad)}
+/* switch */
+.sw{position:relative;width:40px;height:20px;flex:none;cursor:pointer}
+.sw input{opacity:0;width:0;height:0;position:absolute}
+.sw .tr{
+  position:absolute;inset:0;border-radius:20px;background:var(--track);border:1px solid var(--line2);
+  transition:background .25s,border-color .25s;
+}
+.sw .tr::after{
+  content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;
+  background:var(--knob);transition:transform .25s, background .25s;
+}
+.sw input:checked + .tr{background:var(--sw-on);border-color:var(--sw-on-bd)}
+.sw input:checked + .tr::after{transform:translateX(20px);background:var(--cyan)}
+.sw:hover .tr{border-color:var(--cyan)}
+
+/* ---------- presets ---------- */
+.plist{display:flex;flex-direction:column;gap:9px}
+.pcard{
+  position:relative;border:1px solid var(--line);border-radius:9px;
+  background:linear-gradient(180deg,var(--card-a),var(--card-b));
+  padding:11px 12px 10px;cursor:pointer;
+  transition:transform .15s, border-color .2s, box-shadow .2s, background .35s;
+}
+.pcard:hover{transform:translateY(-1px);border-color:var(--bd-cy2);box-shadow:var(--shadow-card)}
+.pcard.active{border-color:var(--bd-cy3);box-shadow:0 0 0 1px rgba(63,216,255,.25), 0 8px 20px var(--glow-cy)}
+.pcard .nm{font-size:14px;font-weight:700;letter-spacing:.05em}
+.pcard .meta{margin-top:5px;display:flex;gap:6px;flex-wrap:wrap}
+.tag{
+  font-family:var(--mono);font-size:10px;padding:2px 7px;border-radius:20px;
+  background:var(--tag-v-bg);border:1px solid var(--tag-v-bd);color:var(--tag-v-fg);
+}
+.tag.cy{background:var(--lv-bg);border-color:var(--lv-bd);color:var(--tag-cy-fg)}
+.tag.am{background:rgba(255,180,84,.10);border-color:rgba(255,180,84,.35);color:var(--tag-am-fg)}
+.pcard .ops{margin-top:9px;display:flex;gap:7px}
+.pbadge{
+  position:absolute;top:10px;right:12px;font-family:var(--mono);font-size:10px;letter-spacing:.1em;
+  color:var(--cyan);
+}
+
+/* ---------- metrics ---------- */
+/* ---------- 整体布局：顶部横排指标栏 + 下方内容 ---------- */
+.shell{
+  max-width:1780px;margin:0 auto;padding:16px 20px 8px;
+  display:flex;flex-direction:column;gap:16px;
+}
+.content{display:flex;flex-direction:column;gap:16px;min-width:0}
+.rail{display:block}
+
+/* ---------- 指标（顶部横排卡片） ---------- */
+/* gap 收紧到 7px，卡片间距更紧凑 */
+.mgrid{display:grid;grid-template-columns:repeat(10,minmax(0,1fr));gap:7px}
+@media (max-width:1500px){ .mgrid{grid-template-columns:repeat(5,minmax(0,1fr))} }
+@media (max-width:1000px){ .mgrid{grid-template-columns:repeat(3,minmax(0,1fr))} }
+@media (max-width:680px){ .mgrid{grid-template-columns:repeat(2,minmax(0,1fr))} }
+.mcard{
+  position:relative;border:1px solid var(--line);border-radius:9px;
+  background:linear-gradient(180deg,var(--card-a),var(--card-b));
+  padding:8px 9px 7px;overflow:hidden;min-width:0;
+  transition:border-color .2s, transform .15s, background .35s;
+}
+.mcard:hover{transform:translateY(-1px);border-color:var(--bd-cy2)}
+.mcard .ml{font-size:9.5px;letter-spacing:.08em;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mcard .mv{
+  margin-top:3px;font-family:var(--mono);font-size:19px;font-weight:700;line-height:1.1;
+  color:var(--val-fg);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+}
+.mcard .mv small{font-size:10px;font-weight:500;color:var(--faint);margin-left:3px}
+.mcard .ms{margin-top:2px;font-family:var(--mono);font-size:9px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mcard::after{
+  content:"";position:absolute;left:0;right:0;top:0;height:2px;
+  background:var(--mc, var(--cyan));opacity:.8;
+}
+.mcard.flash .mv{animation:flash .6s}
+@keyframes flash{0%{text-shadow:0 0 14px var(--flash-glow);color:var(--flash-fg)}100%{text-shadow:none}}
+/* 占用率进度条 */
+.bar{margin-top:6px;height:4px;border-radius:3px;background:var(--track);overflow:hidden}
+.bar i{display:block;height:100%;width:0;border-radius:3px;background:var(--mc,var(--cyan));
+  transition:width .5s cubic-bezier(.2,.7,.3,1)}
+.bar i.warn{background:var(--amber)}
+.bar i.hot{background:var(--red)}
+/* 本机资源一行 */
+.srow{margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
+.srow .stitle{font-size:10px;letter-spacing:.16em;color:var(--faint);margin-bottom:8px}
+/* 资源栏 6 列：CPU / 显存 / 内存 / GPU 状态 / 显卡功耗 / 整机功耗 */
+.sgrid{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:7px}
+@media (max-width:1400px){ .sgrid{grid-template-columns:repeat(3,minmax(0,1fr))} }
+@media (max-width:760px){ .sgrid{grid-template-columns:repeat(2,minmax(0,1fr))} }
+@media (max-width:480px){ .sgrid{grid-template-columns:1fr} }
+/* 估算值标记 */
+.est{font-style:normal;font-size:8.5px;color:var(--faint);opacity:.85;margin-left:2px}
+.sparkwrap{margin-top:10px;border:1px solid var(--line);border-radius:9px;background:var(--inset);padding:8px 12px 6px}
+.sparkwrap .sl{font-size:10.5px;letter-spacing:.14em;color:var(--faint);display:flex;gap:14px}
+.sparkwrap .sl i{font-style:normal}
+.sparkwrap .sl .c1{color:var(--cyan)}
+.sparkwrap .sl .c2{color:var(--amber)}
+canvas{display:block;width:100%;height:64px;margin-top:6px}
+
+/* ---------- chat ---------- */
+.chatbox{display:flex;gap:10px;align-items:flex-end}
+.chatbox textarea{
+  flex:1;min-height:64px;resize:vertical;
+  background:var(--inset);border:1px solid var(--line);border-radius:8px;
+  color:var(--txt);font-family:var(--disp);font-size:13px;padding:9px 11px;outline:none;
+  transition:border-color .2s, box-shadow .2s;
+}
+.chatbox textarea:focus{border-color:var(--bd-cy3);box-shadow:0 0 0 3px var(--focus-ring)}
+.optrow{display:flex;gap:10px;margin:10px 0}
+.optrow label{font-family:var(--mono);font-size:11px;color:var(--faint);display:flex;align-items:center;gap:7px}
+.optrow input{
+  width:84px;background:var(--inset);border:1px solid var(--line);border-radius:6px;
+  color:var(--txt);font-family:var(--mono);font-size:12px;padding:5px 8px;outline:none;
+}
+.stream{
+  margin-top:10px;min-height:120px;max-height:260px;overflow-y:auto;
+  background:var(--inset);border:1px solid var(--line);border-radius:8px;
+  padding:10px 12px;font-family:var(--disp);font-size:13.5px;line-height:1.75;white-space:pre-wrap;
+}
+.stream .cur{display:inline-block;width:8px;height:15px;background:var(--cyan);vertical-align:-2px;animation:blink 1s steps(2) infinite}
+@keyframes blink{50%{opacity:0}}
+.livetime{margin-top:10px;display:flex;gap:8px;flex-wrap:wrap}
+.lv{
+  font-family:var(--mono);font-size:11px;padding:4px 10px;border-radius:20px;
+  background:var(--lv-bg);border:1px solid var(--lv-bd);color:var(--lv-fg);
+}
+.lv.am{background:var(--am-bg);border-color:var(--am-bd);color:var(--lv-am-fg)}
+.lv.gr{background:var(--gr-bg);border-color:var(--gr-bd);color:var(--lv-gr-fg)}
+.timings{margin-top:10px;width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11.5px}
+.timings th{
+  text-align:left;font-size:10px;letter-spacing:.12em;color:var(--faint);
+  padding:5px 8px;border-bottom:1px solid var(--line2);
+}
+.timings td{padding:5px 8px;border-bottom:1px solid var(--line)}
+.timings td:last-child{text-align:right;color:var(--tval-fg)}
+
+/* ---------- log ---------- */
+.logctl{display:flex;gap:10px;align-items:center;margin-bottom:10px}
+.logctl input[type=text]{
+  flex:1;background:var(--inset);border:1px solid var(--line);border-radius:7px;
+  color:var(--txt);font-family:var(--mono);font-size:12px;padding:7px 10px;outline:none;
+}
+.logctl input[type=text]:focus{border-color:var(--bd-cy3)}
+.logctl .cnt{font-family:var(--mono);font-size:11px;color:var(--faint)}
+.logctl label{font-family:var(--mono);font-size:11px;color:var(--faint);display:flex;gap:6px;align-items:center;cursor:pointer}
+.logview{
+  height:300px;overflow-y:auto;background:var(--inset);border:1px solid var(--line);
+  border-radius:8px;padding:10px 12px;font-family:var(--mono);font-size:11.5px;line-height:1.65;
+  white-space:pre-wrap;word-break:break-all;
+}
+.logview .lt{color:var(--faint);margin-right:9px}
+
+/* ---------- footer / toast / LED ---------- */
+footer{
+  margin-top:26px;padding:14px 22px 22px;text-align:center;
+  font-family:var(--mono);font-size:10.5px;color:var(--faint);letter-spacing:.08em;
+  border-top:1px solid var(--line);
+}
+#toast{
+  position:fixed;right:20px;bottom:20px;z-index:99;
+  max-width:420px;padding:11px 16px;border-radius:9px;
+  background:var(--toast-bg);border:1px solid var(--toast-bd);color:var(--toast-fg);
+  font-family:var(--mono);font-size:12px;line-height:1.5;
+  box-shadow:var(--toast-shadow);
+  opacity:0;transform:translateY(10px);transition:opacity .3s, transform .3s;pointer-events:none;
+}
+#toast.show{opacity:1;transform:translateY(0)}
+#toast.bad{border-color:var(--bd-bad);color:var(--toast-bad-fg)}
+.led{
+  width:11px;height:11px;border-radius:50%;flex:none;
+  background:var(--off);box-shadow:0 0 0 0 rgba(0,0,0,0);
+  transition:background .4s;
+}
+.led.ok{background:var(--green);animation:pulseG 1.8s infinite}
+.led.busy{background:var(--amber);animation:pulseA 1.2s infinite}
+.led.err{background:var(--red);animation:pulseR 1.2s infinite}
+.led.ext{background:var(--cyan);animation:pulseC 1.8s infinite}
+@keyframes pulseG{0%{box-shadow:0 0 0 0 rgba(62,224,137,.5)}70%{box-shadow:0 0 0 9px rgba(62,224,137,0)}100%{box-shadow:0 0 0 0 rgba(62,224,137,0)}}
+@keyframes pulseA{0%{box-shadow:0 0 0 0 rgba(255,180,84,.5)}70%{box-shadow:0 0 0 9px rgba(255,180,84,0)}100%{box-shadow:0 0 0 0 rgba(255,180,84,0)}}
+@keyframes pulseR{0%{box-shadow:0 0 0 0 rgba(255,93,108,.5)}70%{box-shadow:0 0 0 9px rgba(255,93,108,0)}100%{box-shadow:0 0 0 0 rgba(255,93,108,0)}}
+@keyframes pulseC{0%{box-shadow:0 0 0 0 rgba(63,216,255,.5)}70%{box-shadow:0 0 0 9px rgba(63,216,255,0)}100%{box-shadow:0 0 0 0 rgba(63,216,255,0)}}
+
+.hchips{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.hchip{
+  font-family:var(--mono);font-size:11px;padding:5px 11px;border-radius:20px;
+  background:var(--hchip-bg);border:1px solid var(--line);color:var(--dim);
+  white-space:nowrap;
+}
+.hchip b{color:var(--hchip-fg);font-weight:700}
+.hchip.cy b{color:var(--cyan)}
+.hchip.am b{color:var(--amber)}
+.hchip.gr b{color:var(--green)}
+
+/* ---------- 主题切换按钮（右上角） ---------- */
+.themebtn{
+  display:inline-flex;align-items:center;gap:6px;
+  font-family:var(--mono);font-size:11px;padding:5px 11px;border-radius:20px;
+  background:var(--hchip-bg);border:1px solid var(--line);color:var(--dim);
+  cursor:pointer;white-space:nowrap;
+  transition:border-color .2s, color .2s, background .35s, transform .15s;
+}
+.themebtn:hover{border-color:var(--bd-cy);color:var(--cyan);transform:translateY(-1px)}
+.themebtn:active{transform:translateY(0)}
+.themebtn .tico{font-size:13px;line-height:1;color:var(--amber)}
+.themebtn .ttxt{letter-spacing:.06em}
+[data-theme="dark"] .themebtn .tico{color:var(--amber)}
+
+/* staggered load（面板入场延迟；.panel 的基础动画在 panel 一节定义） */
+#p4{animation-delay:.02s}
+#p1{animation-delay:.08s}#p2{animation-delay:.14s}#p3{animation-delay:.20s}
+#p5{animation-delay:.26s}#p6{animation-delay:.32s}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <span class="led" id="led"></span>
+    <div style="margin-top:2px">
+      <div style="font-size:17px;font-weight:700;letter-spacing:.12em">KVMEM<span style="color:var(--cyan)">·</span>NINFER <span style="color:var(--cyan)">启动台</span></div>
+      <div style="font-size:10.5px;font-family:var(--mono);color:var(--faint);letter-spacing:.14em">kvmem multi-backend framework · graphical launcher console</div>
+    </div>
+  </div>
+  <div class="hchips">
+    <span class="hchip">模型 <b id="hModel">—</b></span>
+    <span class="hchip cy">decode <b id="hDec">—</b> t/s</span>
+    <span class="hchip am">prefill <b id="hPre">—</b> t/s</span>
+    <span class="hchip gr">MTP 接受率 <b id="hMtp">—</b></span>
+    <span class="hchip">运行 <b id="hUp">—</b></span>
+    <button class="themebtn" id="btnTheme" type="button" title="切换亮色 / 暗色主题（快捷键 T）"
+            aria-label="切换主题">
+      <span class="tico" id="themeIcon">☾</span><span class="ttxt" id="themeText">暗色</span>
+    </button>
+  </div>
+</header>
+
+<main class="shell">
+
+  <!-- ============ 顶部：实时指标（横排） ============ -->
+  <aside class="rail">
+    <section class="panel" id="p4">
+      <div class="ph"><span class="pno">04</span><span class="pt">实时指标</span><span class="psub">每 2 秒 · /stats + /metrics</span></div>
+      <div class="pbody">
+        <div class="mgrid">
+          <div class="mcard" title="解码速度：/metrics llamacpp:predicted_tokens_seconds（执行时间平均 tok/s）；无此指标时回退 /stats 摊销值" style="--mc:var(--cyan)"><div class="ml">DECODE 速度</div><div class="mv"><span id="vDec">—</span><small>t/s</small></div><div class="ms" id="sDec">—</div></div>
+          <div class="mcard" title="Prefill 速度：/metrics llamacpp:prompt_tokens_seconds（执行时间平均 tok/s）；无此指标时回退 /stats 摊销值" style="--mc:var(--amber)"><div class="ml">PREFILL 速度</div><div class="mv"><span id="vPre">—</span><small>t/s</small></div><div class="ms" id="sPre">—</div></div>
+          <div class="mcard" style="--mc:var(--green)"><div class="ml">MTP 接受率</div><div class="mv"><span id="vMtp">—</span><small>%</small></div><div class="ms" id="sMtp">—</div></div>
+          <div class="mcard" style="--mc:var(--violet)"><div class="ml">MTP 草稿统计</div><div class="mv"><span id="vMtpA">—</span></div><div class="ms" id="sMtpA">—</div></div>
+          <div class="mcard" style="--mc:var(--cyan)"><div class="ml">预测 Tokens</div><div class="mv"><span id="vPred">—</span></div><div class="ms" id="sPred">—</div></div>
+          <div class="mcard" style="--mc:var(--amber)"><div class="ml">提示 Tokens</div><div class="mv"><span id="vPrompt">—</span></div><div class="ms" id="sPrompt">—</div></div>
+          <div class="mcard" style="--mc:var(--green)"><div class="ml">KV 容量</div><div class="mv"><span id="vKv">—</span></div><div class="ms" id="sKv">—</div></div>
+          <div class="mcard" style="--mc:var(--violet)"><div class="ml">引擎运行</div><div class="mv"><span id="vUp">—</span></div><div class="ms" id="sUp">—</div></div>
+        </div>
+        <div class="sparkwrap">
+          <div class="sl"><i class="c1">● decode tok/s</i><i class="c2">● prefill tok/s</i><i style="margin-left:auto">最近 150 个采样点</i></div>
+          <canvas id="spark"></canvas>
+        </div>
+
+        <!-- 本机资源占用：CPU / GPU 显存 / 系统内存 / GPU 状态 -->
+        <div class="srow">
+          <div class="stitle">本机资源占用 · 每 2 秒</div>
+          <div class="sgrid">
+            <div class="mcard" style="--mc:var(--cyan)">
+              <div class="ml">CPU 占用</div>
+              <div class="mv"><span id="vCpu">—</span><small>%</small></div>
+              <div class="bar"><i id="bCpu"></i></div>
+              <div class="ms" id="sCpu">—</div>
+            </div>
+            <div class="mcard" style="--mc:var(--violet)">
+              <div class="ml">GPU 显存</div>
+              <div class="mv"><span id="vVram">—</span><small>%</small></div>
+              <div class="bar"><i id="bVram"></i></div>
+              <div class="ms" id="sVram">—</div>
+            </div>
+            <div class="mcard" style="--mc:var(--amber)">
+              <div class="ml">系统内存</div>
+              <div class="mv"><span id="vRam">—</span><small>%</small></div>
+              <div class="bar"><i id="bRam"></i></div>
+              <div class="ms" id="sRam">—</div>
+            </div>
+            <div class="mcard" style="--mc:var(--green)">
+              <div class="ml">GPU 状态</div>
+              <div class="mv"><span id="vGpu">—</span><small>%</small></div>
+              <div class="bar"><i id="bGpu"></i></div>
+              <div class="ms" id="sGpu">—</div>
+            </div>
+            <div class="mcard" style="--mc:var(--amber)">
+              <div class="ml">显卡功耗</div>
+              <div class="mv"><span id="vGpuW">—</span><small>W</small></div>
+              <div class="bar"><i id="bGpuW"></i></div>
+              <div class="ms" id="sGpuW">—</div>
+            </div>
+            <div class="mcard" style="--mc:var(--red)">
+              <div class="ml">整机功耗<i class="est">估算</i></div>
+              <div class="mv"><span id="vSysW">—</span><small>W</small></div>
+              <div class="bar"><i id="bSysW"></i></div>
+              <div class="ms" id="sSysW">—</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </aside>
+
+  <!-- ============ 下方：内容 ============ -->
+  <div class="content">
+
+    <div class="row3">
+      <!-- 01 服务控制 -->
+      <section class="panel" id="p1">
+        <div class="ph"><span class="pno">01</span><span class="pt">服务控制</span><span class="psub" id="stTitle">ninfer · 127.0.0.1:18200</span></div>
+        <div class="pbody">
+          <div class="btnrow">
+            <button class="btn primary" id="btnStart">▲ 启动服务</button>
+            <button class="btn danger" id="btnStop">■ 停止服务</button>
+          </div>
+          <div class="msg" id="stMsg">尚未连接后端…</div>
+          <table class="kv" style="margin-top:10px">
+            <tr><td>进程状态</td><td id="kvState">—</td></tr>
+            <tr><td>受管 PID</td><td id="kvPid">—</td></tr>
+            <tr><td>启动时间</td><td id="kvStart">—</td></tr>
+            <tr><td>退出码</td><td id="kvExit">—</td></tr>
+            <tr><td>上游健康</td><td id="kvHealth">—</td></tr>
+            <tr><td>上游地址</td><td id="kvUp">—</td></tr>
+          </table>
+          <div class="cmdline" id="kvCmd">—</div>
+        </div>
+      </section>
+
+      <!-- 02 启动参数（Tab 切换） -->
+      <section class="panel" id="p2">
+        <div class="ph"><span class="pno">02</span><span class="pt">启动参数</span><span class="psub">25 项 · 与 launcher 字段一一对应</span></div>
+        <div class="pbody">
+          <div id="formRoot"></div>
+          <div class="opsbar">
+            <button class="btn sm" id="btnSync">⇪ 同步运行中参数</button>
+            <button class="btn sm" id="btnReset">↺ 还原主用预设</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- 03 预设管理 -->
+      <section class="panel" id="p3">
+        <div class="ph"><span class="pno">03</span><span class="pt">预设管理</span><span class="psub">保存 / 切换 / 删除</span></div>
+        <div class="pbody">
+          <div class="btnrow" style="margin-bottom:12px">
+            <button class="btn sm primary" id="btnSaveActive">保存为当前预设</button>
+            <button class="btn sm" id="btnSaveNew">＋ 另存为新预设</button>
+          </div>
+          <div class="plist" id="presetList"></div>
+        </div>
+      </section>
+    </div>
+
+    <div class="row2">
+      <!-- 05 对话测试 -->
+      <section class="panel" id="p5">
+        <div class="ph"><span class="pno">05</span><span class="pt">对话测试</span><span class="psub">SSE 流式 · 含逐段耗时</span></div>
+        <div class="pbody">
+          <div class="chatbox">
+            <textarea id="chatIn" placeholder="输入测试问题，例如：用一句话解释 speculative decoding…（Enter 发送 · Shift+Enter 换行）"></textarea>
+            <button class="btn primary" id="btnChat" style="height:40px">发送</button>
+          </div>
+          <div class="optrow">
+            <label>max_tokens <input id="chatMax" type="number" min="1" value="128"></label>
+            <label>temperature <input id="chatTemp" type="number" min="0" step="0.1" value="0.6"></label>
+          </div>
+          <div class="stream" id="chatOut">（对话输出将显示在这里）</div>
+          <div class="livetime" id="chatLive"></div>
+          <table class="timings" id="timingsTbl" style="display:none">
+            <thead><tr><th>指标</th><th>值</th></tr></thead>
+            <tbody id="timingsBody"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- 06 服务日志 -->
+      <section class="panel" id="p6">
+        <div class="ph"><span class="pno">06</span><span class="pt">服务日志</span><span class="psub">受管进程 stdout · 环形缓冲 8000 行</span></div>
+        <div class="pbody">
+          <div class="logctl">
+            <input id="logFilter" type="text" placeholder="过滤关键词…">
+            <label><input id="logAuto" type="checkbox" checked> 跟随</label>
+            <span class="cnt" id="logCnt">0 行</span>
+          </div>
+          <div class="logview" id="logView"></div>
+        </div>
+      </section>
+    </div>
+
+  </div>
+</main>
+
+<footer>
+  backend 127.0.0.1:18300 · /api/state · /api/config · /api/server/start|stop|log · /api/upstream/{stats,metrics,v1/models,chat}
+</footer>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+/* =====================================================================
+   KVMEM·NINFER 启动台 — 前端逻辑（构建产物源）
+   后端: launcher.py  →  http://127.0.0.1:18300
+   ---------------------------------------------------------------------
+   契约（与 launcher.py 逐字对应）:
+     GET  /                    → web/index.html
+     GET  /api/state           → {pid,state,exit_code,started_at,cmdline,upstream{host,port,health,model},exe,gpu}
+     GET  /api/config          → {launcher_port,upstream,exe,bin_dir,gpu,active,presets[{name,flags}]}
+     POST /api/config          → 部分键合并 → {ok:true,config}
+     GET  /api/server/log?after=N → {lines:[{t:"HH:MM:SS",line}],next}
+     POST /api/server/start    → {ok:true,pid,cmdline} | {ok:false,error} | {ok:false,external:true,error}
+     POST /api/server/stop     → {ok:true} | {ok:false,error}
+     GET  /api/upstream/<path> → 上游原始透传（/stats /metrics /v1/models …）
+     POST /api/upstream/chat   → 上游 /v1/chat/completions（SSE 直通）
+   上游 ninfer 契约:
+     /stats   嵌套 JSON: throughput_tokens_per_second.{decode,prefill}, tokens.{committed_decode,computed_prefill},
+                          uptime_seconds, capacity.{kv_capacity_tokens,max_context,kv_capacity_pages}, requests.*, kvmem.*
+     /metrics 文本: llamacpp:* / ninfer:* 计数器；DECODE/PREFILL 速度卡优先取
+                    llamacpp:predicted_tokens_seconds / llamacpp:prompt_tokens_seconds（执行时间平均 tok/s），
+                    /stats 吞吐为总运行时间摊销值（含空闲），仅作回退
+     SSE 分片: "data: {json}\n\n"; timings 键 = cache_n, prompt_n, prompt_ms, prompt_per_token_ms,
+               prompt_per_second, predicted_n, predicted_ms, predicted_per_token_ms, predicted_per_second,
+               draft_n, draft_n_accepted
+   ===================================================================== */
+
+/* ---------- 主题切换 ---------- */
+const THEME_KEY = "kvmem-launcher-theme";
+function currentTheme() {
+  // 默认亮色（白色 UI）；只有显式设为 dark 才是暗色
+  return document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light";
+}
+function applyTheme(theme, persist) {
+  const t = theme === "light" ? "light" : "dark";
+  document.documentElement.setAttribute("data-theme", t);
+  const light = t === "light";
+  // 图标/文案表示"当前主题"，点击切换到另一种
+  const ico = $("themeIcon"), txt = $("themeText");
+  if (ico) ico.textContent = light ? "☀" : "☾";
+  if (txt) txt.textContent = light ? "亮色" : "暗色";
+  const btn = $("btnTheme");
+  if (btn) btn.title = "当前：" + (light ? "亮色" : "暗色") + " · 点击切换（快捷键 T）";
+  if (persist) { try { localStorage.setItem(THEME_KEY, t); } catch (e) { /* 隐私模式忽略 */ } }
+  drawSpark();   // 折线图用固定色绘制在 canvas 上，切主题后重绘
+}
+function toggleTheme() { applyTheme(currentTheme() === "light" ? "dark" : "light", true); }
+
+/* ---------- 字段模式：与 launcher.py 的 FIELD_ORDER 逐项一致（顺序 / 键名 / 标志 / 类型） ---------- */
+const FIELDS = [
+  ["model", null, "text"],
+  ["port", "--port", "num"],
+  ["max_context", "--max-context", "num"],
+  ["kvmem_recent_tokens", "--kvmem-recent-tokens", "num"],
+  ["prefill_chunk", "--prefill-chunk", "num"],
+  ["kvmem_budget", "--kvmem-budget", "num"],
+  ["kvmem_gen_reserve", "--kvmem-gen-reserve", "num"],
+  ["kvmem_host_mib", "--kvmem-host-mib", "num"],
+  ["kvmem_action_lrfu", "--kvmem-action-lrfu", "bool"],
+  ["model_id", "--model-id", "text"],
+  ["kv_dtype", "--kv-dtype", "text"],
+  ["temperature", "--temperature", "num"],
+  ["top_p", "--top-p", "num"],
+  ["top_k", "--top-k", "num"],
+  ["min_p", "--min-p", "num"],
+  ["spec", "--spec", "text"],
+  ["draft_tokens", "--draft-tokens", "num"],
+  ["ngram_draft_tokens", "--ngram-draft-tokens", "num"],
+  ["adaptive_mtp", "--adaptive-mtp", "bool"],
+  ["vision", "--vision", "bool"],
+  ["vision_residency", "--vision-residency", "text"],
+  ["vision_max_merged", "--vision-max-merged", "num"],
+  ["default_reasoning_effort", "--default-reasoning-effort", "text"],
+  ["default_thinking_budget", "--default-thinking-budget", "num"],
+  ["extra_args", null, "text"],
+/*__ADVANCED__*/
+];
+const FLAG2KEY = {};
+for (const f of FIELDS) { if (f[1]) FLAG2KEY[f[1]] = f[0]; }
+
+/* =====================================================================
+   下拉选项（CHOICES）
+   ---------------------------------------------------------------------
+   取值全部取自 ninfer 服务端源码的**枚举解析函数**，不是猜测：
+     --spec                    product/speculative_options.h  parse_speculative_backend
+     --kv-dtype                serve/serve_options.cpp        parse_kv_dtype
+     --vision-residency        serve/serve_options.cpp        (resident|overlay|cpu)
+     --default-reasoning-effort serve/request.h               parse_requested_reasoning_effort
+   每项格式: key → { values:[值...], hint:"中文说明", labels:{值:说明} }
+   值为 "" 的选项表示「省略该参数」（沿用服务端默认值）。
+   ===================================================================== */
+const CHOICES = {
+  spec: {
+    values: ["", "mtp", "dflash", "dflash2"],
+    hint: "服务端支持 mtp / dflash / dflash2",
+    labels: {
+      "": "（省略 · 不启用投机解码）",
+      mtp: "mtp · MTP 多 token 预测",
+      dflash: "dflash · DFlash 草稿",
+      dflash2: "dflash2 · DFlash2 草稿"
+    }
+  },
+  kv_dtype: {
+    values: ["", "bf16", "int8", "fp8", "rk8v4", "rk4v4", "rk4v4-e8", "rk2v4-e8", "nvfp4", "k8v4"],
+    hint: "服务端支持 9 种 KV 存储格式",
+    labels: {
+      "": "（省略 · 默认 bf16）",
+      bf16: "bf16 · 默认",
+      int8: "int8 · Int8Group64",
+      fp8: "fp8 · Fp8E4M3Row256",
+      rk8v4: "rk8v4 · 旋转 INT8 键 + int4 值",
+      rk4v4: "rk4v4 · 4bit Lloyd-Max 键",
+      "rk4v4-e8": "rk4v4-e8 · E8 吸附 int4 键",
+      "rk2v4-e8": "rk2v4-e8 · E8 根码键",
+      nvfp4: "nvfp4 · Nvfp4Group16",
+      k8v4: "k8v4 · fp8 键 + nvfp4 值"
+    }
+  },
+  vision_residency: {
+    values: ["", "resident", "overlay", "cpu"],
+    hint: "需同时勾选「视觉输入」",
+    labels: {
+      "": "（省略）",
+      resident: "resident · 常驻显存",
+      overlay: "overlay · 覆盖层",
+      cpu: "cpu · 放在 CPU 内存"
+    }
+  },
+  default_reasoning_effort: {
+    values: ["", "xhigh", "medium", "low", "none", "minimal", "high", "max"],
+    // 注意：CLI 协议层接受 7 个值（parse_requested_reasoning_effort），
+    // 但 Qwen3.8-27B 的 chat template 只认 xhigh / medium / low 三档；
+    // 其余会被"就近映射"（平局向上取）—— 见 translate.cpp 与 chat_template.cpp。
+    hint: "Qwen3.8-27B 模板实际支持 xhigh / medium / low 三档；" +
+          "none/minimal/high/max 会被就近映射（见括号内说明）",
+    labels: {
+      "": "（省略 · 模板默认 xhigh）",
+      xhigh: "xhigh · 模板支持（默认）",
+      medium: "medium · 模板支持",
+      low: "low · 模板支持",
+      none: "none · 关闭思考",
+      minimal: "minimal → 映射为 low（模板不支持）",
+      high: "high → 映射为 xhigh（模板不支持）",
+      max: "max → 映射为 xhigh（模板不支持）"
+    }
+  },
+  kv_capacity: {
+    values: ["", "auto"],
+    hint: "auto = 自动定容；或直接填 token 数（须 ≥ max-context）",
+    labels: {
+      "": "（省略 · 按预设定容）",
+      auto: "auto · 由服务端自动决定"
+    }
+  }
+};
+
+/* 数值字段的合法区间（同样来自服务端校验代码），用于 input 的 min/max/step 与即时校验 */
+const NUM_RULES = {
+  port:                    { min: 1, max: 65535, step: 1, hint: "[1,65535]" },
+  max_context:             { min: 1, step: 1, hint: "≥1" },
+  prefill_chunk:           { min: 128, step: 128, hint: "128 的正整数倍" },
+  kvmem_recent_tokens:     { min: 64, step: 64, hint: "≥64，64 对齐" },
+  kvmem_budget:            { min: 0, step: 64, hint: "64 对齐" },
+  kvmem_gen_reserve:       { min: 0, step: 64, hint: "64 对齐" },
+  kvmem_host_mib:          { min: 0, step: 1, hint: "MiB" },
+  temperature:             { min: 0, max: 2, step: 0.05, hint: "[0,2]" },
+  top_p:                   { min: 0, max: 1, step: 0.01, hint: "[0,1]" },
+  top_k:                   { min: 0, max: 20, step: 1, hint: "[0,20]" },
+  min_p:                   { min: 0, max: 1, step: 0.01, hint: "[0,1]" },
+  draft_tokens:            { min: 1, max: 15, step: 1, hint: "[1,15]" },
+  ngram_draft_tokens:      { min: 0, max: 63, step: 1, hint: "[0,63]" },
+  vision_max_merged:       { min: 64, max: 16384, step: 64, hint: "[64,16384]" },
+  default_thinking_budget: { min: 0, step: 1, hint: "≥0" },
+  /* ---- 进阶参数区间（同样来自服务端校验代码）---- */
+  max_concurrency:         { min: 1, max: 8, step: 1, hint: "[1,8]" },
+  kvmem_sink_tokens:       { min: 0, step: 64, hint: "64 对齐，0=1 页" },
+  kvmem_sessions:          { min: 1, max: 16, step: 1, hint: "1..16" },
+  kvmem_lrfu_lambda:       { min: 0, max: 1, step: 0.01, hint: "(0,1)" },
+  kvmem_lrfu_top_frac:     { min: 0, max: 1, step: 0.01, hint: "(0,1]" },
+  kvmem_conf_budget:       { min: 0, step: 64, hint: "64 对齐，0=关闭" },
+  kvmem_conf_scale_up:     { min: 0, step: 0.05, hint: "增长系数" },
+  kvmem_conf_cooldown:     { min: 0, step: 1, hint: "压缩轮数" },
+  kvmem_conf_pool:         { min: 0, step: 1, hint: "tokens" },
+  kvmem_conf_stride:       { min: 0, step: 1, hint: "tokens" },
+  kvmem_conf_bottom:       { min: 0, max: 1, step: 0.01, hint: "底部比例" },
+  kvmem_disk_mib:          { min: 0, step: 1, hint: "MiB，需配 disk-path" },
+  default_max_tokens:      { min: 1, step: 1, hint: "≥1" },
+  cuda_graph_allowance_mib:{ min: 0, step: 1, hint: "MiB，需 CUDA 图" },
+  rope_yarn_factor:        { min: 1, max: 4, step: 0.01, hint: "[1,4]" },
+  rope_scaling_factor:     { min: 1, max: 32, step: 0.01, hint: "[1,32]" }
+};
+
+/* ---------- 中文名（仅展示，构建期校验覆盖率） ---------- */
+const ZH = {
+  model: "模型文件（位置参数）",
+  port: "服务端口",
+  max_context: "最大上下文",
+  kvmem_recent_tokens: "KVMem 近期 token",
+  prefill_chunk: "Prefill 分块大小",
+  kvmem_budget: "KVMem 预算 token",
+  kvmem_gen_reserve: "生成预留 token",
+  kvmem_host_mib: "主机 KV 预算 MiB",
+  kvmem_action_lrfu: "KVMem LRU 淘汰",
+  model_id: "对外模型 ID",
+  kv_dtype: "KV 量化类型",
+  temperature: "默认温度",
+  top_p: "默认 Top-P",
+  top_k: "默认 Top-K",
+  min_p: "默认 Min-P",
+  spec: "投机解码方式",
+  draft_tokens: "MTP 草稿数",
+  ngram_draft_tokens: "N-gram 草稿数",
+  adaptive_mtp: "自适应 MTP",
+  vision: "视觉输入",
+  vision_residency: "视觉驻留位置",
+  vision_max_merged: "视觉最大合并",
+  default_reasoning_effort: "默认推理强度",
+  default_thinking_budget: "默认思考预算",
+  extra_args: "附加参数（原样追加）",
+  /* ---- 进阶参数中文名（第 1+2+3 梯队）---- */
+  max_concurrency: "并发解码请求数",
+  kvmem_sink_tokens: "KVMem 锚定 token",
+  kvmem_sessions: "保留历史会话数",
+  kvmem_action_region: "按工具调用评分",
+  kvmem_query_union: "双查询并集评分",
+  kvmem_lrfu_lambda: "LRFU 衰减 λ",
+  kvmem_lrfu_top_frac: "每轮保留比例",
+  kvmem_conf_budget: "自适应预算起点",
+  kvmem_conf_scale_up: "预算增长系数",
+  kvmem_conf_cooldown: "预算增长冷却轮",
+  kvmem_conf_pool: "置信度窗口 tokens",
+  kvmem_conf_stride: "取值间隔 tokens",
+  kvmem_conf_bottom: "拟合底部比例",
+  kvmem_disk_mib: "SSD 分层配额 MiB",
+  kv_capacity: "共享 KV 容量",
+  default_max_tokens: "默认输出上限",
+  no_prefix_reuse: "关闭前缀缓存",
+  fast_prefill_kernel: "快速 Prefill 内核",
+  prefill_cublas: "宽 GEMM 走 cuBLAS",
+  mlp_a8_decode: "MLP 整数激活解码",
+  no_prefill_a8: "Prefill 用 A16 路线",
+  lm_head_q4: "LM 头 Q4 量化",
+  lm_head_q6: "LM 头 Q6 量化",
+  embedding_q4: "Embedding Q4 量化",
+  embedding_q6: "Embedding Q6 量化",
+  gdn_state_fp16: "GDN 状态 FP16",
+  no_cuda_graph: "关闭 CUDA Graphs",
+  cuda_graph_allowance_mib: "CUDA 图预留 MiB",
+  rope_yarn: "启用 YaRN 缩放",
+  rope_yarn_factor: "YaRN 缩放因子",
+  rope_scaling_factor: "线性插值因子"
+};
+
+/* ---------- 分组（仅展示，构建期校验每个字段恰好出现一次） ---------- */
+const GROUPS = [
+  ["模型与端口", ["model", "model_id", "port", "max_context"]],
+  ["KVMem 内存", ["kvmem_recent_tokens", "prefill_chunk", "kvmem_budget",
+                  "kvmem_gen_reserve", "kvmem_host_mib"]],
+  ["actkv", ["kvmem_action_lrfu", "kvmem_lrfu_lambda", "kvmem_lrfu_top_frac"]],
+  ["精度与采样", ["kv_dtype", "temperature", "top_p", "top_k", "min_p"]],
+  ["MTP 投机解码", ["spec", "draft_tokens", "ngram_draft_tokens", "adaptive_mtp"]],
+  ["视觉输入", ["vision", "vision_residency", "vision_max_merged"]],
+  ["推理与附加", ["default_reasoning_effort", "default_thinking_budget", "extra_args"]],
+  /* ---- 进阶：3 个新页签（第 1 / 2 / 3 梯队）---- */
+  ["进阶·KVMem 调优", ["max_concurrency", "kvmem_sink_tokens", "kvmem_sessions",
+                       "kvmem_action_region", "kvmem_query_union",
+                       "kvmem_conf_budget", "kvmem_conf_scale_up", "kvmem_conf_cooldown",
+                       "kvmem_conf_pool", "kvmem_conf_stride", "kvmem_conf_bottom",
+                       "kvmem_disk_mib", "kv_capacity", "default_max_tokens",
+                       "no_prefix_reuse"]],
+  ["进阶·精度与内核", ["fast_prefill_kernel", "prefill_cublas", "mlp_a8_decode",
+                       "no_prefill_a8", "lm_head_q4", "lm_head_q6",
+                       "embedding_q4", "embedding_q6", "gdn_state_fp16",
+                       "no_cuda_graph", "cuda_graph_allowance_mib"]],
+  ["进阶·长上下文", ["rope_yarn", "rope_yarn_factor", "rope_scaling_factor"]]
+];
+
+/* ---------- 全局状态 ---------- */
+let CFG = null;        // /api/config
+let STATE = null;      // /api/state
+let METRICS = {};      // /metrics 名称 → 数值
+let STATS = null;      // /stats 原始对象
+let logLines = [];     // {t,line}
+let logNext = 0;       // 已消费的索引
+let chatBusy = false;
+let lastTimings = null;
+let spark = { dec: [], pre: [] };
+const SPARK_MAX = 150;
+
+/* ---------- 工具 ---------- */
+const $ = (id) => document.getElementById(id);
+function num(v, d) {
+  const x = parseFloat(v);
+  return Number.isFinite(x) ? x : d;
+}
+function fmtInt(v) {
+  if (v == null || !Number.isFinite(Number(v))) return "—";
+  return Math.round(Number(v)).toLocaleString("en-US");
+}
+function fmt1(v) {
+  if (v == null || !Number.isFinite(Number(v))) return "—";
+  return (Math.round(Number(v) * 10) / 10).toString();
+}
+function fmtDur(s) {
+  if (s == null || !Number.isFinite(Number(s))) return "—";
+  s = Math.max(0, Math.floor(Number(s)));
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  if (h > 0) return h + "h " + m + "m";
+  if (m > 0) return m + "m " + sec + "s";
+  return sec + "s";
+}
+function escapeHtml(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+function toast(msg, bad) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = "show" + (bad ? " bad" : "");
+  clearTimeout(t._tm);
+  t._tm = setTimeout(() => { t.className = ""; }, 3000);
+}
+async function jget(url) {
+  const r = await fetch(url, { cache: "no-store" });
+  if (!r.ok) throw new Error(url + " HTTP " + r.status);
+  return r.json();
+}
+async function jpost(url, body) {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {})
+  });
+  return r.json();
+}
+async function tget(url) {
+  const r = await fetch(url, { cache: "no-store" });
+  if (!r.ok) throw new Error(url + " HTTP " + r.status);
+  return r.text();
+}
+
+/* ---------- 参数 Tab 页签：切换逻辑见 buildForm() ---------- */
+function buildForm() {
+  const root = $("formRoot");
+  root.innerHTML = "";
+  const seen = new Set();
+
+  // 每个分组一个 tab；页签栏 + 各页签内容
+  const bar = document.createElement("div");
+  bar.className = "tabs";
+  bar.setAttribute("role", "tablist");
+  root.appendChild(bar);
+
+  const panes = [];
+  const emit = (key, pane) => {
+    const ent = FIELDS.find((f) => f[0] === key);
+    if (!ent) return;
+    const flag = ent[1], kind = ent[2];
+    const choice = CHOICES[key];
+    const rule = NUM_RULES[key];
+    const row = document.createElement("div");
+    row.className = "frow";
+    const lab = document.createElement("div");
+    lab.className = "fl";
+    // flag 后面附带取值约束提示，鼠标悬停显示完整说明
+    const lim = rule ? rule.hint : (choice ? "下拉" : "");
+    lab.innerHTML = '<span class="zh">' + escapeHtml(ZH[key] || key) + "</span>" +
+      '<span class="flag">' + escapeHtml(flag || "位置参数") +
+      (lim ? ' <i class="lim">' + escapeHtml(lim) + "</i>" : "") + "</span>";
+    if (choice || rule) lab.title = choice ? choice.hint : (ZH[key] + "：" + rule.hint);
+    row.appendChild(lab);
+    if (kind === "bool") {
+      const sw = document.createElement("label");
+      sw.className = "sw";
+      sw.innerHTML = '<input type="checkbox" id="f_' + key + '"><span class="tr"></span>';
+      row.appendChild(sw);
+      const cb = sw.querySelector("input");
+      cb.addEventListener("change", renderCmd);
+    } else if (choice) {
+      // 下拉菜单：选项为服务端实际支持的枚举值
+      const wrap = document.createElement("div");
+      wrap.className = "selwrap";
+      const sel = document.createElement("select");
+      sel.id = "f_" + key;
+      sel.title = choice.hint;
+      for (const v of choice.values) {
+        const opt = document.createElement("option");
+        opt.value = v;
+        opt.textContent = (choice.labels && choice.labels[v]) || (v === "" ? "（省略）" : v);
+        sel.appendChild(opt);
+      }
+      sel.addEventListener("change", renderCmd);
+      wrap.appendChild(sel);
+      row.appendChild(wrap);
+    } else {
+      const inp = document.createElement("input");
+      inp.type = kind === "num" ? "number" : "text";
+      inp.id = "f_" + key;
+      if (kind === "num") {
+        // 数值范围来自服务端校验代码，避免提交会被服务端拒绝的值
+        if (rule) {
+          if (rule.min != null) inp.min = String(rule.min);
+          if (rule.max != null) inp.max = String(rule.max);
+          inp.step = String(rule.step != null ? rule.step : "any");
+          inp.title = ZH[key] + "：" + rule.hint;
+        } else {
+          inp.min = "0"; inp.step = "any";
+        }
+      }
+      if (key === "model" || key === "extra_args") inp.className = "wide";
+      inp.placeholder = key;
+      inp.addEventListener("input", renderCmd);
+      row.appendChild(inp);
+    }
+    pane.appendChild(row);
+  };
+
+  // 先建页签，再把字段塞进对应页签
+  const buildPane = (title, index) => {
+    const tab = document.createElement("button");
+    tab.type = "button";
+    tab.className = "tab";
+    tab.dataset.tab = String(index);
+    tab.innerHTML = escapeHtml(title);
+    const pane = document.createElement("div");
+    pane.className = "tabpane";
+    pane.dataset.pane = String(index);
+    bar.appendChild(tab);
+    root.appendChild(pane);
+    panes.push({ tab, pane });
+    return pane;
+  };
+
+  GROUPS.forEach((g, i) => {
+    const pane = buildPane(g[0], i);
+    const gh = document.createElement("div");
+    gh.className = "grouph";
+    gh.textContent = g[0];
+    pane.appendChild(gh);
+    for (const key of g[1]) { if (!seen.has(key)) { seen.add(key); emit(key, pane); } }
+  });
+  // 兜底：未分组的字段放进最后一个页签
+  const rest = FIELDS.filter((f) => !seen.has(f[0]));
+  if (rest.length) {
+    const pane = panes.length ? panes[panes.length - 1].pane : buildPane("其他", 0);
+    for (const f of rest) { seen.add(f[0]); emit(f[0], pane); }
+  }
+
+  // 页签点击切换
+  const select = (idx) => {
+    panes.forEach((p, i) => {
+      const on = i === idx;
+      p.tab.classList.toggle("on", on);
+      p.pane.classList.toggle("on", on);
+      p.tab.setAttribute("aria-selected", on ? "true" : "false");
+    });
+  };
+  bar.addEventListener("click", (e) => {
+    const t = e.target.closest(".tab");
+    if (!t) return;
+    const idx = parseInt(t.dataset.tab, 10);
+    select(idx);
+    try { localStorage.setItem("kvmem-launcher-tab", String(idx)); } catch (err) { /* 忽略 */ }
+  });
+  // 记住上次打开的页签
+  let start = 0;
+  try {
+    const saved = parseInt(localStorage.getItem("kvmem-launcher-tab"), 10);
+    if (Number.isFinite(saved) && saved >= 0 && saved < panes.length) start = saved;
+  } catch (e) { /* 忽略 */ }
+  select(start);
+}
+function readForm() {
+  const o = {};
+  for (const [key, , kind] of FIELDS) {
+    const el = $("f_" + key);
+    if (!el) continue;
+    o[key] = kind === "bool" ? !!el.checked : String(el.value).trim();
+  }
+  return o;
+}
+function fillForm(flags) {
+  for (const [key, , kind] of FIELDS) {
+    const el = $("f_" + key);
+    if (!el) continue;
+    const v = flags ? flags[key] : undefined;
+    if (kind === "bool") {
+      el.checked = v === true || v === "true";
+    } else if (el.tagName === "SELECT") {
+      const s = v == null ? "" : String(v);
+      // 同步自运行中的服务时可能拿到下拉列表外的值：临时补一个选项，避免静默丢参数
+      if (s !== "" && !Array.from(el.options).some((o) => o.value === s)) {
+        const opt = document.createElement("option");
+        opt.value = s;
+        opt.textContent = s + "（来自运行中的服务）";
+        el.appendChild(opt);
+      }
+      el.value = s;
+    } else {
+      el.value = v == null ? "" : String(v);
+    }
+  }
+  renderCmd();
+}
+
+/* ---------- 命令行预览：逐字镜像 launcher.py build_command ---------- */
+function buildCmd(flags) {
+  const cmd = [CFG && CFG.exe ? String(CFG.exe) : "<exe>"];
+  const model = String((flags && flags.model) || "").trim();
+  if (model) cmd.push(model);
+  for (const [key, flag, kind] of FIELDS) {
+    if (!flag) continue;
+    const v = flags ? flags[key] : undefined;
+    if (kind === "bool") { if (v) cmd.push(flag); continue; }
+    const s = String(v == null ? "" : v).trim();
+    if (s === "" || s === "0") continue;
+    cmd.push(flag, s);
+  }
+  const extra = String((flags && flags.extra_args) || "").trim();
+  if (extra) cmd.push.apply(cmd, extra.split(/\s+/));
+  return cmd;
+}
+function renderCmd() {
+  if (STATE && STATE.state === "running" && Array.isArray(STATE.cmdline) && STATE.cmdline.length) return;
+  const cmd = buildCmd(readForm());
+  $("kvCmd").innerHTML = cmd.map((t, i) =>
+    (i === 0 ? "<b>" + escapeHtml(t) + "</b>" : escapeHtml(t))).join(" ");
+}
+
+/* ---------- 预设 ---------- */
+function presetTags(p) {
+  const f = (p && p.flags) || {};
+  const tags = [];
+  if (f.model) {
+    const base = String(f.model).split(/[\\/]/).pop();
+    tags.push(["cy", base.length > 26 ? base.slice(0, 24) + "…" : base]);
+  }
+  if (f.port) tags.push(["am", "port " + f.port]);
+  if (f.spec) tags.push(["", String(f.spec)]);
+  if (f.draft_tokens) tags.push(["", "draft " + f.draft_tokens]);
+  if (f.max_context) tags.push(["", "ctx " + fmtInt(f.max_context)]);
+  return tags;
+}
+function renderPresets() {
+  const box = $("presetList");
+  box.innerHTML = "";
+  const presets = (CFG && CFG.presets) || [];
+  if (!presets.length) {
+    box.innerHTML = '<div style="font-family:var(--mono);font-size:11px;color:var(--faint)">（暂无预设）</div>';
+    return;
+  }
+  presets.forEach((p, i) => {
+    const card = document.createElement("div");
+    card.className = "pcard" + (CFG && CFG.active === i ? " active" : "");
+    const tags = presetTags(p).map((t) =>
+      '<span class="tag ' + t[0] + '">' + escapeHtml(t[1]) + "</span>").join("");
+    card.innerHTML =
+      '<div class="nm">' + escapeHtml(p.name || ("预设 " + (i + 1))) + "</div>" +
+      '<div class="meta">' + tags + "</div>" +
+      '<div class="ops">' +
+        '<button class="btn sm" data-op="load">载入</button>' +
+        '<button class="btn sm" data-op="active">设为主用</button>' +
+        '<button class="btn sm danger" data-op="del">删除</button>' +
+      "</div>" +
+      (CFG && CFG.active === i ? '<div class="pbadge">● 主用</div>' : "");
+    card.addEventListener("click", async (e) => {
+      const op = e.target && e.target.dataset ? e.target.dataset.op : null;
+      if (op === "del") {
+        if (presets.length <= 1) { toast("至少保留一个预设", true); return; }
+        if (!confirm('删除预设「' + (p.name || i) + '」？')) return;
+        const next = presets.filter((_, k) => k !== i);
+        const act = CFG.active > i ? CFG.active - 1 : (CFG.active === i ? 0 : CFG.active);
+        await postConfig({ presets: next, active: Math.min(act, Math.max(0, next.length - 1)) });
+        toast("已删除预设");
+        return;
+      }
+      if (op === "active") { await postConfig({ active: i }); toast("已设为主用预设"); return; }
+      applyPreset(i);
+      toast("已载入预设：" + (p.name || i));
+    });
+    box.appendChild(card);
+  });
+}
+function applyPreset(i) {
+  const p = CFG && CFG.presets && CFG.presets[i];
+  if (!p) return;
+  const flags = Object.assign({}, p.flags || {});
+  if (flags.port == null && CFG.upstream) flags.port = CFG.upstream.port;
+  fillForm(flags);
+}
+async function postConfig(patch) {
+  try {
+    const c = await jpost("/api/config", patch);
+    if (!c || !c.ok) { toast("保存失败：" + ((c && c.error) || "未知错误"), true); return false; }
+    CFG = c.config;
+    renderPresets();
+    renderCmd();
+    return true;
+  } catch (e) {
+    toast("保存失败：" + e.message, true);
+    return false;
+  }
+}
+$("btnSaveActive").addEventListener("click", async () => {
+  if (!CFG || !CFG.presets || !CFG.presets.length) { toast("没有可用的主用预设", true); return; }
+  const idx = CFG.active || 0;
+  const presets = CFG.presets.map((p, i) => i === idx ? { name: p.name, flags: readForm() } : p);
+  if (await postConfig({ presets })) toast("已保存到主用预设：" + (CFG.presets[idx].name || idx));
+});
+$("btnSaveNew").addEventListener("click", async () => {
+  const name = prompt("新预设名称：", "我的预设");
+  if (name == null) return;
+  const presets = ((CFG && CFG.presets) || []).concat([{ name: name.trim() || "预设", flags: readForm() }]);
+  if (await postConfig({ presets, active: presets.length - 1 })) toast("已另存为新预设");
+});
+$("btnReset").addEventListener("click", () => {
+  if (!CFG || !CFG.presets || !CFG.presets.length) return;
+  applyPreset(CFG.active || 0);
+  toast("已还原主用预设");
+});
+
+/* ---------- 从运行中的上游同步参数 ---------- */
+$("btnSync").addEventListener("click", async () => {
+  try {
+    const r = await jget("/api/upstream/v1/models");
+    const m = r && r.data && r.data[0];
+    if (!m) { toast("无法获取上游模型信息", true); return; }
+    const raw = (m.status && m.status.args) || [];
+    const tokens = Array.isArray(raw) ? raw.map(String) : String(raw).split(/\s+/);
+    const flags = {};
+    let n = 0;
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i];
+      if (t.slice(0, 2) !== "--") continue;
+      const key = FLAG2KEY[t];
+      if (!key) continue;
+      const kind = (FIELDS.find((f) => f[0] === key) || [])[2];
+      if (kind === "bool") { flags[key] = true; n++; continue; }
+      const v = tokens[i + 1];
+      if (v != null && v.slice(0, 2) !== "--") { flags[key] = v; i++; n++; }
+    }
+    fillForm(flags);
+    toast("已从运行中的服务同步 " + n + " 项参数");
+  } catch (e) {
+    toast("同步失败：" + e.message, true);
+  }
+});
+
+/* ---------- 状态 ---------- */
+function isManaged(st) { return !!st && st.pid != null && (st.state === "starting" || st.state === "running"); }
+function isExternal(st) { return !!st && !isManaged(st) && !!st.upstream && st.upstream.health === "ok"; }
+function setMsg(text, cls) {
+  const el = $("stMsg");
+  el.textContent = text;
+  el.className = "msg" + (cls ? " " + cls : "");
+}
+function renderState() {
+  const st = STATE || {};
+  const managed = isManaged(st), external = isExternal(st);
+  /* launcher.py 在无受管进程但上游健康时会把 state 置为 "running"（pid=None）。
+     这种「外部服务」必须优先于 state 判断，否则会误显示为绿色「运行中」。 */
+  const disp = external ? "external" : st.state;
+  $("led").className = "led " + (
+    disp === "running" ? "ok" :
+    disp === "starting" ? "busy" :
+    disp === "exited" ? "err" :
+    disp === "external" ? "ext" : ""
+  );
+  const stateText = {
+    stopped: "已停止", starting: "启动中…", running: "运行中", exited: "已退出",
+    external: "外部服务"
+  }[disp] || st.state || "—";
+  $("kvState").textContent = stateText;
+  $("kvPid").textContent = st.pid != null ? String(st.pid) : "—";
+  $("kvStart").textContent = st.started_at ? new Date(st.started_at * 1000).toLocaleString("zh-CN") : "—";
+  $("kvExit").textContent = st.exit_code != null ? String(st.exit_code) : "—";
+  const up = st.upstream || {};
+  const hc = up.health === "ok" ? "ok" : (up.health === "busy" ? "busy" : "bad");
+  const hEl = $("kvHealth");
+  hEl.textContent = "";
+  const dot = document.createElement("span");
+  dot.className = 'dot ' + hc;
+  hEl.appendChild(dot);
+  hEl.appendChild(document.createTextNode(up.health || "unreachable"));
+  $("kvUp").textContent = (up.host || "127.0.0.1") + ":" + (up.port != null ? up.port : "—");
+  $("stTitle").textContent = "ninfer · " + (up.host || "127.0.0.1") + ":" + (up.port != null ? up.port : "—");
+  $("hModel").textContent = up.model || "—";
+  $("btnStart").disabled = managed || external;
+  $("btnStop").disabled = !managed;
+  if (managed && Array.isArray(st.cmdline) && st.cmdline.length) {
+    $("kvCmd").innerHTML = st.cmdline.map((t, i) =>
+      (i === 0 ? "<b>" + escapeHtml(t) + "</b>" : escapeHtml(t))).join(" ");
+  } else {
+    renderCmd();
+  }
+  if (!STATE) setMsg("尚未连接启动器后端…", "bad");
+  else if (external) setMsg("端口 " + up.port + " 已检测到外部运行服务（不受本启动器管理）。启动已禁用；请先停止它或改用其它端口。", "bad");
+  else if (managed && st.state === "starting") setMsg("正在启动服务，等待端口就绪…", "");
+  else if (managed) setMsg("受管进程运行中（PID " + st.pid + "）", "good");
+  else if (st.state === "exited") setMsg("受管进程已退出（exit " + st.exit_code + "）", "bad");
+  else setMsg("服务未运行。可调整参数后点击「启动服务」。", "");
+}
+async function pollState() {
+  try {
+    STATE = await jget("/api/state");
+    if (STATE && STATE.upstream && STATE.upstream.model) $("hModel").textContent = STATE.upstream.model;
+  } catch (e) {
+    STATE = null;
+  }
+  renderState();
+}
+
+/* ---------- 启动 / 停止 ---------- */
+$("btnStart").addEventListener("click", async () => {
+  $("btnStart").disabled = true;
+  setMsg("正在保存预设并启动…", "");
+  try {
+    const idx = CFG ? (CFG.active || 0) : 0;
+    if (CFG && CFG.presets && CFG.presets.length) {
+      const presets = CFG.presets.map((p, i) => i === idx ? { name: p.name, flags: readForm() } : p);
+      await postConfig({ presets });
+    }
+    const j = await jpost("/api/server/start", { preset: readForm() });
+    if (j && j.ok) {
+      toast("已启动，PID " + j.pid);
+      setMsg("已启动（PID " + j.pid + "），等待模型加载…", "good");
+    } else if (j && j.external) {
+      toast(j.error || "端口已有外部服务", true);
+      setMsg(j.error || "端口已有外部服务", "bad");
+    } else {
+      toast((j && j.error) || "启动失败", true);
+      setMsg((j && j.error) || "启动失败", "bad");
+    }
+  } catch (e) {
+    toast("启动失败：" + e.message, true);
+    setMsg("启动失败：" + e.message, "bad");
+  }
+  await pollState();
+});
+$("btnStop").addEventListener("click", async () => {
+  $("btnStop").disabled = true;
+  setMsg("正在停止…", "");
+  try {
+    const j = await jpost("/api/server/stop", {});
+    toast(j && j.ok ? "已停止" : ((j && j.error) || "停止失败"), !(j && j.ok));
+  } catch (e) {
+    toast("停止失败：" + e.message, true);
+  }
+  await pollState();
+});
+
+/* ---------- 日志 ---------- */
+function logVisible(l) {
+  const f = $("logFilter").value.trim().toLowerCase();
+  return !f || String(l.line).toLowerCase().indexOf(f) >= 0;
+}
+function appendLog(l) {
+  logLines.push(l);
+  if (logLines.length > 4000) logLines = logLines.slice(-4000);
+  $("logCnt").textContent = logLines.length + " 行";
+  if (!logVisible(l)) return;
+  const view = $("logView");
+  const nearBottom = view.scrollHeight - view.scrollTop - view.clientHeight < 40;
+  const div = document.createElement("div");
+  div.innerHTML = '<span class="lt">' + escapeHtml(l.t) + "</span>" + escapeHtml(l.line);
+  view.appendChild(div);
+  while (view.childElementCount > 1500) view.removeChild(view.firstChild);
+  if (nearBottom && $("logAuto").checked) view.scrollTop = view.scrollHeight;
+}
+function rerenderLog() {
+  const view = $("logView");
+  view.innerHTML = "";
+  const rows = logLines.filter(logVisible).slice(-1200);
+  const frag = document.createDocumentFragment();
+  for (const l of rows) {
+    const div = document.createElement("div");
+    div.innerHTML = '<span class="lt">' + escapeHtml(l.t) + "</span>" + escapeHtml(l.line);
+    frag.appendChild(div);
+  }
+  view.appendChild(frag);
+  view.scrollTop = view.scrollHeight;
+}
+$("logFilter").addEventListener("input", rerenderLog);
+async function pollLog() {
+  if (!STATE) return;
+  try {
+    const j = await jget("/api/server/log?after=" + logNext);
+    const lines = (j && j.lines) || [];
+    for (const l of lines) appendLog(l);
+    logNext = j && j.next != null ? j.next : logNext + lines.length;
+  } catch (e) { /* 后端短暂不可用，忽略 */ }
+}
+
+/* ---------- 指标 ---------- */
+function setVal(id, text) {
+  const el = $(id);
+  if (!el || el.textContent === text) return;
+  el.textContent = text;
+  const card = el.closest(".mcard");
+  if (card) { card.classList.remove("flash"); void card.offsetWidth; card.classList.add("flash"); }
+}
+function cssVar(name, fallback) {
+  const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  return v || fallback;
+}
+function drawSpark() {
+  const cv = $("spark");
+  if (!cv) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth, h = cv.clientHeight;
+  if (!w || !h) return;
+  if (cv.width !== Math.round(w * dpr)) { cv.width = Math.round(w * dpr); cv.height = Math.round(h * dpr); }
+  const ctx = cv.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  // 网格与曲线颜色跟随主题
+  ctx.strokeStyle = cssVar("--line2", "rgba(125,180,255,.20)");
+  ctx.lineWidth = 1;
+  for (let i = 1; i < 4; i++) {
+    const y = (h / 4) * i;
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+  }
+  const cDec = cssVar("--cyan", "#3fd8ff");
+  const cPre = cssVar("--amber", "#ffb454");
+  const all = spark.dec.concat(spark.pre);
+  const max = Math.max(20, Math.max.apply(null, all.length ? all : [0]));
+  const draw = (arr, color) => {
+    if (arr.length < 2) return;
+    ctx.beginPath();
+    arr.forEach((v, i) => {
+      const x = (i / (arr.length - 1)) * w;
+      const y = h - (v / max) * (h - 8) - 2;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.8;
+    ctx.stroke();
+  };
+  draw(spark.pre, cPre);
+  draw(spark.dec, cDec);
+}
+function parseMetrics(text) {
+  const m = {};
+  for (const line of String(text).split(/\r?\n/)) {
+    if (!line || line.charAt(0) === "#") continue;
+    const i = line.lastIndexOf(" ");
+    if (i <= 0) continue;
+    const name = line.slice(0, i).trim();
+    const v = parseFloat(line.slice(i + 1));
+    if (name && Number.isFinite(v)) m[name] = v;
+  }
+  return m;
+}
+function mget(name) { return METRICS[name] != null ? METRICS[name] : null; }
+/* 上游不可达时清空卡片，避免把上一轮的旧值当成实时数据 */
+function clearMetrics(reason) {
+  METRICS = {};
+  STATS = null;
+  for (const [v, s] of [["vDec", "sDec"], ["vPre", "sPre"], ["vMtp", "sMtp"], ["vMtpA", "sMtpA"],
+                        ["vPred", "sPred"], ["vPrompt", "sPrompt"], ["vKv", "sKv"], ["vUp", "sUp"]]) {
+    setVal(v, "—");
+    setVal(s, reason);
+  }
+  $("hDec").textContent = "—";
+  $("hPre").textContent = "—";
+  $("hMtp").textContent = "—";
+  $("hUp").textContent = "—";
+}
+async function pollMetrics() {
+  const health = STATE && STATE.upstream ? STATE.upstream.health : "unreachable";
+  if (health !== "ok") {
+    clearMetrics(health === "busy" ? "上游忙" : "上游不可达");
+    return;
+  }
+  let stats = null, met = null;
+  try { stats = await jget("/api/upstream/stats"); } catch (e) { /* 忽略 */ }
+  try { met = parseMetrics(await tget("/api/upstream/metrics")); } catch (e) { /* 忽略 */ }
+  if (!stats) { clearMetrics("指标不可达"); return; }
+  STATS = stats;
+  METRICS = met || {};
+
+  const tps = stats.throughput_tokens_per_second || {};
+  const toks = stats.tokens || {};
+  const cap = stats.capacity || {};
+  const reqs = stats.requests || {};
+  const kv = stats.kvmem || {};
+
+  /* 速度口径：优先 /metrics 的执行时间平均（服务端自报的 tok/s，与 llama.cpp eval rate 一致）；
+     /stats.throughput_tokens_per_second 是「总运行时间」摊销值（含空闲），仅作回退 */
+  const dec = mget("llamacpp:predicted_tokens_seconds") != null ? mget("llamacpp:predicted_tokens_seconds") : tps.decode;
+  const pre = mget("llamacpp:prompt_tokens_seconds") != null ? mget("llamacpp:prompt_tokens_seconds") : tps.prefill;
+  const dn = mget("ninfer:draft_tokens_total");
+  const da = mget("ninfer:draft_accepted_tokens_total");
+  const acc = (dn != null && dn > 0 && da != null) ? (da / dn * 100) : null;
+  const nDec = mget("llamacpp:n_decode_total");
+  const pSec = mget("llamacpp:prompt_seconds_total");
+  const reused = mget("ninfer:reused_prompt_tokens_total");
+  const uptime = stats.uptime_seconds != null ? stats.uptime_seconds : mget("ninfer:uptime_seconds");
+
+  setVal("vDec", fmt1(dec));
+  setVal("sDec", nDec ? ("解码 " + fmtInt(nDec) + " 轮 · 执行 " + fmt1(mget("llamacpp:tokens_predicted_seconds_total")) + " s") : "—");
+
+  setVal("vPre", fmt1(pre));
+  setVal("sPre", "执行 " + fmt1(pSec) + " s · 缓存命中 " + fmtInt(reused) + " tok");
+
+  setVal("vMtp", acc == null ? "—" : acc.toFixed(1));
+  setVal("sMtp", dn != null ? ("接受 " + fmtInt(da) + " / 草稿 " + fmtInt(dn)) : "未启用或暂无数据");
+
+  setVal("vMtpA", dn != null ? fmtInt(dn) : "—");
+  setVal("sMtpA", dn != null ? ("拒绝 " + fmtInt((dn || 0) - (da || 0)) + " · 请求 " + fmtInt(mget("ninfer:requests_total"))) : "—");
+
+  setVal("vPred", fmtInt(toks.committed_decode));
+  setVal("sPred", "解码轮次 " + fmtInt(nDec));
+
+  setVal("vPrompt", fmtInt(toks.computed_prefill));
+  setVal("sPrompt", "Prefill 耗时 " + fmt1(pSec) + " s · 分块 " + fmtInt(kv.evaluated_tokens));
+
+  setVal("vKv", fmtInt(cap.kv_capacity_tokens));
+  setVal("sKv", "最大上下文 " + fmtInt(cap.max_context) + " · 页 " + fmtInt(cap.kv_capacity_pages));
+
+  setVal("vUp", fmtDur(uptime));
+  setVal("sUp", "引擎 ninfer · 恢复 " + fmtInt(mget("ninfer:engine_recoveries_total")));
+
+  $("hDec").textContent = fmt1(dec);
+  $("hPre").textContent = fmt1(pre);
+  $("hMtp").textContent = acc == null ? "—" : acc.toFixed(1) + "%";
+  $("hUp").textContent = fmtDur(uptime);
+
+  if (Number.isFinite(dec)) spark.dec.push(dec);
+  if (Number.isFinite(pre)) spark.pre.push(pre);
+  if (spark.dec.length > SPARK_MAX) spark.dec = spark.dec.slice(-SPARK_MAX);
+  if (spark.pre.length > SPARK_MAX) spark.pre = spark.pre.slice(-SPARK_MAX);
+  drawSpark();
+}
+
+/* ---------- 本机资源：CPU / GPU 显存 / 内存（来自 /api/sys） ---------- */
+function setBar(id, pct) {
+  const el = $(id);
+  if (!el) return;
+  const v = Number(pct);
+  if (!Number.isFinite(v)) { el.style.width = "0"; el.className = ""; return; }
+  el.style.width = Math.max(0, Math.min(100, v)) + "%";
+  el.className = v >= 90 ? "hot" : (v >= 70 ? "warn" : "");
+}
+function fmtGiB(v) {
+  return v == null || !Number.isFinite(Number(v)) ? "—" : Number(v).toFixed(1);
+}
+async function pollSys() {
+  let s = null;
+  try { s = await jget("/api/sys"); } catch (e) { s = null; }
+  if (!s) {
+    for (const [v, b, sub] of [["vCpu", "bCpu", "sCpu"], ["vVram", "bVram", "sVram"],
+                               ["vRam", "bRam", "sRam"], ["vGpu", "bGpu", "sGpu"],
+                               ["vGpuW", "bGpuW", "sGpuW"], ["vSysW", "bSysW", "sSysW"]]) {
+      setVal(v, "—"); setBar(b, null); setVal(sub, "监控不可用");
+    }
+    return;
+  }
+
+  // CPU
+  const cpu = s.cpu || {};
+  const cp = cpu.percent;
+  setVal("vCpu", cp == null ? "—" : fmt1(cp));
+  setBar("bCpu", cp);
+  setVal("sCpu", (cpu.count ? cpu.count + " 逻辑核" : "本机 CPU") +
+    (cpu.error ? " · " + cpu.error : ""));
+
+  // 系统内存
+  const mem = s.mem || {};
+  setVal("vRam", mem.percent == null ? "—" : String(mem.percent));
+  setBar("bRam", mem.percent);
+  setVal("sRam", mem.total_gib
+    ? (fmtGiB(mem.used_gib) + " / " + fmtGiB(mem.total_gib) + " GiB")
+    : "不可用");
+
+  // GPU 显存 + 利用率 + 功耗
+  const gpu = s.gpu || {};
+  const g0 = (gpu.items || [])[0];
+  if (g0) {
+    setVal("vVram", g0.mem_percent == null ? "—" : fmt1(g0.mem_percent));
+    setBar("bVram", g0.mem_percent);
+    setVal("sVram", fmtInt(g0.mem_used_mib) + " / " + fmtInt(g0.mem_total_mib) + " MiB");
+    setVal("vGpu", g0.util_percent == null ? "—" : String(g0.util_percent));
+    setBar("bGpu", g0.util_percent);
+    const extra = [];
+    if (g0.temp_c != null) extra.push(g0.temp_c + "°C");
+    if ((gpu.items || []).length > 1) extra.push(gpu.items.length + " 块 GPU");
+    setVal("sGpu", (g0.name || "GPU") + (extra.length ? " · " + extra.join(" · ") : ""));
+    const card = $("vGpu").closest(".mcard");
+    if (card) card.title = (g0.name || "GPU") + " · 显存 " + g0.mem_used_mib + "/" +
+      g0.mem_total_mib + " MiB · 利用率 " + g0.util_percent + "% · " + g0.temp_c + "°C";
+  } else {
+    const why = !gpu.available ? "未找到 nvidia-smi" : (gpu.error || "无 NVIDIA GPU");
+    setVal("vVram", "—"); setBar("bVram", null); setVal("sVram", why);
+    setVal("vGpu", "—"); setBar("bGpu", null); setVal("sGpu", why);
+  }
+
+  // ---- 功耗 ----
+  // 显卡功耗是 nvidia-smi 实测值；整机为线性模型估算（见 launcher.py 注释）
+  const pw = s.power || {};
+  const gw = pw.gpu_w, gl = pw.gpu_limit_w;
+  setVal("vGpuW", gw == null ? "—" : fmt1(gw));
+  setBar("bGpuW", pw.gpu_percent);
+  setVal("sGpuW", gl ? ("上限 " + fmt1(gl) + " W") : (gw == null ? "不支持功耗查询" : "—"));
+  const gpCard = $("vGpuW") && $("vGpuW").closest(".mcard");
+  if (gpCard) gpCard.title = (g0 && g0.name ? g0.name : "GPU") +
+    (gw != null ? " 功耗 " + fmt1(gw) + " W" : " 功耗不可用") +
+    (gl ? " · 功耗墙 " + fmt1(gl) + " W" : "");
+
+  const sw = pw.system_w;
+  setVal("vSysW", sw == null ? "—" : fmt1(sw));
+  // 估算值无固定满量程，用 400W 作参考量程做进度条示意
+  setBar("bSysW", sw == null ? null : Math.min(100, sw / 400 * 100));
+  const parts = pw.system_parts || {};
+  const seg = [];
+  if (gw != null) seg.push("显卡 " + fmt1(gw));
+  if (parts.cpu_w != null) seg.push("CPU " + fmt1(parts.cpu_w));
+  if (parts.mem_w != null) seg.push("内存 " + fmt1(parts.mem_w));
+  if (parts.other_w != null) seg.push("其它 " + fmt1(parts.other_w));
+  setVal("sSysW", seg.length ? seg.join(" + ") : "估算不可用");
+  const swCard = $("vSysW") && $("vSysW").closest(".mcard");
+  if (swCard) swCard.title = "整机功耗为估算值（±30%），非实测\n" +
+    (seg.length ? seg.join(" + ") + " ≈ " + fmt1(sw) + " W" : "");
+}
+
+/* ---------- 对话测试（SSE 流式 + 逐段耗时） ---------- */
+function liveChip(cls, text) {
+  const s = document.createElement("span");
+  s.className = "lv " + (cls || "");
+  s.textContent = text;
+  $("chatLive").appendChild(s);
+  return s;
+}
+const TIMING_ROWS = [
+  ["cache_n", "缓存命中 tokens", "int"],
+  ["prompt_n", "实际 Prefill tokens", "int"],
+  ["prompt_ms", "Prefill 耗时", "ms"],
+  ["prompt_per_token_ms", "每 token Prefill", "ms"],
+  ["prompt_per_second", "Prefill 速度", "tps"],
+  ["predicted_n", "生成 tokens", "int"],
+  ["predicted_ms", "生成耗时", "ms"],
+  ["predicted_per_token_ms", "每 token 生成", "ms"],
+  ["predicted_per_second", "生成速度", "tps"],
+  ["draft_n", "MTP 草稿 tokens", "int"],
+  ["draft_n_accepted", "MTP 接受 tokens", "int"]
+];
+function fmtTiming(kind, v) {
+  if (v == null || !Number.isFinite(Number(v))) return null;
+  if (kind === "int") return fmtInt(v);
+  if (kind === "ms") return (Math.round(Number(v) * 10) / 10) + " ms";
+  if (kind === "tps") return (Math.round(Number(v) * 10) / 10) + " tok/s";
+  return String(v);
+}
+function showTimings(tm) {
+  if (!tm) return;
+  const rows = [];
+  for (const r of TIMING_ROWS) {
+    const s = fmtTiming(r[2], tm[r[0]]);
+    if (s != null) rows.push([r[1] + " (" + r[0] + ")", s]);
+  }
+  if (tm.draft_n > 0 && tm.draft_n_accepted != null) {
+    rows.push(["MTP 接受率", (tm.draft_n_accepted / tm.draft_n * 100).toFixed(2) + " %"]);
+  }
+  if (!rows.length) return;
+  $("timingsBody").innerHTML = rows.map((r) =>
+    "<tr><td>" + escapeHtml(r[0]) + "</td><td>" + escapeHtml(r[1]) + "</td></tr>").join("");
+  $("timingsTbl").style.display = "";
+}
+$("btnChat").addEventListener("click", async () => {
+  const text = $("chatIn").value.trim();
+  if (!text || chatBusy) return;
+  if (!(STATE && STATE.upstream && STATE.upstream.health === "ok")) {
+    toast("上游服务不可用，请先启动服务", true);
+    return;
+  }
+  chatBusy = true;
+  $("btnChat").disabled = true;
+  $("chatOut").innerHTML = "";
+  $("chatLive").innerHTML = "";
+  $("timingsTbl").style.display = "none";
+  lastTimings = null;
+
+  const form = readForm();
+  const model = (STATE.upstream && STATE.upstream.model) || form.model_id || "ninfer-27b";
+  const body = {
+    model: model,
+    messages: [{ role: "user", content: text }],
+    stream: true,
+    max_tokens: Math.max(1, Math.round(num($("chatMax").value, 128))),
+    temperature: num($("chatTemp").value, 0.6),
+    timings_per_token: true
+  };
+  const t0 = performance.now();
+  let firstTok = null, nChunk = 0, chars = 0;
+  let streamChip = null;
+  const out = $("chatOut");
+  const cursor = document.createElement("span");
+  cursor.className = "cur";
+  out.appendChild(cursor);
+  try {
+    const r = await fetch("/api/upstream/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    if (!r.ok) {
+      out.textContent = "HTTP " + r.status + " " + (await r.text()).slice(0, 400);
+      throw new Error("HTTP " + r.status);
+    }
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const step = await reader.read();
+      if (step.done) break;
+      buf += dec.decode(step.value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, idx).replace(/\r$/, "");
+        buf = buf.slice(idx + 1);
+        if (line.slice(0, 5) !== "data:") continue;
+        const payload = line.slice(5).trim();
+        if (payload === "[DONE]") continue;
+        let obj;
+        try { obj = JSON.parse(payload); } catch (e) { continue; }
+        const delta = obj.choices && obj.choices[0] && obj.choices[0].delta;
+        if (delta && typeof delta.content === "string" && delta.content) {
+          if (firstTok == null) {
+            firstTok = performance.now();
+            liveChip("cy", "首字 " + Math.round(firstTok - t0) + " ms");
+          }
+          chars += delta.content.length;
+          out.insertBefore(document.createTextNode(delta.content), cursor);
+          out.scrollTop = out.scrollHeight;
+        }
+        if (obj.timings) { lastTimings = obj.timings; nChunk++; }
+        if (obj.timings && nChunk % 8 === 0) {
+          const now = performance.now();
+          const text = "流式 " + chars + " 字 · " + ((now - t0) / 1000).toFixed(1) + " s";
+          if (streamChip) streamChip.textContent = text;
+          else streamChip = liveChip("", text);
+        }
+      }
+    }
+  } catch (e) {
+    if (!out.textContent) out.textContent = "请求失败：" + e.message;
+    toast("对话请求失败：" + e.message, true);
+  }
+  if (cursor.parentNode) cursor.parentNode.removeChild(cursor);
+  const total = (performance.now() - t0) / 1000;
+  liveChip("am", "总耗时 " + total.toFixed(2) + " s");
+  if (lastTimings) {
+    if (Number.isFinite(Number(lastTimings.predicted_per_second))) {
+      liveChip("gr", fmt1(lastTimings.predicted_per_second) + " tok/s");
+    }
+    if (lastTimings.draft_n > 0 && lastTimings.draft_n_accepted != null) {
+      liveChip("gr", "MTP 接受率 " + (lastTimings.draft_n_accepted / lastTimings.draft_n * 100).toFixed(1) + "%");
+    }
+    if (lastTimings.cache_n != null) liveChip("", "缓存命中 " + fmtInt(lastTimings.cache_n));
+    showTimings(lastTimings);
+  }
+  chatBusy = false;
+  $("btnChat").disabled = false;
+});
+/* ---------- 输入框：中文输入法（IME）兼容 ----------
+   中文/日文输入法用 Enter 确认候选词。若把这次 Enter 当成"发送"并
+   preventDefault()，候选词就提交不上去 —— 表现就是"无法输入中文"。
+
+   不同浏览器/输入法的按键序列并不一致，这里逐一覆盖：
+     Chrome/Edge(微软拼音)  keydown(isComposing=true, keyCode=229) → compositionend
+     Firefox               keydown(isComposing=true)
+     Safari / 部分输入法     keydown(keyCode=229) 且 isComposing=false
+     少数实现               compositionend 先于 keydown(Enter) 到达  ← 时间戳兜底
+   只要命中任意一条，就把这次 Enter 交还给输入法，不发送。 */
+let chatComposing = false;
+let chatCompositionEndAt = 0;
+const chatIn = $("chatIn");
+chatIn.addEventListener("compositionstart", () => { chatComposing = true; });
+chatIn.addEventListener("compositionend", () => {
+  chatComposing = false;
+  chatCompositionEndAt = Date.now();
+});
+chatIn.addEventListener("keydown", (e) => {
+  // 只关心 Enter（含 IME 的 Process/229）
+  if (e.key !== "Enter" && e.key !== "Process" && e.keyCode !== 229) return;
+
+  // 1) 正在组合中：这次 Enter 是"确认候选词"，交还输入法
+  if (chatComposing || e.isComposing) return;
+  // 2) IME 标志位：keyCode 229 表示按键被输入法吞掉了
+  if (e.keyCode === 229 || e.key === "Process") return;
+  // 3) 组合刚刚结束（同一按键的提交 Enter 先触发 compositionend 再触发 keydown）：
+  //    极短窗口内的 Enter 视为上屏动作，不发送
+  if (Date.now() - chatCompositionEndAt < 80) return;
+
+  // Shift+Enter 换行
+  if (e.shiftKey) return;
+  // 真正的发送
+  e.preventDefault();
+  $("btnChat").click();
+});
+
+/* ---------- 主题按钮绑定 ---------- */
+$("btnTheme").addEventListener("click", toggleTheme);
+document.addEventListener("keydown", (e) => {
+  // 快捷键 T：不在输入框里、且没有按修饰键时切换主题
+  if (e.key !== "t" && e.key !== "T") return;
+  if (e.ctrlKey || e.altKey || e.metaKey) return;
+  const tag = (e.target && e.target.tagName) || "";
+  if (tag === "INPUT" || tag === "TEXTAREA") return;
+  toggleTheme();
+});
+/* 默认主题固定为亮色（白色 UI），不跟随系统 —— 用户显式切换过才使用其选择。
+   因此这里不监听 prefers-color-scheme，避免"默认白色"的预期被系统设置覆盖。 */
+
+/* ---------- 初始化 ---------- */
+(async function init() {
+  applyTheme(currentTheme(), false);   // 同步按钮图标/文案（引导脚本已设好 data-theme）
+  buildForm();
+  try {
+    CFG = await jget("/api/config");
+  } catch (e) {
+    toast("无法连接 launcher 后端：请先运行 start-launcher.bat", true);
+    setMsg("无法连接 launcher 后端（127.0.0.1:18300）：" + e.message, "bad");
+    return;
+  }
+  const idx = CFG.active != null && CFG.presets && CFG.presets[CFG.active] ? CFG.active : 0;
+  applyPreset(idx);
+  renderPresets();
+  await pollState();
+  await pollLog();
+  await pollSys();
+  await pollMetrics();
+  setInterval(pollState, 2000);
+  setInterval(pollLog, 2000);
+  setInterval(pollSys, 2000);
+  setInterval(pollMetrics, 2000);
+  window.addEventListener("resize", drawSpark);
+})();
+
+</script>
+</body>
+</html>
