@@ -5,7 +5,8 @@
 基于 kvmem@（https://github.com/kvmem/kvmem-llama.cpp）与 ActKV 技术开发：
 
 - **KVMem**：把长上下文稀疏化成固定窗口（`budget` 选取历史页 B + `gen_reserve` 追加工作区 R）+ Host/磁盘归档，用一个固定大小的注意力窗口换取 200K～262K 的可用上下文。
-- **ActKV**（arXiv:2609.31395，中国科学技术大学提出）：修正长上下文下的“保留策略”——用动作导向的 LRFU keep score 与语义保护，弥补 KVMem 在 200K 以上上下文出现的幻觉、工具调用失效等问题。
+- **ActKV**（arXiv:2609.31395，中国科学技术大学提出）https://arxiv.org/pdf/2609.31395：修正长上下文下的“保留策略”——用动作导向的 LRFU keep score 与语义保护，弥补 KVMem 在 200K 以上上下文出现的幻觉、工具调用失效等问题。
+
 
 项目仍处实验阶段，经本地多轮 256K 召回测试验证有效；actkv 技术属于中国科学技术大学其团队。本 git 项目仅提供参考，不作为标准。
 
