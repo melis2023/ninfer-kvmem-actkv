@@ -65,19 +65,23 @@ ninfer 后端（模型 `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.ninfer`）：
 
 ------------------------------------------------------------------------------------------------------------------------------------
 
-支持的显卡架构（本次与上游同步）
+支持的显卡架构（与上游同步：sm_70 / 75 / 80 / 86 / 89 / 120a）
 
-本次把 ninfer 后端**同步到上游的 Turing/Volta 基线**（pin `1383a50e`，即上游为 **RTX 20 系 / V100** 准备的 `ninfer-all` 版本），本分支的 KVMem/ActKV 补丁已整体移植到该基线（40 处冲突 + 编译期修正，`scripts/prepare-backends.py --backend ninfer --check` 通过），因此以下架构都可构建：
+本次把 ninfer 后端**同步到上游的 Turing/Volta 基线**（pin `1383a50e`），本分支的 KVMem/ActKV 补丁已整体移植到该基线（40 处冲突 + 编译期修正，`scripts/prepare-backends.py --backend ninfer --check` 通过）。允许的架构列表直接来自 `backends/ninfer/CMakeLists.txt`（源码注释：supports Ampere `sm_86` and early Ada `sm_89`, plus `sm_80`, `75`, `70`, `120a`）：
 
 | 架构 | 代表显卡 | CUDA 要求 | 构建参数 |
 |---|---|---|---|
-| **`sm_75`（Turing）** | **RTX 20 系**（2060 / 2070 / 2080 / 2080 Ti）、TITAN RTX | CUDA 13.x 即可（本机 13.4） | `-CudaArchitectures 75` |
-| **`sm_70`（Volta）** | **V100、TITAN V** | **需 CUDA 12.8 / 12.9**（CUDA 13 会拒绝 sm_70） | `-CudaArchitectures 70` |
-| `sm_120a`（Blackwell） | RTX 50 系（本页 256K 测试用的 RTX 5060 Ti） | CUDA 13.4 + `-DNINFER_SM120_NATIVE=ON` | 默认 |
+| **`sm_89`（Ada）** | **RTX 40 系**（4060 / 4070 / 4080 / 4090）、L4 / L40 | CUDA 13.x 即可（也可用 12.x） | `-CudaArchitectures 89` |
+| **`sm_86`（Ampere）** | **RTX 30 系**、A40 / A10 | CUDA 13.x 即可 | `-CudaArchitectures 86`（**上游源码默认**） |
+| `sm_80`（Ampere GA100） | A100 / A30 | CUDA 13.x 即可 | `-CudaArchitectures 80` |
+| **`sm_75`（Turing）** | **RTX 20 系**（2060 / 2070 / 2080 / 2080 Ti）、TITAN RTX、Quadro RTX | CUDA 13.x 即可 | `-CudaArchitectures 75` |
+| **`sm_70`（Volta）** | **V100、TITAN V** | **必须 CUDA 12.8 / 12.9**（源码里 `sm_70 + CUDA ≥ 13.0` 直接 FATAL_ERROR） | `-CudaArchitectures 70` |
+| `sm_120a`（Blackwell） | RTX 50 系（本页 256K 测试用的 RTX 5060 Ti） | **必须 CUDA ≥ 13.1**（12.8/12.9 会误编 sm_120a）；可选 `-DNINFER_SM120_NATIVE=ON` 走上游原生路由 | `-CudaArchitectures 120a` |
 
 - 多显卡按**每架构独立构建、独立出包**（不做多 DLL 拆分，仍是单个 `infer-kvmem-server.exe`）：
-  `scripts\windows\build-backends.ps1 -Backend ninfer -CudaArchitectures 75 -CudaPath <CUDA 路径> -Jobs 6`
-- 上游那次同步是**编译通过级**：他们自述**手头没有 RTX 20 / TITAN RTX / V100 实卡**；本页的 256K 召回测试是在 **RTX 5060 Ti（sm_120a）** 上完成的，Turing/Volta 实卡结果待你在对应卡上验证。
+  `scripts\windows\build-backends.ps1 -Backend ninfer -CudaArchitectures 89 -CudaPath <CUDA 路径> -Jobs 6`
+- 非 120a 架构（70 / 75 / 80 / 86 / 89）走同一套 `mma.sync` 兼容路径；`sm_70` / `sm_75` 在 CMake 里另有专门分支（Turing/Volta 的能力差异）。
+- 目前**只有 `sm_120a` 有本机实卡数据**：本页 256K 召回测试即 RTX 5060 Ti；其余架构属"可构建 + 上游编译通过级"，上游自述**手头没有 RTX 20 / TITAN RTX / V100 实卡**，RTX 30/40 系等其他卡请自行实卡验证。
 
 ------------------------------------------------------------------------------------------------------------------------------------
 
