@@ -21,7 +21,7 @@
 | (1b) | `--kvmem-lrfu-lambda F` | 默认 0.50 | 衰减系数：越大越偏"频率"，越小越偏"新近" |
 | (2) | `--kvmem-score-agg` | **已删除** | GQA 头聚合恒为折叠 mean；传该参数（写 `max` 还是 `mean`）都是启动错误 |
 | (3) | `--kvmem-conf-*` | **已删除** | 论文 §6 Alg. 2 自适应预算：实测换 15% 轮时、丢 23 根针，静态池也存不下省出的内存 |
-| (4) | `--kvmem-protect-semantics` | **开** | 论文 §8.1：system 块 + 当前 user 任务**按需救援**，上限 = 窗口的 25% |
+| (4) | `--kvmem-protect-semantics` | **开** | 论文 §8.1：system 块 + 当前 user 任务**按需救援**，上限 = 窗口的 15% |
 | (5) | `--kvmem-aav-protect` 等三个参数 | **已删除** | 论文 §5.1 的 AAV 是**诊断**（Fig. 6），不是保留策略；逐类改 λ 会冻结工作集、掉召回 |
 | (6) | `--kvmem-query-union` | **已删除** | 论文 §5.1 的动作偏好：本 chat template 的 `tool_calls` 不产生输出区，探针从未激活 |
 | — | `KVMEM_AAV_TRACE=1`（环境变量） | 未设 | 只统计不决策：打印访问模式分类与 `intermittent_dropped` |
@@ -105,12 +105,12 @@ static B+R pool. The selection budget is --kvmem-budget; drop the flag.
 
 | 段 | 来源 | 含义 |
 |---|---|---|
-| `[0, prompt.instruction_tokens)` | `leading_instruction_boundary()`（`frontend.cpp:512`）识别的前导 System/Developer 消息 | 规则块（"你是谁、怎么做事"） |
+| `[0, prompt.instruction_tokens)` | `leading_instruction_boundary()`（`frontend.cpp:560`）识别的前导 System/Developer 消息 | 规则块（"你是谁、怎么做事"） |
 | `prompt.memory_query` 的 provenance span | 最后一条**真实** user 消息 | 当前任务 |
 
 两个刻意的边界：
 
-- 整段提示（`count == total`）不会被保护 —— 那等于让窗口完全没有压缩余地（同文件 543-546 行直接返回空）；
+- 整段提示（`count == total`）不会被保护 —— 那等于让窗口完全没有压缩余地（同文件 `add_range` 里直接返回空）；
 - 只覆盖**前导**的 system/developer 块，对话中间插入的 system 消息不在内。
 
 ### 怎么生效：按需救援，不是预先钉住
@@ -120,17 +120,24 @@ static B+R pool. The selection budget is --kvmem-budget; drop the flag.
 1. 这一轮**先按检索分正常选页**（`mandatory` 只含 sink + 图像 + recent，699-714 行）；
 2. 选定后，看保护段里**哪些页被丢掉了**；
 3. 把这些页按**检索分降序**救回，最多 `protect_cap` 个：
-   `protect_cap = max(1, floor(窗口页数 × 0.25))`，其中 `kProtectRescueFraction = 0.25` 是
-   **硬编码**，没有命令行参数也没有环境变量（730-732 行）；
-4. 用"`mandatory` + 救回页"再选一次，得到最终窗口（802-811 行）。
+   `protect_cap = max(1, floor(窗口页数 × 0.15))`，其中 `kProtectRescueFraction = 0.15` 是
+   **硬编码**，没有命令行参数也没有环境变量（737-739 行）；
+4. 用"`mandatory` + 救回页"再选一次，得到最终窗口（同函数的 `pick_topk_blocks(narrowed)`）。
 
 两个直接后果：
 
 - 保护页如果检索本来就留下了，**一分预算都不花**（前导 instruction 前缀通常就是这种情况），
   不会挤掉检索分更高的页；
-- 保护**永远吃不下超过 1/4 的窗口**，"一条超长 user 消息钉死整个窗口"这种失败模式不可能再发生。
+- 保护**永远吃不下超过 15% 的窗口**，"一条超长 user 消息钉死整个窗口"这种失败模式不可能再发生。
 
-0.25 这个数来自 262k / 33 针 NIAH 实测（见下），不是拍脑袋。
+`0.25` 这个数来自 262k / 33 针 NIAH 实测（见下），不是拍脑袋。**代码里写的是 `0.15`**。
+`protect_cap` 只在保护段本身很大时才起作用，两个尺度下的实测完全不同：
+
+- **短提示**（41k / 57k / 72k token）：实测的保护规模（`protected=2`、`cap=86`）根本够不到上限，cap 只是"病态超长保护段"的
+  安全阀；留到 0.15 是给检索分多留窗口，代价为零。
+- **256k / 40 针长会话**（每轮灌 ~17k token）：它**会顶到上限** —— 33 个压缩轮里有 10 轮
+  `rescued = cap = 86`，而那一轮请求救援的是 229–236 页（`0.25` 对应的上限是 144）。
+  即便如此召回仍是 40/40，所以在这套负载上更紧的限额没有换来召回损失。
 
 ### 为什么需要
 
@@ -146,12 +153,13 @@ static B+R pool. The selection budget is --kvmem-budget; drop the flag.
 |---|---|---|---|
 | 全保护（旧语义，等价 `frac = 1`） | 33/33 | 77.4 tok/s | 62.8% |
 | 关闭保护（`frac = 0`） | 33/33 | 84.7 tok/s | 61.8% |
-| **限额 0.25（现行）** | **33/33** | **90.4 tok/s** | 61.6% |
+| **限额 0.25（实测口径）** | **33/33** | **90.4 tok/s** | 61.6% |
 
 旧语义在长 user 消息上等于 `mandatory == selected == 576 页`（实测），窗口里没有一页留给打分，
-代价约 9% decode 吞吐；改成按需救援 + 25% 上限后代价消失，召回不变。
+代价约 9% decode 吞吐；改成按需救援 + 限额后代价消失，召回不变。上表的限额测的是 0.25，
+代码现行 0.15（实测够不到 cap，见上，降到 0.15 零成本）。
 
-剩下的风险只有一条：`protect_cap` 是**每轮**上限，保护段远大于 1/4 窗口时，超出部分仍然按普通页
+剩下的风险只有一条：`protect_cap` 是**每轮**上限，保护段远大于 15% 窗口时，超出部分仍然按普通页
 参与竞争（这是有意的 —— 保护是"救援"而不是"特权"）。图像页不同：它属于 `mandatory`，整块放不下
 时选择阶段**直接报错**而不是悄悄丢内容 ——
 `KVMem selection budget cannot retain complete image regions; increase the budget or reduce image resolution`（568 行）。
@@ -161,10 +169,10 @@ static B+R pool. The selection budget is --kvmem-budget; drop the flag.
 
 ### 诊断：`KVMEM_PROTECT_TRACE=1`
 
-设了以后每个压缩轮往 stderr 打一行（782-801 行），只打印、不改变任何决策：
+设了以后每个压缩轮往 stderr 打一行（789-808 行），只打印、不改变任何决策：
 
 ```
-KVMEM_PROTECT_TRACE logical=… window_pages=576 cap=144 protected=832 dropped_by_retrieval=256 rescued=144 span_tokens=[…,…) frac=0.25
+KVMEM_PROTECT_TRACE logical=… window_pages=576 cap=86 protected=832 dropped_by_retrieval=256 rescued=86 span_tokens=[…,…) frac=0.15
 KVMEM_PROTECT_TRACE rescued_pages=245(tok 15680-15744 s=1.234),…
 ```
 
@@ -228,7 +236,7 @@ KVMEM_AAV_TRACE row=… frontier=… blocks=… selected=… cold=… intermitte
 最后一行不能有 `^`，否则会传一个空参数、服务在加载前就报 `unknown argument:`。
 
 bat 里现在只开两个开关：`--kvmem-lrfu`（LRFU 保留分）与 `--kvmem-protect-semantics`
-（§8.1：按需救援 system 块与当前 user 任务，上限 25% 窗口）。`--kvmem-query-union`、
+（§8.1：按需救援 system 块与当前 user 任务，上限 15% 窗口）。`--kvmem-query-union`、
 `--kvmem-score-agg`、`--kvmem-conf-*`、`--kvmem-aav-*`、`--kvmem-action-region` 都已删除，
 写进命令行会直接启动报错（错误信息里带删除原因和实测数据）。
 AAV **没有命令行开关**，只有诊断环境变量（见上一节）；语义保护有 `KVMEM_PROTECT_TRACE=1`。
@@ -291,7 +299,7 @@ set "KVMEM_AAV_TRACE=1"
 | `backends/ninfer/include/ninfer/types.h` | `KvmemOptions` 新增字段（含 C 的 `protect_semantics`） |
 | `backends/ninfer/src/serve/serve_options.cpp` | CLI 解析、范围校验、`--help` |
 | `backends/ninfer/src/models/qwen3_5/program/storage/memory_statistics.cpp` | 把选项接进 `KvMemStoreConfig`（唯一构造点） |
-| `backends/ninfer/src/models/qwen3_5/program/storage/kvmem_window.cpp` | `memory_semantic_pages()`(574)（§8.1）、`mandatory` 集合(699)、按需救援与 `kProtectRescueFraction`(730)、`KVMEM_PROTECT_TRACE`(782) |
+| `backends/ninfer/src/models/qwen3_5/program/storage/kvmem_window.cpp` | `memory_semantic_pages()`(574)（§8.1）、`mandatory` 集合(700)、按需救援与 `kProtectRescueFraction`(737)、`KVMEM_PROTECT_TRACE`(789) |
 | `backends/ninfer/src/models/qwen3_5/frontend/frontend.cpp` / `program/prefill.cpp` | `leading_instruction_boundary()`(512)、`instruction_tokens`、`protected_pages` |
 
 λ 只有一个来源：`KvMemStoreConfig::lrfu_lambda`，被 `accumulate_lrfu`（已提交的更新）与
@@ -303,7 +311,7 @@ set "KVMEM_AAV_TRACE=1"
 ## 10. 状态
 
 - **现行 bat 只开两个开关**：`--kvmem-lrfu`（λ、top-p 用默认值）与 `--kvmem-protect-semantics`
-  （按需救援 + 25% 上限）。代码、CLI 接线、单元测试与 ninfer 二进制均已就位，`--help` 里有说明。
+  （按需救援 + 15% 上限）。代码、CLI 接线、单元测试与 ninfer 二进制均已就位，`--help` 里有说明。
 - **已删除**：`--kvmem-query-union` / `--kvmem-action-region`（动作探针从未激活）、
   `--kvmem-score-agg`（GQA 恒为折叠均值）、`--kvmem-conf-*`（静态池下无收益，实测掉 23 针召回）、
   `--kvmem-aav-*`（论文 §5.1 的 AAV 只是诊断）。传任一都是**启动错误**并给出原因与实测数据。
@@ -313,4 +321,6 @@ set "KVMEM_AAV_TRACE=1"
   `I:\model\256k-recall-test\aav_summary.py` 已同步到新的行格式（此前的正则与实现脱节，匹配不到任何行）。
 - `backends/patches/ninfer-kvmem.patch` 与 `backends/versions.json` 已按当前子模块工作树重生成，
   `scripts\prepare-backends.py --backend ninfer --check` 报
-  `ninfer: 8319e8f51247 + ninfer-kvmem.patch ready`，标准路径 `build-backends.ps1` 不再卡在 prepare。
+  `ninfer: 1383a50e4153 + ninfer-kvmem.patch ready`，标准路径 `build-backends.ps1` 不再卡在 prepare。
+- base 已跟到上游 `1383a50e`（Turing/Volta RC，含 `sm_75`/`sm_70`），本地 ActKV 移植随之上线；
+  Windows 构建所需的 FFmpeg/libcurl/zlib 现在固定在 `C:\vcpkg`（见 `docs/ninfer-server-build-record.md`）。

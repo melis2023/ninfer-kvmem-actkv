@@ -2,12 +2,13 @@
 
 | 项目 | 值 |
 |---|---|
-| 目标 | `backends/ninfer`（pin `8319e8f5` + `backends/patches/ninfer-kvmem.patch`，含本次 ActKV 移植） |
+| 目标 | `backends/ninfer`（pin `1383a50e` + `backends/patches/ninfer-kvmem.patch`，含 ActKV 移植） |
 | 构建脚本 | `scripts/windows/build-backends.ps1 -Backend ninfer` |
 | 工具链 | VS 2022 Professional 14.44.35207 + CUDA 13.4.59 + CMake 4.3.1 + Ninja 1.13 |
-| 依赖 | vcpkg x64-windows：`ffmpeg[zlib] 9.0.2`、`curl 8.22.0`、`pkgconf 3.0.3` |
+| 依赖 | vcpkg x64-windows：`ffmpeg[zlib] 9.0.2`、`curl 8.22.0`、`pkgconf 3.0.3`（树在 `C:\vcpkg`） |
 | 卡 | RTX 5060 Ti 16 GB（`GPU-dba26dd9-930f-1b01-2b05-22c1fca6cdce`），`-DCMAKE_CUDA_ARCHITECTURES=120a` |
-| 日期 | 2026-10-10 |
+| 首次记录 | 2026-10-10（pin `8319e8f5`） |
+| 最近重建 | 2026-10-17（pin `1383a50e`，vcpkg 搬到 `C:\vcpkg`，见 §8） |
 
 ---
 
@@ -84,8 +85,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows\build-backen
 CMake 配置（`-DNINFER_KVMEM_SOURCE_DIR=<repo>/kvmem`、`-DNINFER_BUILD_APPS=ON`、`120a`、`NINFER_SM120_NATIVE=ON`）→
 构建目标 `ninfer-serve`。
 
-产物：`build-backends/ninfer/apps/serve/ninfer-serve.exe`（约 0.5 GB，含整张 kernel image）；
+产物：`build-backends/ninfer/apps/ninfer-serve.exe`（约 0.5 GB，含整张 kernel image）；
 `ninfer_stage_runtime_dlls` 会把 vcpkg 的 FFmpeg/curl DLL 一起铺到该目录。
+（10/10 时这个路径是 `apps/serve/`，后来上游挪到了 `apps/`，以实际构建输出为准。）
 
 ## 5. 放到启动器期望的位置
 
@@ -93,7 +95,7 @@ CMake 配置（`-DNINFER_KVMEM_SOURCE_DIR=<repo>/kvmem`、`-DNINFER_BUILD_APPS=O
 `workers/ninfer/infer-kvmem-server.exe`（发行包的命名），所以编译后需要 staging：
 
 ```powershell
-$src = 'build-backends\ninfer\apps\serve'
+$src = 'build-backends\ninfer\apps'
 $dst = 'workers\ninfer'
 New-Item -ItemType Directory -Path $dst -Force
 Copy-Item "$src\ninfer-serve.exe" "$dst\infer-kvmem-server.exe"
@@ -174,4 +176,48 @@ Get-Process infer-kvmem-server | Stop-Process
   单针在预算充足时饱和），LRFU 的收益要在**多轮**会话里才显现；需要两臂各跑一遍多轮脚本。
 * `--log-level debug`（或 KVMEM 的 trace 环境变量）下逐次换页/检索日志没有采集，因此
   "选了哪些块、换出多少" 这一层没有直接观测。
+
+---
+
+## 8. 2026-10-17 重建（上游线 + vcpkg 搬迁）
+
+base 从 `8319e8f5` 换成上游 `1383a50e`（Turing/Volta RC，含 `sm_70`/`sm_75`，即 20 系支持），
+本地 ActKV 移植随之上线；`kProtectRescueFraction` 由 `0.25` 调为 `0.15`。
+
+### 8.1 vcpkg 从 `I:\vcpkg` 搬到 `C:\vcpkg`
+
+搬到 `C:\vcpkg` —— 上游 `build-native.bat` 里 `NINFER_VCPKG_ROOT` 的默认值 —— 并把
+`VCPKG_ROOT` / `VCPKG_TARGET_TRIPLET` 写成**用户级环境变量**。搬迁是安全的：`installed/` 下的
+`.cmake` 用 `${CMAKE_CURRENT_LIST_DIR}/../../` 推导前缀，全树 0 处硬编码旧盘符（迁移后已验证），
+`robocopy /MOVE` 61,439 个文件 / 2.215 GB 零失败。
+
+### 8.2 §2.3 那个坑现在由脚本自己兜住
+
+`build-backends.ps1` 在 `Launch-VsDevShell` **之后**补了一段：若 `VCPKG_ROOT` 形如 `*\VC\vcpkg`
+（即刚被 vcvars 覆盖成 VS 自带的空树），就从机器级/用户级环境变量把它还原。于是不再需要
+本文 §2.3 那套"手动 vcvars + 再覆盖 `VCPKG_ROOT`"的仪式，直接跑 §4 的命令即可。配置阶段的证据：
+
+```
+-- Found FFMPEG: C:\vcpkg/installed/x64-windows/include
+-- Found CURL:   C:/vcpkg/installed/x64-windows/share/curl/CURLConfig.cmake (8.22.0)
+```
+
+### 8.3 结果
+
+| 项目 | 值 |
+|---|---|
+| 编译 | exit 0，814 个目标，00:20 → 01:03（约 43 分钟，`-Jobs 10`） |
+| 产物 | `build-backends/ninfer/apps/ninfer-serve.exe`，**538 MB**（10/10 那次是 512.5 MB） |
+| 二进制自述 | `build 0.12.0-rtx3090+1383a50e-dirty` |
+| ActKV 参数 | `--help` 列出 `--kvmem-lrfu`、`--kvmem-protect-semantics`；`--kvmem-action-lrfu` 已变成直接报错的改名陷阱（`serve_options.cpp:723`） |
+| staging | `workers/ninfer/infer-kvmem-server.exe`，旧版备份为 `infer-kvmem-server.exe.1014-bak` |
+| DLL | vcpkg 树与旧版同名同版本（`avcodec-63`/`avformat-63`/`avutil-61`/`swresample-7`/`swscale-10`/`libcurl`/`z`）；cublas 从 `CUDA\v13.4\bin\x64\` 取（`bin\` 下没有） |
+
+启动后设备档案会提示一次不匹配并自动重标定（正常）：
+
+```
+WARN engine | device-profiles.json: the entry for nvidia-geforce-rtx-5060-ti-sm120 was calibrated
+against route catalog ac2d7b3e311831b0 (build 8319e8f-dirty), this build's is 5893cf72e3d60377;
+it is ignored. Recalibrate (ninfer-calibrate, or --device-profile calibrate)
+```
 

@@ -71,6 +71,20 @@ if (!$env:VSCMD_VER) {
 }
 if ($CudaPath) { $env:PATH = "$CudaPath/bin;$CudaPath/bin/x64;$env:PATH" }
 
+# Launch-VsDevShell runs vcvars64.bat, which points VCPKG_ROOT at <VS>\VC\vcpkg -- a tree with no
+# packages installed. cmake/FindFFMPEG.cmake reads that variable and then reports a missing
+# swscale.lib, which reads as "install vcpkg" rather than "the dev shell clobbered your path".
+# Put the machine-wide triplet back, so setting VCPKG_ROOT and VCPKG_TARGET_TRIPLET once is enough
+# and every build shell does not have to re-export them after the dev shell.
+$vcpkgRoot = (Get-Item 'env:VCPKG_ROOT' -ErrorAction SilentlyContinue).Value
+if ($vcpkgRoot -like '*\VC\vcpkg') {
+    foreach ($name in 'VCPKG_ROOT', 'VCPKG_TARGET_TRIPLET') {
+        $saved = [Environment]::GetEnvironmentVariable($name, 'Machine')
+        if (!$saved) { $saved = [Environment]::GetEnvironmentVariable($name, 'User') }
+        if ($saved) { Set-Item -Path "env:$name" -Value $saved }
+    }
+}
+
 # Pin the MSVC include-dependency prefix instead of letting CMake detect it.
 #
 # cl.exe prints /showIncludes in the system language, and CMake 4.3 stores the

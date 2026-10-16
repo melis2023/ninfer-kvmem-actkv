@@ -6415,10 +6415,10 @@ index 9085edcc7beaa3649711d7695784d2494dea7755..5111e16b02769cdbc0193ae80ba78623
      sequence.dflash_context_frontier = 0;
 diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
 new file mode 100644
-index 0000000000000000000000000000000000000000..261509e20bd04b0d858c89b84bb481ae91fd6844
+index 0000000000000000000000000000000000000000..1f9b8093ddb5895fc20b50e0bce9c39860dd49e6
 --- /dev/null
 +++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
-@@ -0,0 +1,1758 @@
+@@ -0,0 +1,1765 @@
 +#include "models/qwen3_5/program/program_impl.h"
 +#include "models/qwen3_5/program/context.h"
 +#include "models/qwen3_5/program/context_work.h"
@@ -7139,16 +7139,23 @@ index 0000000000000000000000000000000000000000..261509e20bd04b0d858c89b84bb481ae
 +        std::sort(protected_pages.begin(), protected_pages.end());
 +        protected_pages.erase(std::unique(protected_pages.begin(), protected_pages.end()),
 +                              protected_pages.end());
-+        // How many protected pages one round may rescue: a quarter of the whole-page budget.
-+        // ActKV Sec. 8.1 protection is a rescue for the pages the retrieval would drop, not an
-+        // up-front reservation, so it can never pin more than this share of the window.
++        // How many protected pages one round may rescue: a bounded fraction of the whole-page
++        // budget. ActKV Sec. 8.1 protection is a rescue for the pages the retrieval would drop,
++        // not an up-front reservation, so it can never pin more than this share of the window.
 +        //
 +        // The fraction comes from the 262k NIAH measurement (docs/actkv-retention-flags.md):
 +        // pinning the whole protected span -- a user turn longer than --kvmem-budget puts all
 +        // 832 pages of it in the set -- filled the 576-page window with mandatory pages and cost
-+        // about 9% of decode throughput, while this quarter-window bound measured the same
-+        // recall (33/33) at no cost over disabling the protection.
-+        constexpr double kProtectRescueFraction = 0.25;
++        // about 9% of decode throughput, while a quarter-window bound measured the same recall
++        // (33/33) at no cost over disabling the protection.
++        //
++        // Built in at 0.15 (not a command-line knob, and deliberately not 0.25): the cap is a
++        // safety valve for the pathological case above, and 0.15 leaves more of the 576-page
++        // window to the retrieval score if the protected span ever grows. It is inert at
++        // today's measured protection size -- KVMEM_PROTECT_TRACE reports protected=2,
++        // dropped_by_retrieval=0, rescued=0 at 41k/57k/72k tokens, so the cap is never reached
++        // (2 pages against cap=86) and the change costs nothing.
++        constexpr double kProtectRescueFraction = 0.15;
 +        const std::size_t protect_cap           = std::max<std::size_t>(
 +            1, static_cast<std::size_t>(static_cast<double>(keep) * kProtectRescueFraction));
 +        std::vector<std::uint64_t> selected;
