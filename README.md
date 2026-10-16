@@ -15,14 +15,14 @@
   --max-context 262144 --kvmem-recent-tokens 1024 ^
   --prefill-chunk 256 ^
   --kvmem-budget 36864 --kvmem-gen-reserve 16384 --kvmem-host-mib 12288 ^
-  --kvmem-action-lrfu --kvmem-protect-semantics --model-id ninfer-27b ^
+  --kvmem-lrfu --kvmem-protect-semantics --model-id ninfer-27b ^
   --kv-dtype int8  --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
   --spec mtp --draft-tokens 4 --ngram-draft-tokens 31 --adaptive-mtp ^
   --vision --vision-residency cpu --vision-max-merged 256 ^
   --default-reasoning-effort medium  --default-thinking-budget 16384
   
 ---
-  --kvmem-action-lrfu 为开启actkv  
+  --kvmem-lrfu 为开启actkv  
   --kvmem-protect-semantics 为开启 ActKV 语义保护（v1.3 起改为"按需救援"，上限 25% 窗口，不需要额外参数）
   --vision --vision-residency cpu   --vision-max-merged 256 cpu运算需使用256，gpu可改为1024
 
@@ -65,7 +65,7 @@ v1.3更新
 | `--kvmem-conf-*` | 静态 B+R 池存不下省出的显存；40/40 → 17/40 换约 15% 轮时 |
 | `--kvmem-aav-*` | 论文 §5.1 的 AAV 是诊断（`KVMEM_AAV_TRACE=1`），不是保留策略 |
 
-3，修掉两处"静默失效"：--kvmem-sink-tokens 给 1~63（会被悄悄取整成一页）、--kvmem-lrfu-lambda / --kvmem-lrfu-top-frac 没配 --kvmem-action-lrfu（等于没接上任何东西），现在都是启动报错。
+3，修掉两处"静默失效"：--kvmem-sink-tokens 给 1~63（会被悄悄取整成一页）、--kvmem-lrfu-lambda / --kvmem-lrfu-top-frac 没配 --kvmem-lrfu（等于没接上任何东西），现在都是启动报错。
 
 4，新增诊断环境变量 KVMEM_PROTECT_TRACE=1：每个压缩轮打印一行 protected / dropped_by_retrieval / rescued。rescued=0 说明保护页本来就没被丢，这种情况开关开不开都一样。
 
@@ -83,7 +83,7 @@ dflash2启动命令
   --max-context 262144 --kvmem-recent-tokens 1024 ^
   --prefill-chunk 256 ^
   --kvmem-budget 36864 --kvmem-gen-reserve 16384 --kvmem-host-mib 12288 ^
-  --kvmem-action-lrfu --kvmem-protect-semantics --model-id ninfer-27b ^
+  --kvmem-lrfu --kvmem-protect-semantics --model-id ninfer-27b ^
   --kv-dtype rk8v4  --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
   --spec mtp --draft-tokens 5 --ngram-draft-tokens 31 --adaptive-mtp ^
   --vision --vision-residency cpu --vision-max-merged 256 ^
@@ -107,7 +107,7 @@ dflash2启动命令
 | GPU | RTX 5060 Ti 16 GB |
 | KV 量化 | **int8** |
 | KV 池 | `budget 36864` + `gen_reserve 16384` = **53248 token**（832 页 × 64 token） |
-| ActKV | **开启**（`--kvmem-action-lrfu`、λ=0.50、top-frac=0.90） |
+| ActKV | **开启**（`--kvmem-lrfu`、λ=0.50、top-frac=0.90） |
 | GQA 聚合 | 折叠 `mean`（`--kvmem-score-agg` 已在 v1.3 删除，恒为 mean） |
 | recent-tokens | 1024 |
 | 推测解码 | MTP draft 4 + ngram 31 + adaptive |

@@ -39,7 +39,7 @@ struct llama_kvmem_params {
     // ActKV (arXiv:2609.31395): action-oriented LRFU eviction and GQA score
     // aggregation. Field names match the llama ActKV parameters so the same
     // --kvmem-* flags mean the same thing on every backend.
-    bool     action_lrfu;          // --kvmem-action-lrfu
+    bool     action_lrfu;          // --kvmem-lrfu
     float    lrfu_lambda;          // --kvmem-lrfu-lambda; <= 0 → 0.50 (paper)
     float    lrfu_top_frac;        // --kvmem-lrfu-top-frac; <= 0 → 0.90 (paper)
     // GQA aggregation is the folded mean and is no longer configurable. The

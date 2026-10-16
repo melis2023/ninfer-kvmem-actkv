@@ -298,13 +298,15 @@ struct KvMemStoreConfig {
     // cannot grow from page age alone -- see accumulate_lrfu for why that matters
     // at large context.
     // Defaults follow the paper's tuned configuration: lambda = 0.5, p = 90%.
-    bool   action_lrfu   = false;    // --kvmem-action-lrfu
+    bool   action_lrfu   = false;    // --kvmem-lrfu
     float  lrfu_lambda   = 0.50f;    // --kvmem-lrfu-lambda
     float  lrfu_top_frac = 0.90f;    // --kvmem-lrfu-top-frac
     // Restrict growth to the blocks the round actually kept (two-phase form).
     // Callers that select after scoring set this and call commit_lrfu; callers
     // that cannot report a selection leave it off and keep the score-only rule.
-    bool   deferred_lrfu = false;    // --kvmem-lrfu-deferred
+    // Not a CLI flag: the ninfer adapter turns it on unconditionally and commits
+    // with the round's selection; the llama.cpp adapter leaves it off.
+    bool   deferred_lrfu = false;
 
     // Advance the AAV access ring. This is the DIAGNOSTIC only: the serve sets it
     // from KVMEM_AAV_TRACE so the ring and the trace line exist for analysis, and

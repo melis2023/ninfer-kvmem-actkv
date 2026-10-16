@@ -127,7 +127,7 @@ static void print_usage(const char * argv0) {
             "  --kvmem-gen-reserve N      decode slack (default 256)\n"
             "  --kvmem-recent-tokens N    always-kept newest suffix in select budget (default 0)\n"
             "  --kvmem-method NAME        recency | retrieval (default retrieval)\n"
-            "  --kvmem-action-lrfu        ActKV action-oriented LRFU retention (default off)\n"
+            "  --kvmem-lrfu        ActKV action-oriented LRFU retention (default off)\n"
             "  --kvmem-lrfu-lambda F      LRFU decay lambda, 0 < F < 1 (default 0.50)\n"
             "  --kvmem-lrfu-top-frac F    hit fraction kept per round, 0 < F <= 1 (default 0.90)\n"
             "  --kvmem-score-agg          REMOVED: GQA aggregation is always the folded mean\n"
@@ -973,6 +973,10 @@ int main(int argc, char ** argv) {
             const char * m = need(arg);
             st.kparams.method = (eq(m, "retrieval") || eq(m, "retrieve")) ? 1 : 0;
         } else if (eq(arg, "--kvmem-action-lrfu")) {
+            fprintf(stderr, "--kvmem-action-lrfu was renamed: use --kvmem-lrfu (the upstream "
+                            "name; the switch itself is unchanged).\n");
+            return 1;
+        } else if (eq(arg, "--kvmem-lrfu")) {
             st.kparams.action_lrfu = true;
         } else if (eq(arg, "--kvmem-lrfu-lambda")) {
             st.kparams.lrfu_lambda = std::strtof(need(arg), nullptr);

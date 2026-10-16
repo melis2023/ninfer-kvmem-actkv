@@ -87,6 +87,13 @@ or applying patches; `-ConfigureOnly` and `-BuildOnly`
 separate configure and compilation. Backend-specific CMake arguments should be
 passed with the matching `-Backend`, not indiscriminately to `all`.
 
+The ninfer worker also embeds a WebUI, served by `GET /`. Without `-WebUiDir` its
+plan resolves `build/share/kvmem/ui` — the WebUI `build.ps1` stages for the
+llama.cpp backend. When neither exists the flag is omitted and the worker embeds
+none, so its startup log has no `webui http://…` line. `-WebUiDir <dir>` (a
+directory holding `index.html` or `index.html.gz`) embeds a different one, and a
+directory without either entry point is rejected before any compiler runs.
+
 The wrapper configures dependencies from the checked-in ninfer vcpkg manifest.
 An existing compatible dependency installation can be passed with
 `-DVCPKG_INSTALLED_DIR=... -DVCPKG_MANIFEST_INSTALL=OFF`; no local prebuilt ninfer

@@ -30,7 +30,7 @@ REM  ActKV retrieval block (arXiv:2609.31395) - the flags below the model
 REM  line. Ported into the shared kvmem core, so the llama.cpp and ninfer
 REM  backends take the SAME names and defaults:
 REM
-REM  (1) Action-oriented eviction  --kvmem-action-lrfu
+REM  (1) Action-oriented eviction  --kvmem-lrfu
 REM      Blocks are kept by a temporal LRFU keep score instead of a one-shot
 REM      attention score:  KS_t = lambda*KS_{t-1} + (top-p hit ? score : 0)
 REM      lambda 0.50, top-p 0.90 are the paper's tuned values.
@@ -78,7 +78,7 @@ REM      33/33 recall on a 262k NIAH at no cost over switching the protection
 REM      off. Without it only the positional sink window and the recent window
 REM      hold those pages, so the tail of a system prompt longer than the sink
 REM      is dropped as soon as LRFU scoring starts losing interest in it. It
-REM      needs no other flag - it is honoured whether --kvmem-action-lrfu is on
+REM      needs no other flag - it is honoured whether --kvmem-lrfu is on
 REM      or off.
 REM          set "KVMEM_PROTECT_TRACE=1"
 REM      prints one line per compression round with protected / dropped_by_
@@ -113,7 +113,7 @@ REM      --kvmem-aav-protect          -> "was removed: AAV is a diagnostic"
 REM      --kvmem-action-region        -> "was removed: the action probe never activated"
 REM      --kvmem-query-union          -> "was removed: the action probe never activated"
 REM      --kvmem-conf-budget 8192     -> "was removed: ActKV Sec. 6 adaptive budget"
-REM      --kvmem-lruf-lambda 0.6      -> "requires --kvmem-action-lrfu"
+REM      --kvmem-lruf-lambda 0.6      -> "requires --kvmem-lrfu"
 REM --------------------------------------------------------------------
 REM  ninfer differs from the llama.cpp backend (docs/multi-backend-differences.md):
 REM    * page/block size is FIXED at 64 tokens (llama.cpp defaults to 128), so B,
@@ -213,16 +213,6 @@ if not defined BIN set "BIN=%~dp0"
 
 cd /d "%BIN%"
 
-REM ---- what THIS invocation enables --------------------------------------------------
-REM   (1) --kvmem-action-lrfu        ON     LRFU keep score (lambda 0.50, top-p 0.90)
-REM   (4) --kvmem-protect-semantics  ON     system block + last user message pinned
-REM       KVMEM_AAV_TRACE=1          unset  set it to collect the AAV diagnostic rows
-REM                                         (classification only; no retention policy)
-REM--kvmem-sink-tokens（默认 1 页）	最前 1 页	位置	硬
-REM--kvmem-recent-tokens（1024 = 16 页）	最新 16 页	位置	硬
-REM--kvmem-protect-semantics（C）	system 块 + 最后一条 user 消息	语义	硬
-
-REM ------------------------------------------------------------------------------------
 
 "%EXE%" ^
   "%MODEL%" ^
@@ -230,11 +220,11 @@ REM ----------------------------------------------------------------------------
   --max-context 262144 ^
   --prefill-chunk 256 ^
   --kvmem-budget 36864 --kvmem-gen-reserve 16384 --kvmem-host-mib 12288 ^
-  --kvmem-action-lrfu --kvmem-protect-semantics ^
+  --kvmem-lrfu --kvmem-protect-semantics ^
   --kv-dtype int8  --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
   --spec mtp --draft-tokens 4 --ngram-draft-tokens 31 --adaptive-mtp ^
   --vision --vision-residency cpu --vision-max-merged 256 ^
-  --default-reasoning-effort xhigh  --default-thinking-budget 53248
+  --default-reasoning-effort xhigh  --default-thinking-budget 16384
  
 set "RC=%ERRORLEVEL%"
 echo.

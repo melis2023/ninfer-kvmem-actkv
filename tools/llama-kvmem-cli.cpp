@@ -39,7 +39,7 @@ static void print_usage(const char * argv0) {
             "  --kvmem-sink-tokens N      always-kept prefix; 0 = one block\n"
             "  --kvmem-recent-tokens N    always-kept suffix blocks (default 0)\n"
             "  --kvmem-method NAME        recency | retrieval (default retrieval)\n"
-            "  --kvmem-action-lrfu        ActKV action-oriented LRFU retention (default off)\n"
+            "  --kvmem-lrfu        ActKV action-oriented LRFU retention (default off)\n"
             "  --kvmem-lrfu-lambda F      LRFU decay lambda, 0 < F < 1 (default 0.50)\n"
             "  --kvmem-lrfu-top-frac F    hit fraction kept per round, 0 < F <= 1 (default 0.90)\n"
             "  --kvmem-score-agg NAME     accepted for compatibility: only \"mean\" is valid\n"
@@ -175,6 +175,10 @@ int main(int argc, char ** argv) {
                 kparams.method = 0;
             }
         } else if (eq(arg, "--kvmem-action-lrfu")) {
+            fprintf(stderr, "--kvmem-action-lrfu was renamed: use --kvmem-lrfu (the upstream "
+                            "name; the switch itself is unchanged).\n");
+            return 1;
+        } else if (eq(arg, "--kvmem-lrfu")) {
             kparams.action_lrfu = true;
         } else if (eq(arg, "--kvmem-lrfu-lambda")) {
             kparams.lrfu_lambda = std::strtof(need(arg), nullptr);

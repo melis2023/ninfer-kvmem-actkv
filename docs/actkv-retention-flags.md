@@ -17,7 +17,7 @@
 
 | 编号 | 参数 | 当前 bat | 作用 |
 |---|---|---|---|
-| (1) | `--kvmem-action-lrfu` | **开** | 用带时间衰减的 LRFU 保留分 KS 取代一次性注意力分 |
+| (1) | `--kvmem-lrfu` | **开** | 用带时间衰减的 LRFU 保留分 KS 取代一次性注意力分 |
 | (1b) | `--kvmem-lrfu-lambda F` | 默认 0.50 | 衰减系数：越大越偏"频率"，越小越偏"新近" |
 | (2) | `--kvmem-score-agg` | **已删除** | GQA 头聚合恒为折叠 mean；传该参数（写 `max` 还是 `mean`）都是启动错误 |
 | (3) | `--kvmem-conf-*` | **已删除** | 论文 §6 Alg. 2 自适应预算：实测换 15% 轮时、丢 23 根针，静态池也存不下省出的内存 |
@@ -28,7 +28,7 @@
 
 ---
 
-## 1. (1) 动作导向的逐出 `--kvmem-action-lrfu`
+## 1. (1) 动作导向的逐出 `--kvmem-lrfu`
 
 每个块的保留分不再等于"这一轮它被注意到多少"，而是带时间衰减的累积量：
 
@@ -174,7 +174,7 @@ KVMEM_PROTECT_TRACE rescued_pages=245(tok 15680-15744 s=1.234),…
 
 ### 与其它开关的关系
 
-不依赖 (1)：`--kvmem-action-lrfu` 开或关都生效。与 AAV 诊断（§5）不互斥。做 A/B 时用上面的
+不依赖 (1)：`--kvmem-lrfu` 开或关都生效。与 AAV 诊断（§5）不互斥。做 A/B 时用上面的
 `KVMEM_PROTECT_TRACE=1` 判定，比猜"是不是预算给少了"可靠。
 
 ---
@@ -227,7 +227,7 @@ KVMEM_AAV_TRACE row=… frontier=… blocks=… selected=… cold=… intermitte
 编辑规则（bat 头部也写了）：除最后一行外，每条参数行末尾必须是 ` ^`（前后各一个空格）；
 最后一行不能有 `^`，否则会传一个空参数、服务在加载前就报 `unknown argument:`。
 
-bat 里现在只开两个开关：`--kvmem-action-lrfu`（LRFU 保留分）与 `--kvmem-protect-semantics`
+bat 里现在只开两个开关：`--kvmem-lrfu`（LRFU 保留分）与 `--kvmem-protect-semantics`
 （§8.1：按需救援 system 块与当前 user 任务，上限 25% 窗口）。`--kvmem-query-union`、
 `--kvmem-score-agg`、`--kvmem-conf-*`、`--kvmem-aav-*`、`--kvmem-action-region` 都已删除，
 写进命令行会直接启动报错（错误信息里带删除原因和实测数据）。
@@ -250,7 +250,7 @@ set "KVMEM_AAV_TRACE=1"
 |---|---|---|
 | `--kvmem-lrfu-lambda` | (0,1) | `--kvmem-lrfu-lambda must be in (0, 1)` |
 | `--kvmem-lrfu-top-frac` | (0,1] | 超出范围即启动错误（同类报错） |
-| `--kvmem-lrfu-lambda` / `--kvmem-lrfu-top-frac`（任一显式给出） | 必须同时有 `--kvmem-action-lrfu` | `… require --kvmem-action-lrfu: without the LRFU keep score there is no decay or hit threshold to configure` |
+| `--kvmem-lrfu-lambda` / `--kvmem-lrfu-top-frac`（任一显式给出） | 必须同时有 `--kvmem-lrfu` | `… require --kvmem-lrfu: without the LRFU keep score there is no decay or hit threshold to configure` |
 | `--kvmem-sink-tokens` | 0（一页）或 ≥ 64 | `KVMem --kvmem-sink-tokens must be 0 (one page) or at least 64: a smaller non-zero value rounded to one page silently` |
 | `--kvmem-sink-tokens` + `--kvmem-recent-tokens` | 取整到 64 页后不得超过 `--kvmem-budget` | `KVMem sink and recent tokens exceed --kvmem-budget after rounding to 64-token pages` |
 | `--kvmem-score-agg` | 不接受任何值 | `was removed: GQA aggregation is always the folded mean…` |
@@ -302,13 +302,13 @@ set "KVMEM_AAV_TRACE=1"
 
 ## 10. 状态
 
-- **现行 bat 只开两个开关**：`--kvmem-action-lrfu`（λ、top-p 用默认值）与 `--kvmem-protect-semantics`
+- **现行 bat 只开两个开关**：`--kvmem-lrfu`（λ、top-p 用默认值）与 `--kvmem-protect-semantics`
   （按需救援 + 25% 上限）。代码、CLI 接线、单元测试与 ninfer 二进制均已就位，`--help` 里有说明。
 - **已删除**：`--kvmem-query-union` / `--kvmem-action-region`（动作探针从未激活）、
   `--kvmem-score-agg`（GQA 恒为折叠均值）、`--kvmem-conf-*`（静态池下无收益，实测掉 23 针召回）、
   `--kvmem-aav-*`（论文 §5.1 的 AAV 只是诊断）。传任一都是**启动错误**并给出原因与实测数据。
 - `--kvmem-sink-tokens` 与 `--kvmem-lrfu-*` 不再有"静默失效"：非零 sink 小于一页、或 LRFU 参数
-  没配 `--kvmem-action-lrfu`，都在启动期报错（见第 7 节）。
+  没配 `--kvmem-lrfu`，都在启动期报错（见第 7 节）。
 - AAV 保留为诊断：`KVMEM_AAV_TRACE=1` 打印分类行；语义保护用 `KVMEM_PROTECT_TRACE=1`；
   `I:\model\256k-recall-test\aav_summary.py` 已同步到新的行格式（此前的正则与实现脱节，匹配不到任何行）。
 - `backends/patches/ninfer-kvmem.patch` 与 `backends/versions.json` 已按当前子模块工作树重生成，

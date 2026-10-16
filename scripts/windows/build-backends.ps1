@@ -8,6 +8,7 @@ param(
     [string]$CudaArchitectures = '120a',
     [ValidateRange(1, 64)][int]$Jobs = 8,
     [string[]]$CMakeArgs = @(),
+    [string]$WebUiDir,
     [switch]$ConfigureOnly,
     [switch]$BuildOnly,
     [switch]$SkipMsvcIncludePrefix,
@@ -37,6 +38,21 @@ $plans = foreach ($name in $backends) {
             '-DNINFER_BUILD_BENCHMARKS=OFF', "-DCMAKE_CUDA_ARCHITECTURES=$CudaArchitectures")
         if ($CudaArchitectures -eq '120a') { $configure += '-DNINFER_SM120_NATIVE=ON' }
         $target = @('--target', 'ninfer-serve')
+        # WebUI：把 llama.cpp 那套 WebUI 编进 ninfer-serve（由 GET / 提供）。不显式传 -WebUiDir 时
+        # 自动取 build/share/kvmem/ui —— 也就是 scripts/windows/build.ps1 构建 llama.cpp 后端时
+        # 放好的那份。两者都没有就**不传该开关**：那样 exe 不含 WebUI，启动日志里也不会有
+        # `webui http://…` 那一行（CMake 侧 NINFER_WEBUI_DIR 默认为空，这是合法的）。
+        $webui = $WebUiDir
+        if (!$webui) {
+            $candidate = Join-Path $source 'build/share/kvmem/ui'
+            if (Test-Path -LiteralPath (Join-Path $candidate 'index.html')) { $webui = $candidate }
+        }
+        if ($webui -and
+            !(Test-Path -LiteralPath (Join-Path $webui 'index.html')) -and
+            !(Test-Path -LiteralPath (Join-Path $webui 'index.html.gz'))) {
+            throw "WebUiDir has no index.html: $webui"
+        }
+        if ($webui) { $configure += "-DNINFER_WEBUI_DIR=$webui" }
     }
     if ($name -ne 'core' -and $CudaPath) {
         $configure += @("-DCMAKE_CUDA_COMPILER=$CudaPath/bin/nvcc.exe", "-DCUDAToolkit_ROOT=$CudaPath")
