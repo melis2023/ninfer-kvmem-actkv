@@ -65,6 +65,22 @@ ninfer 后端（模型 `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.ninfer`）：
 
 ------------------------------------------------------------------------------------------------------------------------------------
 
+支持的显卡架构（本次与上游同步）
+
+本次把 ninfer 后端**同步到上游的 Turing/Volta 基线**（pin `1383a50e`，即上游为 **RTX 20 系 / V100** 准备的 `ninfer-all` 版本），本分支的 KVMem/ActKV 补丁已整体移植到该基线（40 处冲突 + 编译期修正，`scripts/prepare-backends.py --backend ninfer --check` 通过），因此以下架构都可构建：
+
+| 架构 | 代表显卡 | CUDA 要求 | 构建参数 |
+|---|---|---|---|
+| **`sm_75`（Turing）** | **RTX 20 系**（2060 / 2070 / 2080 / 2080 Ti）、TITAN RTX | CUDA 13.x 即可（本机 13.4） | `-CudaArchitectures 75` |
+| **`sm_70`（Volta）** | **V100、TITAN V** | **需 CUDA 12.8 / 12.9**（CUDA 13 会拒绝 sm_70） | `-CudaArchitectures 70` |
+| `sm_120a`（Blackwell） | RTX 50 系（本页 256K 测试用的 RTX 5060 Ti） | CUDA 13.4 + `-DNINFER_SM120_NATIVE=ON` | 默认 |
+
+- 多显卡按**每架构独立构建、独立出包**（不做多 DLL 拆分，仍是单个 `infer-kvmem-server.exe`）：
+  `scripts\windows\build-backends.ps1 -Backend ninfer -CudaArchitectures 75 -CudaPath <CUDA 路径> -Jobs 6`
+- 上游那次同步是**编译通过级**：他们自述**手头没有 RTX 20 / TITAN RTX / V100 实卡**；本页的 256K 召回测试是在 **RTX 5060 Ti（sm_120a）** 上完成的，Turing/Volta 实卡结果待你在对应卡上验证。
+
+------------------------------------------------------------------------------------------------------------------------------------
+
 前端启动器（kvmem-launcher）
 
 位置：**仓库根目录 `kvmem-launcher/`**（`launcher.py` + `web/index.html` + `config.json` + `verify.py` + `pick.py` + `start-launcher.bat`）——纯本地、零依赖的 Web 控制台，用来配置并管理 `workers\ninfer\infer-kvmem-server.exe`。
