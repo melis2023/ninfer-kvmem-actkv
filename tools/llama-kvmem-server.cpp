@@ -1,6 +1,8 @@
 #include "llama-kvmem-diag.h"
 #include "llama.h"
 #include "llama-kvmem-hooks.h"
+#include "llama-kvmem-execution.h"
+#include "kvmem/retrieval_options.hpp"
 #include "kvmem-spec.h"
 #include "kvmem-chat-sampling.h"
 #include "kvmem-chat-template.h"
@@ -127,11 +129,10 @@ static void print_usage(const char * argv0) {
             "  --kvmem-gen-reserve N      decode slack (default 256)\n"
             "  --kvmem-recent-tokens N    always-kept newest suffix in select budget (default 0)\n"
             "  --kvmem-method NAME        recency | retrieval (default retrieval)\n"
-            "  --kvmem-lrfu        ActKV action-oriented LRFU retention (default off)\n"
-            "  --kvmem-lrfu-lambda F      LRFU decay lambda, 0 < F < 1 (default 0.50)\n"
-            "  --kvmem-lrfu-top-frac F    hit fraction kept per round, 0 < F <= 1 (default 0.90)\n"
-            "  --kvmem-score-agg          REMOVED: GQA aggregation is always the folded mean\n"
-            "                             (the max variant regressed recall 39/40 -> 28/40)\n"
+            "  --kvmem-lrfu               rank by decayed retrieval history\n"
+            "  --kvmem-lrfu-lambda X      history decay [0,1] (default 0.5)\n"
+            "  --kvmem-lrfu-top-frac X    hit fraction (0,1] (default 0.9)\n"
+            "  --kvmem-score-agg MODE     mean | max across GQA heads (default mean)\n"
             "  --kvmem-query-last N       fallback query-last if last-user span missing (default 64)\n"
             "  --kvmem-query-max-tokens N cap last-user retrieval query to this many tokens\n"
             "                            from the end of the span (default 512; qw3-style)\n"
@@ -140,6 +141,9 @@ static void print_usage(const char * argv0) {
             "  --kvmem-mtp-state MODE     snapshots, auto or replay (default replay with MTP)\n"
             "  --kvmem-gpu-ratio R        cap slot pool at this fraction of GPU VRAM (default 0.50)\n"
             "  --kvmem-cpu-gb GB          CPU spill arena in GiB (0 = off)\n"
+            "  --kvmem-host-mib MIB      shared native K/V RAM quota (default unlimited)\n"
+            "  --kvmem-disk-mib MIB      active/idle native K/V SSD quota (default off)\n"
+            "  --kvmem-disk-path PATH    process-local native K/V spill directory\n"
             "  --kvmem-nvme-gb GB         NVMe file in GiB (0 = off)\n"
             "  --kvmem-nvme-dir PATH      NVMe directory (default /tmp/kvmem_nvme)\n"
             "  --kvmem-harvest-v          prefill D2H V with raw-K (default off; RAM until NVMe flush)\n"
@@ -972,25 +976,14 @@ int main(int argc, char ** argv) {
         } else if (eq(arg, "--kvmem-method")) {
             const char * m = need(arg);
             st.kparams.method = (eq(m, "retrieval") || eq(m, "retrieve")) ? 1 : 0;
-        } else if (eq(arg, "--kvmem-action-lrfu")) {
-            fprintf(stderr, "--kvmem-action-lrfu was renamed: use --kvmem-lrfu (the upstream "
-                            "name; the switch itself is unchanged).\n");
-            return 1;
         } else if (eq(arg, "--kvmem-lrfu")) {
-            st.kparams.action_lrfu = true;
+            st.kparams.lrfu = true;
         } else if (eq(arg, "--kvmem-lrfu-lambda")) {
-            st.kparams.lrfu_lambda = std::strtof(need(arg), nullptr);
+            st.kparams.lrfu_lambda = kvmem::parse_lrfu_real(need(arg), true);
         } else if (eq(arg, "--kvmem-lrfu-top-frac")) {
-            st.kparams.lrfu_top_frac = std::strtof(need(arg), nullptr);
+            st.kparams.lrfu_top_fraction = kvmem::parse_lrfu_real(need(arg), false);
         } else if (eq(arg, "--kvmem-score-agg")) {
-            // Gone rather than defaulted: GQA aggregation is the folded mean, always.
-            // The max-over-query-heads variant regressed the 40-needle / 256k recall
-            // from 39/40 to 28/40, and a stub that accepted "mean" only implied the
-            // aggregation was configurable when it is not.
-            fprintf(stderr, "--kvmem-score-agg was removed: GQA aggregation is always the "
-                            "folded mean (the max variant regressed recall 39/40 -> 28/40); "
-                            "drop the flag.\n");
-            return 1;
+            st.kparams.score_agg = kvmem::parse_score_aggregation(need(arg));
         } else if (eq(arg, "--kvmem-query-last")) {
             st.query_last_fallback = kvmem_cli_int(arg, need(arg));
         } else if (eq(arg, "--kvmem-query-replay")) {
@@ -1121,6 +1114,16 @@ int main(int argc, char ** argv) {
     requested_conversations = options.conversations;
     options.conversations = std::max(options.conversations, options.parallel);
     st.kparams.sink_tokens = static_cast<uint32_t>(options.sink_tokens);
+    st.kparams.payload_host_bytes = options.payload_host_bytes;
+    st.kparams.payload_disk_bytes = options.payload_disk_bytes;
+    st.kparams.payload_disk_dir = options.payload_disk_dir.empty() ? nullptr : options.payload_disk_dir.c_str();
+    if (options.payload_disk_dir.empty() != (options.payload_disk_bytes == 0))
+        throw std::invalid_argument("--kvmem-disk-path and --kvmem-disk-mib must be provided together");
+    if (options.payload_disk_bytes && (!options.payload_host_bytes || !st.kparams.enabled))
+        throw std::invalid_argument("KVMem SSD requires --kvmem-host-mib and KVMem enabled");
+    if (options.payload_disk_bytes && (options.session_disk_bytes || st.kparams.cpu_bytes ||
+            st.kparams.nvme_bytes || st.kparams.raw_k_nvme))
+        throw std::invalid_argument("shared KV SSD cannot be combined with legacy spill stores");
     // Cross-checks on the two new flags, thrown so they reach the
     // "invalid arguments (source=...)" printer below the way every other
     // rejection here does. Neither can fire without one of the flags, so the
@@ -1341,9 +1344,14 @@ int main(int argc, char ** argv) {
         cparams.n_outputs_max_per_seq = n_out;
         cparams.n_rs_seq = (uint32_t) std::max(0, st.spec_n_max);
     }
+    std::shared_ptr<kvmem::HostKvStorage> shared_payload_storage;
     auto initialize_lane = [&](ServerState & st) {
         kvmem_execution_scope scope(st.execution.get());
         llama_kvmem_set_params(&st.kparams);
+        if (options.payload_disk_bytes) {
+            st.execution->payload_domains = options.parallel;
+            st.execution->payload_storage = shared_payload_storage;
+        }
         st.ctx = llama_init_from_model(st.model, cparams);
         if (!st.ctx) {
             fprintf(stderr, "KVMEM_STARTUP_ERROR failed to create context; check --ctx-size, KV types, --flash-attn and available memory\n");
@@ -1372,6 +1380,12 @@ int main(int argc, char ** argv) {
             }
         }
 
+        if (st.kparams.payload_disk_bytes && !shared_payload_storage)
+            shared_payload_storage = st.execution->payload_storage;
+        if (st.kparams.payload_disk_bytes && !llama_kvmem_payload_budget()) {
+            LOG_ERR("srv    KVMEM SSD RAM quota must hold a native working window including MTP\n");
+            return false;
+        }
         return true;
     };
     if (!initialize_lane(st)) return 1;
@@ -1436,19 +1450,20 @@ int main(int argc, char ** argv) {
         } else {
             st.conv_limits.max_stores = options.conversations;
             st.conv_limits.max_bytes = options.conversation_bytes;
-            if (options.session_disk_bytes) {
+            if (options.session_disk_bytes || options.payload_disk_bytes) {
                 try {
                     st.session_files = std::make_unique<kvmem_session_files>(
-                        std::filesystem::u8path(options.session_cache_dir), options.session_disk_bytes,
+                        std::filesystem::u8path(options.payload_disk_bytes ? options.payload_disk_dir : options.session_cache_dir),
+                        options.payload_disk_bytes ? options.payload_disk_bytes : options.session_disk_bytes,
                         [](bool warning, const std::string & message) {
                             if (warning) { LOG_WRN("srv    KVMEM session cache %s\n", message.c_str()); }
                             else { LOG_INF("srv    KVMEM session cache %s\n", message.c_str()); }
-                        });
+                        }, kvmem_execution_spill_file(st.execution.get()));
                 } catch (const std::exception & e) {
                     LOG_ERR("srv    KVMEM session cache initialization failed: %s\n", e.what()); return 1;
                 }
                 LOG_INF("srv    KVMEM session disk cache=%s quota=%llu bytes\n", st.session_files->directory().u8string().c_str(),
-                    (unsigned long long)options.session_disk_bytes);
+                    (unsigned long long)st.session_files->limit());
             }
             st.conv_active = st.conv_table.add(llama_kvmem_store_current());
             st.conv.emplace(st.conv_active, kvmem_conversation{});
@@ -1657,6 +1672,12 @@ int main(int argc, char ** argv) {
                 sessions["disk_errors"] = conv.disk_errors;
             }
             if (lane_conversations) slot["kvmem"]["conversations"] = lane_conversations->status((int)lane);
+            const auto storage = llama_kvmem_execution_storage_stats(st.execution.get());
+            slot["kvmem"]["storage"] = {
+                {"host_payload_bytes", storage.host_bytes}, {"host_payload_budget_bytes", storage.host_capacity},
+                {"disk_payload_bytes", storage.disk_bytes}, {"disk_payload_budget_bytes", storage.disk_capacity},
+                {"disk_read_bytes", storage.read_bytes}, {"disk_written_bytes", storage.written_bytes},
+                {"disk_reads", storage.reads}, {"disk_writes", storage.writes}, {"disk_errors", storage.errors}};
             all_busy = all_busy && busy;
             slots.push_back(std::move(slot));
         }
@@ -1913,11 +1934,23 @@ int main(int argc, char ** argv) {
             if (lane_conversations) lane_conversations->attach(*operation, st, cr.conversation_id);
             else if (st.session_files) llama_driver_begin_disk_request(st, *parsed_prompt, cr.conversation_id, cr.max_tokens);
             else llama_driver_begin_request(st, *parsed_prompt, cr.conversation_id);
+            if (lane_conversations) lane_conversations->reserve_payload(*operation, st, *parsed_prompt, cr.max_tokens);
+            else llama_driver_check_payload_budget(st, *parsed_prompt, cr.max_tokens);
         } catch (const std::exception & e) {
             res.status = 503;
             res.set_content(json{{"error", e.what()}}.dump(), "application/json"); return;
         }
         st.active_prompt = parsed_prompt;
+        st.history_input_end = uint32_t(toks.size());
+        if (st.kparams.lrfu && !formatted.generation_prompt.empty() &&
+            prompt.size() >= formatted.generation_prompt.size() &&
+            prompt.compare(prompt.size() - formatted.generation_prompt.size(),
+                formatted.generation_prompt.size(), formatted.generation_prompt) == 0) {
+            const auto header = llama_driver_tokenize(st.vocab, formatted.generation_prompt, false);
+            if (!header.empty() && header.size() < toks.size() &&
+                std::equal(header.rbegin(), header.rend(), toks.rbegin()))
+                st.history_input_end -= uint32_t(header.size());
+        }
         st.turn_generation_rows = (uint32_t) std::min<uint64_t>(UINT32_MAX,
                 (uint64_t) std::max(0, cr.max_tokens) + (st.spec.ok ? std::max(0, st.spec_n_max) + 1u : 0u));
         int qbegin = cr.query_begin;

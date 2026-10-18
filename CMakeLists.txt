@@ -64,6 +64,7 @@ add_test(NAME kvmem-session-transfer-test COMMAND kvmem-session-transfer-test)
 # Independent processes exercise actual OS lock release on forced termination.
 add_executable(kvmem-session-cache-lifecycle-worker tests/session-cache-lifecycle-worker.cpp)
 target_include_directories(kvmem-session-cache-lifecycle-worker PRIVATE tools kvmem/include)
+target_link_libraries(kvmem-session-cache-lifecycle-worker PRIVATE kvmem)
 find_package(Python3 COMPONENTS Interpreter QUIET)
 if (Python3_Interpreter_FOUND)
     add_test(NAME kvmem-session-cache-lifecycle-test
@@ -289,7 +290,7 @@ if (KVMEM_BUILD_LLAMA)
         src/adapter
         backends/llamacpp/include
         backends/llamacpp/common)
-    target_link_libraries(llama-kvmem-cli PRIVATE llama llama-common)
+    target_link_libraries(llama-kvmem-cli PRIVATE llama llama-common kvmem)
     target_compile_features(llama-kvmem-cli PRIVATE cxx_std_17)
 
     add_executable(llama-kvmem-server tools/llama-kvmem-server.cpp tools/llama-kvmem-driver.cpp tools/kvmem-spec.cpp

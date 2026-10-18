@@ -7,17 +7,17 @@
     "license_file": "backends/llamacpp/LICENSE",
     "local_changes": "KVMem integration is maintained in the versioned patch; the submodule remains pinned to base_commit",
     "patch": "backends/patches/llamacpp-kvmem.patch",
-    "patch_sha256": "3d24ff686dac57f170e7577c6e6bddfb80733a051b962802e3b6958e29236a96",
-    "patched_tree": "33b84ca6308bfe68fccdfca4b805991d2c220681"
+    "patch_sha256": "6004bd7d148f1a4eb10ed816be81228fdff5d9686bac90374f55c2f4bc2494b5",
+    "patched_tree": "b190e67570206f5f1aa8c2adbc1cb05c914d9354"
   },
   "ninfer": {
     "path": "backends/ninfer",
     "upstream": "https://github.com/iamwavecut/ninfer-all.git",
-    "base_commit": "1383a50e415348e6fca4c7ecfd85ceb79b0426d5",
+    "base_commit": "8319e8f512477d0cfdef89e16c17c1ba9f9bc7b3",
     "license_file": "backends/ninfer/LICENSE",
     "local_changes": "KVMem integration is maintained in the versioned patch; the submodule remains pinned to base_commit",
     "patch": "backends/patches/ninfer-kvmem.patch",
-    "patch_sha256": "59048c3aa4a149e9a46afce26157bf304f0d4b60f733a96df055f96ecb3f8523",
-    "patched_tree": "74b3ab9b0728c24bbb002db0965b169732fe13fd"
+    "patch_sha256": "84d173228793853d889881f41ccf4d21b6cd899e81f612841cc5e149240119c4",
+    "patched_tree": "cdcc146ff28e07092c12d2a8f590b9ba7fa8f421"
   }
 }

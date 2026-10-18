@@ -1,0 +1,6 @@
+{
+  "source_url": "https://github.com/ggml-org/llama.cpp/releases/download/b11165/llama-b11165-ui.tar.gz",
+  "tag": "b11165",
+  "archive_sha256": "1cfd2d7335dfd1a5a07d00154424a92df3a18088c4ce72c9200f8f9b54cf46f3",
+  "webui_dir": "C:\\Users\\leyew\\AppData\\Local\\KVMem\\backend-p0p1-20261002\\results\\windows50-task2-b764974-20261003\\ui-b11165\\llama-b11165"
+}

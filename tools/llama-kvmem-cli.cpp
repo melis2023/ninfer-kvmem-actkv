@@ -1,5 +1,6 @@
 #include "llama.h"
 #include "llama-kvmem-hooks.h"
+#include "kvmem/retrieval_options.hpp"
 #include "kvmem-spec.h"
 #include "kvmem-server-devices.h"
 
@@ -39,11 +40,10 @@ static void print_usage(const char * argv0) {
             "  --kvmem-sink-tokens N      always-kept prefix; 0 = one block\n"
             "  --kvmem-recent-tokens N    always-kept suffix blocks (default 0)\n"
             "  --kvmem-method NAME        recency | retrieval (default retrieval)\n"
-            "  --kvmem-lrfu        ActKV action-oriented LRFU retention (default off)\n"
-            "  --kvmem-lrfu-lambda F      LRFU decay lambda, 0 < F < 1 (default 0.50)\n"
-            "  --kvmem-lrfu-top-frac F    hit fraction kept per round, 0 < F <= 1 (default 0.90)\n"
-            "  --kvmem-score-agg NAME     accepted for compatibility: only \"mean\" is valid\n"
-            "                             (the max variant was removed; it regressed recall)\n"
+            "  --kvmem-lrfu               rank by decayed retrieval history\n"
+            "  --kvmem-lrfu-lambda X      history decay [0,1] (default 0.5)\n"
+            "  --kvmem-lrfu-top-frac X    hit fraction (0,1] (default 0.9)\n"
+            "  --kvmem-score-agg MODE     mean | max across GQA heads (default mean)\n"
             "  --kvmem-query-last N       last N prompt tokens are the retrieval query (default 64)\n"
             "  --kvmem-force-substr S     force-select the block containing substring S\n"
             "  --kvmem-gpu-ratio R        cap slot pool at this fraction of GPU VRAM (default 0.50)\n"
@@ -174,26 +174,14 @@ int main(int argc, char ** argv) {
             } else {
                 kparams.method = 0;
             }
-        } else if (eq(arg, "--kvmem-action-lrfu")) {
-            fprintf(stderr, "--kvmem-action-lrfu was renamed: use --kvmem-lrfu (the upstream "
-                            "name; the switch itself is unchanged).\n");
-            return 1;
         } else if (eq(arg, "--kvmem-lrfu")) {
-            kparams.action_lrfu = true;
+            kparams.lrfu = true;
         } else if (eq(arg, "--kvmem-lrfu-lambda")) {
-            kparams.lrfu_lambda = std::strtof(need(arg), nullptr);
+            kparams.lrfu_lambda = kvmem::parse_lrfu_real(need(arg), true);
         } else if (eq(arg, "--kvmem-lrfu-top-frac")) {
-            kparams.lrfu_top_frac = std::strtof(need(arg), nullptr);
+            kparams.lrfu_top_fraction = kvmem::parse_lrfu_real(need(arg), false);
         } else if (eq(arg, "--kvmem-score-agg")) {
-            // GQA aggregation is always the folded mean now. The max variant
-            // regressed the 40-needle / 256k recall from 39/40 to 28/40, so it
-            // is refused rather than silently ignored.
-            if (eq(need(arg), "max")) {
-                fprintf(stderr, "--kvmem-score-agg max was removed: it regressed recall "
-                                "(39/40 -> 28/40). GQA aggregation is the folded mean; "
-                                "drop the flag.\n");
-                return 1;
-            }
+            kparams.score_agg = kvmem::parse_score_aggregation(need(arg));
         } else if (eq(arg, "--kvmem-query-last")) {
             query_last = std::atoi(need(arg));
         } else if (eq(arg, "--kvmem-force-substr")) {
@@ -520,6 +508,9 @@ int main(int argc, char ** argv) {
     const bool recr_ckpt = do_retr && llama_kvmem_has_recurrent();
     const int prefix_end = recr_ckpt ? kparams.query_begin : eval_end;
 
+    if (kparams.lrfu) llama_kvmem_set_request_span(kparams.query_begin,
+        std::min(kparams.query_end > 0 ? kparams.query_end : eval_end, eval_end), kparams.force_pos);
+    llama_kvmem_begin_retrieval_round();
     if (decode_span(0, prefix_end, "prefill") != 0) {
         return 1;
     }
@@ -631,6 +622,7 @@ int main(int argc, char ** argv) {
 
     std::vector<llama_token> gen;
     gen.reserve(static_cast<size_t>(n_predict));
+    llama_kvmem_accept_retrieval_round();
     llama_kvmem_end_prefill_capture();
     llama_synchronize(ctx);
     const auto t_gen0 = std::chrono::steady_clock::now();

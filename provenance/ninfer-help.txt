@@ -1,0 +1,425 @@
+usage: C:\Users\leyew\AppData\Local\KVMem\windows-ninfer-938c2f1-20261011\packages\kvmem-ninfer-windows-rtx50-sm120a-938c2f1\workers\ninfer\ninfer-kvmem-server.exe <model.ninfer> [options]
+
+Serves the OpenAI Responses/Chat Completions and Anthropic Messages APIs.
+  --help, -h                    show this help and exit
+
+MODEL & CONTEXT
+  --kvmem-budget N              selected history B, tokens aligned to 64
+  --kvmem-lrfu               rank by decayed retrieval history
+  --kvmem-lrfu-lambda X      history decay [0,1] (default 0.5)
+  --kvmem-lrfu-top-frac X    hit fraction (0,1] (default 0.9)
+  --kvmem-score-agg MODE     mean | max across GQA heads (default mean)
+  --kvmem-gen-reserve N         append workspace R, tokens aligned to 64
+  --kvmem-host-mib N            Host native KV payload budget H, MiB
+  --kvmem-sink-tokens N         always-kept prefix; default 0 = one 64-token
+                                page; positive values round down, minimum one page
+  --kvmem-recent-tokens N       always-kept newest suffix; default 64 (one page);
+                                minimum 64; values round down to whole pages
+  --kvmem-sessions N            retained Host histories, 1..16 (default 4)
+  --kvmem-disk-path PATH        Ephemeral active/idle KV spill directory
+  --kvmem-disk-mib N            Shared SSD payload quota D, MiB
+                                KVMem uses B+R device tokens and its own
+                                verified history reuse; BF16/INT8/FP8/NVFP4/K8V4,
+                                RK8V4/RK4V4/RK4V4-E8/RK2V4-E8,
+                                1..8 text or resident/CPU-vision lanes,
+                                ordinary/fixed/adaptive MTP1..15; ngram1..63,
+                                C2..8 automatically cap ngram at 15;
+                                ngram text/images use all nine KV formats,
+                                SSD: process-local active/idle tiering; fast prefill supports
+                                INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 text/images
+  --kvmem-verify-transfers      check restored KV/GDN bytes (diagnostic)
+  --max-context N               logical context ceiling of each request (default
+                                8192)
+  --max-concurrency N           requests decoded together, 1..8 (default 1)
+  --prefill-chunk N             prefill chunk in tokens, a multiple of 128
+                                (default 1024)
+  --default-max-tokens N        output limit of a request that sets none
+                                (default: the largest budget that still lets
+                                every lane be admitted at once, the remaining
+                                context with one lane)
+  --model-id ID                 public model name instead of the artifact's
+                                metadata.name
+  --chat-template FILE          replace the artifact's chat template at startup
+  --device N                    CUDA device index (default 0)
+  --devices A,B,...             one pipeline stage per listed device, 2..8
+                                (Linux/Windows); excludes --device
+  --stage-layers A,B,...        layers per stage in --devices order (default:
+                                split by free memory)
+  --expert-residency device|host|disk  Qwen3.8-Flash-Next: expert banks in GPU
+                                memory (default), in pinned host memory read
+                                across the bus, or left in the artifact's files
+                                and streamed into the device expert cache
+  --expert-cache-mib N|auto     with host or disk experts: device memory for the
+                                most used experts (default auto: what is free;
+                                0 turns the host cache off; disk needs one)
+  --ngram-table PATH            Qwen3.8-Flash-Next: the n-gram table artifact,
+                                for a model published without its table
+  --ngram-ram                   Qwen3.8-Flash-Next: load the n-gram table into
+                                RAM instead of reading its rows from the file
+  --no-ngram-table              Qwen3.8-Flash-Next: run without the n-gram table.
+                                Non-standard experimental mode: the model was
+                                trained with the table and degrades badly
+                                without it (WikiText-2 perplexity 2.66 -> 5.01)
+  --no-cuda-graph               decode without CUDA Graphs (on by default)
+  --cuda-graph-allowance-mib N  CUDA Graph driver-state allowance taken from the
+                                KV sizing budget (default 0: computed per
+                                profile)
+  --device-profile auto|off|calibrate
+                                per-GPU route profile: auto uses the stored or
+                                built-in one and calibrates a device that has
+                                none; off keeps the compiled routes; calibrate
+                                measures anew (default auto)
+  --device-profile-path FILE    profile file instead of the user cache
+  --context-cost-presets FILE   runtime context-cost presets over the
+                                compiled-in values
+
+PRECISION & KERNELS
+  --fast-prefill-kernel         prefill an int8 or rk* KV cache with the fast
+                                prompt-attention kernel (FP16 PV per 64-key
+                                tile) and round --prefill-chunk down to whole
+                                attention waves; an nvfp4 cache past 2048 keys
+                                with its FP4 Tensor Core QK kernel (Blackwell)
+  --prefill-cublas              hand wide prefill GEMMs to cuBLAS: a large
+                                prefill speedup for a small perplexity cost;
+                                wants a larger --prefill-chunk
+  --no-prefill-cublas-projections
+                                with --prefill-cublas, keep the attention and
+                                GDN input projections off that route
+  --no-prefill-a8               prefill every projection on the A16 routes
+                                instead of the integer-activation ones
+  --mlp-a8-decode               integer-activation MLP gate_up at decode and
+                                verify widths
+  --lm-head-q4 | --lm-head-q6   store the output head as Q4 or Q6 while loading
+                                (Q4 costs +0.69% perplexity, Q6 +0.01%)
+  --embedding-q4 | --embedding-q6
+                                store the token embedding as Q4 or Q6 while
+                                loading
+  --mtp-experts-q4              Qwen3.6-35B-A3B: store the MTP layer's routed
+                                experts in the text layers' formats
+  --gdn-state-fp16              keep the GDN recurrent state in FP16 (halves
+                                each host state image)
+  --rope-yarn                   past the model's native window, apply Qwen's
+                                YaRN at factor max-context / native instead of
+                                unscaled RoPE
+  --rope-yarn-factor F          apply YaRN at this fixed factor, 1..4, to every
+                                position whatever --max-context is (default 1:
+                                as --rope-yarn decides)
+  --rope-scaling-factor F       instead of YaRN, interpolate positions past
+                                --rope-scaling-original-context linearly by F,
+                                1..32 (default 1: off)
+  --rope-scaling-original-context N
+                                the interpolation threshold (default: the
+                                model's native window)
+  --cuda-memory-policy MODE    behavior when dedicated GPU memory is insufficient:
+    default                     plan against CUDA-reported free memory; ordinary
+                                driver behavior, no dedicated-residency guarantee
+    mixed                       attempt requested allocations beyond CUDA free;
+                                allow Windows to borrow system RAM for device data.
+                                Placement is driver-managed, not forced to Shared;
+                                inference may become much slower. Auto KV is capped
+                                at one page-rounded context window per concurrent
+                                request; allocation failure is reported, not retried
+    strict                      require observed dedicated-VRAM residency; equals
+                                strict-64-128 (64 MiB reserve, 128 MiB probe step)
+    strict-RESERVE-STEP          customize both values in MiB; RESERVE >= 0,
+                                STEP 1..16384. Example: strict-128-64. Reserve is
+                                verified at startup, not permanently locked; step
+                                controls probes, final device arenas stay contiguous
+                                strict selects its required cache automatically.
+                                --host-cache-mib independently sizes CPU context
+                                retention, not device-data system-RAM fallback.
+                                mixed/strict: Windows single-GPU text, no WDDM mode;
+                                no model suspend, router, grafts or qwen4_exp.
+  --wddm-evictable-budget       Windows D3D12 builds: budget against dedicated
+                                memory, holding arenas resident
+
+ROUTER (several models, llama.cpp-compatible; give no artifact path)
+  --models-dir DIR              serve every .ninfer in DIR (and each subdirectory
+                                holding one) by its file or directory name
+  --models-preset FILE          INI presets: [id] sections with model = PATH and
+                                options without dashes; [*] applies to all
+  --models-max N                models loaded at once (default 1, 0 = no limit);
+                                the least recently used idle one sleeps (with
+                                --model-suspend) or unloads to make room
+  --no-models-autoload          a request for a model that is not loaded fails
+                                instead of loading it (?autoload=1 overrides)
+  --sleep-idle-seconds N        put a model idle for N s to sleep (needs
+                                --model-suspend); also without a router
+  --unload-idle-seconds N       unload a model idle for N s
+
+MODEL SUSPEND
+  --model-suspend               enable POST /v1/models/{id}/suspend and /resume
+                                (and /models/unload, /models/load): device memory
+                                at fixed addresses, released while suspended;
+                                needs CUDA virtual memory management
+  --suspend-snapshot M          where suspended state waits: pageable (default;
+                                host memory only while suspended) or pinned
+                                (reserved at startup, faster transfers)
+  --suspend-weights S           resume reads the weights from: artifact
+                                (default) or host (a host copy taken at suspend:
+                                weight-sized host memory, resume at bus speed)
+  --no-auto-resume              a request while suspended fails (503) instead of
+                                resuming the model (also per suspend request)
+
+KV CACHE
+  --kv-capacity N|auto          shared KV capacity in tokens (default
+                                --max-context, or auto with
+                                Hybrid/strict); auto follows --cuda-memory-policy
+  --kv-headroom-mib N           default policy only: auto KV leaves free (default
+                                1024); alias --vram-headroom-mib
+  --kv-dtype T                  KV storage: bf16 (default), int8, fp8, rk8v4,
+                                rk4v4, rk4v4-e8, rk2v4-e8, nvfp4 or k8v4
+
+CONTEXT CACHE
+  --no-prefix-reuse             disable compatible-prefix caching (on by
+                                default); excludes the options below
+  --device-state-slots N        checkpoint states on the device beyond the
+                                active lanes (default max-concurrency)
+  --host-state-slots N          pinned host checkpoint states (default 8)
+  --host-kv-mib N               pinned host KV in MiB (default 8192)
+  --host-cache-mib N            one pinned host RAM ceiling instead of the two
+                                above: host states for every checkpoint the
+                                capture path creates (at most half), more
+                                automatic anchors with the headroom, host KV the
+                                rest; with --use-alt-prefix-caching the pool KV
+                                blocks and state snapshots share (default 8192,
+                                0 keeps the cache on the device)
+  --max-private-continuations N private continuation catalog (default 2x
+                                max-concurrency)
+  --max-shared-prefixes N       shared stable-prefix catalog (default
+                                max(max-concurrency,7))
+  --max-long-anchors-per-continuation N
+                                long anchors kept per continuation (default 2, 4
+                                with --auto-long-anchors)
+  --auto-long-anchors           anchor up to that many message boundaries of
+                                every request, so a request that rewrites
+                                earlier history resumes from the nearest anchor
+                                instead of root (off)
+  --branch-anchors              anchor a request where its prompt stops matching
+                                a retained conversation, when no checkpoint lies
+                                near that depth, so the next request diverging
+                                there resumes from it (off)
+  --no-endpoint-anchors         do not keep the endpoint a request resumes and
+                                extends as a long anchor; a later request that
+                                diverges there (another reply, an edited last
+                                message) then re-prefills the conversation (kept)
+  --long-anchor-spacing N       with --auto-long-anchors, minimum tokens between
+                                anchors, doubling per anchor back from the
+                                prompt end (default 1024; 0 anchors every
+                                boundary)
+  --max-cache-markers-per-request N
+                                client cache markers one request may carry
+                                (default 4)
+  --auto-prefix-grid            offer shared candidates on a token grid, so
+                                callers whose prompts start alike share a prefix
+                                without a client hint; a grid frontier is
+                                published once two callers ask for it
+  --derive-session-keys         give a request without a session key one derived
+                                from its instructions and first user message,
+                                so the conversation keeps a session lineage
+                                and live-session retention (default off)
+  --context-cache-policy default|rolling
+                                rolling: a capture that extends a resident
+                                checkpoint inherits its demand, for one
+                                conversation whose prompt only grows
+  --release-diverged-checkpoints
+                                a conversation's private checkpoint that its
+                                next prompt diverges from keeps no value and
+                                goes first
+  --thorough-admission-search   search up to 250 ms for a new request's reuse
+                                plan even while others decode (otherwise 10 ms),
+                                longer for a costly request, exploring every
+                                eligible option
+  --recency-eviction            under pressure give up the least recently used
+                                owners first, only as many as needed, and demote
+                                kept ones to Host
+  --value-aware-demote          under pressure prefer evicting the conversations
+                                cheapest to rebuild and demoting the costliest
+  --kv-lease-growth             reserve a 4096-token output window and extend it
+                                instead of the whole max_tokens budget; an answer
+                                the pool cannot extend ends with length
+  --concurrent-prefill          admit waiting requests to free lanes while other
+                                requests prefill
+  --disk-kv-path DIR            disk tier: evicted continuations write their KV
+                                and states there, per artifact and profile, and
+                                survive restarts
+  --disk-kv-gib N               disk tier budget (default 64)
+  --disk-kv-restore             seed a new request's matching prefix from the
+                                disk tier
+  --disk-kv-directstorage       read restores through DirectStorage (Windows
+                                builds with NINFER_DIRECTSTORAGE)
+  --slot-save-path DIR          enable POST /slots/{id}?action=save|restore|erase,
+                                which writes a retained session to a file in DIR
+                                or restores one from it
+  --auto-save-evicted           write a retained session back to the slot file it
+                                was last saved to or restored from before an
+                                involuntary eviction destroys it (needs
+                                --slot-save-path)
+  --use-alt-prefix-caching      the hybrid prefix cache instead of the checkpoint
+                                catalog: content-addressed KV blocks and sparse
+                                state snapshots; free VRAM becomes block cache
+                                and --host-cache-mib sizes the Host tier;
+                                excludes the catalog options above
+  --use-original-prefix-caching the checkpoint catalog, which is the default;
+                                accepted for command lines that name it
+  --device-snapshot-slots N     hybrid: device state snapshot slots (default
+                                concurrency + 1; + 2 without a Host tier)
+  --cache-taps-per-request N    hybrid: new prefill snapshots per request
+                                (default 8; 2 without a Host tier)
+  --cache-tap-ladder N          hybrid: ladder base in tokens for history
+                                snapshots (default max(4096, 2x prefill chunk))
+  --cache-tap-min-gap N         hybrid: minimum tokens between ladder snapshots
+                                (default max(1024, prefill chunk))
+  --prefix-cache-file PATH      hybrid: restore the Host tier from PATH at
+                                startup when this binary wrote it for the same
+                                artifact and KV format, and save it there when
+                                the server stops (Ctrl+C twice) (default off)
+
+SPECULATIVE DECODING (off by default)
+  --spec mtp|dflash|dflash2     speculative decoding backend
+  --draft-tokens N              drafts per round, 1..15
+  --lm-head-draft               draft with the optimized proposal head
+  --adaptive-mtp                each MTP round verifies 3..--draft-tokens
+                                drafts, the width the drafts' measured survival
+                                and round cost favor; greedy output is unchanged
+  --mtp-attention-window N      the MTP draft head attends to its first 64 keys
+                                and the newest N before its query, not the
+                                whole history; verification is unchanged
+                                (default 0: whole history)
+  --ngram-draft-tokens N        copy up to N tokens (1..63) per round from
+                                earlier prompt, tool-result or output text,
+                                verified alongside --spec; on with 15 whenever
+                                --spec is set, 0 disables it; widths above 15
+                                automatically reduce to 15 with concurrency >1
+  --ngram-min-match N           shortest match a copy is drawn from, 4..64
+                                (default 12)
+  --ngram-archive-mib N         keep finished requests' copy sources in RAM for
+                                later requests naming the same
+                                X-NInfer-Draft-Session (default 0: off)
+  --ngram-session-mib N         per-session share of that archive (default 128)
+  --ngram-native-sessions       also recognize the session identities Kilo,
+                                Codex and Claude send
+  --lookup-ngram N              context-lookup drafting alongside --spec: the
+                                last N tokens are matched against the sequence
+                                so far and what followed is proposed (default 0:
+                                off; disabled with KVMem)
+
+VISION (off by default)
+  --vision                      accept images and video and load the Vision GPU
+                                allocations
+  --vision-residency resident|overlay|cpu
+                                overlay keeps the Vision tower in host memory
+                                and borrows device memory per image (alias
+                                --vision-offload); cpu runs it on CPU threads
+                                with no device Vision memory, and caps
+                                --vision-max-merged at 256 unless given
+  --vision-cpu                  --vision with --vision-residency cpu
+  --vision-max-merged N         merged tokens of one media item, 64..16384
+                                (default 16384); larger media is downscaled
+  --media-cache-mib N           retained prepared media (default 1024; 0
+                                disables)
+  --media-live-mib N            all live prepared media payloads (default 2048)
+  --media-preprocess-threads N  media preprocessing workers (default 0: auto, at
+                                most 16)
+
+SAMPLING & THINKING
+  --temperature F               0..2
+  --top-p F                     0..1
+  --top-k N                     0..20
+  --min-p F                     0..1
+  --presence-penalty F          -2..2
+  --frequency-penalty F         -2..2
+  --seed N                      seed of a request that sets none (default: fresh
+                                per request)
+  --greedy                      force temperature 0 (exact argmax)
+  --post-thinking               sample a thinking request's answer with the
+                                post-thinking preset (temperature 0.2) from the
+                                token after its reasoning closes (default off;
+                                a request opts in with a post_thinking object)
+  --post-thinking-temperature F 0..2; implies --post-thinking
+  --post-thinking-top-p F       0..1; implies --post-thinking
+  --post-thinking-top-k N       0..20; implies --post-thinking
+  --post-thinking-sampler temp=F,top_p=F,top_k=N[,min_p=F,presence=F,frequency=F]
+                                the same fields in one flag
+  --no-thinking                 disable thinking by default
+  --preserve-thinking           retain closed-turn assistant reasoning in later
+                                prompts
+  --default-thinking-budget N   cap model-origin thinking of thinking requests;
+                                control tokens count toward the output limit
+  --thinking-budget-message TEXT
+                                notice a request gets at its thinking budget;
+                                the canonical </think> close is appended when
+                                missing
+  --default-reasoning-effort E  none, minimal, low, medium, high, xhigh or max
+                                for requests that set no effort and keep
+                                thinking on
+
+PROMPT GRAFTS
+  --graft NAME=PATH             load a phantom-kv graft (a safetensors container
+                                with a .json sidecar beside it); a request
+                                selecting it with "graft": "NAME" runs as if
+                                the graft's hidden turn preceded its own
+                                messages; repeatable
+  --default-graft NAME          apply a loaded graft to every request that names
+                                none; a request opts out with "graft": ""
+
+API BEHAVIOR
+  --structured-output           accept JSON and JSON Schema response formats;
+                                native tool constraints are enabled by default
+  --unconstrained-response-format
+                                without --structured-output, generate such a
+                                request unconstrained instead of refusing it
+  --assistant-prefill           continue a Chat Completions request's trailing
+                                assistant message in place, as /v1/messages
+                                does; needs thinking disabled
+  --lenient-assistant-history   accept Responses input whose assistant text or
+                                reasoning follows function_call Items; it joins
+                                that turn, rendered before its calls
+  --usage-chunk-choice          give the streamed usage chunk a zero-delta
+                                choice, for strict parsers that reject
+                                choices:[]
+
+NETWORK & LIMITS
+  --host H                      listen address (default 127.0.0.1)
+  --port N                      listen port (default 8080)
+  --stats-port N                also serve /health, /stats, /v1/load and /metrics
+                                on port N with a worker of their own (default off)
+  --api-key KEY                 require this bearer or x-api-key value (default:
+                                none)
+  --cors                        send permissive CORS headers for browser clients
+  --no-webui                    do not serve a WebUI built in with
+                                NINFER_WEBUI_DIR on GET /
+  --webui-mcp-proxy             relay the WebUI's MCP traffic at /cors-proxy;
+                                http targets only, reaches any host and carries
+                                no API key, so only on a trusted bind
+  --max-request-mib N           request body limit, enforced before parsing
+                                (default 384)
+  --max-pending-requests N      requests waiting for admission (default 16)
+  --pending-timeout-ms N        preparation-plus-admission wait (default 600000)
+  --recover-invariant-failures  on a broken internal invariant, fail the active
+                                requests and keep serving the queue instead of
+                                failing the engine
+  --response-store-max-records N
+                                retained Responses objects (default 1024)
+  --response-store-max-mib N    Responses state budget (default 256)
+
+LOGGING
+  --request-log-jsonl FILE      append full-precision server and request records
+  --request-log-max-mib N       rotate the request log at N MiB (default 0: one
+                                unbounded file)
+  --request-log-keep N          rotated request logs kept (default 4)
+  --log-stats-interval-ms N     throughput report interval (default 5000; 0
+                                disables)
+  --log-level L                 trace, debug, info (default), warning, error,
+                                critical or off
+  --log-colours on|off          colour the console log's levels and statistics
+                                (default: levels on a console, statistics off)
+  --log-stats-panel on|off      pin session statistics beneath the console log on
+                                an interactive terminal (default off)
+
+NOTES
+  Sampler defaults come from the loaded model and the resolved thinking mode;
+  server flags and request fields override individual values.
+  context cache defaults: device-state=max-concurrency, private=2x concurrency,
+  shared=max(max-concurrency,7), anchors=2 (4 with --auto-long-anchors),
+  Host state=8 slots, Host KV=8192 MiB.

@@ -24,6 +24,10 @@ struct llama_kvmem_params {
     uint32_t sink_tokens;   // 0 → one block
     uint32_t recent_tokens; // 0 → pressure uses newest tail only
     int32_t  method;        // 0 recency, 1 retrieval (CLI default 1)
+    bool     lrfu = false;
+    double   lrfu_lambda = 0.5;
+    double   lrfu_top_fraction = 0.9;
+    int32_t  score_agg = 0; // 0 folded mean, 1 max within a GQA group
     int32_t  query_begin;   // original token pos, -1 = unset
     int32_t  query_end;     // exclusive, -1 = end of prompt
     int32_t  force_pos;     // include block containing this orig pos; -1 = none
@@ -35,16 +39,10 @@ struct llama_kvmem_params {
     const char * nvme_dir;         // directory for the ephemeral NVMe file
     bool     raw_k_nvme;           // put raw-K/V authority on NVMe (qw3-style)
     bool     harvest_v;            // prefill D2H V with K (default off; not implied by raw_k_nvme)
+    uint64_t payload_host_bytes;   // shared native K/V RAM quota; 0 = unlimited RAM
+    uint64_t payload_disk_bytes;   // shared active/idle SSD quota; 0 = disabled
+    const char * payload_disk_dir; // process-local spill directory, UTF-8
     int32_t  mtp_state;            // 0 snapshots, 1 auto, 2 replay
-    // ActKV (arXiv:2609.31395): action-oriented LRFU eviction and GQA score
-    // aggregation. Field names match the llama ActKV parameters so the same
-    // --kvmem-* flags mean the same thing on every backend.
-    bool     action_lrfu;          // --kvmem-lrfu
-    float    lrfu_lambda;          // --kvmem-lrfu-lambda; <= 0 → 0.50 (paper)
-    float    lrfu_top_frac;        // --kvmem-lrfu-top-frac; <= 0 → 0.90 (paper)
-    // GQA aggregation is the folded mean and is no longer configurable. The
-    // --kvmem-score-agg max variant regressed the 40-needle / 256k recall from
-    // 39/40 to 28/40, so the option and its max path were removed.
 };
 
 // Call before llama_init_from_model. A null pointer resets to defaults
@@ -62,6 +60,13 @@ LLAMA_API struct llama_kvmem_execution_state * llama_kvmem_execution_create(void
 LLAMA_API void llama_kvmem_execution_free(struct llama_kvmem_execution_state * state);
 LLAMA_API struct llama_kvmem_execution_state * llama_kvmem_execution_exchange(
         struct llama_kvmem_execution_state * state);
+struct llama_kvmem_storage_stats {
+    uint64_t host_bytes, host_capacity, disk_bytes, disk_capacity;
+    uint64_t read_bytes, written_bytes, reads, writes, errors;
+};
+// Read-only accounting; the execution state must remain alive during the call.
+LLAMA_API struct llama_kvmem_storage_stats llama_kvmem_execution_storage_stats(
+        const struct llama_kvmem_execution_state * state);
 
 // Legacy eval-callback entry. Always returns false so ggml does not split the
 // graph. Capture harvest runs after the full ubatch compute instead.
@@ -171,6 +176,8 @@ LLAMA_API void llama_kvmem_decode_mean_flush(void);
 
 // Score + reselect + stage-in raw-K/V for retrieval. No-op if method is recency.
 LLAMA_API void llama_kvmem_apply_retrieval(struct llama_context * ctx);
+LLAMA_API void llama_kvmem_begin_retrieval_round(void);
+LLAMA_API void llama_kvmem_accept_retrieval_round(void);
 // True when sink + [query_begin, prompt_end) fits the GPU selection budget
 // (qw3 kvmem_replay_capacity). False → skip query seq_rm/replay.
 LLAMA_API bool llama_kvmem_query_replay_fits(uint32_t query_begin, uint32_t prompt_end);
@@ -193,6 +200,7 @@ LLAMA_API void llama_kvmem_dump_kv_writeback(struct llama_context * ctx, int32_t
 #include <vector>
 #include <string>
 #include <memory>
+#include "kvmem/lrfu.hpp"
 namespace kvmem { class ContentPrefix; }
 
 namespace kvmem { class SnapshotWriter; class SnapshotReader; struct SnapshotBuffer; }
@@ -208,6 +216,9 @@ LLAMA_API void llama_kvmem_store_bundle_reset(llama_kvmem_store_bundle * bundle)
 LLAMA_API uint64_t llama_kvmem_store_active_bytes();
 LLAMA_API uint32_t llama_kvmem_store_bundle_rows(const llama_kvmem_store_bundle * bundle);
 LLAMA_API uint64_t llama_kvmem_store_bundle_bytes(const llama_kvmem_store_bundle * bundle);
+LLAMA_API uint64_t llama_kvmem_store_bundle_payload_bytes(const llama_kvmem_store_bundle * bundle);
+LLAMA_API void llama_kvmem_store_bundle_freeze(llama_kvmem_store_bundle * bundle, std::vector<kvmem::SnapshotBuffer> & buffers);
+LLAMA_API void llama_kvmem_store_bundle_thaw(llama_kvmem_store_bundle * bundle);
 // Process-local disk-cache hooks. Park leaves an empty, valid execution store
 // attached so the outgoing RAM can be released before a cold store is read.
 LLAMA_API bool llama_kvmem_store_park();
@@ -217,6 +228,9 @@ LLAMA_API void llama_kvmem_store_snapshot_write(int32_t id, kvmem::SnapshotWrite
 LLAMA_API void llama_kvmem_store_snapshot_read(int32_t id, kvmem::SnapshotReader & in);
 LLAMA_API void llama_kvmem_store_release_payload(int32_t id);
 LLAMA_API uint64_t llama_kvmem_store_capacity(uint32_t tokens);
+LLAMA_API uint64_t llama_kvmem_store_payload_capacity(uint32_t tokens);
+LLAMA_API uint64_t llama_kvmem_payload_budget(void);
+LLAMA_API uint64_t llama_kvmem_store_payload_bytes(int32_t store_id, bool disk_only);
 
 struct llama_kvmem_row_range {
     int32_t begin = 0;
@@ -241,6 +255,7 @@ struct llama_kvmem_query_state {
     std::vector<llama_kvmem_row_range> ranges;
 };
 struct llama_kvmem_tail_mean_state {
+    kvmem::LrfuState history;
     std::shared_ptr<const kvmem::ContentPrefix> prefix;
     std::vector<float> values;
     uint32_t row = 0;
@@ -272,4 +287,6 @@ LLAMA_API bool llama_kvmem_get_tail_mean(uint32_t row, llama_kvmem_tail_mean_sta
 // and checkpoint selection remain the driver's responsibility.
 LLAMA_API bool llama_kvmem_tail_mean_valid(uint32_t row, const llama_kvmem_tail_mean_state & state);
 LLAMA_API bool llama_kvmem_set_tail_mean(uint32_t row, const llama_kvmem_tail_mean_state & state);
+LLAMA_API void llama_kvmem_restore_history(const kvmem::LrfuState & state);
+LLAMA_API kvmem::LrfuState llama_kvmem_get_history();
 #endif

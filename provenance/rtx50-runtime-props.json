@@ -1,0 +1,97 @@
+{
+  "backend": "ninfer",
+  "cors_proxy_enabled": false,
+  "default_generation_settings": {
+    "n_ctx": 204800,
+    "params": {
+      "frequency_penalty": 0.0,
+      "max_tokens": 16384,
+      "min_p": 0.0,
+      "n_predict": 16384,
+      "presence_penalty": 0.0,
+      "seed": -1,
+      "temperature": 1.0,
+      "top_k": 20,
+      "top_p": 0.949999988079071
+    },
+    "speculative": true
+  },
+  "endpoint_metrics": true,
+  "endpoint_props": true,
+  "endpoint_slots": true,
+  "execution": {
+    "devices": [
+      0
+    ],
+    "mode": "single",
+    "stage_layers": []
+  },
+  "is_sleeping": false,
+  "kvmem": {
+    "capabilities": {
+      "active_kv_tiering": true,
+      "cross_backend_kv_transfer": false,
+      "disk_budget_bytes": 0,
+      "disk_restore": false,
+      "history_reuse": true,
+      "max_active_requests": 1,
+      "mtp_drafts": 4,
+      "multi_gpu_mode": "single",
+      "multimodal": true,
+      "ngram_drafts": 31,
+      "ngram_min_match": 12,
+      "original_positions": true,
+      "retained_sessions": 1,
+      "shared_host_history": true,
+      "speculative_decoding": true,
+      "ssd_enabled": false,
+      "ssd_persistence": "process",
+      "streaming": true,
+      "text_chat": true
+    },
+    "enabled": true,
+    "host_payload_budget_bytes": 12884901888,
+    "recent_tokens": 5120,
+    "reserve_tokens": 16384,
+    "selected_tokens": 36864,
+    "sink_tokens": 5120,
+    "usage": {
+      "active_payload_reservation_bytes": 0,
+      "checkpoint_bytes": 0,
+      "checkpoint_tokens": 0,
+      "disk_errors": 0,
+      "disk_hits": 0,
+      "disk_payload_budget_bytes": 0,
+      "disk_payload_bytes": 0,
+      "disk_read_bytes": 0,
+      "disk_writes": 0,
+      "disk_written_bytes": 0,
+      "enabled": true,
+      "evaluated_tokens": 0,
+      "history_evictions": 0,
+      "history_hits": 0,
+      "history_misses": 1,
+      "history_restored_bytes": 0,
+      "history_spilled_bytes": 0,
+      "history_swaps": 0,
+      "host_payload_budget_bytes": 12884901888,
+      "host_payload_bytes": 0,
+      "mtp_resident_pages": 0,
+      "reserve_tokens": 16384,
+      "resident_pages": 0,
+      "retained_payload_budget_bytes": 12884901888,
+      "retained_sessions": 0,
+      "selected_tokens": 36864,
+      "statistics_bytes": 0,
+      "statistics_staging_bytes": 2818048,
+      "transfer_staging_bytes": 0
+    }
+  },
+  "modalities": {
+    "audio": false,
+    "vision": true
+  },
+  "model_alias": "kvmem-ninfer-iq3s",
+  "model_path": "C:\\Users\\leyew\\AppData\\Local\\KVMem\\backend-p0p1-20261002\\converted-models\\Qwen3.8-27B-GSQ-RCO-IQ3_S-vision-mtp.ninfer",
+  "total_slots": 1
+}

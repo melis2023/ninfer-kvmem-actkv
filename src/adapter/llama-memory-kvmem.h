@@ -105,6 +105,10 @@ public:
     void harvest_perf_print_sum();
     void harvest_capture(struct ggml_tensor * t, int il, char which);
     void apply_retrieval();
+    void begin_retrieval_round() { runtime_->store().begin_retrieval_round(); }
+    void accept_retrieval_round();
+    void restore_history(const kvmem::LrfuState& state) { runtime_->store().restore_retrieval(state); }
+    kvmem::LrfuState history() const { return runtime_->store().retrieval_checkpoint(); }
     void set_turn_spans(const llama_kvmem_turn_spans & spans);
     bool query_contains(llama_pos row) const;
     bool query_overlaps(uint32_t n, const llama_pos * rows) const;
@@ -219,6 +223,9 @@ public:
     uint32_t conv_n_tokens(const ConvStore & conv) const;
     uint64_t conv_host_bytes(const ConvStore & conv) const;
     uint64_t host_bytes() const;
+    uint64_t payload_bytes(bool disk_only) const;
+    uint64_t payload_capacity_bytes(uint32_t tokens) const;
+    uint64_t payload_budget() const;
     uint64_t host_capacity(uint32_t tokens) const;
 
 private:
@@ -308,11 +315,6 @@ private:
     void copy_gpu_block_from_host(uint32_t block_id, int32_t gpu_slot,
                                   const void * host, uint64_t bytes);
     void score_retrieval();
-    // ActKV (arXiv:2609.31395) Alg. 1 round stamp: (attention epoch, rows).
-    // Scoring can run several times inside one working-set round (preview,
-    // apply, replay); repeats share this id and must not decay the keep score
-    // twice.
-    uint64_t lrfu_round_id() const;
     bool read_gpu_block(uint32_t block_id, uint32_t il, bool is_k, std::vector<float> & out) const;
     static void kv_stats(const char * tag, const float * a, const float * b, size_t n);
     static void tensor_to_f32_token_major(const struct ggml_tensor * t, std::vector<float> & out, int64_t * read_us = nullptr);
@@ -419,6 +421,7 @@ private:
     // Copies of the configs the constructor computes, so a sibling store for
     // another conversation is configured identically.
     kvmem::KvMemRuntimeConfig rt_cfg_{};
+    int score_agg_ = 0;
     kvmem::RawKvStoreConfig raw_cfg_{};
     std::unique_ptr<kvmem::KvMemRuntime> runtime_;
     std::unique_ptr<kvmem::RawKvStore> raw_;

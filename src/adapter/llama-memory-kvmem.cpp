@@ -3,6 +3,7 @@
 #include "llama-memory-kvmem-hybrid.h"
 #include "llama-memory-kvmem-mtp.h"
 
+#include "kvmem/mean_key_retrieval.hpp"
 #include "llama-kvmem-batch.h"
 #include "llama-kvmem-capture.h"
 #include "llama-kvmem-execution.h"
@@ -24,6 +25,7 @@
 #include "kvmem/snapshot.hpp"
 #include "kvmem/native_kv_payload.hpp"
 #include "kvmem/snapshot_buffer.hpp"
+#include "kvmem/spill_io.hpp"
 
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
@@ -123,6 +125,36 @@ llama_kvmem_execution_state::~llama_kvmem_execution_state() {
 llama_kvmem_execution_state & kvmem_current_execution() {
     static llama_kvmem_execution_state legacy;
     return active_execution ? *active_execution : legacy;
+}
+
+std::shared_ptr<kvmem::HostKvStorage> kvmem_execution_payload_storage() {
+    auto & execution = kvmem_current_execution();
+    if (!execution.payload_storage) {
+        const auto & p = execution.params;
+        std::shared_ptr<kvmem::SpillFile> spill;
+        if (p.payload_disk_bytes) {
+            if (!p.payload_host_bytes || !p.payload_disk_dir || !*p.payload_disk_dir)
+                throw std::invalid_argument("shared KV SSD requires RAM quota and directory");
+            if (p.raw_k_nvme || p.nvme_bytes || p.cpu_bytes)
+                throw std::invalid_argument("shared KV storage cannot be combined with legacy spill arenas");
+            spill = std::make_shared<kvmem::SpillFile>(
+                std::filesystem::u8path(p.payload_disk_dir), p.payload_disk_bytes);
+        }
+        execution.payload_storage = std::make_shared<kvmem::HostKvStorage>(
+            p.payload_host_bytes ? p.payload_host_bytes : UINT64_MAX, std::move(spill));
+    }
+    return execution.payload_storage;
+}
+
+llama_kvmem_storage_stats llama_kvmem_execution_storage_stats(const llama_kvmem_execution_state * state) {
+    if (!state || !state->payload_storage) return {};
+    const auto & storage = *state->payload_storage;
+    const auto io = storage.io_stats();
+    return {storage.charged_bytes(), storage.capacity_bytes(), storage.disk_bytes(), storage.disk_capacity_bytes(),
+        io.read_bytes, io.written_bytes, io.reads, io.writes, io.errors};
+}
+std::shared_ptr<kvmem::SpillFile> kvmem_execution_spill_file(const llama_kvmem_execution_state * state) {
+    return state && state->payload_storage ? state->payload_storage->spill_file() : nullptr;
 }
 
 llama_kvmem_execution_state * llama_kvmem_execution_create() {
@@ -427,6 +459,8 @@ static bool kvmem_env_perf() {
 }
 
 void llama_kvmem_set_params(const struct llama_kvmem_params * params) {
+    auto & execution = kvmem_current_execution();
+    if (!execution.memory && !execution.mtp) execution.payload_storage.reset();
     if (params) {
         kvmem_current_execution().params = *params;
     } else {
@@ -473,23 +507,15 @@ static kvmem::KvMemRuntimeConfig make_runtime_cfg(
         uint32_t recent_tokens,
         uint64_t block_bytes) {
     kvmem::KvMemRuntimeConfig cfg;
+    cfg.store.lrfu = kvmem_current_execution().params.lrfu;
+    cfg.store.lrfu_lambda = kvmem_current_execution().params.lrfu_lambda;
+    cfg.store.lrfu_top_fraction = kvmem_current_execution().params.lrfu_top_fraction;
     cfg.store.block_tokens = block_tokens;
     cfg.store.select_budget = budget;
     cfg.store.prefill_budget = budget;
     cfg.store.select_method = kvmem_current_execution().params.method == 1
         ? kvmem::KvMemMethod::Retrieval
         : kvmem::KvMemMethod::Recency;
-    // ActKV action-oriented eviction (arXiv:2609.31395, Sec. 5.2). lambda and
-    // top-p default to the paper's tuned values (0.50 / 90%), NOT to 0: lambda 0
-    // would collapse the retention into pure recency and top_frac 0 would pin
-    // the hit threshold at the single worst block.
-    cfg.store.action_lrfu = kvmem_current_execution().params.action_lrfu;
-    cfg.store.lrfu_lambda = kvmem_current_execution().params.lrfu_lambda > 0.0f
-        ? kvmem_current_execution().params.lrfu_lambda
-        : kvmem::KvMemStoreConfig{}.lrfu_lambda;
-    cfg.store.lrfu_top_frac = kvmem_current_execution().params.lrfu_top_frac > 0.0f
-        ? kvmem_current_execution().params.lrfu_top_frac
-        : kvmem::KvMemStoreConfig{}.lrfu_top_frac;
     cfg.store.sink_blocks = sink_tokens == 0
         ? 1u
         : std::max(1u, sink_tokens / block_tokens);
@@ -865,6 +891,7 @@ llama_memory_kvmem::llama_memory_kvmem(
             block_tokens_, pool.budget, kvmem_current_execution().params.sink_tokens, kvmem_current_execution().params.recent_tokens,
             pool.block_bytes);
     rt_cfg_.store.estimated_gpu_block_capacity = pool.cap_blocks;
+    score_agg_ = kvmem_current_execution().params.score_agg;
     runtime_ = std::make_unique<kvmem::KvMemRuntime>(rt_cfg_, &backend_);
 
     if (ext_kv) {
@@ -960,6 +987,9 @@ llama_memory_kvmem::llama_memory_kvmem(
     query_end_ = kvmem_current_execution().params.query_end;
     force_pos_ = kvmem_current_execution().params.force_pos;
     kvmem::RawKvStoreConfig & rcfg = raw_cfg_;
+    if (kvmem_current_execution().params.payload_disk_bytes && v_trans_)
+        throw std::invalid_argument("shared KV SSD requires Flash Attention native packed K/V");
+    rcfg.payload_storage = kvmem_execution_payload_storage();
     rcfg.n_layer = n_layer_;
     rcfg.n_embd_k = n_embd_k_;
     rcfg.n_embd_v = n_embd_v_;
@@ -1061,6 +1091,7 @@ void llama_memory_kvmem::reset_policy() {
     }
     if (runtime_) {
         runtime_->truncate_to(0);
+        runtime_->store().restore_retrieval({});
     }
     host_mirror_stale_ = false;
     reset_slots();
@@ -1165,6 +1196,10 @@ bool llama_memory_kvmem::conv_compatible(const llama_memory_kvmem & other) const
         kv_->type_v() == other.kv_->type_v() && n_slots_ == other.n_slots_ &&
         (mtp_ != nullptr) == (other.mtp_ != nullptr) &&
         rt_cfg_.store.block_tokens == other.rt_cfg_.store.block_tokens &&
+        rt_cfg_.store.lrfu == other.rt_cfg_.store.lrfu &&
+        rt_cfg_.store.lrfu_lambda == other.rt_cfg_.store.lrfu_lambda &&
+        rt_cfg_.store.lrfu_top_fraction == other.rt_cfg_.store.lrfu_top_fraction &&
+        score_agg_ == other.score_agg_ &&
         rt_cfg_.store.select_budget == other.rt_cfg_.store.select_budget &&
         rt_cfg_.cpu_bytes == other.rt_cfg_.cpu_bytes;
 }
@@ -1216,6 +1251,25 @@ uint64_t llama_memory_kvmem::host_bytes() const {
     bytes += q_sum_.capacity()*sizeof(std::vector<float>);
     for (const auto & q : q_sum_) bytes += q.capacity()*sizeof(float);
     return bytes;
+}
+uint64_t llama_memory_kvmem::payload_bytes(bool disk_only) const {
+    return (raw_ ? raw_->payload_bytes(disk_only) : 0) + (mtp_ ? mtp_->payload_bytes(disk_only) : 0);
+}
+uint64_t llama_memory_kvmem::payload_capacity_bytes(uint32_t tokens) const {
+    return (raw_ ? raw_->payload_capacity_bytes(tokens, uint32_t(kv_->get_layer_ids().size())) : 0) +
+        (mtp_ ? mtp_->payload_capacity_bytes(tokens) : 0);
+}
+uint64_t llama_memory_kvmem::payload_budget() const {
+    const auto storage = raw_cfg_.payload_storage;
+    if (!storage) return UINT64_MAX;
+    const auto h = storage->capacity_bytes(), d = storage->disk_capacity_bytes();
+    if (!d) return h;
+    const auto per_domain = payload_capacity_bytes(kv_size_ + block_tokens_);
+    const auto domains = kvmem_current_execution().payload_domains;
+    if (!domains || per_domain > UINT64_MAX / domains) return 0;
+    const auto headroom = per_domain * domains;
+    if (h < headroom || h > UINT64_MAX - d) return 0;
+    return std::max(h, h + d - headroom);
 }
 
 uint64_t llama_memory_kvmem::host_capacity(uint32_t tokens) const {
@@ -4235,107 +4289,39 @@ void llama_memory_kvmem::copy_gpu_block_from_host(uint32_t block_id, int32_t gpu
 }
 
 void llama_memory_kvmem::score_retrieval() {
-    auto & store = runtime_->store();
-    const uint32_t nblk = store.block_count();
-    std::vector<double> scores(nblk, 0.0);
-    std::vector<float> mk(n_embd_k_, 0.0f);
-    const uint32_t g = n_head_kv_ == 0 ? 1 : n_head_ / n_head_kv_;
-
-    // Fold q_sum_ down to one normalized probe vector per (layer, kv head)
-    // before the block loop. GQA repeats every query head group for every block,
-    // and the old inner loop heap-allocated a qh vector per block x layer x head
-    // -- 320k allocations for a 2500-block pool with 16 layers and 8 kv heads.
-    // The arithmetic is unchanged: invq is folded into qh here, and it cancels
-    // out of dot / (|q| |k|).
-    std::vector<std::vector<float>> qn(n_layer_);
-    std::vector<uint8_t> qn_ok(n_layer_, 0);
-    for (uint32_t il = 0; il < n_layer_; ++il) {
-        if (il >= q_sum_.size() || q_count_[il] == 0 ||
-            q_sum_[il].size() < static_cast<size_t>(n_head_) * n_embd_head_) {
-            continue;
-        }
-        qn[il].assign(static_cast<size_t>(n_head_kv_) * n_embd_head_, 0.0f);
-        const float invq = 1.0f / static_cast<float>(q_count_[il] * std::max(1u, g));
-        for (uint32_t h = 0; h < n_head_kv_; ++h) {
-            float * qh = qn[il].data() + static_cast<size_t>(h) * n_embd_head_;
-            uint32_t seen = 0;
-            for (uint32_t gi = 0; gi < g; ++gi) {
-                const uint32_t qh_i = h * g + gi;
-                if (qh_i >= n_head_) {
-                    break;
-                }
-                ++seen;
-                const float * q = q_sum_[il].data() + static_cast<size_t>(qh_i) * n_embd_head_;
-                for (uint32_t d = 0; d < n_embd_head_; ++d) {
-                    qh[d] += q[d] * invq;
-                }
-            }
-            // GQA groups are not always a whole multiple of n_head_kv_: when the
-            // last group is short, dividing by g under-weights it. Rescale by the
-            // number of heads actually summed so every kv head contributes a
-            // comparable-magnitude probe.
-            if (seen != 0 && seen != g) {
-                const float fix = static_cast<float>(g) / static_cast<float>(seen);
-                for (uint32_t d = 0; d < n_embd_head_; ++d) qh[d] *= fix;
-            }
-        }
-        qn_ok[il] = 1;
-    }
-
-    // GQA aggregation: the folded mean probe, per KV head. ActKV Sec. 7.1
-    // Alg. 3 step 8 instead takes the MAX over a group's query heads. That
-    // variant was implemented and measured on the ninfer backend's 40-needle /
-    // 256k test, where it REGRESSED recall from 39/40 to 28/40 and decayed
-    // progressively from round 6 rather than failing randomly: a per-head max
-    // is dominated by whichever head happens to peak, and the noisier score
-    // compounds through the LRFU keep score until action-critical blocks lose
-    // their slots. The max path and its --kvmem-score-agg option were removed
-    // here too, so both backends rank identically. See
-    // docs/actkv-section56-wiring-record.md section 5.
-
-    for (uint32_t b = 0; b < nblk; ++b) {
-        if (!raw_->has_block(b)) {
-            continue;
-        }
-        double acc = 0;
-        uint32_t nlay = 0;
-        for (uint32_t il = 0; il < n_layer_; ++il) {
-            if (!qn_ok[il]) {
-                continue;
-            }
-            raw_->mean_k(b, il, mk.data());
-            double layer = 0;
-            const float * qn_l = qn[il].data();
-            for (uint32_t h = 0; h < n_head_kv_; ++h) {
-                const float * kh = mk.data() + static_cast<size_t>(h) * n_embd_head_;
-                const float * qh = qn_l + static_cast<size_t>(h) * n_embd_head_;
-                float dot = 0, nq = 0, nk = 0;
-                for (uint32_t d = 0; d < n_embd_head_; ++d) {
-                    dot += qh[d] * kh[d];
-                    nq += qh[d] * qh[d];
-                    nk += kh[d] * kh[d];
-                }
-                layer += dot / (std::sqrt(nq) * std::sqrt(nk) + 1e-6f);
-            }
-            acc += layer / static_cast<double>(std::max(1u, n_head_kv_));
-            nlay++;
-        }
-        scores[b] = nlay ? acc / nlay : 0;
-    }
-    // ActKV Module 2: in Action mode the store folds this one-shot score into
-    // the per-block temporal LRFU retention (Alg. 1) and re-points the selection
-    // score onto that retention, so pick_topk ranks by how often the block has
-    // been the model's action-region target across rounds, not by one-shot
-    // attention. lrfu_round_id() makes repeated scoring inside one ORA round
-    // (preview, apply, multimodal replay) a no-op instead of decaying twice.
-    store.set_retrieval_scores(scores, lrfu_round_id());
+    std::vector<float> query;
+    query.reserve(size_t(n_layer_) * n_head_ * n_embd_head_);
+    for (const auto & layer : q_sum_) query.insert(query.end(), layer.begin(), layer.end());
+    runtime_->store().set_retrieval_scores(kvmem::mean_key_retrieval_scores(*raw_,
+        runtime_->store().block_count(), {query.data(), q_count_.data(), n_layer_,
+            n_embd_head_, n_head_, n_head_kv_, kvmem_current_execution().params.score_agg == 1
+                ? kvmem::GqaScoreAggregation::Max : kvmem::GqaScoreAggregation::Mean}));
 }
 
-uint64_t llama_memory_kvmem::lrfu_round_id() const {
-    // A new ORA round starts whenever the working-set layout changes (a
-    // selection was applied) or the context grew. Two scoring passes inside the
-    // same round share both, so the second one republishes KS without decaying.
-    return (attention_epoch_ << 32) | static_cast<uint64_t>(store_n_tokens());
+void llama_memory_kvmem::accept_retrieval_round() {
+    if (!runtime_->store().config().lrfu || runtime_->store().retrieval_checkpoint().committed) return;
+    harvest_flush();
+    uint64_t expected = 0;
+    if (explicit_spans_) {
+        for (const auto& range : turn_spans_.query) expected += range.end - range.begin;
+    } else if (query_begin_ >= 0 && query_end_ > query_begin_) {
+        expected = query_end_ - query_begin_;
+    }
+    if (!expected) return;
+    bool query_ready = false;
+    for (uint32_t il = 0; il < n_layer_; ++il) {
+        if (kvmem_cache_has_layer(kv_, il)) {
+            if (q_count_[il] != expected) return;
+            query_ready = true;
+        }
+    }
+    if (!query_ready) return;
+    // Recompute after the final replay. Every probe uses the same prior history.
+    score_retrieval();
+    runtime_->store().commit_retrieval_round();
+    const auto history = runtime_->store().retrieval_checkpoint();
+    kvmem_diag("KVMEM_LRFU round=%llu committed=%d blocks=%zu\n",
+        (unsigned long long) history.round, int(history.committed), history.scores->size());
 }
 
 void llama_memory_kvmem::retr_perf_print() {
@@ -4586,6 +4572,7 @@ bool llama_memory_kvmem::get_tail_mean(uint32_t row, llama_kvmem_tail_mean_state
     state.row = row;
     state.prefix = content_->prefix(row);
     state.values = raw_->mean_checkpoint(row);
+    state.history = runtime_->store().retrieval_checkpoint();
     return tail_mean_valid(row, state);
 }
 
@@ -5111,6 +5098,20 @@ void llama_kvmem_end_prefill_capture(void) {
     }
 }
 
+void llama_kvmem_begin_retrieval_round(void) {
+    if (auto * mem = kvmem_capture_active()) mem->begin_retrieval_round();
+}
+void llama_kvmem_accept_retrieval_round(void) {
+    if (auto * mem = kvmem_capture_active()) mem->accept_retrieval_round();
+}
+void llama_kvmem_restore_history(const kvmem::LrfuState & state) {
+    if (auto * mem = kvmem_capture_active()) mem->restore_history(state);
+}
+kvmem::LrfuState llama_kvmem_get_history() {
+    if (auto * mem = kvmem_capture_active()) return mem->history();
+    return {};
+}
+
 void llama_kvmem_begin_cached_turn(void) {
     if (llama_memory_kvmem * mem = kvmem_capture_active()) {
         mem->begin_cached_turn(true);
@@ -5331,6 +5332,7 @@ void llama_kvmem_store_bundle_reset(llama_kvmem_store_bundle * bundle) {
     if (store.mtp_raw) store.mtp_raw->truncate_to(0);
     store.row_positions.clear();
     store.resident.clear();
+    store.cold = false;
     for (auto & sum : store.q_sum) std::fill(sum.begin(), sum.end(), 0.0f);
     std::fill(store.q_count.begin(), store.q_count.end(), 0);
 }
@@ -5517,6 +5519,27 @@ bool llama_kvmem_store_park() {
     }
 }
 
+uint64_t llama_kvmem_store_payload_bytes(int32_t store_id, bool disk_only) {
+    auto * mem = kvmem_capture_active();
+    if (!mem) return 0;
+    const auto & pool = *kvmem_current_execution().conversations;
+    if (pool.owner != mem) return store_id == 0 ? mem->payload_bytes(disk_only) : 0;
+    if (store_id == pool.active) return mem->payload_bytes(disk_only);
+    const auto * entry = kvmem_conv_find(store_id);
+    if (!entry || !entry->store) return 0;
+    const auto & store = *entry->store;
+    return (store.raw ? store.raw->payload_bytes(disk_only) : 0) +
+        (store.mtp_raw ? store.mtp_raw->payload_bytes(disk_only) : 0);
+}
+uint64_t llama_kvmem_store_payload_capacity(uint32_t tokens) {
+    const auto * mem = kvmem_capture_active();
+    return mem ? mem->payload_capacity_bytes(tokens) : 0;
+}
+uint64_t llama_kvmem_payload_budget() {
+    const auto * mem = kvmem_capture_active();
+    return mem ? mem->payload_budget() : 0;
+}
+
 static llama_memory_kvmem::ConvStore & kvmem_detached(int32_t id) {
     if ((*kvmem_current_execution().conversations).owner != kvmem_capture_active() || id == (*kvmem_current_execution().conversations).active)
         throw std::runtime_error("session snapshot requires a detached store");
@@ -5525,12 +5548,28 @@ static llama_memory_kvmem::ConvStore & kvmem_detached(int32_t id) {
     return *e->store;
 }
 
-void llama_kvmem_store_freeze(int32_t id, std::vector<kvmem::SnapshotBuffer> & buffers) {
-    auto & s = kvmem_detached(id);
+static void kvmem_freeze_store(llama_memory_kvmem::ConvStore & s, std::vector<kvmem::SnapshotBuffer> & buffers) {
     if (s.cold) throw std::runtime_error("session is already frozen");
     s.raw->snapshot_buffers(buffers);
     if (s.mtp_raw) s.mtp_raw->snapshot_buffers(buffers);
     s.cold = true; // partial stores must never be attached to inference
+}
+
+void llama_kvmem_store_freeze(int32_t id, std::vector<kvmem::SnapshotBuffer> & buffers) {
+    kvmem_freeze_store(kvmem_detached(id), buffers);
+}
+void llama_kvmem_store_bundle_freeze(llama_kvmem_store_bundle * bundle, std::vector<kvmem::SnapshotBuffer> & buffers) {
+    if (!bundle || !bundle->store) throw std::invalid_argument("missing parked KV owner");
+    kvmem_freeze_store(*bundle->store, buffers);
+}
+void llama_kvmem_store_bundle_thaw(llama_kvmem_store_bundle * bundle) {
+    if (!bundle || !bundle->store) throw std::invalid_argument("missing parked KV owner");
+    bundle->store->cold = false;
+}
+uint64_t llama_kvmem_store_bundle_payload_bytes(const llama_kvmem_store_bundle * bundle) {
+    if (!bundle || !bundle->store) return 0;
+    const auto & s = *bundle->store;
+    return (s.raw ? s.raw->payload_bytes() : 0) + (s.mtp_raw ? s.mtp_raw->payload_bytes() : 0);
 }
 
 void llama_kvmem_store_thaw(int32_t id) {
@@ -5542,6 +5581,7 @@ void llama_kvmem_store_snapshot_write(int32_t id, kvmem::SnapshotWriter & out) {
     if (s.cold) throw std::runtime_error("session is already on disk");
     out.scalar(id);
     out.scalar(s.runtime->store().total_tokens());
+    kvmem::write_lrfu(out, s.runtime->store().retrieval_checkpoint());
     s.raw->snapshot_write(out);
     out.scalar(uint8_t(s.mtp_raw != nullptr));
     if (s.mtp_raw) s.mtp_raw->snapshot_write(out);
@@ -5558,11 +5598,13 @@ void llama_kvmem_store_snapshot_read(int32_t id, kvmem::SnapshotReader & in) {
     auto & s = kvmem_detached(id);
     if (!s.cold) throw std::runtime_error("session restore requires an empty host payload");
     in.expect(id); in.expect(s.runtime->store().total_tokens());
+    const auto history = kvmem::read_lrfu(in, s.runtime->store().block_count());
     auto raw = std::make_unique<kvmem::RawKvStore>(s.raw->config());
     raw->snapshot_read(in, s.runtime->store().block_count());
     in.expect(uint8_t(s.mtp_raw != nullptr));
     auto mtp = s.mtp_raw ? std::make_unique<kvmem::RawKvStore>(s.mtp_raw->config()) : nullptr;
     if (mtp) mtp->snapshot_read(in, s.runtime->store().block_count());
+    s.runtime->store().restore_retrieval(history);
     s.raw = std::move(raw); s.mtp_raw = std::move(mtp); s.cold = false;
 }
 

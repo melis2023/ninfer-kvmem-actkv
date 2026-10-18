@@ -11,11 +11,17 @@ param(
     [string]$ApiKey,
     [string]$ApiKeyFile = $env:LLAMA_ARG_API_KEY_FILE,
     [ValidateRange(1, 2147483647)][int]$BlockTokens = 128,
+    [ValidateRange(0, 2147483647)][int]$SinkTokens = 5120,
+    [ValidateRange(0, 2147483647)][int]$RecentTokens = 64,
     [string]$ReasoningEffort,
     [ValidateSet('f16', 'f32', 'q8_0', 'q5_0', 'q4_0')][string]$CacheTypeK,
     [ValidateSet('f16', 'f32', 'q8_0', 'q5_0', 'q4_0')][string]$CacheTypeV,
     [ValidateRange(0, 2147483647)][int]$ReasoningBudget = 4096,
     [ValidateRange(1, 5)][int]$Mtp = 3,
+    [switch]$NoLrfu,
+    [ValidateRange(0.0, 1.0)][double]$LrfuLambda = 0.5,
+    [ValidateScript({ $_ -gt 0 -and $_ -le 1 })][double]$LrfuTopFraction = 0.9,
+    [ValidateSet('mean', 'max')][string]$ScoreAggregation = 'max',
     [ValidateSet('cpu', 'gpu')][string]$VisionDevice,
     [string]$ChatTemplateFile,
     [string]$ChatTemplateKwargs,
@@ -61,7 +67,14 @@ $serverArgs = @('-m', $Model, '--mmproj', $Mmproj, $visionFlag,
     '-c', '262144', '-n', "$reserve", '--kvmem-budget', "$budget", '--kvmem-gen-reserve', "$reserve",
     '--kv-dtype', $kv, '--spec-type', 'draft-mtp', '--spec-draft-n-max', "$Mtp",
     '--kvmem-block-tokens', "$BlockTokens", '--kvmem-query-policy', 'user',
+    '--kvmem-sink-tokens', "$SinkTokens", '--kvmem-recent-tokens', "$RecentTokens",
     '--enable-thinking', '--reasoning-budget', "$ReasoningBudget")
+if (!$NoLrfu) {
+    $serverArgs += @('--kvmem-lrfu',
+        '--kvmem-lrfu-lambda', $LrfuLambda.ToString('R', [Globalization.CultureInfo]::InvariantCulture),
+        '--kvmem-lrfu-top-frac', $LrfuTopFraction.ToString('R', [Globalization.CultureInfo]::InvariantCulture))
+}
+$serverArgs += @('--kvmem-score-agg', $ScoreAggregation)
 if ($CacheTypeK) { $serverArgs += @('--cache-type-k', $CacheTypeK) }
 if ($CacheTypeV) { $serverArgs += @('--cache-type-v', $CacheTypeV) }
 if ($ApiKey) { $serverArgs += @('--api-key', $ApiKey) }

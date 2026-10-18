@@ -1,0 +1,203 @@
+{
+  "backend": "ninfer",
+  "argv": [
+    "C:\\Users\\leyew\\AppData\\Local\\KVMem\\windows-ninfer-938c2f1-20261011\\packages\\kvmem-ninfer-windows-rtx50-sm120a-938c2f1\\workers\\ninfer\\ninfer-kvmem-server.exe",
+    "C:\\Users\\leyew\\AppData\\Local\\KVMem\\backend-p0p1-20261002\\converted-models\\Qwen3.8-27B-GSQ-RCO-IQ3_S-vision-mtp.ninfer",
+    "--host",
+    "127.0.0.1",
+    "--port",
+    "18200",
+    "--max-context",
+    "204800",
+    "--max-concurrency",
+    "1",
+    "--prefill-chunk",
+    "256",
+    "--default-max-tokens",
+    "16384",
+    "--kvmem-budget",
+    "36864",
+    "--kvmem-gen-reserve",
+    "16384",
+    "--kvmem-host-mib",
+    "12288",
+    "--kvmem-sink-tokens",
+    "5120",
+    "--kvmem-recent-tokens",
+    "5120",
+    "--kvmem-sessions",
+    "1",
+    "--kv-dtype",
+    "int8",
+    "--device-profile",
+    "off",
+    "--device",
+    "0",
+    "--spec",
+    "mtp",
+    "--draft-tokens",
+    "4",
+    "--ngram-draft-tokens",
+    "31",
+    "--ngram-min-match",
+    "12",
+    "--adaptive-mtp",
+    "--vision",
+    "--vision-residency",
+    "cpu",
+    "--vision-max-merged",
+    "1024",
+    "--default-thinking-budget",
+    "8192",
+    "--kvmem-lrfu",
+    "--kvmem-lrfu-lambda",
+    "0.5",
+    "--kvmem-lrfu-top-frac",
+    "0.9",
+    "--kvmem-score-agg",
+    "max"
+  ],
+  "environment": {
+    "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+    "CUDA_VISIBLE_DEVICES": "GPU-5847813c-9e6e-bb43-cc5e-621aac091b6c"
+  },
+  "capabilities": {
+    "ssd_persistence": "process",
+    "history_reuse": true,
+    "speculative_decoding": true,
+    "backend": "ninfer",
+    "disk_restore": false,
+    "supported_combinations": {
+      "multi_gpu": {
+        "host_history": "shared",
+        "vision_residency": [
+          "resident",
+          "cpu"
+        ],
+        "mtp": true,
+        "mode": "layer",
+        "max_devices": 8
+      },
+      "ngram": {
+        "concurrent_max_drafts": 15,
+        "max_concurrency": 8,
+        "requires_mtp": true,
+        "image_kv": [
+          "bf16",
+          "int8",
+          "fp8",
+          "nvfp4",
+          "k8v4",
+          "rk8v4",
+          "rk4v4",
+          "rk4v4-e8",
+          "rk2v4-e8"
+        ],
+        "text_only": false,
+        "wide_max_concurrency": 1,
+        "concurrent_width_policy": "clamp_to_15",
+        "max_drafts": 63
+      },
+      "text": {
+        "kv": [
+          "bf16",
+          "int8",
+          "fp8",
+          "nvfp4",
+          "k8v4",
+          "rk8v4",
+          "rk4v4",
+          "rk4v4-e8",
+          "rk2v4-e8"
+        ],
+        "max_concurrency": 8,
+        "mtp_drafts": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      },
+      "lookup_ngram": {
+        "replacement": "--ngram-draft-tokens --ngram-min-match",
+        "reason": "legacy_path_disabled",
+        "enabled": false
+      },
+      "video": false,
+      "images": {
+        "kv": [
+          "bf16",
+          "int8",
+          "fp8",
+          "nvfp4",
+          "k8v4",
+          "rk8v4",
+          "rk4v4",
+          "rk4v4-e8",
+          "rk2v4-e8"
+        ],
+        "residency": [
+          "resident",
+          "cpu"
+        ],
+        "max_concurrency": 8
+      },
+      "cold_disk": {
+        "reason": "replaced_by_process_local_tiering",
+        "enabled": false
+      },
+      "adaptive_mtp": {
+        "text_only": false,
+        "ngram": true,
+        "cold_disk": false,
+        "ngram_concurrent_max_drafts": 15,
+        "max_concurrency": 8,
+        "ngram_max_concurrency": 8
+      },
+      "active_disk": {
+        "max_concurrency": 8,
+        "shared_active_idle_quota": true,
+        "enabled": true
+      },
+      "fast_prefill": {
+        "kv": [
+          "int8",
+          "rk8v4",
+          "rk4v4",
+          "rk4v4-e8",
+          "rk2v4-e8"
+        ],
+        "residency": [
+          "resident",
+          "cpu"
+        ],
+        "text_only": false,
+        "max_concurrency": 8,
+        "cold_disk": false
+      },
+      "rk8v4": {
+        "max_concurrency": 8,
+        "text_only": false
+      }
+    },
+    "model_format": ".ninfer",
+    "active_kv_tiering": true,
+    "cross_backend_kv_transfer": false,
+    "concurrent_requests": true,
+    "multimodal": true,
+    "text_chat": true,
+    "streaming": true
+  }
+}

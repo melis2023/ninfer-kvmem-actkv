@@ -37,6 +37,7 @@ CLAUDE.md
 /dsh-*/
 /results/
 
-# Locally staged backend workers (packaging output: the exe is covered by *.exe,
-# but its FFmpeg/curl/cuBLAS DLLs are hundreds of MB and are rebuilt here).
-/workers/
+# Runtime binaries / archives staged under workers (never commit)
+*.dll
+*.rar
+*.bak*

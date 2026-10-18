@@ -1,0 +1,21 @@
+{
+  "health": {
+    "status": "ok"
+  },
+  "model": "kvmem-ninfer-iq3s",
+  "response_status": "completed",
+  "reasoning_items": 1,
+  "summary_arrays_empty": true,
+  "text": "2",
+  "usage": {
+    "input_tokens": 63,
+    "input_tokens_details": {
+      "cached_tokens": 0
+    },
+    "output_tokens": 59,
+    "output_tokens_details": {
+      "reasoning_tokens": 57
+    },
+    "total_tokens": 122
+  }
+}

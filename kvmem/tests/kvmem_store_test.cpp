@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <cmath>
 #include <stdexcept>
 #include <vector>
 
@@ -678,13 +680,48 @@ static void test_request_semantic_budget_override_is_scoped_and_bounded() {
     }
     s.set_retrieval_scores(scores);
 
-    // The configured budget is the answer: the ActKV Sec. 6 adaptive budget used to
-    // narrow this through a runtime override, and that policy (plus its setter) was
-    // removed after it cost 23 needles of recall on the 40-needle / 256k test.
     CHECK(s.select_budget_tokens() == 32 * 8);
-    CHECK(s.budget_blocks() == 8);
+    CHECK(s.runtime_select_budget_tokens() == 0);
     CHECK(s.pick_topk_blocks().size() == 8);
     CHECK(s.pick_prefill_pressure_blocks().size() == 12);
+
+    // A request may narrow semantic selection while pressure prefill remains
+    // at the configured 12-block construction window.
+    s.set_runtime_select_budget(32 * 4);
+    CHECK(s.select_budget_tokens() == 32 * 4);
+    CHECK(s.runtime_select_budget_tokens() == 32 * 4);
+    CHECK(s.pick_topk_blocks().size() == 4);
+    CHECK(s.pick_prefill_pressure_blocks().size() == 12);
+
+    // Zero restores the CLI maximum for the next request.
+    s.set_runtime_select_budget(0);
+    CHECK(s.select_budget_tokens() == 32 * 8);
+    CHECK(s.pick_topk_blocks().size() == 8);
+
+    bool over_max_threw = false;
+    try {
+        s.set_runtime_select_budget(32 * 9);
+    } catch (const std::invalid_argument &) {
+        over_max_threw = true;
+    }
+    CHECK(over_max_threw);
+
+    bool unaligned_threw = false;
+    try {
+        s.set_runtime_select_budget(32 * 4 + 1);
+    } catch (const std::invalid_argument &) {
+        unaligned_threw = true;
+    }
+    CHECK(unaligned_threw);
+
+    bool keep_allocation_threw = false;
+    try {
+        s.set_runtime_select_budget(32);  // sink + recent need two blocks.
+    } catch (const std::invalid_argument &) {
+        keep_allocation_threw = true;
+    }
+    CHECK(keep_allocation_threw);
+    CHECK(s.runtime_select_budget_tokens() == 0);
 }
 
 static void test_quota_policy_sink_recent_retrieval_profile() {
@@ -1093,345 +1130,57 @@ static void test_media_suffix_over_budget() {
     CHECK(threw);
 }
 
-// --- ActKV (arXiv:2609.31395 Sec. 5.2 Alg. 1): action-oriented LRFU ---------
-//   KS_t(i) = lambda * KS_{t-1}(i) + (hit at t ? retrieval_t(i) : 0)
-
-static void test_lrfu_defaults_match_actkv() {
+static void test_lrfu_round_and_restore() {
     KvMemStoreConfig cfg;
-    CHECK(cfg.action_lrfu == false);
-    CHECK(cfg.lrfu_lambda > 0.49f && cfg.lrfu_lambda < 0.51f);
-    CHECK(cfg.lrfu_top_frac > 0.89f && cfg.lrfu_top_frac < 0.91f);
-}
-
-static void test_lrfu_off_keeps_one_shot_ranking() {
-    KvMemStoreConfig cfg; cfg.block_tokens = 128;   // action_lrfu defaults off
-    KvMemStore s(cfg);
-    s.register_append(128 * 4);
-    s.set_retrieval_scores({1.0, 2.0, 3.0, 4.0});
-    for (uint32_t i = 0; i < 4; ++i) {
-        CHECK(s.blocks()[i].retrieval_score == double(i + 1));
-        CHECK(s.blocks()[i].attn_score == double(i + 1));
-        CHECK(s.blocks()[i].select_score == double(i + 1));
-        CHECK(s.blocks()[i].lrfu_score == 0.0);
-    }
-}
-
-static void test_lrfu_accumulates_and_decays() {
-    KvMemStoreConfig cfg; cfg.block_tokens = 128;
-    cfg.action_lrfu = true; cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 1.0f;
-    KvMemStore s(cfg);
-    s.register_append(128 * 4);
-    s.set_retrieval_scores({1.0, 0.0, 0.0, 0.0}, 1);
-    CHECK(s.blocks()[0].lrfu_score == 1.0);
-    CHECK(s.blocks()[0].select_score == 1.0);   // KS is the ranking signal
-    CHECK(s.blocks()[0].retrieval_score == 1.0);
-    CHECK(s.blocks()[0].attn_score == 1.0);     // content signal, never KS
-    s.set_retrieval_scores({1.0, 0.0, 0.0, 0.0}, 2);
-    CHECK(s.blocks()[0].lrfu_score == 1.5);   // 0.5*1.0 + 1.0
-    CHECK(s.blocks()[1].lrfu_score == 0.0);
-}
-
-static void test_lrfu_round_id_is_idempotent() {
-    KvMemStoreConfig cfg; cfg.block_tokens = 128;
-    cfg.action_lrfu = true; cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 1.0f;
-    KvMemStore s(cfg);
-    s.register_append(128 * 4);
-    s.set_retrieval_scores({1.0, 0.0, 0.0, 0.0}, 7);
-    CHECK(s.blocks()[0].lrfu_score == 1.0);
-    // A repeat inside the same round must not decay or re-add; it only keeps
-    // select_score (the ranking signal) equal to KS.
-    s.set_retrieval_scores({1.0, 0.0, 0.0, 0.0}, 7);
-    CHECK(s.blocks()[0].lrfu_score == 1.0);
-    CHECK(s.blocks()[0].select_score == 1.0);
-    s.set_retrieval_scores({1.0, 0.0, 0.0, 0.0}, 8);
-    CHECK(s.blocks()[0].lrfu_score == 1.5);
-}
-
-static void test_lrfu_top_frac_masks_low_scores() {
-    KvMemStoreConfig cfg; cfg.block_tokens = 128;
-    cfg.action_lrfu = true;
-    cfg.lrfu_lambda = 0.0f;      // no carry-over: isolate the hit mask
-    cfg.lrfu_top_frac = 0.5f;    // top 50% of 10 blocks = the 5 highest
-    KvMemStore s(cfg);
-    s.register_append(128 * 10);
-    std::vector<double> scores(10);
-    for (int i = 0; i < 10; ++i) scores[i] = double(i);
-    s.set_retrieval_scores(scores);
-    for (uint32_t i = 0; i < 10; ++i) {
-        const double expect = i >= 5 ? double(i) : 0.0;
-        CHECK(s.blocks()[i].lrfu_score == expect);
-    }
-}
-
-static void test_lrfu_never_goes_negative_and_can_recover() {
-    KvMemStoreConfig cfg; cfg.block_tokens = 128;
-    cfg.action_lrfu = true; cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 1.0f;
-    KvMemStore s(cfg);
-    s.register_append(128 * 4);
-    s.set_retrieval_scores({-1.0, -2.0, 0.5, 0.0}, 1);
-    for (uint32_t i = 0; i < 4; ++i) CHECK(s.blocks()[i].lrfu_score >= 0.0);
-    CHECK(s.blocks()[2].lrfu_score == 0.5);
-    // A block that scored badly is not sunk forever.
-    s.set_retrieval_scores({2.0, 0.0, 0.0, 0.0}, 2);
-    CHECK(s.blocks()[0].lrfu_score == 2.0);
-}
-
-// A caller with no round clock of its own (the ninfer backend scores out of
-// prepare_window) passes round_id == 0. The store then derives the round from
-// the block frontier, so re-scoring the SAME frontier must not decay the pool
-// twice, while the next append starts a new round.
-static void test_lrfu_derived_round_is_idempotent() {
-    KvMemStoreConfig cfg; cfg.block_tokens = 128;
-    cfg.action_lrfu = true; cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 1.0f;
-    KvMemStore s(cfg);
-    s.register_append(128 * 4);
-    s.set_retrieval_scores({1.0, 0.0, 0.0, 0.0});   // derived round = frontier 512
-    CHECK(s.blocks()[0].lrfu_score == 1.0);
-    s.set_retrieval_scores({1.0, 0.0, 0.0, 0.0});   // same frontier: a repeat
-    CHECK(s.blocks()[0].lrfu_score == 1.0);
-    CHECK(s.blocks()[0].select_score == 1.0);
-    s.register_append(128);                          // frontier grew: new round
-    s.set_retrieval_scores({1.0, 0.0, 0.0, 0.0});
-    CHECK(s.blocks()[0].lrfu_score == 1.5);
-}
-
-static void test_lrfu_reset_clears_keep_scores() {
-    KvMemStoreConfig cfg; cfg.block_tokens = 128;
-    cfg.action_lrfu = true; cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 1.0f;
-    KvMemStore s(cfg);
-    s.register_append(128 * 4);
-    s.set_retrieval_scores({1.0, 1.0, 0.0, 0.0});
-    s.reset_lrfu();
-    for (uint32_t i = 0; i < 4; ++i) {
-        CHECK(s.blocks()[i].lrfu_score == 0.0);
-        CHECK(s.blocks()[i].select_score == 0.0);
-        CHECK(s.blocks()[i].attn_score == 0.0);
-    }
-}
-
-// A block with no positive evidence must not build a keep score across rounds.
-// KVMem re-scores the whole resident pool every round, so if zero-score blocks
-// counted as hits their KS would grow with page AGE and outrank the blocks the
-// query actually matched -- and at large context the oldest blocks are the ones
-// whose host records the tier has already dropped.
-static void test_lrfu_zero_scores_do_not_accumulate() {
-    KvMemStoreConfig cfg; cfg.block_tokens = 128;
-    cfg.action_lrfu = true; cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 0.90f;
-    KvMemStore s(cfg);
-    s.register_append(128 * 8);
-    std::vector<double> scores(8, 0.0);
-    scores[7] = 1.0;                     // only block 7 has evidence
-    s.set_retrieval_scores(scores, 1);
-    s.set_retrieval_scores(scores, 2);
-    s.set_retrieval_scores(scores, 3);
-    CHECK(s.blocks()[7].lrfu_score == 1.75);   // 0.5*(0.5*1+1)+1
-    for (uint32_t i = 0; i < 7; ++i) {
-        CHECK(s.blocks()[i].lrfu_score == 0.0);
-        CHECK(s.blocks()[i].select_score == 0.0);
-        CHECK(s.blocks()[i].attn_score == 0.0);
-    }
-}
-
-// A round where nothing matches must be a pure decay, not a rescaling of the
-// whole pool.
-static void test_lrfu_round_without_evidence_only_decays() {
-    KvMemStoreConfig cfg; cfg.block_tokens = 128;
-    cfg.action_lrfu = true; cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 0.90f;
-    KvMemStore s(cfg);
-    s.register_append(128 * 4);
-    s.set_retrieval_scores({0.0, 2.0, 0.0, 0.0}, 1);
-    CHECK(s.blocks()[1].lrfu_score == 2.0);
-    s.set_retrieval_scores({0.0, 0.0, 0.0, 0.0}, 2);
-    CHECK(s.blocks()[1].lrfu_score == 1.0);    // decayed, nothing added
-    CHECK(s.blocks()[0].lrfu_score == 0.0);
-}
-
-// Action mode must change WHICH blocks survive a tight budget: a block with a
-// weaker current score but a strong recent history outranks a fresher one.
-static void test_lrfu_changes_selection_order() {
-    KvMemStoreConfig cfg; cfg.block_tokens = 128;
-    cfg.select_budget = 128 * 2;   // sink(1) + one retrieved block
-    cfg.sink_blocks = 1;
-    cfg.recent_blocks = 0;
-    cfg.action_lrfu = true; cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 1.0f;
-    KvMemStore s(cfg);
-    s.register_append(128 * 8);
-    s.set_retrieval_scores({0, 0, 0, 0, 0, 1.0, 0.0, 0}, 1);   // block 5 strong
-    s.set_retrieval_scores({0, 0, 0, 0, 0, 0.0, 0.4, 0}, 2);   // block 6 now best
-    // KS: block5 = 0.5, block6 = 0.4 -> the history keeps block 5 selected.
-    auto picked = s.pick_topk_blocks();
-    CHECK(std::find(picked.begin(), picked.end(), 0u) != picked.end());
-    CHECK(std::find(picked.begin(), picked.end(), 5u) != picked.end());
-    CHECK(std::find(picked.begin(), picked.end(), 6u) == picked.end());
-
-    // Same scores with ActKV off: the one-shot winner (block 6) is selected.
-    KvMemStoreConfig one_shot = cfg; one_shot.action_lrfu = false;
-    KvMemStore t(one_shot);
-    t.register_append(128 * 8);
-    t.set_retrieval_scores({0, 0, 0, 0, 0, 0.0, 0.4, 0});
-    auto picked2 = t.pick_topk_blocks();
-    CHECK(std::find(picked2.begin(), picked2.end(), 6u) != picked2.end());
-    CHECK(std::find(picked2.begin(), picked2.end(), 5u) == picked2.end());
-}
-
-// T1 (docs/dev-actkv-swap-redesign.md): the ActKV keep score and the ranking
-// signal are separate fields. The keep score is never written into attn_score,
-// so the content signal constrain_media reads stays a function of the current
-// query, not of how many rounds LRFU has rewarded a block.
-static void test_lrfu_keeps_content_signal_out_of_the_ranking_field() {
-    KvMemStoreConfig cfg; cfg.block_tokens = 128;
-    cfg.action_lrfu = true; cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 1.0f;
-    KvMemStore s(cfg);
-    s.register_append(128 * 4);
-    s.set_retrieval_scores({1.0, 0.0, 0.0, 0.0}, 1);
-    s.set_retrieval_scores({1.0, 0.0, 0.0, 0.0}, 2);   // KS = 1.5, one-shot = 1.0
-    CHECK(s.blocks()[0].lrfu_score == 1.5);            // persistent keep score
-    CHECK(s.blocks()[0].select_score == 1.5);          // ranking follows KS
-    CHECK(s.blocks()[0].retrieval_score == 1.0);
-    CHECK(s.blocks()[0].attn_score == 1.0);            // content signal, not KS
-}
-
-// T1 acceptance: constrain_media ranks image groups by attn_score, so a block
-// with a large keep score but no current query evidence must not win a
-// media-constrained slot. With KS leaking into attn_score (the pre-T1 bug) the
-// stale block 2 would be kept and the fresh block 10 dropped.
-static void test_media_constraint_ignores_actkv_keep_score() {
-    KvMemStoreConfig cfg;
-    cfg.block_tokens = 32;
-    cfg.select_budget = cfg.prefill_budget = 6 * 32;
-    cfg.sink_blocks = 1;
-    cfg.recent_blocks = 0;
-    cfg.action_lrfu = true;
-    cfg.lrfu_lambda = 1.0f;      // no decay: KS diverges from the one-shot score
-    cfg.lrfu_top_frac = 1.0f;
-    KvMemStore store(cfg);
-    store.register_append(12 * 32);
-    // Round 1 rewards block 2; round 2 has evidence only for block 9.
-    store.set_retrieval_scores({0, 0, 8.0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 1);
-    store.set_retrieval_scores({0, 0, 0, 0, 0, 0, 0, 0, 0, 1.0, 0, 0}, 2);
-    CHECK(store.blocks()[2].lrfu_score == 8.0);
-    CHECK(store.blocks()[2].attn_score == 0.0);   // no current evidence
-    CHECK(store.blocks()[9].attn_score == 1.0);
-    store.set_media_ranges({{6 * 32, 8 * 32}});   // image group = blocks 6..7
-    const auto selected = store.pick_topk_blocks({});
-    // sink(0) + latest image(6,7) + the three highest CONTENT blocks (9,10,11).
-    CHECK((selected == std::vector<uint32_t>{0, 6, 7, 9, 10, 11}));
-}
-
-// Deferred LRFU (two-phase): scoring happens before the selection exists, so the
-// round is held and applied at commit_lrfu. The selector must still rank by the
-// PROVISIONAL keep score that includes this round, or a freshly written block
-// (KS = 0) can never outrank the incumbents and is evicted immediately
-// (docs/a9-deferred-lrfu-regression.md).
-static void test_lrfu_deferred_ranking_sees_current_query() {
-    KvMemStoreConfig cfg; cfg.block_tokens = 128;
-    cfg.select_budget = 128 * 3;   // sink(1) + two retrieved
-    cfg.sink_blocks = 1;
-    cfg.recent_blocks = 0;
-    cfg.action_lrfu = true; cfg.deferred_lrfu = true;
-    cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 1.0f;
-    KvMemStore s(cfg);
-    s.register_append(128 * 8);
-    s.set_retrieval_scores({0, 0, 0, 0, 0, 10.0, 0.0, 0}, 1);
-    s.commit_lrfu({0, 5, 7});
-    CHECK(s.blocks()[5].lrfu_score == 10.0);
-    // Round 2: block 6 has the only evidence. Its committed KS is still 0, but
-    // the provisional ranking must see this round's 8.0 and select it.
-    s.set_retrieval_scores({0, 0, 0, 0, 0, 0.0, 8.0, 0}, 2);
-    CHECK(s.blocks()[6].lrfu_score == 0.0);    // not committed yet
-    CHECK(s.blocks()[6].select_score == 8.0);  // provisional ranking value
-    const auto picked = s.pick_topk_blocks();
-    CHECK(std::find(picked.begin(), picked.end(), 6u) != picked.end());
-    s.commit_lrfu(picked);
-    CHECK(s.blocks()[6].lrfu_score == 8.0);    // committed after the selection
-}
-
-// Deferred commit narrows growth to the blocks this round actually kept; a
-// positive score alone is not enough.
-static void test_lrfu_deferred_commit_narrows_hits() {
-    KvMemStoreConfig cfg; cfg.block_tokens = 128;
-    cfg.action_lrfu = true; cfg.deferred_lrfu = true;
-    cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 1.0f;
-    KvMemStore s(cfg);
-    s.register_append(128 * 4);
-    s.set_retrieval_scores({1.0, 2.0, 0.0, 0.0}, 1);
-    CHECK(s.blocks()[0].select_score == 1.0);   // provisional, pre-commit
-    CHECK(s.blocks()[0].lrfu_score == 0.0);
-    s.commit_lrfu({1});
-    CHECK(s.blocks()[1].lrfu_score == 2.0);     // selected + positive -> grew
-    CHECK(s.blocks()[0].lrfu_score == 0.0);     // positive but not selected -> no growth
-}
-
-// Deferred off keeps the score-only rule: no selection gate, every positive
-// block grows immediately.
-static void test_lrfu_deferred_off_keeps_score_only_rule() {
-    KvMemStoreConfig cfg; cfg.block_tokens = 128;
-    cfg.action_lrfu = true; cfg.deferred_lrfu = false;
-    cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 1.0f;
-    KvMemStore s(cfg);
-    s.register_append(128 * 4);
-    s.set_retrieval_scores({1.0, 2.0, 0.0, 0.0}, 1);
-    CHECK(s.blocks()[0].lrfu_score == 1.0);
-    CHECK(s.blocks()[1].lrfu_score == 2.0);
-}
-
-// ActKV Sec. 5.1 AAV: record_access turns each round's selection into one hit
-// bit, and aav_class_of reads the ring back. Only the observed prefix of the
-// 16-bit ring counts, so a block that appeared this round is not "silent".
-static void test_aav_ring_classification() {
-    KvMemStoreConfig cfg; cfg.block_tokens = 128;
-    cfg.aav_trace = true;        // advances the ring without the trace env var
-    KvMemStore s(cfg);
-    s.register_append(128 * 4);
-    s.commit_lrfu({0});          // r1: 0 hit, 1..3 miss
-    s.register_append(128);
-    s.commit_lrfu({0, 1});       // r2: 0 hit, 1 hit
-    s.register_append(128);
-    s.commit_lrfu({0});          // r3: 0 hit, 1 miss
-    s.register_append(128);
-    s.commit_lrfu({0, 1});       // r4: 0 hit, 1 hit
-    // Hit in every observed round.
-    CHECK(s.aav_class_of(0) == KvAavClass::Continuous);
-    // Hit twice, missed twice: repeated but discontinuous -- the paper's
-    // "intermittent" access pattern.
-    CHECK(s.aav_class_of(1) == KvAavClass::Intermittent);
-    // Never hit, but old enough to have been observed.
-    CHECK(s.aav_class_of(2) == KvAavClass::Silent);
-    CHECK(s.aav_class_of(3) == KvAavClass::Silent);
-    // Out of range is not a crash.
-    CHECK(s.aav_class_of(9999) == KvAavClass::Cold);
-}
-
-// The classification is computed over the observed 16-round window, so a single
-// missed round keeps a block intermittent only while that miss is still inside
-// it. This is the boundary that decides how long one unlucky round keeps paying.
-static void test_aav_intermittent_forgets_an_old_miss() {
-    KvMemStoreConfig cfg; cfg.block_tokens = 128;
-    cfg.action_lrfu = true; cfg.lrfu_lambda = 0.5f; cfg.lrfu_top_frac = 1.0f;
-    cfg.aav_trace = true;
-    KvMemStore s(cfg);
-    s.register_append(128 * 4);
-    s.set_retrieval_scores({0.0, 1.0, 0.0, 0.0}, 1);
-    s.commit_lrfu({1});                       // r1 hit
-    s.register_append(128);
-    s.set_retrieval_scores({}, 2);
-    s.commit_lrfu({0});                       // r2 miss
-    s.register_append(128);
-    s.set_retrieval_scores({0.0, 1.0, 0.0, 0.0}, 3);
-    s.commit_lrfu({1});                       // r3 hit
-    CHECK(s.aav_class_of(1) == KvAavClass::Intermittent);
-    // Hit from r4 through r18. At r17 the window still holds the r2 miss; by r18
-    // the last 16 rounds are all hits, so the class clears.
-    for (uint32_t round = 4; round <= 18; ++round) {
-        s.register_append(128);
-        s.set_retrieval_scores({0.0, 1.0, 0.0, 0.0}, round);
-        s.commit_lrfu({1});
-        if (round == 17) { CHECK(s.aav_class_of(1) == KvAavClass::Intermittent); }
-        if (round == 18) { CHECK(s.aav_class_of(1) == KvAavClass::Continuous); }
-    }
+    cfg.block_tokens = 64; cfg.select_budget = 192; cfg.sink_blocks = 1; cfg.recent_blocks = 1;
+    cfg.lrfu = true; cfg.lrfu_top_fraction = 1;
+    KvMemStore store(cfg); store.register_append(384);
+    store.begin_retrieval_round();
+    std::vector<double> scores(6, -0.2); scores[2] = 0.8; scores[3] = 0.6;
+    store.set_retrieval_scores(scores);
+    const auto chosen = store.pick_topk_blocks();
+    CHECK(chosen == std::vector<uint32_t>({0, 2, 5}));
+    CHECK(store.retrieval_checkpoint().scores->empty()); // Preview is not a committed update.
+    CHECK(store.commit_retrieval_round());
+    const auto first = store.retrieval_checkpoint();
+    store.begin_retrieval_round(); scores[2] = 0.1; scores[3] = 0.3;
+    store.set_retrieval_scores(scores); store.set_retrieval_scores(scores);
+    CHECK(std::abs(store.selection_score(2) - 0.5) < 1e-12);
+    CHECK(std::abs(store.selection_score(3) - 0.6) < 1e-12);
+    CHECK(store.commit_retrieval_round());
+    scores[2] = 100; store.set_retrieval_scores(scores);
+    const auto second = store.retrieval_checkpoint();
+    CHECK(store.pick_topk_blocks() == std::vector<uint32_t>({0, 3, 5}));
+    CHECK(!store.commit_retrieval_round());
+    store.restore_retrieval(first);
+    CHECK(store.pick_topk_blocks() == chosen); // Rollback removes rewards on surviving blocks too.
+    std::vector<uint8_t> bytes;
+    kvmem::SnapshotWriter out([&](const void* p, size_t n) {
+        const auto* first = static_cast<const uint8_t*>(p); bytes.insert(bytes.end(), first, first + n);
+    });
+    kvmem::write_lrfu(out, first);
+    const std::vector<kvmem::LrfuPoint> points{{384, first}, {512, second}};
+    CHECK(kvmem::lrfu_input_point(128, 64, first).state.scores->size() == 2);
+    CHECK(kvmem::lrfu_prefix_points(points, 384, 384) == 0);
+    CHECK(kvmem::lrfu_prefix_points(points, 512, 512) == 1);
+    CHECK(kvmem::lrfu_prefix_points(points, 500, 600) == 1);
+    CHECK(kvmem::lrfu_prefix_points(points, 600, 600) == 2);
+    kvmem::write_lrfu_points(out, points);
+    size_t offset = 0;
+    kvmem::SnapshotReader in([&](void* p, size_t n) { std::memcpy(p, bytes.data() + offset, n); offset += n; }, bytes.size());
+    store.restore_retrieval(kvmem::read_lrfu(in, 6));
+    const auto restored_points = kvmem::read_lrfu_points(in, 512, 64);
+    CHECK(restored_points.size() == 2 && restored_points.back().state.round == 2);
+    CHECK(*restored_points.front().state.scores == *first.scores);
+    scores[3] = 100; store.set_retrieval_scores(scores);
+    CHECK(store.pick_topk_blocks() == chosen); // Restored committed round cannot be rewarded twice.
+    store.register_append(64); CHECK(store.selection_score(6) == 0);
+    kvmem::LrfuHistory half(0, 0.5); half.begin_round(); half.preview({-3, -2, -1, -1}); half.commit();
+    CHECK(half.score(0) == 0 && half.score(1) == 0 && half.score(2) == -1 && half.score(3) == -1);
 }
 
 int main() {
+    test_lrfu_round_and_restore();
     test_media_suffix_over_budget();
     test_media_groups_with_shared_boundary();
     test_register_append();
@@ -1465,24 +1214,6 @@ int main() {
     test_deltanet_config_and_scores();
     test_round_groups_are_selected_whole();
     test_round_groups_charge_shared_boundary_once();
-    test_lrfu_defaults_match_actkv();
-    test_lrfu_off_keeps_one_shot_ranking();
-    test_lrfu_accumulates_and_decays();
-    test_lrfu_round_id_is_idempotent();
-    test_lrfu_derived_round_is_idempotent();
-    test_lrfu_top_frac_masks_low_scores();
-    test_lrfu_never_goes_negative_and_can_recover();
-    test_lrfu_zero_scores_do_not_accumulate();
-    test_lrfu_round_without_evidence_only_decays();
-    test_lrfu_reset_clears_keep_scores();
-    test_lrfu_changes_selection_order();
-    test_lrfu_keeps_content_signal_out_of_the_ranking_field();
-    test_media_constraint_ignores_actkv_keep_score();
-    test_lrfu_deferred_ranking_sees_current_query();
-    test_lrfu_deferred_commit_narrows_hits();
-    test_lrfu_deferred_off_keeps_score_only_rule();
-    test_aav_ring_classification();
-    test_aav_intermittent_forgets_an_old_miss();
 
     if (g_fail != 0) {
         std::printf("FAILED: %d check(s)\n", g_fail);

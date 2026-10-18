@@ -1,0 +1,71 @@
+{
+  "kv_cross_backend_transfer": false,
+  "runtime_validation": {
+    "clean_path_help_passed": true,
+    "cuda_architecture_verified": true,
+    "powershell_51_default_launch_dryrun_passed": true,
+    "actual_gpu_inference_validated": true,
+    "runtime_evidence_basis": "Reuse 2026-10-11 RTX 5060 Ti verification of the exact same worker binary",
+    "inference_performance_measured_this_release": false,
+    "gpu_uuid": "GPU-5847813c-9e6e-bb43-cc5e-621aac091b6c",
+    "worker_sha256": "07045531b47f0e4907756753b31e86998f126ae36311a0ce597b53e00cfcd5d2"
+  },
+  "backend_sources": {
+    "ninfer": {
+      "path": "backends/ninfer",
+      "upstream": "https://github.com/iamwavecut/ninfer-all.git",
+      "base_commit": "8319e8f512477d0cfdef89e16c17c1ba9f9bc7b3",
+      "license_file": "backends/ninfer/LICENSE",
+      "local_changes": "KVMem integration is maintained in the versioned patch; the submodule remains pinned to base_commit",
+      "patch": "backends/patches/ninfer-kvmem.patch",
+      "patch_sha256": "84d173228793853d889881f41ccf4d21b6cd899e81f612841cc5e149240119c4",
+      "patched_tree": "cdcc146ff28e07092c12d2a8f590b9ba7fa8f421"
+    },
+    "layout": "git-submodules-with-patches"
+  },
+  "models_included": false,
+  "workers": {
+    "ninfer": {
+      "sha256": "07045531b47f0e4907756753b31e86998f126ae36311a0ce597b53e00cfcd5d2",
+      "clean_path_help_passed": true,
+      "path": "workers/ninfer/ninfer-kvmem-server.exe"
+    }
+  },
+  "source_commit": "938c2f1968b0283e7d7dd143918a9f3ff866dd4d",
+  "source_branch": "feat/multi-backend-framework",
+  "package_backend": "ninfer",
+  "rtx_series": "50",
+  "ninfer_architecture": "120a",
+  "ninfer_sm120_native": true,
+  "cuda_version": "13.2.86",
+  "compiler": "MSVC 19.44.35222 (VS 2022 v143)",
+  "entrypoint": "scripts/windows/start-ninfer.ps1",
+  "package_startup_defaults": {
+    "Gpu": "0",
+    "Context": 204800,
+    "Budget": 36864,
+    "Reserve": 16384,
+    "HostMiB": 12288,
+    "Prefill": 256,
+    "MaxTokens": 16384,
+    "KvType": "int8",
+    "MtpDrafts": 4,
+    "AdaptiveMtp": true,
+    "NgramDrafts": 31,
+    "NgramMinMatch": 12,
+    "Concurrency": 1,
+    "RetainedSessions": 1,
+    "Vision": true,
+    "VisionResidency": "cpu",
+    "VisionTokens": 1024,
+    "DeviceProfile": "off",
+    "ThinkingBudget": 8192,
+    "SinkTokens": 5120,
+    "RecentTokens": 5120,
+    "LrfuLambda": 0.5,
+    "LrfuTopFraction": 0.9,
+    "ScoreAggregation": "max",
+    "Lrfu": true,
+    "DiskPath": null
+  }
+}

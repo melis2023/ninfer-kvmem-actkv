@@ -38,7 +38,7 @@ struct MultimodalCheckpointData {
     std::vector<uint8_t> draft_carry;
     llama_kvmem_tail_mean_state tail_mean;
     std::shared_ptr<MultimodalCheckpointAccounting> accounting;
-    size_t bytes() const { return recurrent.size() + draft_carry.size() + tail_mean.values.size()*sizeof(float); }
+    size_t bytes() const { return recurrent.size() + draft_carry.size() + tail_mean.values.size()*sizeof(float) + tail_mean.history.scores->size()*sizeof(double); }
 };
 
 struct MultimodalCheckpoint {
@@ -73,10 +73,13 @@ struct kvmem_conversation {
     uint32_t stored = 0;    // llama_kvmem_store_n_tokens() at the last commit
     std::vector<llama_token> cached_tokens;
     std::shared_ptr<kvmem_prompt> cached_prompt;
+    std::shared_ptr<kvmem_prompt> history_input_prompt;
+    std::vector<kvmem::LrfuPoint> history_points;
     std::vector<MultimodalCheckpoint> mm_checkpoints;
     int mm_live_row = 0;
     std::shared_ptr<const MultimodalCheckpointData> mm_live_checkpoint;
     std::shared_ptr<const MultimodalQuery> mm_query;
+    kvmem::LrfuState gdn_history, gdn_query_history;
     std::vector<uint8_t> gdn_ckpt;
     std::vector<uint8_t> gdn_carry, gdn_query_carry;
     int gdn_ckpt_pos = -1;
@@ -157,6 +160,10 @@ struct LlamaEngineState {
     std::shared_ptr<kvmem_vision> vision;
     std::shared_ptr<kvmem_prompt> active_prompt;
     std::shared_ptr<kvmem_prompt> cached_prompt;
+    std::shared_ptr<kvmem_prompt> history_input_prompt;
+    std::vector<kvmem::LrfuPoint> history_points;
+    kvmem::LrfuState rollback_history;
+    uint32_t history_input_end = 0;
     std::vector<MultimodalCheckpoint> mm_checkpoints;
     std::shared_ptr<MultimodalCheckpoint> mm_rollback;
     std::shared_ptr<kvmem_prompt> mm_rollback_prompt;
@@ -176,6 +183,7 @@ struct LlamaEngineState {
     int mm_error_status = 500;
     bool mm_reset_requested = false;
     int perf_p_eval = 0;
+    kvmem::LrfuState gdn_history, gdn_query_history;
     std::vector<uint8_t> gdn_ckpt;
     std::vector<uint8_t> gdn_carry, gdn_query_carry;
     int gdn_ckpt_pos = -1; // gen-start (eval_end-1); next-turn suffix rewind
@@ -209,6 +217,7 @@ std::vector<llama_token> llama_driver_tokenize(const llama_vocab * vocab, const 
 void llama_driver_swap_conversation(LlamaEngineState & st, kvmem_conversation & conv);
 
 void llama_driver_drop_conversation(kvmem_conversation & conv);
+void llama_driver_conversation_buffers(kvmem_conversation & conv, std::vector<kvmem::SnapshotBuffer> & buffers);
 
 void llama_driver_publish_conversations(LlamaEngineState & st);
 
@@ -219,6 +228,7 @@ void llama_driver_begin_request(LlamaEngineState & st, const kvmem_prompt & prom
 
 void llama_driver_begin_disk_request(LlamaEngineState & st, const kvmem_prompt & prompt,
                                   const std::string & client_id, int predict);
+void llama_driver_check_payload_budget(LlamaEngineState & st, const kvmem_prompt & prompt, int predict);
 
 void llama_driver_commit(LlamaEngineState & st, const std::vector<llama_token> & prompt,
                           const std::vector<llama_token> & gen);

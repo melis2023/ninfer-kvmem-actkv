@@ -87,13 +87,6 @@ or applying patches; `-ConfigureOnly` and `-BuildOnly`
 separate configure and compilation. Backend-specific CMake arguments should be
 passed with the matching `-Backend`, not indiscriminately to `all`.
 
-The ninfer worker also embeds a WebUI, served by `GET /`. Without `-WebUiDir` its
-plan resolves `build/share/kvmem/ui` — the WebUI `build.ps1` stages for the
-llama.cpp backend. When neither exists the flag is omitted and the worker embeds
-none, so its startup log has no `webui http://…` line. `-WebUiDir <dir>` (a
-directory holding `index.html` or `index.html.gz`) embeds a different one, and a
-directory without either entry point is rejected before any compiler runs.
-
 The wrapper configures dependencies from the checked-in ninfer vcpkg manifest.
 An existing compatible dependency installation can be passed with
 `-DVCPKG_INSTALLED_DIR=... -DVCPKG_MANIFEST_INSTALL=OFF`; no local prebuilt ninfer
@@ -139,7 +132,9 @@ the active patches live under `backends/patches/`.
 The current branch is a development candidate. P6-P10 and the later source
 admissions are in this tree: nine KV types, text and resident/CPU vision at up
 to eight requests, ngram, fast prefill on the admitted formats, and the ninfer
-layer pipeline. Cold snapshots stay disabled at the entry points. The release
+layer pipeline. Active KV tiering replaces the disabled ninfer disk entry with
+process-local storage shared by active and idle histories; it does not support
+restart persistence. See [tiering qualification](active-kv-tiering-plan.md). The release
 matrix and a package that matches this source are not finished. Current patch
 hashes are in `backends/versions.json`. See [validation status](multi-backend-validation.md)
 and [supported backend combinations](multi-backend.md). Once accepted, merge into

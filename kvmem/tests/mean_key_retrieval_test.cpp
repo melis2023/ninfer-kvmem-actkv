@@ -10,6 +10,17 @@ static void require(bool ok, const char* text) { if (!ok) throw std::runtime_err
 
 int main() {
     try {
+        // Opposed GQA heads cancel in the folded mean, but max preserves a match.
+        {
+            kvmem::RawKvStore keys({1, 2, 0, 64});
+            const float key[]{64, 0}; keys.write_layer_mean_sum(0, 64, 0, key);
+            const float query[]{1, 0, -1, 0}; const uint32_t count[]{1};
+            const auto mean = kvmem::mean_key_retrieval_scores(keys, 1, {query, count, 1, 2, 2, 1});
+            const auto max = kvmem::mean_key_retrieval_scores(keys, 1,
+                {query, count, 1, 2, 2, 1, kvmem::GqaScoreAggregation::Max});
+            require(mean[0] == 0 && std::abs(max[0] - 1.0 / (1 + 1e-6)) < 1e-6,
+                "GQA max lost matching head");
+        }
         for (uint32_t kv_heads : {2U, 4U}) {
             const uint32_t layers = 3, dim = 256, q_heads = kv_heads == 2 ? 16 : 24;
             const uint32_t kw = kv_heads * dim, qw = q_heads * dim, group = q_heads / kv_heads;
@@ -26,6 +37,8 @@ int main() {
             }
             const auto actual = kvmem::mean_key_retrieval_scores(keys, 6,
                 {queries.data(), counts.data(), layers, dim, q_heads, kv_heads});
+            const auto max_actual = kvmem::mean_key_retrieval_scores(keys, 6,
+                {queries.data(), counts.data(), layers, dim, q_heads, kv_heads, kvmem::GqaScoreAggregation::Max});
             for (uint32_t b = 0; b < 5; ++b) {
                 double expected = 0;
                 for (uint32_t l : {0U, 2U}) {
@@ -46,6 +59,23 @@ int main() {
                     expected += layer / kv_heads / 2;
                 }
                 require(std::abs(actual[b] - expected) < 2e-6, "GQA cosine differs from independent FP64 oracle");
+                double max_expected = 0;
+                for (uint32_t l : {0U, 2U}) {
+                    for (uint32_t h = 0; h < kv_heads; ++h) {
+                        double best = -2;
+                        for (uint32_t g = 0; g < group; ++g) {
+                            double dot = 0, qn = 0, kn = 0;
+                            for (uint32_t d = 0; d < dim; ++d) {
+                                const double q = queries[l * qw + (h * group + g) * dim + d];
+                                const double k = sums[(l * 5 + b) * kw + h * dim + d] / double(b == 4 ? 17 : 64);
+                                dot += q * k; qn += q * q; kn += k * k;
+                            }
+                            best = std::max(best, dot / (std::sqrt(qn * kn) + 1e-6));
+                        }
+                        max_expected += best / kv_heads / 2;
+                    }
+                }
+                require(std::abs(max_actual[b] - max_expected) < 2e-6, "GQA max differs from FP64 oracle");
             }
             require(actual[5] == 0, "missing block is not zero");
             std::fill(counts.begin(), counts.end(), 0);

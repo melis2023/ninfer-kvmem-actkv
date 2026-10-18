@@ -9,7 +9,7 @@ param(
     [ValidateRange(1, 65535)][int]$Port = 18200,
     [string]$ListenHost = '127.0.0.1',
     [ValidateRange(256, 2147483647)][int]$Context = 262144,
-    [ValidateRange(128, 2147483647)][int]$Budget = 4096,
+    [ValidateRange(128, 2147483647)][int]$Budget = 32768,
     [ValidateRange(64, 2147483647)][int]$Reserve = 1024,
     [ValidateRange(1, 1048576)][int]$HostMiB = 16384,
     [ValidateRange(128, 2147483647)][int]$Prefill = 128,
@@ -27,8 +27,12 @@ param(
     [ValidateRange(1, 16384)][int]$VisionTokens = 1024,
     [ValidateSet('off', 'auto')][string]$DeviceProfile = 'off',
     [ValidateRange(0, 2147483647)][int]$ThinkingBudget = 0,
-    [ValidateRange(0, 2147483647)][int]$SinkTokens = 0,
-    [ValidateRange(64, 2147483647)][int]$RecentTokens = 64,
+    [ValidateRange(0, 2147483647)][int]$SinkTokens = 5120,
+    [ValidateRange(0, 2147483647)][int]$RecentTokens = 64,
+    [switch]$NoLrfu,
+    [ValidateRange(0.0, 1.0)][double]$LrfuLambda = 0.5,
+    [ValidateScript({ $_ -gt 0 -and $_ -le 1 })][double]$LrfuTopFraction = 0.9,
+    [ValidateSet('mean', 'max')][string]$ScoreAggregation = 'max',
     [string]$DiskPath,
     [ValidateRange(1, 1048576)][int]$DiskMiB = 4096,
     [string[]]$WorkerArgs = @(),
@@ -44,6 +48,7 @@ $capabilities = @{
     text_chat = $true; streaming = $true; history_reuse = $true
     speculative_decoding = $true; multimodal = $true
     concurrent_requests = $true; disk_restore = $true
+    active_kv_tiering = $true; ssd_persistence = 'process'
     cross_backend_kv_transfer = $false
 }
 if ($Backend -eq 'ninfer') {
@@ -52,7 +57,8 @@ if ($Backend -eq 'ninfer') {
         text = @{ kv = @('bf16', 'int8', 'fp8', 'nvfp4', 'k8v4', 'rk8v4', 'rk4v4', 'rk4v4-e8', 'rk2v4-e8'); max_concurrency = 8; mtp_drafts = @(0..15) }
         images = @{ kv = @('bf16', 'int8', 'fp8', 'nvfp4', 'k8v4', 'rk8v4', 'rk4v4', 'rk4v4-e8', 'rk2v4-e8'); max_concurrency = 8; residency = @('resident', 'cpu') }
         rk8v4 = @{ max_concurrency = 8; text_only = $false }
-        cold_disk = @{ enabled = $false; reason = 'temporarily_disabled' }
+        cold_disk = @{ enabled = $false; reason = 'replaced_by_process_local_tiering' }
+        active_disk = @{ enabled = $true; shared_active_idle_quota = $true; max_concurrency = 8 }
         ngram = @{ max_concurrency = 8; text_only = $false; image_kv = @('bf16', 'int8', 'fp8', 'nvfp4', 'k8v4', 'rk8v4', 'rk4v4', 'rk4v4-e8', 'rk2v4-e8'); requires_mtp = $true; max_drafts = 63; concurrent_max_drafts = 15; wide_max_concurrency = 1; concurrent_width_policy = 'clamp_to_15' }
         lookup_ngram = @{ enabled = $false; reason = 'legacy_path_disabled'; replacement = '--ngram-draft-tokens --ngram-min-match' }
         adaptive_mtp = @{ max_concurrency = 8; text_only = $false; ngram = $true; ngram_max_concurrency = 8; ngram_concurrent_max_drafts = 15; cold_disk = $false }
@@ -60,15 +66,18 @@ if ($Backend -eq 'ninfer') {
         multi_gpu = @{ mode = 'layer'; max_devices = 8; vision_residency = @('resident', 'cpu'); mtp = $true; host_history = 'shared' }
         video = $false
     }
-    if ($PSBoundParameters.ContainsKey('DiskPath') -or $PSBoundParameters.ContainsKey('DiskMiB') -or
-        @($WorkerArgs | Where-Object { $_ -match '^--kvmem-disk-(path|mib)(=|$)' }).Count) {
-        throw 'KVMem cold snapshots are temporarily disabled for ninfer'
-    }
     if (@($WorkerArgs | Where-Object { $_ -match '^--lookup-ngram(=|$)' }).Count) {
         throw 'KVMem disables legacy --lookup-ngram; use -NgramDrafts and -NgramMinMatch'
     }
 }
 if ($Describe) { $capabilities | ConvertTo-Json -Depth 4; return }
+if (@($WorkerArgs | Where-Object { $_ -match '^--kvmem-disk-(path|mib)(=|$)' }).Count) {
+    throw 'Use -DiskPath and -DiskMiB to configure shared active/idle SSD storage'
+}
+if (($PSBoundParameters.ContainsKey('DiskPath') -or $PSBoundParameters.ContainsKey('DiskMiB')) -and
+    [string]::IsNullOrWhiteSpace($DiskPath)) {
+    throw 'SSD storage requires a nonempty -DiskPath'
+}
 if (!$Worker) {
     $file = if ($Backend -eq 'ninfer') { 'ninfer-kvmem-server.exe' } else { 'llama-kvmem-server.exe' }
     $Worker = Join-Path $root "workers/$Backend/$file"
@@ -116,10 +125,11 @@ if ($Backend -eq 'ninfer') {
     if ($AdaptiveMtp -and !$MtpDrafts) {
         throw 'Adaptive MTP requires MTP; image, ngram and disk limits still apply'
     }
-    if ($FastPrefill -and ($KvType -notin @('int8', 'rk8v4', 'rk4v4', 'rk4v4-e8', 'rk2v4-e8') -or $DiskPath)) {
-        throw 'Fast prefill requires INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 without cold disk'
+    if ($FastPrefill -and ($KvType -notin @('int8', 'rk8v4', 'rk4v4', 'rk4v4-e8', 'rk2v4-e8'))) {
+        throw 'Fast prefill requires INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8'
     }
     if ($VisionResidency -ne 'resident' -and !$Vision) { throw 'CPU Vision requires -Vision' }
+    if ($RecentTokens -lt 64) { throw 'ninfer -RecentTokens must be at least 64 to keep the newest append page' }
     $sinkBlocks = if ($SinkTokens -lt 64) { 1 } else { [int][Math]::Floor($SinkTokens / 64) }
     $recentBlocks = [int][Math]::Floor($RecentTokens / 64)
     if (($sinkBlocks + $recentBlocks) * 64 -gt $Budget) {
@@ -147,16 +157,23 @@ if ($Backend -eq 'ninfer') {
     if ($Vision) { $nativeArgs += @('--vision', '--vision-residency', $VisionResidency, '--vision-max-merged', "$VisionTokens") }
     if ($ThinkingBudget -gt 0) { $nativeArgs += @('--default-thinking-budget', "$ThinkingBudget") }
 } else {
-    foreach ($name in @('StageLayers', 'MtpDrafts', 'AdaptiveMtp', 'FastPrefill', 'NgramDrafts', 'NgramMinMatch', 'Concurrency', 'RetainedSessions', 'Vision', 'VisionResidency', 'VisionTokens', 'DeviceProfile', 'DiskPath', 'DiskMiB', 'ThinkingBudget', 'SinkTokens', 'RecentTokens')) {
+    foreach ($name in @('StageLayers', 'MtpDrafts', 'AdaptiveMtp', 'FastPrefill', 'NgramDrafts', 'NgramMinMatch', 'Concurrency', 'RetainedSessions', 'Vision', 'VisionResidency', 'VisionTokens', 'DeviceProfile', 'ThinkingBudget')) {
         if ($PSBoundParameters.ContainsKey($name)) { throw "-$name configures ninfer; use llama native options in -WorkerArgs" }
-    }
-    if ($PSBoundParameters.ContainsKey('HostMiB')) {
-        throw '-HostMiB configures ninfer native payload storage; use llama native options in -WorkerArgs'
     }
     $nativeArgs = @('-m', $Model, '--host', $ListenHost, '--port', "$Port", '-c', "$Context",
         '-n', "$MaxTokens", '--kvmem-budget', "$Budget", '--kvmem-gen-reserve', "$Reserve",
-        '--kv-dtype', $KvType, '-b', "$Prefill", '-ub', "$Prefill")
+        '--kv-dtype', $KvType, '-b', "$Prefill", '-ub', "$Prefill",
+        '--kvmem-sink-tokens', "$SinkTokens", '--kvmem-recent-tokens', "$RecentTokens")
+    if ($PSBoundParameters.ContainsKey('HostMiB') -or $DiskPath) { $nativeArgs += @('--kvmem-host-mib', "$HostMiB") }
 }
+if ($DiskPath) { $nativeArgs += @('--kvmem-disk-path', $DiskPath, '--kvmem-disk-mib', "$DiskMiB") }
+# Use invariant decimals because both native parsers expect a dot.
+if (!$NoLrfu) {
+    $nativeArgs += @('--kvmem-lrfu',
+        '--kvmem-lrfu-lambda', $LrfuLambda.ToString('R', [Globalization.CultureInfo]::InvariantCulture),
+        '--kvmem-lrfu-top-frac', $LrfuTopFraction.ToString('R', [Globalization.CultureInfo]::InvariantCulture))
+}
+$nativeArgs += @('--kvmem-score-agg', $ScoreAggregation)
 $nativeArgs += $WorkerArgs
 if ($DryRun) {
     @{ backend = $Backend; argv = @($Worker) + $nativeArgs; capabilities = $capabilities

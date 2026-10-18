@@ -2,7 +2,6 @@
 #include "kvmem/memory_contract.hpp"
 
 #include <algorithm>
-#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -13,56 +12,6 @@
 namespace kvmem {
 
 namespace {
-
-uint32_t ring_popcount(uint16_t value) {
-    uint32_t count = 0;
-    while (value != 0) {
-        count += value & 1u;
-        value = static_cast<uint16_t>(value >> 1);
-    }
-    return count;
-}
-
-// ActKV Sec. 5.1 AAV classification, shared by the public query and the
-// diagnostic trace so the two agree. The ring holds one hit bit per compression
-// round with the newest in bit 0, so only the low min(access_rounds, 16) bits
-// have been observed -- the zero bits above them are padding, not misses, and
-// counting them would make every new block look silent.
-//
-// This is analysis, not policy: the paper classifies access patterns (its Fig. 6)
-// to motivate ONE global lambda for LRFU, and never attaches a per-class decay.
-// Protecting a subset would drive lambda toward 1, the "frequency-dominated
-// eviction may retain obsolete continuous entries" regime the paper warns about,
-// and it measurably cost needle recall here.
-constexpr uint32_t kAavRingBits = 16;
-// Hits inside the observed window before a block counts as intermittent rather
-// than cold. Fixed because the classification is a diagnostic, not a knob.
-constexpr uint32_t kAavIntermittentMinHits = 2;
-
-uint32_t aav_window(const KvMemBlock & block) {
-    return std::min<uint32_t>(block.access_rounds, kAavRingBits);
-}
-
-uint32_t aav_hits(const KvMemBlock & block) {
-    const uint32_t window = aav_window(block);
-    if (window == 0) { return 0; }
-    const uint16_t mask = window == kAavRingBits
-        ? static_cast<uint16_t>(0xFFFFu)
-        : static_cast<uint16_t>((1u << window) - 1u);
-    return ring_popcount(static_cast<uint16_t>(block.access_ring & mask));
-}
-
-KvAavClass aav_classify(const KvMemBlock & block) {
-    const uint32_t window = aav_window(block);
-    // Never observed: a block that appeared after the last round has no history
-    // to describe, and the recent window already keeps it.
-    if (window == 0) { return KvAavClass::Cold; }
-    const uint32_t hits = aav_hits(block);
-    if (hits == 0) { return KvAavClass::Silent; }
-    // Hit in every observed round: the working set holds it anyway.
-    if (hits == window) { return KvAavClass::Continuous; }
-    return hits >= kAavIntermittentMinHits ? KvAavClass::Intermittent : KvAavClass::Cold;
-}
 
 uint32_t ceil_div_u32(uint32_t value, uint32_t divisor) {
     if (value == 0) return 0;
@@ -80,6 +29,30 @@ uint32_t ceil_percent(uint32_t value, uint32_t percent) {
 }
 
 }  // namespace
+
+void KvMemStore::set_runtime_select_budget(uint32_t tokens) {
+    if (tokens == 0) {
+        runtime_select_budget_ = 0;
+        return;
+    }
+    if (tokens > cfg_.select_budget) {
+        throw std::invalid_argument(
+            "KVMem request semantic budget exceeds configured maximum");
+    }
+    if (tokens < cfg_.block_tokens || tokens % cfg_.block_tokens != 0) {
+        throw std::invalid_argument(
+            "KVMem request semantic budget must be a positive multiple of "
+            "block_tokens");
+    }
+    const uint32_t blocks = tokens / cfg_.block_tokens;
+    if (static_cast<uint64_t>(cfg_.sink_blocks) + cfg_.recent_blocks >
+        blocks) {
+        throw std::invalid_argument(
+            "KVMem request semantic budget is smaller than the configured "
+            "sink + recent allocation");
+    }
+    runtime_select_budget_ = tokens;
+}
 
 KvMemKeepAllocation resolve_kvmem_keep_allocation(
         uint32_t block_tokens,
@@ -260,7 +233,6 @@ void KvMemStore::accumulate_attn(const std::vector<double> &scores) {
     for (uint32_t i = 0; i < n; ++i) {
         blocks_[i].profile_score += scores[i];
         blocks_[i].attn_score = blocks_[i].profile_score;
-        blocks_[i].select_score = blocks_[i].profile_score;
     }
 }
 
@@ -268,338 +240,13 @@ void KvMemStore::set_attn_scores(const std::vector<double> &scores) {
     set_retrieval_scores(scores);
 }
 
-// Top-p hit rule for the ActKV keep score, shared by the immediate and the
-// deferred paths so both agree on what counts as a hit.
-//
-// The threshold is taken over the scores that carry positive evidence. KVMem
-// re-scores every resident block every round, so it is NOT the paper's small
-// action region: a threshold over the whole pool would mark roughly p of the
-// pool a hit even in a round where the query matches nothing. KS would then grow
-// with page AGE instead of relevance, and pick_topk would start preferring the
-// oldest blocks -- exactly the ones whose host records the tier has dropped.
-// Requiring scores[i] > 0 keeps "hit" meaning "the model cared this round".
-struct LrfuHitMask {
-    double threshold = 0.0;
-    bool   thresholded = false;
-};
-
-LrfuHitMask lrfu_hit_mask(std::vector<double> & scratch,
-                          const std::vector<double> & scores,
-                          uint32_t n_score, double p) {
-    LrfuHitMask out;
-    scratch.clear();
-    for (uint32_t i = 0; i < n_score; ++i) {
-        if (scores[i] > 0.0) scratch.push_back(scores[i]);
-    }
-    const size_t n_pos = scratch.size();
-    out.thresholded = p < 1.0 && n_pos > 1;
-    if (n_pos > 0) {
-        const double want = (1.0 - p) * static_cast<double>(n_pos);
-        size_t rank = static_cast<size_t>(want);
-        if (rank >= n_pos) rank = n_pos - 1;   // guard: p -> 0
-        // The input is const, so the threshold needs a copy; reuse the caller's
-        // buffer instead of allocating one per call.
-        std::nth_element(scratch.begin(), scratch.begin() + rank, scratch.end());
-        out.threshold = out.thresholded ? scratch[rank] : 0.0;
-    }
-    return out;
-}
-
-void KvMemStore::accumulate_lrfu(const std::vector<double> &scores,
-                                 uint64_t round_id,
-                                 const std::vector<uint32_t> * selected) {
+void KvMemStore::set_retrieval_scores(const std::vector<double> &scores) {
+    if (cfg_.lrfu) history_.preview(scores);
     const uint32_t n = block_count();
-    if (n == 0) return;
-
-    // One compression round == one keep-score update. Scoring may be re-run
-    // inside the same round (preview + apply + multimodal replay); every repeat
-    // used to decay the pool again and re-add the same score, which turned
-    // "frequency" into "how many times the code was called". On a repeat we only
-    // republish KS so the ranking stays identical between the passes.
-    //
-    // round_id == 0 has no ORA clock to read, so the block frontier stands in for
-    // it: the context grew => a new round, the same frontier => a repeat. The
-    // ninfer backend scores out of prepare_window() and can only supply this, so
-    // deriving it here is what keeps the guard effective on that path.
-    const uint64_t round = round_id != 0
-        ? round_id
-        : static_cast<uint64_t>(total_tokens_);
-    if (lrfu_round_seen_ && lrfu_last_round_ == round) {
-        for (auto & b : blocks_) b.select_score = b.lrfu_score;
-        return;
-    }
-    lrfu_last_round_ = round;
-    lrfu_round_seen_ = true;
-
-    const uint32_t n_score = std::min<uint32_t>(
-        static_cast<uint32_t>(scores.size()), n);
-    const double p = (cfg_.lrfu_top_frac > 0.0f && cfg_.lrfu_top_frac < 1.0f)
-        ? static_cast<double>(cfg_.lrfu_top_frac) : 1.0;
-    const LrfuHitMask mask = lrfu_hit_mask(lrfu_scratch_, scores, n_score, p);
-    const bool thresholded = mask.thresholded;
-    const double threshold = mask.threshold;
-
-    // When the caller knows which blocks this round kept, only those may grow.
-    // Membership is tested through a byte map so the check stays O(1) per block
-    // and tolerates an unsorted or out-of-range id list.
-    std::vector<uint8_t> in_selection;
-    if (selected != nullptr) {
-        in_selection.assign(n, 0);
-        for (uint32_t id : *selected) {
-            if (id < n) in_selection[id] = 1;
-        }
-    }
     for (uint32_t i = 0; i < n; ++i) {
-        double ks = cfg_.lrfu_lambda * blocks_[i].lrfu_score;
-        const bool carried = i < n_score && scores[i] > 0.0 &&
-            (!thresholded || scores[i] >= threshold);
-        if (carried && (selected == nullptr || in_selection[i])) {
-            ks += scores[i];
-        }
-        // The keep score is a non-negative attention mass. Clamping at 0 keeps a
-        // block that went cold able to come back; a negative keep score would
-        // rank it last forever (and nothing resets it while it stays resident).
-        // Only the ranking field and the persistent KS are written: attn_score
-        // stays the content signal (docs/dev-actkv-swap-redesign.md T1).
-        if (ks < 0.0) ks = 0.0;
-        blocks_[i].lrfu_score = ks;
-        blocks_[i].select_score = ks;
-    }
-}
-
-const std::vector<double> &KvMemStore::normalized_retrieval_scores(
-        const std::vector<double> &scores) {
-    const double temperature = static_cast<double>(cfg_.retrieval_temperature);
-    if (!(temperature > 0.0) || scores.empty()) { return scores; }
-    // Softmax over the positively scored blocks only. A block without positive
-    // evidence contributes no mass, which is what keeps the "a keep score cannot
-    // grow from page age alone" rule intact: the raw sign stays the gate, the
-    // softmax only replaces the magnitude.
-    double best = 0.0;
-    bool any = false;
-    for (double value : scores) {
-        if (value > 0.0 && (!any || value > best)) {
-            best = value;
-            any  = true;
-        }
-    }
-    if (!any) { return scores; }
-    retrieval_scratch_.assign(scores.size(), 0.0);
-    double total = 0.0;
-    for (std::size_t i = 0; i < scores.size(); ++i) {
-        if (!(scores[i] > 0.0)) { continue; }
-        const double weight = std::exp((scores[i] - best) / temperature);
-        retrieval_scratch_[i] = weight;
-        total += weight;
-    }
-    if (!(total > 0.0) || !std::isfinite(total)) { return scores; }
-    for (double &weight : retrieval_scratch_) { weight /= total; }
-    return retrieval_scratch_;
-}
-
-KvAavClass KvMemStore::aav_class_of(uint32_t block_id) const {
-    if (block_id >= blocks_.size()) { return KvAavClass::Cold; }
-    return aav_classify(blocks_[block_id]);
-}
-
-void KvMemStore::record_access(const std::vector<uint32_t> &selected) {
-    // Two reasons to run: the diagnostic trace, or a caller that enabled the ring
-    // itself. Nothing else consumes the ring, so with both off the fields stay
-    // untouched and this is the only early exit on the default path.
-    const bool trace = std::getenv("KVMEM_AAV_TRACE") != nullptr;
-    if (!trace && !cfg_.aav_trace) { return; }
-    const uint32_t n = block_count();
-    if (n == 0) { return; }
-    // Score can be re-run inside one round (preview + apply + replay), and the
-    // token frontier separates a new round from a repeat on the ninfer path. The
-    // frontier is NOT a round counter though -- it is not monotone across the
-    // requests of one session (measured: 10 reversals in a 13-round run), so the
-    // row is numbered with a counter of its own and the frontier is reported
-    // beside it as data.
-    const uint64_t frontier = static_cast<uint64_t>(total_tokens_);
-    if (aav_round_seen_ && aav_last_round_ == frontier) { return; }
-    aav_last_round_ = frontier;
-    aav_round_seen_ = true;
-    const uint64_t row = ++aav_rows_;
-
-    // The block table grows as history is appended, so the selection has to be
-    // compared as SETS. Comparing equal-length bitmaps returned 0 every time the
-    // table had grown, which is always: the metric read 0.000 for all 45 rows of
-    // a full run, and a stability number that is always zero is worse than none.
-    std::vector<uint8_t> keep(n, 0);
-    for (uint32_t id : selected) {
-        if (id < n) { keep[id] = 1; }
-    }
-    std::vector<uint32_t> ids;
-    ids.reserve(selected.size());
-    for (uint32_t id : selected) {
-        if (id < n) { ids.push_back(id); }
-    }
-    std::sort(ids.begin(), ids.end());
-    ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
-
-    uint32_t cold = 0;
-    uint32_t intermittent = 0;
-    uint32_t continuous = 0;
-    uint32_t silent = 0;
-    uint32_t resurrected = 0;
-    // The counterfactual the protect policy has to be judged by: an intermittent
-    // block this round did NOT keep is exactly the entry the paper says a
-    // current-round-preference eviction drops by mistake.
-    uint32_t intermittent_dropped = 0;
-    for (uint32_t i = 0; i < n; ++i) {
-        auto &block = blocks_[i];
-        const bool hit = keep[i] != 0;
-        // A block that comes back after at least one missed round is the paper's
-        // failure mode made countable: it was dropped and later mattered again.
-        if (hit && (block.access_ring & 0x1u) == 0 && block.access_ring != 0) {
-            ++resurrected;
-        }
-        block.access_ring =
-            static_cast<uint16_t>((block.access_ring << 1) | (hit ? 1u : 0u));
-        if (block.access_rounds < 0xFFFFu) { ++block.access_rounds; }
-        // One classification rule, shared with aav_class_of and the protect
-        // policy: silent = never hit, cold = too few hits yet, continuous = hit
-        // every observed round, intermittent = hit some but missed others.
-        switch (aav_classify(block)) {
-        case KvAavClass::Silent: ++silent; break;
-        case KvAavClass::Cold: ++cold; break;
-        case KvAavClass::Continuous: ++continuous; break;
-        case KvAavClass::Intermittent:
-            ++intermittent;
-            if (!hit) { ++intermittent_dropped; }
-            break;
-        }
-    }
-
-    const auto jaccard = [](const std::vector<uint32_t> &a, const std::vector<uint32_t> &b) {
-        if (a.empty() && b.empty()) { return 0.0; }
-        std::size_t i = 0;
-        std::size_t j = 0;
-        std::size_t both = 0;
-        while (i < a.size() && j < b.size()) {
-            if (a[i] == b[j]) {
-                ++both;
-                ++i;
-                ++j;
-            } else if (a[i] < b[j]) {
-                ++i;
-            } else {
-                ++j;
-            }
-        }
-        const std::size_t either = a.size() + b.size() - both;
-        return either == 0 ? 0.0 : static_cast<double>(both) / static_cast<double>(either);
-    };
-    const double jaccard_prev =
-        aav_history_count_ >= 1 ? jaccard(ids, aav_history_[(aav_history_next_ + 3) % 4]) : 0.0;
-    const double jaccard_4 =
-        aav_history_count_ >= 4 ? jaccard(ids, aav_history_[aav_history_next_]) : 0.0;
-    aav_history_[aav_history_next_] = std::move(ids);
-    aav_history_next_ = (aav_history_next_ + 1) % 4;
-    if (aav_history_count_ < 4) { ++aav_history_count_; }
-
-    if (trace) {
-        std::fprintf(stderr,
-                     "KVMEM_AAV_TRACE row=%llu frontier=%llu blocks=%u selected=%zu cold=%u "
-                     "intermittent=%u intermittent_dropped=%u continuous=%u silent=%u "
-                     "resurrected=%u jaccard_prev=%.3f jaccard_4=%.3f\n",
-                     static_cast<unsigned long long>(row),
-                     static_cast<unsigned long long>(frontier), n, selected.size(), cold,
-                     intermittent, intermittent_dropped, continuous, silent, resurrected,
-                     jaccard_prev, jaccard_4);
-    }
-}
-
-void KvMemStore::reset_lrfu() {
-    for (auto & b : blocks_) {
-        b.lrfu_score = 0.0;
-        b.select_score = 0.0;
-        b.attn_score = 0.0;
-    }
-    lrfu_last_round_ = 0;
-    lrfu_round_seen_ = false;
-}
-
-void KvMemStore::set_retrieval_scores(const std::vector<double> &scores,
-                                      uint64_t round_id) {
-    const uint32_t n = block_count();
-    // --kvmem-retrieval-temp (cross-page normalization). Off by default, and then
-    // `scored` aliases `scores` so every use below stays byte-identical to the
-    // raw-cosine behaviour it had before this option existed.
-    const std::vector<double> &scored = normalized_retrieval_scores(scores);
-    if (cfg_.action_lrfu) {
-        // Keep the one-shot score available (diagnostics, quota selector), then
-        // fold it into the temporal keep score which becomes the ranking signal.
-        for (uint32_t i = 0; i < n; ++i) {
-            blocks_[i].retrieval_score = (i < scored.size()) ? scored[i] : 0.0;
-            // Keep the one-shot content signal live for constrain_media and
-            // diagnostics: the LRFU keep score ranks the working set, not images.
-            blocks_[i].attn_score = blocks_[i].retrieval_score;
-        }
-        if (cfg_.deferred_lrfu) {
-            // Two-phase form. commit_lrfu() knows the selection, so the real KS
-            // update waits for it -- but the ranking has to happen NOW, inside
-            // pick_topk_blocks, so select_score cannot simply stay at the
-            // previous KS. Doing that hid the current query from the selector
-            // entirely: on the first round every select_score was zero (so it
-            // fell back to recency and looked fine), and after that the
-            // accumulated KS of old blocks locked the window shut. A block
-            // written this round has KS = 0, could never outrank the incumbents,
-            // and was evicted again immediately -- the just-written needle became
-            // unreadable.
-            //
-            // So publish a PROVISIONAL KS here: lambda * KS + this round's hit.
-            // It has exactly the ranking the immediate path would use, while
-            // lrfu_score itself is left untouched until commit_lrfu applies the
-            // narrower, selection-gated update.
-            lrfu_pending_scores_.assign(scored.begin(), scored.end());
-            lrfu_pending_round_ = round_id;
-            lrfu_pending_ = true;
-            const uint32_t n = block_count();
-            const uint32_t n_score = std::min<uint32_t>(
-                static_cast<uint32_t>(scored.size()), n);
-            const double p = (cfg_.lrfu_top_frac > 0.0f && cfg_.lrfu_top_frac < 1.0f)
-                ? static_cast<double>(cfg_.lrfu_top_frac) : 1.0;
-            const LrfuHitMask mask = lrfu_hit_mask(lrfu_scratch_, scored, n_score, p);
-            for (uint32_t i = 0; i < n; ++i) {
-                double ks = cfg_.lrfu_lambda * blocks_[i].lrfu_score;
-                if (i < n_score && scored[i] > 0.0 &&
-                    (!mask.thresholded || scored[i] >= mask.threshold)) {
-                    ks += scored[i];
-                }
-                if (ks < 0.0) ks = 0.0;
-                blocks_[i].select_score = ks;
-            }
-            return;
-        }
-        accumulate_lrfu(scored, round_id);
-        return;
-    }
-    for (uint32_t i = 0; i < n; ++i) {
-        blocks_[i].retrieval_score = (i < scored.size()) ? scored[i] : 0.0;
+        blocks_[i].retrieval_score = (i < scores.size()) ? scores[i] : 0.0;
         blocks_[i].attn_score = blocks_[i].retrieval_score;
-        blocks_[i].select_score = blocks_[i].retrieval_score;
     }
-}
-
-void KvMemStore::commit_lrfu(const std::vector<uint32_t> & selected) {
-    // AAV bookkeeping is independent of the keep-score rule: the selection is
-    // what "access" means, and it arrives here on every reselect regardless of
-    // whether action_lrfu is on. A no-op unless the diagnostic is enabled (there
-    // is no retention policy on the classification). Order against the decay
-    // below does not matter: a round's own hit bit can never change its own
-    // class, because advancing the ring
-    // moves hits and window together (Intermittent is 0 < hits < window).
-    record_access(selected);
-    if (!cfg_.action_lrfu || !cfg_.deferred_lrfu || !lrfu_pending_) return;
-    // Apply the held round with the caller's selection as the hit set, then drop
-    // it. accumulate_lrfu keeps its own idempotency guard, so a second commit
-    // for the same round stays a no-op.
-    accumulate_lrfu(lrfu_pending_scores_, lrfu_pending_round_, &selected);
-    lrfu_pending_ = false;
-    lrfu_pending_scores_.clear();
-    lrfu_pending_round_ = 0;
 }
 
 void KvMemStore::set_block_tier(uint32_t block_id, KvTier tier,
@@ -753,12 +400,8 @@ std::vector<uint32_t> KvMemStore::constrain_media(std::vector<uint32_t> selected
     auto newest = mandatory;
     std::sort(newest.begin(), newest.end(), std::greater<uint32_t>());
     for (auto id : newest) keep(id, recency);
-    // Media groups rank by the CONTENT signal (attn_score), never by the ActKV
-    // keep score: an image must be kept because the query is looking at it, not
-    // because LRFU has rewarded the block over many rounds
-    // (docs/dev-actkv-swap-redesign.md T1 acceptance).
     auto better = [&](uint32_t a, uint32_t b) {
-        if (!recency && blocks_[a].attn_score != blocks_[b].attn_score) return blocks_[a].attn_score > blocks_[b].attn_score;
+        if (!recency && selection_score(a) != selection_score(b)) return selection_score(a) > selection_score(b);
         return a > b;
     };
     std::sort(selected.begin(), selected.end(), better);
@@ -947,8 +590,8 @@ std::vector<uint32_t> KvMemStore::pick_topk_ungrouped(
         // Fill any leftover quota with the configured method's combined score
         // so rounding, overlap, or zero explicit quotas still use the budget.
         if (kept_count < budget) {
-            take_top(budget - kept_count, [](const KvMemBlock &b) {
-                return b.select_score;
+            take_top(budget - kept_count, [&](const KvMemBlock &b) {
+                return selection_score(b.block_id);
             });
         }
         selected.reserve(kept_count);
@@ -966,11 +609,11 @@ std::vector<uint32_t> KvMemStore::pick_topk_ungrouped(
             if (!kept[i]) candidates.push_back(i);
         }
         const uint32_t need = budget - kept_count;
-        // Partial sort by the active method's ranking score (select_score);
-        // tie-break by recency (higher id) so selection is deterministic.
+        // Partial sort by attn_score desc; tie-break by recency (higher id) so
+        // selection is deterministic.
         auto better = [&](uint32_t a, uint32_t b) {
-            if (blocks_[a].select_score != blocks_[b].select_score) {
-                return blocks_[a].select_score > blocks_[b].select_score;
+            if (selection_score(a) != selection_score(b)) {
+                return selection_score(a) > selection_score(b);
             }
             return a > b;
         };
