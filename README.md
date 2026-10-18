@@ -38,7 +38,7 @@ ninfer 后端的 `--spec dflash2` 在 KVMem 长上下文下现已正常工作。
 
 ## GGUF → .ninfer 模型转换
 
-转换工具位于 `backends/ninfer/tools/convert`（Python 3.11 + PyTorch/NumPy）。
+转换工具可在Releases中下载（Python 3.11 + PyTorch/NumPy）。
 `qwen3_8_27b_gguf` 配方把 Qwen3.8-27B GGUF **按自身块格式直接转换**（不做反量化），
 可选加入 MTP 头、DFlash2 草稿与视觉投影器。在 `backends/ninfer` 目录下运行：
 
