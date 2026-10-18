@@ -21,6 +21,7 @@ ninfer 后端的 `--spec dflash2` 在 KVMem 长上下文下现已正常工作。
    （`KV coverage exceeds active entitlement`，tokens=53250 vs 53248）。
 4. **state-slot fork 跟随**：环 lane 跟随 StateImage 槽位变化。
 5. **draft-bypass 诊断**：`KVMEM_DFLASH_BYPASS` 记录连续空手神经轮。
+6. dflash2模型推荐，Qwen3.8-27B-GSQ-RCO-IQ3_XXS-Uncensored-MTP，或者其他低于11G容量，精度格式推荐rk8v4，或者nvfp4。
 
 ### 256K 召回复测（2026-10-18，RTX 5060 Ti，dflash2 草稿 3，nvfp4，15 轮 / 80 次工具调用）
 
