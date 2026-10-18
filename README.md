@@ -65,7 +65,6 @@ python3 -m tools.convert \
 - 不需要的组件可省略（例如纯文本去掉 `vision`）；`mtp` 组件要求 `-mtp` GGUF
   （`blk.64.nextn.*`）。
 - CPU 转换追加 `--device cpu`。
-- 更多配方与排错见 [backends/ninfer/docs/weight-conversion.md](backends/ninfer/docs/weight-conversion.md)。
 
 ## 快速开始
 
@@ -77,11 +76,5 @@ python3 -m tools.convert \
      --kvmem-gen-reserve 16384 --kvmem-host-mib 12288`。
 3. 服务地址 `http://127.0.0.1:18200`，OpenAI 兼容 API。
 
-## 文档
-
-- [DFlash2 × KVMem 修复记录（2026-10-18）](docs/dflash2-kvmem-fixes-20261018.md)
-- [后端能力与启动说明](docs/multi-backend.md)
-- [仓库结构与构建](docs/multi-backend-repository.md)
-- [后端差异](docs/multi-backend-differences.md)
 
 
