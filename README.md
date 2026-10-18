@@ -78,6 +78,4 @@ python3 -m tools.convert \
 - [仓库结构与构建](docs/multi-backend-repository.md)
 - [后端差异](docs/multi-backend-differences.md)
 
-## 致谢
 
-感谢 B 站 **melis** 和 **redsnow23** 参与测试并提供反馈。
