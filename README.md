@@ -48,6 +48,71 @@ Previous milestone: [`v0.16.0-rc3`](docs/milestones/v0.16.0-rc3.md) (pre-release
 
 Source version: **0.18.0**. See the [English / 中文 release notes](docs/releases/v0.18.0.md). The Windows NInfer packages are based on RC3 with recent=64; the separate llama.cpp/ROCm packages remain at their listed versions.
 
+## DFlash2 x KVMem fixes — 2026-10-18
+
+The ninfer backend's `--spec dflash2` now works at long context under KVMem. Five
+issues were fixed; [docs/dflash2-kvmem-fixes-20261018.md](docs/dflash2-kvmem-fixes-20261018.md)
+has the root-cause analysis and the full evidence matrix:
+
+1. **Envelope short-circuit (main bug).** The draft's sliding-window attention
+   envelope used the ring capacity (2048) as its `max_context`, and CUDA graphs
+   baked that in; the kernel's guard then silently zeroed every draft round past
+   absolute position 2048 — which is why draft acceptance collapsed above ~2K
+   tokens regardless of content.
+2. **KVMem reselection poisoning.** Blocks swapped out by retrieval left stale
+   ring slots (stitched history). A `dflash_context_floor` plus a per-batch
+   `min_positions` mask now limit the 2048-token conditioning window to the
+   trailing continuous segment.
+3. **Missing `prepare_window` in dflash rounds.** Filling the B+R device window
+   crashed the engine (`KV coverage exceeds active entitlement`, tokens=53250
+   vs 53248). The dflash batch now prepares its window like the MTP batch.
+4. **State-slot fork follow-up** (ring follows StateImage slot changes) and
+   **draft-bypass diagnostics** (`KVMEM_DFLASH_BYPASS`).
+
+### 256K recall re-run (2026-10-18, RTX 5060 Ti, dflash2 draft 3, nvfp4, 15 rounds, 80 tool calls)
+
+| Metric | Before | After |
+|---|---:|---:|
+| Same-turn recall | 33/33 | **33/33** |
+| Final recall (strict / union) | 33/33 | **33/33** |
+| Cross-tool recall (send_alert) | 14/14 | **14/14** |
+| Final recall decode | ~72.6 tok/s | **106.0–135.8 tok/s** |
+| Probe decode | ~30–40 tok/s | **58.7–98.5 tok/s** |
+| 131K decode (greedy, stitched window) | 71.4 tok/s | **120.3 tok/s** |
+
+Recall quality is unchanged (33/33) while decode improves by up to ~+87%.
+`niah33_262k.py` in the repository root is the test driver; results are written
+to `niah33-262k-metrics.json`.
+
+## GGUF → .ninfer conversion (Qwen3.8-27B)
+
+NInfer's converter lives in `backends/ninfer/tools/convert` (Python 3.11 with
+PyTorch and NumPy). The `qwen3_8_27b_gguf` recipe converts a Qwen3.8-27B GGUF
+**in its own block formats** (no dequantisation), optionally adding the MTP
+head, the DFlash2 draft and the vision projector. Run from `backends/ninfer`:
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/conversion-input/metadata \
+  --recipe qwen3_8_27b_gguf \
+  --source gguf=Qwen3.8-27B-GSQ-RCO-IQ3_XXS-Uncensored-MTP.gguf \
+  --source dflash2=Qwen3.8-27B-DFlash2-Q4_K_M.gguf \
+  --source vision=mmproj-Qwen3.8-27B-Q8_0.gguf \
+  --components text,vision,mtp,dflash2 \
+  --name qwen3.8-27b \
+  --out model.ninfer
+```
+
+- `--model` needs only the base checkpoint's config and tokenizer (the
+  `metadata` directory produced when preparing conversion inputs).
+- The `dflash2` source accepts the official DFlash2 GGUF or its safetensors
+  directory.
+- Omit components you do not need (e.g. drop `vision` for text-only). The `mtp`
+  component requires an `-mtp` GGUF (`blk.64.nextn.*`).
+- CPU conversion: append `--device cpu`.
+- More recipes, proposal heads and troubleshooting:
+  [backends/ninfer/docs/weight-conversion.md](backends/ninfer/docs/weight-conversion.md).
+
 ## How KVMem works
 
 Completed KV blocks are stored in host RAM. For each agent step, KVMem retrieves relevant blocks using the current query and places them in chronological order in a bounded GPU working set. Previously computed KV is reused across turns.
@@ -587,6 +652,7 @@ generation space is allocated separately with `--kvmem-gen-reserve`.
 
 - [v0.16.0-rc3 milestone](docs/milestones/v0.16.0-rc3.md)
 - [v0.17.0 release notes (English / 中文)](docs/releases/v0.17.0.md)
+- [DFlash2 x KVMem fixes (2026-10-18)](docs/dflash2-kvmem-fixes-20261018.md)
 - [Modification plan](docs/modification-plan.md)
 - [Architecture](docs/architecture.md)
 - [Patch replay](patches/README.md)
