@@ -8,7 +8,7 @@ set "BIN=%~dp0"
 set "EXE=%BIN%ninfer-kvmem-server.exe"
 
 REM model
-set "MODEL=I:\model\Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.ninfer"
+set "MODEL=I:\model\ninfer\Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.ninfer"
 
 REM GPU: an existing CUDA_VISIBLE_DEVICES wins; otherwise this box's RTX 5060 Ti
 if defined CUDA_VISIBLE_DEVICES (set "GPU=%CUDA_VISIBLE_DEVICES%") else (set "GPU=GPU-dba26dd9-930f-1b01-2b05-22c1fca6cdce")

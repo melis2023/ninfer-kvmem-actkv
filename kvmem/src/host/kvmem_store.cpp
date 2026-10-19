@@ -8,6 +8,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace kvmem {
 
@@ -545,27 +546,29 @@ std::vector<uint32_t> KvMemStore::pick_topk_ungrouped(
 
     auto take_top = [&](uint32_t quota, auto score_fn) {
         if (kept_count >= budget || quota == 0) return;
-        std::vector<uint32_t> candidates;
-        candidates.reserve(n - kept_count);
+        // Score each candidate exactly once and rank contiguous (score, id)
+        // pairs. The previous comparator re-read blocks_[id] on every
+        // nth_element comparison, which is cache hostile on long histories.
+        std::vector<std::pair<double, uint32_t>> ranked;
+        ranked.reserve(n - kept_count);
         for (uint32_t i = 0; i < n; ++i) {
-            if (!kept[i]) candidates.push_back(i);
+            if (!kept[i]) ranked.emplace_back(score_fn(blocks_[i]), i);
         }
-        if (candidates.empty()) return;
+        if (ranked.empty()) return;
         const uint32_t need = std::min<uint32_t>(
             std::min<uint32_t>(quota, budget - kept_count),
-            static_cast<uint32_t>(candidates.size()));
-        auto better = [&](uint32_t a, uint32_t b) {
-            const double sa = score_fn(blocks_[a]);
-            const double sb = score_fn(blocks_[b]);
-            if (sa != sb) return sa > sb;
-            return a > b;
+            static_cast<uint32_t>(ranked.size()));
+        auto better = [](const std::pair<double, uint32_t> &a,
+                         const std::pair<double, uint32_t> &b) {
+            if (a.first != b.first) return a.first > b.first;
+            return a.second > b.second;
         };
-        if (need < candidates.size()) {
-            std::nth_element(candidates.begin(), candidates.begin() + need,
-                             candidates.end(), better);
-            candidates.resize(need);
+        if (need < ranked.size()) {
+            std::nth_element(ranked.begin(), ranked.begin() + need,
+                             ranked.end(), better);
+            ranked.resize(need);
         }
-        for (uint32_t id : candidates) keep(id);
+        for (const auto &entry : ranked) keep(entry.second);
     };
 
     if (cfg_.select_policy == KvMemSelectPolicy::Quota && kept_count < budget) {
@@ -603,26 +606,27 @@ std::vector<uint32_t> KvMemStore::pick_topk_ungrouped(
 
     // Fill the rest with the highest cumulative-attention middle blocks.
     if (kept_count < budget) {
-        std::vector<uint32_t> candidates;
-        candidates.reserve(n - kept_count);
+        // Same single-pass scoring as take_top: selection_score() can branch on
+        // policy, so calling it twice per comparison is pure overhead.
+        std::vector<std::pair<double, uint32_t>> ranked;
+        ranked.reserve(n - kept_count);
         for (uint32_t i = 0; i < n; ++i) {
-            if (!kept[i]) candidates.push_back(i);
+            if (!kept[i]) ranked.emplace_back(selection_score(i), i);
         }
         const uint32_t need = budget - kept_count;
         // Partial sort by attn_score desc; tie-break by recency (higher id) so
         // selection is deterministic.
-        auto better = [&](uint32_t a, uint32_t b) {
-            if (selection_score(a) != selection_score(b)) {
-                return selection_score(a) > selection_score(b);
-            }
-            return a > b;
+        auto better = [](const std::pair<double, uint32_t> &a,
+                         const std::pair<double, uint32_t> &b) {
+            if (a.first != b.first) return a.first > b.first;
+            return a.second > b.second;
         };
-        if (need < candidates.size()) {
-            std::nth_element(candidates.begin(), candidates.begin() + need,
-                             candidates.end(), better);
-            candidates.resize(need);
+        if (need < ranked.size()) {
+            std::nth_element(ranked.begin(), ranked.begin() + need,
+                             ranked.end(), better);
+            ranked.resize(need);
         }
-        for (uint32_t id : candidates) keep(id);
+        for (const auto &entry : ranked) keep(entry.second);
     }
 
     selected.reserve(kept_count);
