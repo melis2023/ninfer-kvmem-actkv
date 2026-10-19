@@ -1,0 +1,43 @@
+From 9a5e90b540afe5dab8d30fa579104d746c0195cd Mon Sep 17 00:00:00 2001
+From: melis2023 <zhuangisme@gmail.com>
+Date: Mon, 19 Oct 2026 20:10:44 +0800
+Subject: [PATCH 2/2] perf(kvmem): start reselection at 80% of the window
+
+The swap used to start only when the compact position reached the full B+R window, which forced the transfer to run at exactly the point where no reserve was left. Triggering at 80% lets a swap complete before the window fills; the selection itself is unchanged.
+
+Measured on RTX 5060 Ti / Qwen3.8-27B IQ3_S (MTP draft 3, sink 1024):
+- 64K decode 45.40 -> 46.41 tok/s (+2.2%), acceptance 42.5% -> 51.3%
+- 256K end to end 724.2 -> 637.1 s (-12.0%), prefill 343.4 -> 390.5 tok/s
+- 256K NIAH 33 needles / 80 tool calls: 33/33 strict, 33/33 union, 14/14 cross-tool
+
+The gain comes from the smaller average window (45,056 -> 39,700 tokens), not from
+the extra swaps: reselections grow 24 -> 75 and transfers 6.14 -> 17.51 s, but the
+attention saving is 110 s. Restore is still a full 576 pages per swap; a delta
+restore would recover another ~15 s. See docs/kvmem-reselect-high-water-20261019.md.
+---
+ src/models/qwen3_5/program/storage/kvmem_window.cpp | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+index a84cb916..5ade982a 100644
+--- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
++++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+@@ -631,8 +631,14 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
+         force_selection = false;
+     }
+     if (end == begin && !force_selection) { return true; }
++    // Begin the swap at 80% of the window so the transfer overlaps the decode that
++    // follows instead of stalling the request at 100%. Selection is unchanged; only
++    // the trigger moves earlier. A completed swap compacts the view back to
++    // selected_tokens, which leaves the reserve free for the next segment.
++    const std::uint32_t reselect_high_water =
++        kvmem_window_tokens - kvmem_window_tokens / 5;
+     const bool reselecting =
+-        force_selection || compact_position(sequence, end) > kvmem_window_tokens;
++        force_selection || compact_position(sequence, end) > reselect_high_water;
+     long long reselect_score_us = 0;
+     long long reselect_select_us = 0;
+     if (reselecting) {
+-- 
+2.53.0.windows.1
+

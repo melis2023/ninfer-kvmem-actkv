@@ -93,6 +93,22 @@ strided 拷贝。`kvmem_window.cpp` 的 spill/restore 却传了块 id（sink / r
 - 完整带宽基准、逐次对比与剩余优化空间见
   [docs/kvmem-recall-opt-20261019.md](docs/kvmem-recall-opt-20261019.md)。
 
+### 重选水位提前到 80%
+
+窗口原来要等到 100%（53,248 token）才重选，此时已经没有余量，传输只能在最卡的位置发生。
+改成 80%（42,598 token）触发后，重选在窗口填满前完成，平均窗口从 45,056 降到 39,700
+（−12%），attention 计算随之下降：
+
+| 指标 | 100% 水位 | 80% 水位 | 变化 |
+|---|---:|---:|---:|
+| 64K decode | 45.40 tok/s | **46.41** | +2.2% |
+| 256K 端到端 | 724.2 s | **637.1 s** | **−12.0%** |
+| 256K prefill | 343.4 tok/s | **390.5** | +13.7% |
+| 256K NIAH 33 针 | 33/33 | **33/33** | 无退化 |
+
+代价是重选次数 24 → 75、传输 6.14 → 17.51 s（多 23 s），但窗口收益是 110 s，净省 87 s。
+详见 [docs/kvmem-reselect-high-water-20261019.md](docs/kvmem-reselect-high-water-20261019.md)。
+
 > 子模块 `backends/ninfer` 的上游是第三方仓库（`iamwavecut/ninfer-all.git`），本次改动
 > 没有推送权限。完整改动已作为
 > [`docs/patches/0001-feat-qwen3_5-DFlash2-KVMem-window-recall-with-merged.patch`](docs/patches/0001-feat-qwen3_5-DFlash2-KVMem-window-recall-with-merged.patch)
