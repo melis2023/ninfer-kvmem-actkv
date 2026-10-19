@@ -42,6 +42,28 @@ ninfer 后端的 `--spec dflash2` 在 KVMem 长上下文下现已正常工作。
 召回质量零损失，decode 最高提升 ~87%。测试驱动为仓库根目录
 [`niah33_262k.py`](niah33_262k.py)，结果写入 `niah33-262k-metrics.json`。
 
+## 2026-10-19 更新：召回传输优化（2 倍）
+
+KVMem 每次窗口重选要搬约 2.2 GB，实测只有 3.8–4.5 GB/s，而同一张卡的链路能跑 14.1 GB/s。
+根因是 `record_groups` 的语义用错：合并条件要求相邻记录属于同一分配区，调用方却传了块 id
+（sink / recent / topk 混排，天然不连续），于是 576 页被拆成 36,864 次单页 26 KiB 拷贝，
+耗时全花在驱动提交上，GPU 拷贝引擎几乎空闲（`sync_us` 仅 5 ms）。
+
+改为传入空 groups 后，连续页合并为每 plane 一次 2D 拷贝：
+
+| 指标 | 修复前 | 修复后 |
+|---|---:|---:|
+| DMA 带宽 | 4.0 GB/s | **14.1 GB/s** |
+| 单次重选传输（256K 均值） | 515 ms | **256 ms** |
+| 256K 24 次重选传输合计 | 12.37 s | **6.14 s** |
+| 256K prefill | 340.8 tok/s | **343.4 tok/s** |
+| 256K 端到端 | 729.8 s | **724.2 s** |
+
+输出逐位不变（256K 接受率 112/343，64K 124/296），`--kvmem-verify-transfers` 回放
+`payload_exact=1 state_exact=1`。传输只占端到端 1.7%，所以整体提升有限；
+完整带宽基准、24 次逐次对比与剩余优化空间见
+[docs/kvmem-recall-opt-20261019.md](docs/kvmem-recall-opt-20261019.md)。
+
 ## GGUF → .ninfer 模型转换
 
 转换工具可在Releases中下载（Python 3.11 + PyTorch/NumPy）。
@@ -77,4 +99,11 @@ python3 -m tools.convert \
 3. 服务地址 `http://127.0.0.1:18200`，OpenAI 兼容 API。
 
 
+## 文档
+
+- [DFlash2 × KVMem 修复记录（2026-10-18）](docs/dflash2-kvmem-fixes-20261018.md)
+- [召回传输优化：带宽基准、256K A/B 与逐次对比（2026-10-19）](docs/kvmem-recall-opt-20261019.md)
+- [后端能力与启动说明](docs/multi-backend.md)
+- [仓库结构与构建](docs/multi-backend-repository.md)
+- [后端差异](docs/multi-backend-differences.md)
 
