@@ -64,6 +64,11 @@ KVMem 每次窗口重选要搬约 2.2 GB，实测只有 3.8–4.5 GB/s，而同�
 完整带宽基准、24 次逐次对比与剩余优化空间见
 [docs/kvmem-recall-opt-20261019.md](docs/kvmem-recall-opt-20261019.md)。
 
+> 子模块 `backends/ninfer` 的上游是第三方仓库（`iamwavecut/ninfer-all.git`），本次改动
+> 没有推送权限。完整改动已作为
+> [`docs/patches/0001-feat-qwen3_5-DFlash2-KVMem-window-recall-with-merged.patch`](docs/patches/0001-feat-qwen3_5-DFlash2-KVMem-window-recall-with-merged.patch)
+> 附带（183 个文件）；在 `backends/ninfer` 里 `git am <该文件>` 即可复现。
+
 ## GGUF → .ninfer 模型转换
 
 转换工具可在Releases中下载（Python 3.11 + PyTorch/NumPy）。
