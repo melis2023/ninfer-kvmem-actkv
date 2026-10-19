@@ -44,25 +44,54 @@ ninfer 后端的 `--spec dflash2` 在 KVMem 长上下文下现已正常工作。
 
 ## 2026-10-19 更新：召回传输优化（2 倍）
 
-KVMem 每次窗口重选要搬约 2.2 GB，实测只有 3.8–4.5 GB/s，而同一张卡的链路能跑 14.1 GB/s。
-根因是 `record_groups` 的语义用错：合并条件要求相邻记录属于同一分配区，调用方却传了块 id
-（sink / recent / topk 混排，天然不连续），于是 576 页被拆成 36,864 次单页 26 KiB 拷贝，
-耗时全花在驱动提交上，GPU 拷贝引擎几乎空闲（`sync_us` 仅 5 ms）。
+### 问题
 
-改为传入空 groups 后，连续页合并为每 plane 一次 2D 拷贝：
+KVMem 每次窗口重选要搬约 2.2 GB（spill 832 页 + restore 576 页），实测只有 3.8–4.5 GB/s，
+而同一张卡的链路能跑 14.1 GB/s（独立探针实测，见文档 §8）。
 
-| 指标 | 修复前 | 修复后 |
-|---|---:|---:|
-| DMA 带宽 | 4.0 GB/s | **14.1 GB/s** |
-| 单次重选传输（256K 均值） | 515 ms | **256 ms** |
-| 256K 24 次重选传输合计 | 12.37 s | **6.14 s** |
-| 256K prefill | 340.8 tok/s | **343.4 tok/s** |
-| 256K 端到端 | 729.8 s | **724.2 s** |
+### 根因
 
-输出逐位不变（256K 接受率 112/343，64K 124/296），`--kvmem-verify-transfers` 回放
-`payload_exact=1 state_exact=1`。传输只占端到端 1.7%，所以整体提升有限；
-完整带宽基准、24 次逐次对比与剩余优化空间见
-[docs/kvmem-recall-opt-20261019.md](docs/kvmem-recall-opt-20261019.md)。
+`record_groups` 的语义是「每条记录所在的分配区」，用于阻止跨 `cudaMalloc` 区域拼一次
+strided 拷贝。`kvmem_window.cpp` 的 spill/restore 却传了块 id（sink / recent / topk 混排，
+天然不连续），合并条件 `groups[next] == groups[next-1]` 恒不成立——576 页被拆成
+36,864 次单页 26 KiB 拷贝，耗时全耗在驱动提交上，GPU 拷贝引擎几乎空闲（`sync_us` 仅 5 ms）。
+
+设备页其实是连续的（`runs=1`），宿主记录也来自同一块 pinned staging（步长恒为
+1,671,168），本就该合并。
+
+### 修复
+
+`kvmem_window.cpp` 4 处调用点把第三个实参从 `spill_ids` / `selected` 改为空 groups：
+`start_spill` 的 text / MTP，`start_restore` 的 text / MTP。空 groups 与 `verify` 分支
+原有写法一致，合并仍受「设备页连续 + 宿主步长恒定 + 步长上限」三重约束。
+
+### 实测
+
+| 指标 | 修复前 | 修复后 | 提升 |
+|---|---:|---:|---:|
+| DMA 带宽 | 4.0 GB/s | **14.1 GB/s** | **3.5×** |
+| 单次重选（64K 首次） | 1,002 ms | **584 ms** | 1.72× |
+| 单次重选（64K 稳态） | 857 ms | **463 ms** | 1.85× |
+| 单次重选（256K 均值，24 次） | 515 ms | **256 ms** | **2.02×** |
+| 256K 传输合计 | 12.37 s | **6.14 s** | −50.4% |
+| 256K prefill | 340.8 tok/s | **343.4 tok/s** | +0.78% |
+| 256K 端到端 | 729.8 s | **724.2 s** | −0.77% |
+
+256K 的 24 次重选中，22 次稳态均为 1.99–2.20×；两次冷启动（spill 832 页）为 1.63×/1.76×，
+因为另有约 300 ms 的 plan/evict/epoch 开销未动。
+
+### 正确性
+
+输出逐位不变：64K 接受率 124/296，256K 112/343（新旧一致）；
+`--kvmem-verify-transfers` 回放两次重选均 `payload_exact=1 state_exact=1`；
+纯计算吞吐 346.7 → 346.4 tok/s（−0.08%，噪声内）。
+
+### 同日其他改动
+
+- 新增诊断开关 `KVMEM_PLANE_TIMING`（逐 plane 打印）、`KVMEM_GEOM`（几何）、`KVMEM_RESELECT`。
+- `start_spill` 清零从整窗 memset 改为只清 partial 页，省约 66 ms/次。
+- 完整带宽基准、逐次对比与剩余优化空间见
+  [docs/kvmem-recall-opt-20261019.md](docs/kvmem-recall-opt-20261019.md)。
 
 > 子模块 `backends/ninfer` 的上游是第三方仓库（`iamwavecut/ninfer-all.git`），本次改动
 > 没有推送权限。完整改动已作为
