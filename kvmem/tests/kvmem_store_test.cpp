@@ -1143,11 +1143,11 @@ static void test_lrfu_round_and_restore() {
     CHECK(store.retrieval_checkpoint().scores->empty()); // Preview is not a committed update.
     CHECK(store.commit_retrieval_round());
     const auto first = store.retrieval_checkpoint();
-    // EMA with lambda=0.5: 0.5*0.8 + 0.5*0.1 = 0.45, 0.5*0.6 + 0.5*0.4 = 0.5.
+    // ActKV LRFU with lambda=0.5: 0.5*0.8 + 0.1 = 0.5, 0.5*0.6 + 0.4 = 0.7.
     store.begin_retrieval_round(); scores[2] = 0.1; scores[3] = 0.4;
     store.set_retrieval_scores(scores); store.set_retrieval_scores(scores);
-    CHECK(std::abs(store.selection_score(2) - 0.45) < 1e-12);
-    CHECK(std::abs(store.selection_score(3) - 0.5) < 1e-12);
+    CHECK(std::abs(store.selection_score(2) - 0.5) < 1e-12);
+    CHECK(std::abs(store.selection_score(3) - 0.7) < 1e-12);
     CHECK(store.commit_retrieval_round());
     scores[2] = 100; store.set_retrieval_scores(scores);
     const auto second = store.retrieval_checkpoint();
