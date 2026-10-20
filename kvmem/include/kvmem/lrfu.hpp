@@ -69,9 +69,18 @@ public:
             std::nth_element(ranked.begin(), ranked.begin() + rank, ranked.end());
             threshold = ranked[rank];
         }
-        for (size_t i = 0; i < scores.size(); ++i)
-            (*next)[i] = lambda_ * (i < state_.scores->size() ? (*state_.scores)[i] : 0) +
-                (scores[i] >= threshold ? scores[i] : 0);
+        // Exponential moving average instead of an unbounded cumulative sum.
+        // A cumulative keep score grows with block age, so an old block can
+        // outrank a currently relevant one only because it has been around
+        // longer. Folding in (1 - lambda) keeps every score in the range of
+        // the retrieval signal. A block seen for the first time is seeded with
+        // its current score instead of being penalized for having no history.
+        for (size_t i = 0; i < scores.size(); ++i) {
+            const double hit = scores[i] >= threshold ? scores[i] : 0.0;
+            (*next)[i] = i < state_.scores->size()
+                ? lambda_ * (*state_.scores)[i] + (1.0 - lambda_) * hit
+                : hit;
+        }
         candidate_ = std::move(next);
     }
     bool commit() noexcept {
