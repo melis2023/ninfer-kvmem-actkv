@@ -9,7 +9,7 @@
 
 本项目仅供研究学习，稳定使用可前往kvmem原作者。
 
-## 2026-10-21 更新：ActKV LRFU 与增量 restore
+## 2026-10-21 更新：ActKV LRFU 与增量 restore，新版需自行git编译。
 
 ### 打分与驱逐
 
