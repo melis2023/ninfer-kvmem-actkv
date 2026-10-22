@@ -22,6 +22,8 @@ for p in ../../docs/patches/000*.patch; do git am "$p"; done
 | `0003-perf-kvmem-score-token-only-prompts-on-their-tail.patch` | `/v1/completions` 原始文本取尾部打分 | 本地 |
 | `0004-perf-kvmem-restore-only-changed-pages.patch` | 差异 restore，只搬变化的页 | 本地 |
 | `0005-fix-serve-tool-request-sampling-without-presence-penalty.patch` | 带 tools 的请求 `presence_penalty` 归零 | 上游 `bff41bea` 的 cherry-pick |
+| `0006-feat-ops-sm70-and-sm75-build-support-on-the-compatib.patch` | sm70/sm75 的 31 个实现文件与 device profile | 上游 `08fd7019` 的最小移植 |
+| `0007-feat-sm70-sm75-wire-the-compatibility-path-into-mma-.patch` | mma/memory 接入、codec 与 QType 依赖 | 同上 |
 
 ## 已验证的基线
 
