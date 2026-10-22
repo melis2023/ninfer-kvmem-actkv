@@ -9,6 +9,62 @@
 
 本项目仅供研究学习，稳定使用可前往kvmem原作者。
 
+## 2026-10-22 更新：sm70 / sm75 源码支持
+
+ninfer 后端新增 **sm75（RTX 20 系、TITAN RTX、T4）** 与 **sm70（Tesla V100）** 的构建支持。召回与驱逐保持 ActKV 不变。
+
+### 改动范围
+
+最小移植，不升级上游 210 个提交：
+
+| 项 | 内容 |
+|---|---|
+| 新增文件 | 31 个（sm70 整套 GEMM、sm75 MMA、`pre_sm80.cuh` / `sm70_emulation.cuh` 兼容层） |
+| 接入修改 | 8 处（CMake 白名单、`mma.cuh`、`memory.cuh`、sources、`QType`、2 个 codec） |
+| GPU profile | 9 个（V100×2、TITAN RTX、2060S、2070、2070S、2080Ti、Quadro RTX 6000、T4） |
+| ActKV | **未改动**：LRFU 公式、mean-Q 打分、sink/recent 逻辑与 10-21 版一致 |
+
+### 构建
+
+```bash
+# RTX 20 系（sm75，CUDA 13.x 支持 compute_75）
+cmake -S backends/ninfer -B build-sm75 -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=75
+cmake --build build-sm75 --target ninfer-serve
+
+# V100（sm70，必须 CUDA 12.x；CUDA 13 已移除 Volta）
+cmake -S backends/ninfer -B build-sm70 -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=70 \
+  -DCMAKE_CUDA_COMPILER="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/bin/nvcc.exe"
+cmake --build build-sm70 --target ninfer-serve
+```
+
+启动参数与现有配置一致，不需要 `--kvmem-query-scorer`（本地版本默认即 mean-Q cosine）。
+
+### 验证
+
+| 项 | 结果 |
+|---|---|
+| sm120a 编译 | 0 错误 |
+| 64K | prefill 427.1 tok/s / decode 45.5 tok/s / 接受率 48.1% |
+| 256K NIAH | 33/33、14/14、80 工具调用 |
+| sm75 / sm70 运行 | **未验证**（本机只有 sm120a） |
+
+### 块大小不可调
+
+尝试把页大小从 64 改到 32，编译期被断言挡住：
+
+```cpp
+static_assert(kCausalPromptI8FastBc == kPagedKVPageSize);
+```
+
+页大小同时是 fast prompt 内核的 K 方向 tile，改它需要重写 MMA 迭代与共享内存预算。48 更不可行：页表索引是 `position >> 6`，要求 2 的幂。
+
+### 文档
+
+- [sm70/sm75 移植与块大小结论（2026-10-22）](docs/kvmem-sm75-sm70-port-20261022.md)
+- [子模块 patch 恢复说明](docs/patches/README.md)
+
 ## 2026-10-21 更新：ActKV LRFU 与增量 restore，新版需自行git编译。
 
 ### 打分与驱逐
@@ -113,4 +169,6 @@ python3 -m tools.convert \
 - [后端能力与启动说明](docs/multi-backend.md)
 - [仓库结构与构建](docs/multi-backend-repository.md)
 - [后端差异](docs/multi-backend-differences.md)
+- [sm70/sm75 移植与块大小结论（2026-10-22）](docs/kvmem-sm75-sm70-port-20261022.md)
+- [子模块 patch 恢复说明](docs/patches/README.md)
 
