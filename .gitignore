@@ -41,3 +41,8 @@ CLAUDE.md
 *.dll
 *.rar
 *.bak*
+
+# Local bench inputs and server logs under the worker directory
+/workers/ninfer/*
+!/workers/ninfer/start-kvmem-ninfer.bat
+!/workers/ninfer/start-kvmem-ninfer-dflash.bat

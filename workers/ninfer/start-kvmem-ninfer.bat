@@ -30,7 +30,7 @@ cd /d "%BIN%"
 "%EXE%" ^
   "%MODEL%" ^
   --port 18200 --model-id ninfer-27b ^
-  --max-context 262144 ^
+  --max-context 262144   --kvmem-sink-tokens 1024 ^
   --prefill-chunk 256 ^
   --kvmem-budget 36864 --kvmem-gen-reserve 16384 --kvmem-host-mib 12288 ^
   --kvmem-lrfu ^

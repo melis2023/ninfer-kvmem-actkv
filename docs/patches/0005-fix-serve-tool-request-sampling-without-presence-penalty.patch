@@ -1,0 +1,156 @@
+﻿From e530d1ed4c2f236d08e3c2b0295813c1a10cd666 Mon Sep 17 00:00:00 2001
+From: Valeriy Selitskiy <239034+iamwavecut@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 18:27:57 +0200
+Subject: [PATCH] fix(serve): sample a request that offers tools without the
+ preset's presence penalty
+
+The Qwen non-thinking preset's presence penalty of 1.5 subtracts from every token the answer already used, and a second tool call repeats the first call's markup and function name, so the model dropped calls it would otherwise make (issue #114: BFCL parallel_multiple 59.5 against 67.0 with --presence-penalty 0). A request with tools and a tool_choice other than none now resolves presence_penalty to 0 unless the request or --presence-penalty names a value; the same rule covers the post-thinking sampler.
+---
+ docs/cli.md                  |  3 ++-
+ docs/serving.md              | 10 ++++++++--
+ src/serve/translate.cpp      | 19 ++++++++++++++++++-
+ tests/test_openai_schema.cpp | 35 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 63 insertions(+), 4 deletions(-)
+
+diff --git a/docs/cli.md b/docs/cli.md
+index 2f424c71..c12ffee3 100644
+--- a/docs/cli.md
++++ b/docs/cli.md
+@@ -298,7 +298,8 @@ and rendered prompt mode:
+ | Qwen3.8-Flash-Next | non-thinking | `0.7` | `0.80` | `20` | `0` | `1.5` |
+ 
+ Frequency penalty is `0` in every registered preset. Task-specific profiles such as Qwen's
+-precise-coding profile use explicit sampling overrides.
++precise-coding profile use explicit sampling overrides. `ninfer-serve` drops the presence penalty
++for a request that offers tools ([HTTP serving](serving.md#server-options)).
+ 
+ Repeat `--stop-token-id`, `--stop`, or `--reasoning-stop` to add stop conditions. Use
+ `--raw-output` to expose the frontend's raw output stream and `--print-token-ids` to include
+diff --git a/docs/serving.md b/docs/serving.md
+index e37692ee..fa2c4293 100644
+--- a/docs/serving.md
++++ b/docs/serving.md
+@@ -1376,8 +1376,10 @@ separate `namespace` and `name` fields in aggregate output, SSE events, and repl
+ function name may therefore appear in different namespaces. Namespace members remain ordinary
+ client-executed functions; this does not add a remote MCP executor.
+ 
+-NInfer renders these definitions in the Qwen prompt and parses model output into separate
+-`function_call` output Items. Each output has a protocol Item `id` (`fc_...`) and a distinct
++NInfer renders a function definition in the Qwen prompt, whichever protocol declared it, as
++`{"type":"function","function":{"name":鈥?"description":鈥?"parameters":鈥}` in declaration order
++and without `strict`, which only selects the server's output contract, and parses model output
++into separate `function_call` output Items. Each output has a protocol Item `id` (`fc_...`) and a distinct
+ `call_id` (`call_...`). The client executes the function and sends a `function_call_output` Item in
+ a later request. Only functions in the current effective tool set can become structured calls;
+ undeclared names are blocked during constrained decoding. `allowed_tools` filters that set without changing
+@@ -1868,6 +1870,10 @@ Qwen3.6-27B, Qwen3.8-27B and the artifacts built from it, and Qwen3.8-Flash-Next
+ penalty, which is `1.5`.
+ Frequency penalty is `0` for all registered presets. Process flags override registered values,
+ request fields override process flags, and `--greedy` finally forces temperature `0`.
++A request that offers tools (`tools` with a `tool_choice` other than `none`, on every protocol)
++samples without the presence penalty unless the request or `--presence-penalty` sets one: a second
++tool call repeats the first call's markup and function name, and under `1.5` the model drops calls
++it would otherwise make. The request log records the resolved value.
+ 
+ ### Post-thinking sampling
+ 
+diff --git a/src/serve/translate.cpp b/src/serve/translate.cpp
+index 01d1ee98..0d7965f0 100644
+--- a/src/serve/translate.cpp
++++ b/src/serve/translate.cpp
+@@ -125,14 +125,19 @@ std::vector<const ToolDefinition*> effective_tools(const GenerationRequest& requ
+     return tools;
+ }
+ 
++// The members follow the order the Qwen templates were trained on, name, description and
++// parameters; `strict` is the server's enforcement flag for the output contract, and the frontend
++// leaves it out of the rendered prompt.
+ std::string render_tool_definition(const ToolDefinition& tool) {
+     using Json  = RequestJson;
+     Json schema = Json::parse(tool.input_schema_json);
+-    Json function{{"name", tool.name}, {"parameters", std::move(schema)}, {"strict", tool.strict}};
++    Json function{{"name", tool.name}};
+     if (!tool.description.empty()) { function["description"] = tool.description; }
++    function["parameters"] = std::move(schema);
+     if (tool.input_examples_json) {
+         function["input_examples"] = Json::parse(*tool.input_examples_json);
+     }
++    function["strict"] = tool.strict;
+     return Json{{"type", "function"}, {"function", std::move(function)}}.dump();
+ }
+ 
+@@ -441,6 +446,18 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
+     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
+     options.execution.post_thinking_sampling =
+         resolve_post_thinking_overrides(request.post_thinking, server);
++    // A second tool call repeats the first one's markup and function name, which a presence penalty
++    // punishes: under the Qwen presets' 1.5 the model drops calls it would otherwise make. A request
++    // that offers tools samples without one unless the request or the server named a value.
++    if (request.uses_tools()) {
++        if (!options.execution.sampling.presence_penalty) {
++            options.execution.sampling.presence_penalty = 0.0F;
++        }
++        if (options.execution.post_thinking_sampling &&
++            !options.execution.post_thinking_sampling->presence_penalty) {
++            options.execution.post_thinking_sampling->presence_penalty = 0.0F;
++        }
++    }
+     options.execution.logprobs = request.logprobs;
+     options.output.raw                     = false;
+     options.output.preserve_special_tokens =
+diff --git a/tests/test_openai_schema.cpp b/tests/test_openai_schema.cpp
+index f8fb42fc..1c9a5ef7 100644
+--- a/tests/test_openai_schema.cpp
++++ b/tests/test_openai_schema.cpp
+@@ -467,6 +467,39 @@ int test_tools() {
+     failures += check(automatic.generation.uses_tools(), "function tools default to auto");
+     failures += check(prompt(automatic.generation).options.tool_jsons.size() == 1,
+                       "auto tools reach PromptInput");
++    // The definition keeps the member order the templates were trained on; `strict` rides along
++    // for the output contract and the frontend leaves it out of the prompt.
++    failures += check(
++        prompt(automatic.generation).options.tool_jsons[0] ==
++            R"({"type":"function","function":{"name":"weather","description":"Get weather","parameters":{"type":"object"},"strict":false}})",
++        "a tool definition did not reach the prompt as name, description, parameters");
++    // A second call repeats the first call's markup and name, so a request that offers tools
++    // samples without the preset's presence penalty unless the request or the server names one.
++    failures += check(options(automatic.generation).execution.sampling.presence_penalty == 0.0F,
++                      "a request with tools kept the preset's presence penalty");
++    failures += check(!options(parse(base_request()).generation).execution.sampling.presence_penalty,
++                      "a request without tools lost the preset's presence penalty");
++    Json penalized                = body;
++    penalized["presence_penalty"] = 1.0;
++    failures +=
++        check(options(parse(penalized).generation).execution.sampling.presence_penalty == 1.0F,
++              "a request with tools lost its own presence penalty");
++    ServeOptions penalizing;
++    penalizing.sampling_overrides.presence_penalty = 0.5F;
++    failures += check(to_request_options(automatic.generation, penalizing,
++                                         semantics(automatic.generation), true)
++                              .execution.sampling.presence_penalty == 0.5F,
++                      "a request with tools lost the server's presence penalty");
++    Json post             = body;
++    post["post_thinking"] = Json{{"temperature", 0.1}};
++    const ninfer::RequestOptions post_options = options(parse(post).generation);
++    failures += check(post_options.execution.post_thinking_sampling &&
++                          post_options.execution.post_thinking_sampling->presence_penalty == 0.0F,
++                      "a request with tools kept the post-thinking preset's presence penalty");
++    post["post_thinking"] = Json{{"presence_penalty", 0.7}};
++    failures += check(options(parse(post).generation)
++                              .execution.post_thinking_sampling->presence_penalty == 0.7F,
++                      "a request with tools lost its own post-thinking presence penalty");
+ 
+     body["tools"][0]["future_item_field"]                 = "ignored";
+     body["tools"][0]["function"]["future_function_field"] = "ignored";
+@@ -481,6 +514,8 @@ int test_tools() {
+     failures +=
+         check(!none.generation.uses_tools() && prompt(none.generation).options.tool_jsons.empty(),
+               "tool_choice none makes parallel_tool_calls neutral and removes executable tools");
++    failures += check(!options(none.generation).execution.sampling.presence_penalty,
++                      "tool_choice none did not restore the preset's presence penalty");
+ 
+     body["parallel_tool_calls"]             = true;
+     body["enable_thinking"]                 = false;
+-- 
+2.53.0.windows.1
+
