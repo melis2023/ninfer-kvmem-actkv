@@ -1,0 +1,79 @@
+From 3b38da0b3fd176ab95f81df59e98e1818d2e3a8d Mon Sep 17 00:00:00 2001
+From: melis2023 <zhuangisme@gmail.com>
+Date: Thu, 22 Oct 2026 18:49:24 +0800
+Subject: [PATCH] perf(kvmem): prepare RAM records ahead of prefill and overlap
+ candidate reads
+
+---
+ src/models/qwen3_5/program/prefill.cpp              | 10 +++++++++-
+ src/models/qwen3_5/program/storage/kvmem_window.cpp | 10 ++++++++--
+ 2 files changed, 17 insertions(+), 3 deletions(-)
+
+diff --git a/src/models/qwen3_5/program/prefill.cpp b/src/models/qwen3_5/program/prefill.cpp
+index 608f4969..bc65448e 100644
+--- a/src/models/qwen3_5/program/prefill.cpp
++++ b/src/models/qwen3_5/program/prefill.cpp
+@@ -999,6 +999,9 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
+                 }
+             }
+         }
++        // Candidate statistics belong to verification, not Fold. Read them
++        // before Fold so host bookkeeping can overlap the state update.
++        read_memory_candidates();
+         const std::span<const ops::GdnReplayFoldRow> fold_span(fold_rows.data(), lanes.size());
+         {
+             // Each state shard folds its own layers on its own device's stream.
+@@ -1111,7 +1114,6 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
+     const double tail_seconds = std::chrono::duration<double>(Clock::now() - tail_started).count();
+     const std::uint32_t width = verify_drafts + 1U;
+     try {
+-        read_memory_candidates();
+         for (std::size_t row = 0; row < lanes.size(); ++row) {
+             SequenceState& sequence = active_sequence(lanes[row]);
+             RequestControl& request = requests[lanes[row]];
+@@ -1258,6 +1260,12 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
+                 staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
+                 return runtime::PrefillStepResult{.summary = summary, .timing = timing.finish()};
+             }
++            if (memory_io && chunk_end < staged.prompt_tokens) {
++                // RAM lookahead: prepare the next chunk's host records while this GPU chunk
++                // runs. prepare_window joins and publishes them before their first use.
++                (void)prepare_memory_append(sequence, chunk_end,
++                    std::min(staged.prompt_tokens, chunk_end + prefill_chunk), true);
++            }
+         }
+         bind_sequence_kv(sequence);
+         StateImageSelectors selectors = state_selectors(sequence);
+diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+index ad735309..2a21931f 100644
+--- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
++++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+@@ -3,6 +3,7 @@
+ #include "models/qwen3_5/program/context_work.h"
+ 
+ #include "core/paged_kv_cache.h"
++#include "kvmem/prefix_checkpoint.hpp"
+ 
+ #include <atomic>
+ #include <chrono>
+@@ -984,10 +985,15 @@ void ProgramImpl::capture_memory_endpoint(SequenceState& sequence, const Request
+ bool ProgramImpl::memory_same_query(const KvmemWindowState& window, const PreparedPromptData& prompt,
+                                     std::uint32_t frontier) const {
+     if (!prompt.memory_query || !window.query_tokens ||
+-        window.query_tokens != window.query_end - window.query_begin || frontier < window.query_end) return false;
++        window.query_tokens != window.query_end - window.query_begin) return false;
+     const auto& query = *prompt.memory_query;
+     // The caller's exact checkpoint match proves all tokens/positions through this range.
+-    return query.begin == window.query_begin && query.count == window.query_tokens;
++    if (query.begin != window.query_begin || query.count != window.query_tokens) return false;
++    // LCP boundary: a reuse may not restore past the evaluated frontier. The replay itself
++    // keeps the committed query sum, so no logits are needed at the boundary.
++    const auto limit = kvmem::prefix_restore_limit(
++        window.query_end, window.query_end, frontier, /*needs_logits=*/false);
++    return limit >= window.query_end;
+ }
+ 
+ void ProgramImpl::capture_memory_rewrite(SequenceState& sequence, KvmemCheckpointKind kind) noexcept {
+-- 
+2.53.0.windows.1
+
