@@ -27,14 +27,15 @@ cd /d "%BIN%"
 "%EXE%" ^
   "%MODEL%" ^
   --port 18200 --model-id ninfer-27b --host 127.0.0.1 ^
-    --max-context 262144   --kvmem-sink-tokens 1024 ^
+    --max-context 262144 ^
     --prefill-chunk 256 --no-cuda-graph --full-draft-head ^
     --kvmem-budget 36864 --kvmem-gen-reserve 16384 --kvmem-host-mib 12288 ^
   --kvmem-lrfu ^
   --kv-dtype nvfp4  --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
   --spec dflash2 --draft-tokens 4 --ngram-draft-tokens 15 ^
   --vision --vision-residency cpu --vision-max-merged 256 ^
-  --default-reasoning-effort xhigh  --default-thinking-budget 16384
+  --default-reasoning-effort xhigh  --default-thinking-budget 16384 ^
+  --default-max-tokens 20480
 
 set "RC=%ERRORLEVEL%"
 echo.

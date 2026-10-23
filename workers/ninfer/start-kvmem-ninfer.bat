@@ -8,7 +8,7 @@ set "BIN=%~dp0"
 set "EXE=%BIN%ninfer-kvmem-server.exe"
 
 REM model
-set "MODEL=I:\model\ninfer\Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.ninfer"
+set "MODEL=I:\model\gguf\Qwen3.8-27B-GSQ-RCO-IQ3_S-nvfps-dflash2.ninfer"
 
 if not exist "%EXE%" (
     echo ERROR: worker missing: "%EXE%"
@@ -26,14 +26,15 @@ cd /d "%BIN%"
 "%EXE%" ^
   "%MODEL%" ^
   --port 18200 --model-id ninfer-27b --host 127.0.0.1 ^
-  --max-context 262144   --kvmem-sink-tokens 1024 ^
+  --max-context 262144  ^
   --prefill-chunk 256 ^
   --kvmem-budget 36864 --kvmem-gen-reserve 16384 --kvmem-host-mib 12288 ^
   --kvmem-lrfu ^
   --kv-dtype int8  --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
   --spec mtp --draft-tokens 4 --ngram-draft-tokens 31 --adaptive-mtp --full-draft-head ^
   --vision --vision-residency cpu --vision-max-merged 256 ^
-  --default-reasoning-effort xhigh  --default-thinking-budget 16384
+  --default-reasoning-effort xhigh  --default-thinking-budget 16384 ^
+  --default-max-tokens 32000
 
 set "RC=%ERRORLEVEL%"
 echo.
