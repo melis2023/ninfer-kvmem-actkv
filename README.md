@@ -52,6 +52,7 @@ DFlash2 权重比 MTP 多约 1.1 GiB，256K 窗口下开 CUDA graphs 会 OOM，�
 
 详细说明（转换用法、`.safetensors` 限制、参数规律）见
 [docs/dflash2-nvfp4-20261023.md](docs/dflash2-nvfp4-20261023.md)。
+可下载Releases内tool进行转换。
 
 ## 2026-10-22 更新：sm70 / sm75 源码支持
 
