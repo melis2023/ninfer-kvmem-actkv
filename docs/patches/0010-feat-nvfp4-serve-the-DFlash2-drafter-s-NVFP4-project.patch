@@ -1,0 +1,137 @@
+From 18e3c7c844f3176ae982512a4e4a448fe07efdbf Mon Sep 17 00:00:00 2001
+From: kvmem <kvmem@local>
+Date: Fri, 23 Oct 2026 16:31:04 +0800
+Subject: [PATCH 2/2] feat(nvfp4): serve the DFlash2 drafter's NVFP4
+ projections
+
+The dynamic grouped conv finish only accepted Q8, so an NVFP4 DFlash2 companion failed warmup with 'linear dynamic grouped conv add: invalid projection_weight'. Accept an NVFP4 parent by n/k and route it through the materialized linear + conv finish, which already handles every format the linear dispatcher supports.
+
+Conversion: dflash2_import_nvfp4.py imports an already-encoded ModelOpt NVFP4 draft verbatim (skipping QKV, conv kernels, the feature projection and the selector hidden projection); dflash2_nvfp4.py keeps the convolution kernel projection BF16 for the same engine constraint.
+---
+ src/ops/wrapper/dynamic_grouped_conv.cpp      | 16 +++++++++
+ tools/convert/recipes/dflash2_import_nvfp4.py | 35 +++++++++++++++++++
+ tools/convert/recipes/dflash2_nvfp4.py        | 32 +++++++++++++++++
+ 3 files changed, 83 insertions(+)
+ create mode 100644 tools/convert/recipes/dflash2_import_nvfp4.py
+ create mode 100644 tools/convert/recipes/dflash2_nvfp4.py
+
+diff --git a/src/ops/wrapper/dynamic_grouped_conv.cpp b/src/ops/wrapper/dynamic_grouped_conv.cpp
+index 626c9336..b0bea84d 100644
+--- a/src/ops/wrapper/dynamic_grouped_conv.cpp
++++ b/src/ops/wrapper/dynamic_grouped_conv.cpp
+@@ -3,6 +3,7 @@
+ 
+ #include "ops/dynamic_grouped_conv/bf16/bf16_dynamic_grouped_conv_prepare_plan.h"
+ #include "ops/dynamic_grouped_conv/q8/q8_dynamic_grouped_conv_add_plan.h"
++#include "ops/linear/nvfp4/nvfp4_format.h"
+ 
+ #include <array>
+ #include <cmath>
+@@ -59,6 +60,12 @@ std::uint64_t required_q8_payload_bytes(std::int32_t input_rows) {
+ }
+ 
+ void require_finish_projection_weight(const Weight& weight, std::int32_t input_rows) {
++    if (weight.qtype == QType::NVFP4) {
++        if (weight.n != kHidden || weight.k != input_rows) {
++            throw std::invalid_argument("linear dynamic grouped conv add: invalid projection_weight");
++        }
++        return; // the full NVFP4 payload contract is validated by the linear route
++    }
+     const std::uint64_t payload_bytes = required_q8_payload_bytes(input_rows);
+     if (weight.qtype != QType::Q8_G32_FP16 || weight.layout != QuantLayout::RowSplit ||
+         weight.scale_dtype != DType::FP16 || weight.group_size != 32 || weight.group != 32 ||
+@@ -225,6 +232,15 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
+     require_tensor(finish_delta, DType::BF16, kGroups, kTaps, width, batch_size, kAddOp,
+                    "finish_delta");
+     require_tensor(residual, DType::BF16, kHidden, width, batch_size, 1, kAddOp, "residual");
++    if (projection_weight.qtype == QType::NVFP4) {
++        require_finish_projection_weight(projection_weight, input_rows);
++        (void)detail::validate_nvfp4_weight(projection_weight, kAddOp);
++        require_finish_nonoverlap(x, projection_weight, base_kernel, finish_delta, residual,
++                                  workspace);
++        detail::materialized_linear_dynamic_grouped_conv_add_dispatch(
++            x, projection_weight, base_kernel, finish_delta, residual, workspace, stream);
++        return;
++    }
+     if (materialized_projection(projection_weight, input_rows)) {
+         require_finish_nonoverlap(x, projection_weight, base_kernel, finish_delta, residual,
+                                   workspace);
+diff --git a/tools/convert/recipes/dflash2_import_nvfp4.py b/tools/convert/recipes/dflash2_import_nvfp4.py
+new file mode 100644
+index 00000000..13e3d23f
+--- /dev/null
++++ b/tools/convert/recipes/dflash2_import_nvfp4.py
+@@ -0,0 +1,35 @@
++"""Import the DFlash2 module's NVFP4 weights verbatim from a ModelOpt source.
++
++Unlike ``dflash2_nvfp4.py`` (which re-quantises a BF16/FP8 companion), this override
++keeps the source's NVFP4 codes, block scales and global divisor. Use it when the
++companion checkpoint is already ModelOpt NVFP4, e.g.
++``maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal``.
++
++The source's ``quantization_config.ignore`` list keeps the feature projection, the
++selector hidden projection and the convolution kernel projections in BF16; those
++parameters are left to the base recipe.
++"""
++from tools.convert.methods import import_encoded
++
++# Parameters the ModelOpt checkpoint keeps outside NVFP4.
++_KEPT_DIRECT = (
++    'dflash2/feature_projection',
++    'dflash2/candidate_selector/hidden_projection',
++)
++
++# The engine's native QKV input projection requires Q8_G32_FP16, so those three
++# projections keep the base recipe's Q8 even though the source ships them as NVFP4.
++_KEPT_Q8 = ('/attention/query', '/attention/key', '/attention/value')
++
++
++def configure(model, recipe, sources):
++    if 'dflash2' not in model.components:
++        raise ValueError('DFlash2 NVFP4 import requires the DFlash2 component')
++    for name, parameter in model.parameters.items():
++        if not name.startswith('dflash2/') or not parameter.projection:
++            continue
++        if name in _KEPT_DIRECT or 'conv' in name or '/attention/context_' in name:
++            continue
++        if any(name.endswith(suffix) for suffix in _KEPT_Q8):
++            continue
++        recipe.assign(name, format='nvfp4', method=import_encoded)
+diff --git a/tools/convert/recipes/dflash2_nvfp4.py b/tools/convert/recipes/dflash2_nvfp4.py
+new file mode 100644
+index 00000000..7b643a6e
+--- /dev/null
++++ b/tools/convert/recipes/dflash2_nvfp4.py
+@@ -0,0 +1,32 @@
++"""Shipped fork DFlash2 weight-only NVFP4 override for full/QAT recipes.
++
++Pass --components text,dflash2 --source dflash2=CHECKPOINT and
++--override tools/convert/recipes/dflash2_nvfp4.py to tools.convert.
++The 31 parents are five layers' QKV/output/gate-up/down and two convolution
++control projections, plus the selector hidden projection. Feature projection
++remains W8; codebooks, base kernels and norms remain BF16. No A4 divisor is used.
++"""
++from tools.convert.quantization.nvfp4 import nvfp4_maxabs
++
++# The dynamic grouped conv reads the kernel projection as plain BF16; quantising it makes
++# startup fail with "dynamic grouped conv prepare: invalid kernel_projection_weight".
++_KEPT_BF16 = ('/attention_conv/kernel_projection', '/mlp_conv/kernel_projection')
++
++
++def configure(model, recipe, sources):
++    if 'dflash2' not in model.components:
++        raise ValueError('NVFP4 module override requires the DFlash2 component')
++    for name, parameter in model.parameters.items():
++        if not name.startswith('dflash2/') or not parameter.projection:
++            continue
++        if name == 'dflash2/feature_projection' or '/attention/context_' in name:
++            continue
++        if any(name.endswith(suffix) for suffix in _KEPT_BF16):
++            continue
++        recipe.assign(name, format='nvfp4', method=nvfp4_maxabs, activation_policy='A16Only')
++    for layer in range(model.components['dflash2']['config']['num_hidden_layers']):
++        prefix = f'dflash2/layers/{layer}/'
++        recipe.group(tuple(prefix + 'attention/' + role for role in ('query', 'key', 'value')))
++        recipe.group((prefix + 'mlp/gate', prefix + 'mlp/up'))
++        for role in ('key', 'value'):
++            recipe.share(prefix + 'attention/context_' + role, prefix + 'attention/' + role)

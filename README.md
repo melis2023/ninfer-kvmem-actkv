@@ -9,6 +9,45 @@
 
 本项目仅供研究学习，稳定使用可前往kvmem原作者。
 
+## 2026-10-23 更新：DFlash2 NVFP4 草稿支持
+
+ninfer 后端现在可以直接加载 **NVFP4 编码的 DFlash2 草稿**，`attention/output` 与
+`mlp/down` 以 NVFP4 权重跑在动态卷积的 finish 路径上。
+
+**DFlash2 草稿推荐地址**（ModelOpt NVFP4，原样导入、无损）：
+
+<https://huggingface.co/maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal/tree/main>
+
+### 引擎改动
+
+| commit | 内容 |
+|---|---|
+| `f4d18713` | NVFP4 线性表注册 DFlash2 的五个几何（Feature/QKV/AttnOut/ConvProj/Selector），own 与 unified 两条调度同时生效 |
+| `18e3c7c8` | 动态卷积的 add 路径接受 NVFP4 父权重；补上 `dflash2_import_nvfp4.py` 与 `dflash2_nvfp4.py` 两个转换配方 |
+
+约束：`kernel_projection` 仍必须是 BF16（prepare 路径没有 NVFP4 内核），QKV 仍是
+Q8（融合 attention 输入只对 `4096x5120` 放行 NVFP4，本模型是 `6144x5120`）。
+
+### 64K 实测（RTX 5060 Ti 16 GB，nvfp4 KV）
+
+| 后端 | draft | CUDA graphs | decode | 接受率 |
+|---|---|---|---:|---:|
+| dflash2 | 4 | 关 | **52.7 tok/s** | 44.0% |
+| dflash2 | 3 | 关 | 51.3 tok/s | 52.9% |
+| mtp | 3 | 开 | 49.7 tok/s | 54.7% |
+
+DFlash2 权重比 MTP 多约 1.1 GiB，64K 下开 CUDA graphs 会 OOM，必须
+`--no-cuda-graph`；接受率上限约 44%，参数层面已基本榨干。
+
+推荐参数：
+
+```
+--kv-dtype nvfp4 --no-cuda-graph --spec dflash2 --draft-tokens 4 --full-draft-head
+```
+
+详细说明（转换用法、`.safetensors` 限制、参数规律）见
+[docs/dflash2-nvfp4-20261023.md](docs/dflash2-nvfp4-20261023.md)。
+
 ## 2026-10-22 更新：sm70 / sm75 源码支持
 
 ninfer 后端新增 **sm75（RTX 20 系、TITAN RTX、T4）** 与 **sm70（Tesla V100）** 的构建支持。召回与驱逐保持 ActKV 不变。
@@ -146,10 +185,40 @@ python3 -m tools.convert \
 ```
 
 - `--model` 只需要基础检查点的配置与分词器（准备转换输入时生成的 `metadata` 目录）。
-- `dflash2` 源支持官方 DFlash2 GGUF 或其 safetensors 目录。
+- `dflash2` 源支持三种 safetensors 布局和 GGUF：ModelOpt NVFP4（推荐，原样导入）、
+  BF16（重新量化）、per-row FP8（重新量化）。
 - 不需要的组件可省略（例如纯文本去掉 `vision`）；`mtp` 组件要求 `-mtp` GGUF
   （`blk.64.nextn.*`）。
 - CPU 转换追加 `--device cpu`。
+
+### DFlash2 NVFP4 草稿
+
+推荐使用 ModelOpt NVFP4 目录，并加 `--override` 走无损导入：
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/conversion-input/metadata \
+  --recipe qwen3_8_27b_gguf \
+  --source gguf=Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf \
+  --source dflash2=/path/to/Qwen3.8-27B-DFlash2-NVFP4-RTNcal \
+  --override tools/convert/recipes/dflash2_import_nvfp4.py \
+  --components text,mtp,dflash2 \
+  --device cpu \
+  --name qwen3.8-27b-dflash2-nvfp4 \
+  --out model.ninfer
+```
+
+| 源格式 | 特征 | 处理 |
+|---|---|---|
+| ModelOpt NVFP4 | `quant_algo=NVFP4`；`weight`(U8) + `weight_scale`(E4M3) + `weight_scale_2`(F32) | 原样导入 |
+| BF16 | 普通 BF16 权重 | 重新量化为 NVFP4 |
+| per-row FP8 | `quant_method=fp8`，每行一个 `weight_scale` | 重新量化为 NVFP4 |
+| **128×128 block FP8** | `weight_block_size=[128,128]`，scale 名 `weight_scale_inv` | **不支持**，报 `missing ... weight_scale`，需先反量化成 BF16 |
+| **GGUF NVFP4** | ggml type 40（64 元素/36 字节 super-block） | **不支持直通导入** |
+
+> 推荐草稿地址：<https://huggingface.co/maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal/tree/main>
+>
+> 详细说明见 [docs/dflash2-nvfp4-20261023.md](docs/dflash2-nvfp4-20261023.md)。
 
 ## 快速开始
 
@@ -164,6 +233,7 @@ python3 -m tools.convert \
 
 ## 文档
 
+- [DFlash2 NVFP4 草稿支持（2026-10-23）](docs/dflash2-nvfp4-20261023.md)
 - [DFlash2 × KVMem 修复记录（2026-10-18）](docs/dflash2-kvmem-fixes-20261018.md)
 - [召回传输优化：带宽基准、256K A/B 与逐次对比（2026-10-19）](docs/kvmem-recall-opt-20261019.md)
 - [后端能力与启动说明](docs/multi-backend.md)
