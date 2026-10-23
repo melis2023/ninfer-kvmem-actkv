@@ -28,20 +28,25 @@ ninfer 后端现在可以直接加载 **NVFP4 编码的 DFlash2 草稿**，`atte
 约束：`kernel_projection` 仍必须是 BF16（prepare 路径没有 NVFP4 内核），QKV 仍是
 Q8（融合 attention 输入只对 `4096x5120` 放行 NVFP4，本模型是 `6144x5120`）。
 
-### 64K 实测（RTX 5060 Ti 16 GB，nvfp4 KV）
+### 256K 实测（RTX 5060 Ti 16 GB，nvfp4 KV）
 
-| 后端 | draft | CUDA graphs | decode | 接受率 |
-|---|---|---|---:|---:|
-| dflash2 | 4 | 关 | **52.7 tok/s** | 44.0% |
-| dflash2 | 3 | 关 | 51.3 tok/s | 52.9% |
-| mtp | 3 | 开 | 49.7 tok/s | 54.7% |
+条件：`--max-context 262144 --kvmem-budget 36864 --kvmem-gen-reserve 16384
+--kv-dtype nvfp4`，prompt 257,089 token，输出 256，temperature 0。
 
-DFlash2 权重比 MTP 多约 1.1 GiB，64K 下开 CUDA graphs 会 OOM，必须
-`--no-cuda-graph`；接受率上限约 44%，参数层面已基本榨干。
+| 后端 | draft | CUDA graphs | decode | 接受率 | prefill |
+|---|---|---|---:|---:|---:|
+| dflash2 | 4 | 关（256K 必须关） | **55.1 tok/s** | 44.8% | 419 tok/s |
+| mtp | 3 | 开 | 50.2 tok/s | 48.7% | 432 tok/s |
+| mtp | 3 | 关 | 47.7 tok/s | 48.7% | 431 tok/s |
+
+DFlash2 权重比 MTP 多约 1.1 GiB，256K 窗口下开 CUDA graphs 会 OOM，必须
+`--no-cuda-graph`；接受率约 44.8%，参数层面已基本榨干。DFlash2 比 MTP 开图快约
+9.8%，比 MTP 关图快约 15.5%。
 
 推荐参数：
 
 ```
+--max-context 262144 --kvmem-budget 36864 --kvmem-gen-reserve 16384 \
 --kv-dtype nvfp4 --no-cuda-graph --spec dflash2 --draft-tokens 4 --full-draft-head
 ```
 
