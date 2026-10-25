@@ -233,3 +233,27 @@ CONFLICT files: 891
 - 8.7K / 62K prompt decode + 接受率
 - prefix cache：同 prompt 二次请求 `cache_n`
 - 长跑：显存 retained 不持续增长
+
+## 9. 128K prompt 实测（2026-10-25）
+
+条件：520,402 字符 ≈ 137,465 token；B/R 61,440/16,384 = 77,824；开图 + 自动校准；nvfp4 KV；temp 0；thinking off；max_tokens 256。
+
+| 模型 | draft | prefill tok/s | decode tok/s | 接受率 | wall |
+|---|---:|---:|---:|---:|---:|
+| q3blocks | 5 | 395.2 | **51.2** | 164/452 = 36.3% | 353.1s |
+| q3blocks | 7 | 361.9 | 46.1 | 171/575 = 29.7% | 385.6s |
+| q4blocks | 5 | 367.9 | 49.2 | 162/462 = 35.1% | 379.1s |
+| q4blocks | 7 | 400.7 | 45.9 | 168/596 = 28.2% | 348.9s |
+| nvfp4full | 5 | 389.7 | 50.1 | 165/447 = 36.9% | 358.1s |
+| nvfp4full | 7 | 387.9 | 44.9 | 169/589 = 28.7% | 360.2s |
+
+结论：
+
+- 128K 档 **draft 5 全面优于 draft 7**（decode +8~14%，接受率高 6~9 个点）；
+- 三个模型差距在测量噪声内：q3 51.2 > nvfp4 50.1 > q4 49.2（draft 5）；
+- 128K prompt 的 decode 比 8.7K 的 66 tok/s 低约 23%，主要来自长上下文与 KVMem 驱逐/回收；
+- 137K prompt 超过 77,824 的 KV 窗口，本次是 **KVMem 窗口召回**下的速度，不是 128K 全驻留；
+- 128K 全驻留需要 B+R ≈ 131,072，约多 0.93 GiB KV；q3 开图极限 86,016（free 313 MiB），**16 GB 下放不下 128K 全驻留**；
+- q4/d5 在 77,824 下 free 仅 267.7 MiB，长跑余量最小，不建议作为 128K 档首选。
+
+推荐 128K prompt：**q3blocks + draft 5 + B/R 77,824**（当前 bat）。
