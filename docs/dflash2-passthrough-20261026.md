@@ -150,12 +150,13 @@ FATAL | requested Engine runtime reservation requires 1729925888 bytes,
 
 | 后端 | 接受率 | decode | wall（含 query replay） |
 |---|---:|---:|---:|
-| dflash2 + q3km，draft 4 | **82.1%**（92/112） | **86.3 tok/s** | 350.7 s |
-| MTP + q3km，draft 3 | **86.9%**（86/99） | 76.7 tok/s | 368.3 s |
+| dflash2 + q3km，draft 4 | **82.1%**（92/112） | **86.3–87.1 tok/s** | 350.7 s |
+| MTP + q3km，draft 3 | **86.9%**（86/99） | 72.2–76.7 tok/s | 349.5–368.3 s |
 
+- 两组第一遍 prefill 都是 **826.5 tok/s（180 s）**，完全相同（目标模型决定）；
 - 代码任务的接受率远高于总结（82% vs 28%），因为输出大量复用模块里的命名和结构；
-- DFlash2 draft 4 的 decode 比 MTP 快 **12.5%**，接受率低 4.8 个点；
-- 两组 wall 都约 350–368 s，其中 prefill 占 340 s 以上。
+- DFlash2 draft 4 的 decode 比 MTP 快约 **20%**，接受率低 4.8 个点；
+- 两组 wall 都约 350 s，其中 prefill 占 340 s 以上。
 
 ## 6. 接受率为什么低、怎么提
 

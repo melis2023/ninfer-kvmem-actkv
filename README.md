@@ -86,8 +86,11 @@ Draft 精度不是瓶颈（Q4_K 23.4% vs NVFP4 23.8%）；Q8 草稿（2.05 GB）
 
 | 后端 | 接受率 | decode | wall |
 |---|---:|---:|---:|
-| dflash2 + q3km，draft 4 | **82.1%**（92/112） | **86.3 tok/s** | 350.7 s |
-| MTP + q3km，draft 3 | 86.9%（86/99） | 76.7 tok/s | 368.3 s |
+| dflash2 + q3km，draft 4 | **82.1%**（92/112） | **86.3–87.1 tok/s** | 350.7 s |
+| MTP + q3km，draft 3 | 86.9%（86/99） | 72.2–76.7 tok/s | 349.5–368.3 s |
+
+两组第一遍 prefill 都是 **826.5 tok/s（180 s）**，完全相同；DFlash2 decode 快约 20%，
+接受率低 4.8 个点。
 
 同样是 draft 4/总结任务只有 28.3%：**接受率主要由任务可预测性决定**，不是 KVMem 的
 bug。排查中确实发现一处 floor 不一致（restore / checkpoint recovery 只用 recent 页，
