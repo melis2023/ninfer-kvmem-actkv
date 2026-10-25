@@ -347,3 +347,27 @@ BLUEBIRD-42, MAPLE-91, REDWOOD-77
 - 两者 KVMEM_SPILL 都是 503 次 / 8,902 MiB，换页量相同，差距来自 drafter 路径与显存余量。
 
 128K 时两者几乎持平（q3 51.2 / nvfp4 50.1 decode；395.2 / 389.7 prefill），256K 才拉开。原因是 NVFP4 drafter 的 A16 前向按 32-token chunk 执行，长 prefill 下不如 q3 的 GGUF block GEMM；256K 的 drafter context materialization 放大了这个差距。
+
+### 11.2 MTP 3 vs DFlash2 5（256K，同一 253K/256-token 报告 prompt）
+
+q3blocks + nvfp4 KV + B/R 77,824：
+
+| 后端 | prefill | decode | 接受率 | wall |
+|---|---:|---:|---:|---:|
+| **MTP draft 3**（adaptive + full head） | 369.1 tok/s | **52.4 tok/s** | **51.2%**（154/301） | 690.7s |
+| DFlash2 draft 5 | 369.7 tok/s | 50.5 tok/s | 33.5%（159/475） | 689.8s |
+
+- prefill 几乎相同（target 主导）；
+- MTP decode 快 **3.8%**；
+- MTP 接受率高 **17.7 个点**，draft 3 反而比 DFlash2 draft 5 更稳；
+- wall 基本相同（prefill 占 99%）。
+
+接受率随上下文的变化：
+
+| 上下文 | DFlash2 d5 | MTP d3 |
+|---|---:|---:|
+| 8.7K | 43.6% | 54.7%（64K 实测） |
+| 128K | 36.3% | — |
+| 256K | 33.5% | 51.2% |
+
+DFlash2 的接受率随上下文明显下降，MTP 更稳。256K 长报告场景建议优先试 MTP draft 3。
