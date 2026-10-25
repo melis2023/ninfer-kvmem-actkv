@@ -27,19 +27,46 @@ WDDM 下探针读数会抖动（同一配置连续启动实测过 0.0 / 83.3 / 9
 - 256K 窗口下 `nvfp4` / `q4km` / `q3km` 等草稿都能加载，不再出现启动即爆显存；
 - 开图 decode 比关图快约 6%，且 KV 容量比盲预留多约 700–800 MiB。
 
-### 2. 推荐草稿：q3km
+### 2. 推荐草稿：q3km（直通草稿，统一量化精度）
 
-当前启动器默认使用 **q3km** 草稿：权重更小、启动余量更大，256K 窗口下开图不再爆显存。
+**当前引擎已经支持直通草稿**：草稿权重按源工件的 GGUF 块格式直接加载，不再统一重化成
+Q8/NVFP4。q3km 工件里的 DFlash2 草稿实际精度：
 
-253K prompt 的对照实测（同为 nvfp4 KV、draft 5，B/R=77,824）：
+| 张量 | 精度 |
+|---|---|
+| `attention/output`、`mlp/down`（各 5 个） | `Q4_K` |
+| `feature_projection`、`candidate_selector/hidden_projection` | `Q3_K` |
+| conv `kernel_projection` / `base_kernel`、norm、codebook | BF16（prepare 路径没有量化内核） |
 
-| 草稿 | 256K prefill | decode | wall | 备注 |
-|---|---:|---:|---:|---|
-| q3blocks | **404 tok/s** | 46.6 tok/s | **627 s** | 显存余量最大，启动 free 约 587 MiB |
-| nvfp4full | 334 tok/s | 46.4 tok/s | 759 s | 权重更小但 drafter 前向更慢 |
+**为什么这样做：降低显存占用。** 直通保留源块字节，不再为第二种精度另存一份；草稿按
+Q3/Q4 块存储后，256K 窗口下省出来的显存留给 KV 和 CUDA Graph，开图也不需要
+`--no-cuda-graph`。两个启动器启动后的 free 分别是 **863.8 MiB**（DFlash2 + nvfp4 KV）
+和 **1,001.8 MiB**（MTP + int8 KV）。
 
-q3blocks 比 nvfp4full prefill 快约 21%、wall 少约 17%，召回同为 3/3；q3km 与
-q3blocks 同属 Q3 家族，作为默认推荐，256K 的单独对照尚未测。
+#### 256K 速度对比（两个启动器，prefill 取第一遍）
+
+同一 950K 字符 prompt（253,031 token）、输出 256 token、temperature 0、thinking off，
+RTX 5060 Ti 16 GB：
+
+| 启动器 | 草稿 | KV | B/R | prefill（第一遍） | decode | 接受率 | wall |
+|---|---|---|---:|---:|---:|---:|---:|
+| `start-kvmem-ninfer-dflash.bat` | dflash2 draft 5 | nvfp4 | 36,480/16,384 | **872.5 tok/s**（290 s） | 34.8 tok/s | 20.2%（88/435） | **584.0 s** |
+| `start-kvmem-ninfer.bat` | MTP draft 3 adaptive | int8 | 36,864/16,384 | 803.3 tok/s（315 s） | **47.5 tok/s** | **40.7%**（140/344） | 630.9 s |
+
+- **DFlash2 prefill 快 8.6%、总 wall 少 7.4%**（长 prompt 下 prefill 占绝对主导）；
+- **MTP decode 快 36.5%**，接受率高 20.5 个点；
+- 256K 长 prompt + 短输出（报告/问答）选 DFlash2；长输出、多轮对话选 MTP；
+- 两个启动器都不需要 `--no-cuda-graph`；prefill 只算第一遍，第二遍是 hidden replay
+  （不计 token，但计入 wall）。
+
+同模型不同量化的历史对照（B/R=77,824、nvfp4 KV、253K prompt，prefill 为两遍口径）：
+
+| 草稿 | prefill | decode | wall |
+|---|---:|---:|---:|
+| q3blocks | 404 tok/s | 46.6 tok/s | 627 s |
+| nvfp4full | 334 tok/s | 46.4 tok/s | 759 s |
+
+q3blocks 比 nvfp4full prefill 快约 21%；q3km 与 q3blocks 同属 Q3 家族，作为默认推荐。
 
 启动参数：
 
@@ -90,8 +117,11 @@ ninfer 后端现在可以直接加载 **NVFP4 编码的 DFlash2 草稿**，`atte
 | `f4d18713` | NVFP4 线性表注册 DFlash2 的五个几何（Feature/QKV/AttnOut/ConvProj/Selector），own 与 unified 两条调度同时生效 |
 | `18e3c7c8` | 动态卷积的 add 路径接受 NVFP4 父权重；补上 `dflash2_import_nvfp4.py` 与 `dflash2_nvfp4.py` 两个转换配方 |
 
-约束：`kernel_projection` 仍必须是 BF16（prepare 路径没有 NVFP4 内核），QKV 仍是
-Q8（融合 attention 输入只对 `4096x5120` 放行 NVFP4，本模型是 `6144x5120`）。
+约束（NVFP4 导入路径）：`kernel_projection` 仍必须是 BF16（prepare 路径没有 NVFP4
+内核），QKV 仍是 Q8（融合 attention 输入只对 `4096x5120` 放行 NVFP4，本模型是
+`6144x5120`）。如果走 **GGUF 直通**（`dflash2_gguf_blocks.py`），`attention/output`
+与 `mlp/down` 保持源块类型（Q2_K/Q3_K/Q4_K），草稿不再混用 Q8/NVFP4，详见
+[docs/dflash2-nvfp4-20261023.md](docs/dflash2-nvfp4-20261023.md) 的“直通草稿模式”。
 
 ### 256K 实测（RTX 5060 Ti 16 GB，nvfp4 KV）
 
