@@ -1338,9 +1338,12 @@ bool ProgramImpl::restore_memory_history(SequenceState& sequence, RequestControl
         if (speculative_backend != SpeculativeBackend::Mtp) {
             kvmem_set_backend_frontier(sequence, *frontier);
             // The ring snapshot holds the trailing window; anything earlier may be reselected
-            // history and must not feed the draft.
-            const std::uint64_t recent_tokens =
-                static_cast<std::uint64_t>(kvmem_options.recent_blocks()) * page_tokens;
+            // history and must not feed the draft. Keep the whole masked-draft ring readable,
+            // exactly like the reselect path: the recent-page span alone is one page by default
+            // and would hide the rest of the 2048-token conditioning ring after a restore.
+            const std::uint64_t recent_tokens = std::max<std::uint64_t>(
+                static_cast<std::uint64_t>(kvmem_options.recent_blocks()) * page_tokens,
+                masked_draft_ring_capacity());
             sequence.dflash_context_floor = *frontier > recent_tokens
                 ? static_cast<std::uint32_t>(*frontier - recent_tokens) : 0U;
             // Re-anchor the restored ring to the sequence's current write slot.

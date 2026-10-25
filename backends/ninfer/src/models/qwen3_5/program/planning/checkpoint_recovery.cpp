@@ -765,10 +765,12 @@ void ProgramImpl::publish_checkpoint_drop(SequenceState& sequence,
     } else if (is_masked_draft_backend(speculative_backend)) {
         sequence.dflash_context_frontier = retained->main_frontier;
         // The ring snapshot covers the trailing window; reselected history below the recent
-        // pages must not feed the draft.
-        const std::uint64_t recent_tokens =
+        // pages must not feed the draft. Keep the whole ring readable (the recent-page span is
+        // one page by default), matching the reselect and query-restore paths.
+        const std::uint64_t recent_tokens = std::max<std::uint64_t>(
             static_cast<std::uint64_t>(kvmem_options.recent_blocks()) *
-            static_cast<std::uint64_t>(kPagedKVPageSize);
+                static_cast<std::uint64_t>(kPagedKVPageSize),
+            masked_draft_ring_capacity());
         sequence.dflash_context_floor = retained->main_frontier > recent_tokens
             ? static_cast<std::uint32_t>(retained->main_frontier - recent_tokens) : 0U;
         // The restored ring lives in the sequence's current write slot; re-anchor it there so a
