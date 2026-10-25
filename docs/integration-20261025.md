@@ -330,3 +330,20 @@ BLUEBIRD-42, MAPLE-91, REDWOOD-77
 - prefill 只比 128K 慢 7.5%，wall 约翻倍；
 - 256K 不是全驻留，仍是 77,824 窗口 + Host 召回；
 - 单次、重复 filler，严格 NIAH 需要多 seed/多 needle/非重复 filler。
+
+### 11.1 q3 vs nvfp4（256K）
+
+同一 253,104 token prompt、3 needle、draft 5、max_tokens 256：
+
+| 模型 | prefill | decode | 接受率 | wall | 命中 |
+|---|---:|---:|---:|---:|---:|
+| q3blocks | **370.5 tok/s** | **48.8 tok/s** | 34.3% | **683.9s** | 3/3 |
+| nvfp4full | 333.7 tok/s | 46.4 tok/s | 34.3% | 759.2s | 3/3 |
+
+- q3 prefill 快 **11%**，decode 快 **5%**，wall 少 **10%**；
+- 两者接受率完全一致（12/35）；
+- 3 个 needle 都是 3/3，召回无差别；
+- 启动 free：q3 650.0 MiB，nvfp4 452.9 MiB（nvfp4 大 0.12 GiB）；
+- 两者 KVMEM_SPILL 都是 503 次 / 8,902 MiB，换页量相同，差距来自 drafter 路径与显存余量。
+
+128K 时两者几乎持平（q3 51.2 / nvfp4 50.1 decode；395.2 / 389.7 prefill），256K 才拉开。原因是 NVFP4 drafter 的 A16 前向按 32-token chunk 执行，长 prefill 下不如 q3 的 GGUF block GEMM；256K 的 drafter context materialization 放大了这个差距。
