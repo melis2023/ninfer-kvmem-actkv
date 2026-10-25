@@ -1,0 +1,163 @@
+From 815302a5a4a51c8e0feb71e75337151b79929db4 Mon Sep 17 00:00:00 2001
+From: kvmem <kvmem@local>
+Date: Sun, 25 Oct 2026 13:05:40 +0800
+Subject: [PATCH] feat(startup): calibrate the CUDA graph allowance from a
+ minimal KV probe
+
+The topology formula covers every driver shape, so it over-reserves long DFlash2 windows by roughly 700 MiB. Build a probe Program with the full logical window but only the physical pages that window needs, read its measured graph footprint, and use max(measured, 256 MiB) for the final capacity plan. A failed probe keeps the static allowance; --no-cuda-graph returns without probing; an explicit --cuda-graph-allowance-mib still wins.
+---
+ .../qwen3_5/program/planning/startup.cpp      | 20 +++++++++++++
+ src/models/qwen3_5/program/planning/startup.h |  6 ++++
+ src/models/qwen3_5/program/program.cpp        | 28 +++++++++++++++++++
+ src/models/qwen3_5/program/program.h          |  9 ++++++
+ src/runtime/engine/model_instance.cpp         | 19 ++++++++++++-
+ 5 files changed, 81 insertions(+), 1 deletion(-)
+
+diff --git a/src/models/qwen3_5/program/planning/startup.cpp b/src/models/qwen3_5/program/planning/startup.cpp
+index f3d70f92..144c9a9c 100644
+--- a/src/models/qwen3_5/program/planning/startup.cpp
++++ b/src/models/qwen3_5/program/planning/startup.cpp
+@@ -1483,6 +1483,26 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
+     return planner;
+ }
+ 
++std::unique_ptr<SequencePlanImpl>
++make_graph_probe_plan(const execution::Parameters& parameters, DeviceContext& device,
++                      const EngineOptions& options, std::uint32_t main_page_groups) {
++    auto planner = make_sequence_planner_impl(parameters, device, options, 0);
++    auto inputs  = planner->inputs;
++    // A KVMem window is the capacity the masked-draft graph profiles are built from; using it as
++    // the probe's logical capacity keeps every profile while avoiding a full max-context KV pool.
++    const bool windowed = (inputs.speculative_backend == SpeculativeBackend::DFlash ||
++                           inputs.speculative_backend == SpeculativeBackend::DFlash2) &&
++                          inputs.kvmem_window_tokens != 0 &&
++                          inputs.kvmem_window_tokens < inputs.capacity;
++    if (windowed) inputs.capacity = inputs.kvmem_window_tokens;
++    const auto pages = std::max(page_count(inputs.capacity), main_page_groups);
++    if (pages == 0) { throw std::invalid_argument("CUDA graph probe needs a physical KV page"); }
++    // Keep the planner's logical capacity so every graph profile is captured, but allocate only
++    // the pages that capacity needs. The capacity-curve minimum deliberately does not apply: this
++    // plan is never served.
++    return build_sequence_candidate(inputs, pages);
++}
++
+ std::unique_ptr<SequencePlanImpl>
+ finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl> planner,
+                             std::uint32_t main_page_groups) {
+diff --git a/src/models/qwen3_5/program/planning/startup.h b/src/models/qwen3_5/program/planning/startup.h
+index 042cadeb..59935f77 100644
+--- a/src/models/qwen3_5/program/planning/startup.h
++++ b/src/models/qwen3_5/program/planning/startup.h
+@@ -211,6 +211,12 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
+ finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl> planner,
+                             std::uint32_t main_page_groups);
+ 
++// Builds a full-logical-context plan with the caller's physical page count, bypassing the
++// capacity-curve minimum. Used only to capture the startup graph set; the plan is never served.
++[[nodiscard]] std::unique_ptr<SequencePlanImpl>
++make_graph_probe_plan(const execution::Parameters& parameters, DeviceContext& device,
++                      const EngineOptions& options, std::uint32_t main_page_groups);
++
+ // Resolves the single Host RAM budget into the plan's context-cache shape: one StateImage per
+ // position it retains and Host KV for everything else. StateImages are the fixed per-position cost
+ // of a checkpoint and Host KV the per-token cost, so the budget first covers the inventory the
+diff --git a/src/models/qwen3_5/program/program.cpp b/src/models/qwen3_5/program/program.cpp
+index 1d9bdc98..d2831dc0 100644
+--- a/src/models/qwen3_5/program/program.cpp
++++ b/src/models/qwen3_5/program/program.cpp
+@@ -3,6 +3,9 @@
+ #include "models/qwen3_5/program/graft_injection.h"
+ #include "models/qwen3_5/program/planning/startup.h"
+ #include "models/qwen3_5/program/program_impl.h"
++#include "core/startup.h"
++#include <algorithm>
++#include <cstdio>
+ #include <stdexcept>
+ #include <string>
+ #include <utility>
+@@ -757,6 +760,31 @@ std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
+     return std::unique_ptr<Program>(new Program(std::move(impl)));
+ }
+ 
++std::optional<std::size_t> measure_cuda_graph_bytes(const execution::Parameters& parameters,
++                                                    DeviceContext& device,
++                                                    const EngineOptions& options) {
++    if (!options.use_cuda_graph) return std::nullopt;
++    auto probe_options = options;
++    // The probe measures the graph set only; its own reservation must not feed back into the
++    // plan. The context-cache shape stays exactly as configured because the plan validates its
++    // Host inventory whether or not the cache is captured.
++    probe_options.cuda_graph_allowance_bytes = 0;
++    try {
++        const auto pages = std::max<std::uint32_t>(1U, options.max_concurrency);
++        auto plan = detail::make_graph_probe_plan(parameters, device, probe_options, pages);
++        auto probe = create_program(parameters, SequencePlan(std::move(plan)), device,
++                                    StartupObserver{});
++        const auto measured = probe->memory_summary().cuda_graph_measured_bytes;
++        probe.reset();
++        device.synchronize();
++        return measured;
++    } catch (const std::exception& error) {
++        std::fprintf(stderr, "CUDA graph probe failed: %s\n", error.what());
++        device.synchronize();
++        return std::nullopt;
++    }
++}
++
+ void Program::inject_graft(const PromptGraft& graft) {
+     inject_direct_graft(*impl_, graft);
+ }
+diff --git a/src/models/qwen3_5/program/program.h b/src/models/qwen3_5/program/program.h
+index 29d23036..d2ee085b 100644
+--- a/src/models/qwen3_5/program/program.h
++++ b/src/models/qwen3_5/program/program.h
+@@ -1418,6 +1418,15 @@ struct RuntimeContractAccess {
+                                                  DeviceContext& device,
+                                                  const EngineOptions& options);
+ 
++// Measures the CUDA Graph driver-state footprint with a minimal physical KV probe: the plan keeps
++// the full logical context so every graph profile is captured, but allocates only enough pages for
++// the configured lanes. The probe is destroyed before the caller plans final capacity. Returns
++// nullopt when graphs are disabled or the probe cannot be built; a successful probe may report 0
++// when WDDM clamps the free-memory delta, which the caller treats as "captured but unmeasured".
++[[nodiscard]] std::optional<std::size_t>
++measure_cuda_graph_bytes(const execution::Parameters& parameters, DeviceContext& device,
++                         const EngineOptions& options);
++
+ [[nodiscard]] std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
+                                                       SequencePlan&& plan, DeviceContext& device,
+                                                       const StartupObserver& startup_observer);
+diff --git a/src/runtime/engine/model_instance.cpp b/src/runtime/engine/model_instance.cpp
+index 486537b0..05eb4916 100644
+--- a/src/runtime/engine/model_instance.cpp
++++ b/src/runtime/engine/model_instance.cpp
+@@ -853,8 +853,25 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext&
+             graft_main_pages += (graft.n_slots + page_tokens - 1U) / page_tokens;
+         }
+     }
+-    const EngineOptions planning_options =
++    EngineOptions planning_options =
+         artifact_scoped_disk_tier(options, instance->model->info().artifact_id);
++    // The topology formula must cover every shape a driver could materialize, so it over-reserves
++    // long DFlash2 windows. Measure the configured graph set on a minimal physical KV probe and
++    // use that value for the final capacity plan; a failed probe keeps the static allowance.
++    if (options.use_cuda_graph && options.cuda_graph_allowance_bytes == 0) {
++        const auto measured = models::qwen3_5::measure_cuda_graph_bytes(
++            instance->parameters, device, planning_options);
++        if (measured.has_value()) {
++            constexpr std::size_t kMinimumGraphAllowance = 256ULL << 20;
++            const auto allowance = std::max(*measured, kMinimumGraphAllowance);
++            options.cuda_graph_allowance_bytes          = allowance;
++            planning_options.cuda_graph_allowance_bytes = allowance;
++            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
++                               "CUDA graph probe measured %.1f MiB; planning allowance %.1f MiB",
++                               static_cast<double>(*measured) / 1048576.0,
++                               static_cast<double>(allowance) / 1048576.0);
++        }
++    }
+     const auto curve = models::qwen3_5::make_sequence_planner(
+         instance->parameters, device, planning_options, graft_main_pages).capacity_curve();
+     std::vector<std::size_t> free_by_rank =
+-- 
+2.53.0.windows.1
+
