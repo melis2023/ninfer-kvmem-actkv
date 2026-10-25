@@ -28,6 +28,7 @@ for p in ../../docs/patches/000*.patch; do git am "$p"; done
 | `0009-feat-nvfp4-register-DFlash2-drafter-matrices-on-both.patch` | NVFP4 线性表注册 DFlash2 五个几何（own + unified） | 本地 |
 | `0010-feat-nvfp4-serve-the-DFlash2-drafter-s-NVFP4-project.patch` | 动态卷积 add 接受 NVFP4 父权重；补两个转换 recipe | 本地 |
 | `0011-feat-startup-calibrate-the-CUDA-graph-allowance-from.patch` | CUDA Graph 启动校准：最小 KV 探针实测，按 256 MiB 规划 | 本地 |
+| `0012-fix-kvmem-gate-the-80-reselect-on-growth-since-the-l.patch` | 80% 重选增加增长门限，避免 B>4R 空转 | 本地 |
 
 ## 已验证的基线
 
@@ -47,4 +48,6 @@ for p in ../../docs/patches/000*.patch; do git am "$p"; done
   原样导入）与 `dflash2_nvfp4.py`（重新量化，conv 保持 BF16）。
 - 0011 只改启动与容量规划，不依赖 0009/0010；在 0001–0010 之后按编号应用。探针实测
   90–143.5 MiB，规划 256 MiB；`--cuda-graph-allowance-mib` 仍优先，`--no-cuda-graph` 跳过。
+- 0012 修 B>4R 的 no-op 重选；`B <= 4R` 行为不变；启动会在 B>4R 时打 WARN 并给出推荐
+  `--kvmem-gen-reserve`。
 - 若上游后续改动了 `src/serve/translate.cpp` 或 `src/models/qwen3_5/frontend/chat_template.cpp`，0005 可能需要手工解冲突。

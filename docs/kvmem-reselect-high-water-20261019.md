@@ -169,3 +169,48 @@ curl.exe -s -X POST http://127.0.0.1:18200/v1/chat/completions `
 # 召回
 python niah33_262k.py
 ```
+
+## 11. 2026-10-25 修复：B > 4R 的 reselect thrash
+
+### 触发条件
+
+80% 水位是 `W - W/5`，而重选后视图压到 `B = selected_tokens`。如果
+`B > W - W/5`，压缩结果本身就在水位之上，下一步立即再次触发，形成 no-op 重选：
+
+```text
+B > W - W/5,  W = B + R
+=> B > 4/5 (B + R)
+=> B > 4R
+```
+
+### 修法
+
+- `KvmemWindowState` 增加 `last_reselect_visible`；
+- 触发条件改为：
+
+  ```cpp
+  visible > reselect_high_water &&
+  visible - last_reselect_visible > reserve_tokens / 2
+  ```
+
+- 每次 reselect/compaction 完成后，把 `last_reselect_visible` 设为当前
+  `compact_position`；
+- checkpoint restore 也更新基线；
+- 启动时如果 `B > 4R`，打印 WARN，并给出推荐的 reserve。
+
+### 验证
+
+5 轮 `/v1/responses` + `prompt_cache_key`，B=67,584 / R=16,384（B/R=4.12），
+输入从 68,186 增长到 102,976：
+
+| 版本 | reselect 次数 | 说明 |
+|---|---:|---|
+| 修复后 | 21 | 约每 8K 增长一次，未出现 no-op 连续触发 |
+| 修复前 | 待补 | 后台对比运行中 |
+
+安全配置 B/R=2.23 启动无 WARN，行为不变；B/R=4.12 启动出现：
+
+```text
+WARN engine | KVMem B/R is 4.12 (> 4): the 80% reselect high-water is in the thrash regime;
+set --kvmem-gen-reserve to at least 16897 to avoid repeated reselections
+```
