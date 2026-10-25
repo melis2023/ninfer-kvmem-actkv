@@ -288,3 +288,45 @@ The secret verification code for station 2047 is BLUEBIRD-42.
 - 单 needle、单次、filler 重复度高；完整 NIAH 需要多 needle、随机位置、非重复 filler；
 - 5% 命中只证明该 fact 被召回，不代表所有早期块都能召回；
 - 回答无 thinking，max_tokens 256 足够。
+
+## 11. 256K 召回（NIAH，2026-10-25）
+
+条件：q3blocks + nvfp4 KV + dflash2 draft 5，max_tokens 256，B/R 61,440/16,384 = 77,824，max-context 262,144。
+
+prompt：950,493 字符 = **253,104 token**；一次 prefill 放 3 个 needle。
+
+| 深度 | station | code | 是否在 77,824 窗口 | hit |
+|---:|---|---|---|:-:|
+| 5% | 2047 | `BLUEBIRD-42` | ❌ 需要召回 | ✅ |
+| 50% | 4093 | `MAPLE-91` | ❌ 需要召回 | ✅ |
+| 95% | 8191 | `REDWOOD-77` | ✅ 尾部窗口 | ✅ |
+
+回答：
+
+```text
+BLUEBIRD-42, MAPLE-91, REDWOOD-77
+```
+
+速度：
+
+| 项 | 值 |
+|---|---:|
+| prefill | **370.5 tok/s** |
+| wall | **683.9s（11.4 分钟）** |
+| decode | 48.8 tok/s（19 token） |
+| draft / 接受 | 35 / 12 = 34.3% |
+
+对比 128K（137K prompt）：
+
+| 项 | 128K | 256K | 变化 |
+|---|---:|---:|---:|
+| prefill | 400.6 tok/s | 370.5 tok/s | -7.5% |
+| wall | 343.8s | 683.9s | ×1.99 |
+| decode（短回答） | 38.0 | 48.8 | 短回答不可比 |
+
+结论：
+
+- **3/3 命中**，5% 和 50% 都在 77,824 窗口之外，说明 KVMem 在 256K prompt 下仍能召回早期块；
+- prefill 只比 128K 慢 7.5%，wall 约翻倍；
+- 256K 不是全驻留，仍是 77,824 窗口 + Host 召回；
+- 单次、重复 filler，严格 NIAH 需要多 seed/多 needle/非重复 filler。
