@@ -59,11 +59,40 @@ q3blocks 比 nvfp4full prefill 快约 21%；q3km 与 q3blocks 同属 Q3 家族�
 
 | 草稿 | 第一遍 prefill | decode | 接受率 | wall |
 |---|---:|---:|---:|---:|
-| dflash2 + **q3km** | 904.8 tok/s（140 s） | 42.8 tok/s | 23.4%（137/585） | 282.8 s |
-| dflash2 + **q4km** | 904.8 tok/s（140 s） | 43.6 tok/s | 24.2%（139/575） | 282.4 s |
+| dflash2 + **q3km**（draft 5） | 904.8 tok/s（140 s） | 42.8 tok/s | 23.4%（137/585） | 282.8 s |
+| dflash2 + **q4km**（draft 5） | 904.8 tok/s（140 s） | 43.6 tok/s | 24.2%（139/575） | 282.4 s |
+| dflash2 + q3km（**draft 4**） | 904.8 tok/s（140 s） | 45.8 tok/s | 28.3%（135/477） | 288.5 s |
+| dflash2 + q3km（**draft 3**） | 904.8 tok/s（140 s） | 46.1 tok/s | 34.9%（130/373） | 288.4 s |
+| dflash2 + **混合 NVFP4 草稿**（draft 5） | 844.5 tok/s（150 s） | 40.7 tok/s | 23.8% | 296.7 s |
 | **MTP + q3km**（draft 3） | 904.8 tok/s（140 s） | **47.7 tok/s** | **40.8%**（140/343） | 280.9 s |
 
 dflash2在代码上效果要好于mtp，目前仍有少许bug，等待后续修复。
+
+**接受率怎么提**：
+
+| 场景 | 配置 |
+|---|---|
+| 开放式生成 / 总结 | dflash2 + **draft 3**（或直接用 MTP） |
+| 复制 / 抽取 / 代码修改 | dflash2 + draft 5 + `--ngram-draft-tokens 31` |
+| 追求 decode 速度 | MTP draft 3 + `--adaptive-mtp` |
+
+Draft 精度不是瓶颈（Q4_K 23.4% vs NVFP4 23.8%）；Q8 草稿（2.05 GB）会让权重涨到
+13.0 GiB，B/R=36,480 启动差 184 MiB，只能配更小窗口。DFlash2 目前是固定 draft 长度，
+没有 MTP 的 `--adaptive-mtp`；按上面的曲线，做自适应宽度预计能到 40% 附近。
+
+#### 代码任务：接受率明显更高（128K 代码 prompt）
+
+同一套 148,774 token 的 Python 模块补函数任务（`max_tokens 256`、greedy、ngram 0）：
+
+| 后端 | 接受率 | decode | wall |
+|---|---:|---:|---:|
+| dflash2 + q3km，draft 4 | **82.1%**（92/112） | **86.3 tok/s** | 350.7 s |
+| MTP + q3km，draft 3 | 86.9%（86/99） | 76.7 tok/s | 368.3 s |
+
+同样是 draft 4/总结任务只有 28.3%：**接受率主要由任务可预测性决定**，不是 KVMem 的
+bug。排查中确实发现一处 floor 不一致（restore / checkpoint recovery 只用 recent 页，
+没有算 DFlash2 的 2048 滑动窗口），已统一成 `max(recent, ring)`，但实测前后都是
+135/477，说明它在本流程里没有生效，属于防御性修正。
 
 启动参数：
 

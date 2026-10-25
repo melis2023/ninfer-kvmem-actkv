@@ -102,7 +102,100 @@ B/R=36,480/16,384、`--ngram-draft-tokens 0`、126,668 token prompt，只换草�
 - 三组 prefill 完全相同（904.8 tok/s），说明 prefill 由目标模型决定，换草稿不影响；
 - wall 约 281–283 s，其中约一半是 query replay；decode 仅约 6 s。
 
-## 6. 复现
+## 5.2 混合精度 vs 直通（128K，同目标）
+
+“不开直通、用混合精度”的对照：同一份 `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf` 目标 +
+ModelOpt NVFP4 草稿（`I:\model\dflash2-nvfp4-modelopt`），按 `dflash2_import_nvfp4.py`
+转出 `...-q3km-nvfp4.ninfer`（13.85 GB，草稿 = 12× NVFP4 + conv/norm BF16）。
+
+条件同 5.1（126,668 token、nvfp4 KV、B/R=36,480/16,384、ngram 0、draft 5）：
+
+| 草稿转换 | 第一遍 prefill | decode | 接受率 | wall |
+|---|---:|---:|---:|---:|
+| **直通 Q3_K_M**（q3km） | **904.8 tok/s**（140 s） | **42.8 tok/s** | 23.4% | **282.8 s** |
+| 混合 NVFP4（import） | 844.5 tok/s（150 s） | 40.7 tok/s | 23.8% | 296.7 s |
+
+- 直通 prefill 快 **6.7%**、decode 快 **4.9%**，接受率基本相同；
+- 这台卡上 NVFP4 draft 的 A16 路径不如 GGUF 块，混合精度没有速度优势；
+- 混合工件的启动 free 更低（823.3 vs 863.8 MiB）。
+
+## 5.3 draft 长度扫描（q3km 直通，128K）
+
+| draft | 接受率 | decode | wall |
+|---|---:|---:|---:|
+| 5 | 23.4%（137/585） | 42.8 tok/s | 282.8 s |
+| 4 | 28.3%（135/477） | 45.8 tok/s | 288.5 s |
+| **3** | **34.9%**（130/373） | **46.1 tok/s** | 288.4 s |
+| MTP draft 3（对照） | **40.8%**（140/343） | **47.7 tok/s** | 280.9 s |
+
+draft 从 5 降到 3：接受率 +11.5 个点，decode +7.7%，wall 基本不变（prefill 主导）。
+
+## 5.4 Q8 草稿：先撞显存
+
+`Qwen3.8-27B-DFlash2-Q8_0.gguf`（2.05 GB）直通转换后工件 14.6 GB，权重 13.0 GiB。
+B/R=36,480/16,384 启动失败：
+
+```text
+FATAL | requested Engine runtime reservation requires 1729925888 bytes,
+        but only 1545273344 bytes are available for runtime capacity
+```
+
+差 184 MiB，缩到 B/R=28,672/12,288（W=40,960）才能启动。因此 Q8 草稿只能作为
+“更高保真换更小窗口”的选项，不适合当前 16 GB 的主力配置。
+
+## 5.5 代码编写（128K 代码 prompt）
+
+同一份 480K 字符的合成 Python 模块（148,774 token），要求补一个 `merge_intervals`
+函数，`max_tokens 256`、greedy、ngram 0、nvfp4 KV、B/R=36,480/16,384：
+
+| 后端 | 接受率 | decode | wall（含 query replay） |
+|---|---:|---:|---:|
+| dflash2 + q3km，draft 4 | **82.1%**（92/112） | **86.3 tok/s** | 350.7 s |
+| MTP + q3km，draft 3 | **86.9%**（86/99） | 76.7 tok/s | 368.3 s |
+
+- 代码任务的接受率远高于总结（82% vs 28%），因为输出大量复用模块里的命名和结构；
+- DFlash2 draft 4 的 decode 比 MTP 快 **12.5%**，接受率低 4.8 个点；
+- 两组 wall 都约 350–368 s，其中 prefill 占 340 s 以上。
+
+## 6. 接受率为什么低、怎么提
+
+| 因素 | 观察 | 结论 |
+|---|---|---|
+| **任务类型** | 代码 82.1%、NIAH 33.5%、开放式总结 20–28% | **决定性因素**：输出越可预测，draft 越准 |
+| draft 长度 | 总结任务 5 → 3：23.4% → 34.9% | 后几个位置基本白算 |
+| 草稿精度 | Q4_K 23.4% vs NVFP4 23.8% | 4-bit 档位不是瓶颈 |
+| ngram | 总结类输出不复用输入，命中低 | 只适合复制/改写类任务 |
+| 后端 | MTP 自适应 40.8%（总结）/ 86.9%（代码） | 自适应宽度确实有效 |
+
+### 6.1 排查：masked-draft conditioning floor（已修，无实测影响）
+
+KVMem 下 DFlash2 的 draft 只读 `dflash_context_floor` 之后的 conditioning 行。三处设置
+这个 floor 的代码不一致：
+
+| 位置 | 原公式 | 问题 |
+|---|---|---|
+| `kvmem_window.cpp` 重选 | `max(recent, draft.sliding_window)` | ✅ 正确 |
+| `kvmem_window.cpp` query restore | 只有 `recent`（默认 64） | ⚠️ 会隐藏 2048 窗口的大部分 |
+| `planning/checkpoint_recovery.cpp` | 只有 `recent` | ⚠️ 同上 |
+
+重选路径的注释自己写了：`recent-page span silently hides most of it and drags acceptance
+down`。已把后两处改成同样的 `max(recent*64, masked_draft_ring_capacity())`。
+
+**实测影响：没有。** 修复前后同一 128K 总结 prompt、q3km draft 4 都是
+**135/477 = 28.3%**、decode 43.8–45.8 tok/s。说明本流程里 floor 已由最后一次重选设好，
+restore 路径没有覆盖它；这个修复是防御性的一致性修正，不是接受率低的原因。
+
+### 6.2 结论
+
+低接受率来自**任务可预测性**，不是 KVMem 的 bug：
+
+- 同一模型、同一窗口、同一 draft 4：代码 82.1%，总结 28.3%；
+- 想提高接受率，优先换任务/缩短 draft；其次用 MTP 的自适应宽度；
+- 代码层面的下一步：DFlash2 目前是**固定** draft 长度，没有 MTP 的 `--adaptive-mtp`。
+  可以复用 `mtp_adaptive.h` 的按位置命中率估计，给 DFlash2 也做自适应宽度；按 5.3 的
+曲线，开放式任务上预计能到 40% 左右，接近 MTP。
+
+## 7. 复现
 
 ```bat
 REM DFlash2
@@ -115,7 +208,7 @@ workers\ninfer\start-kvmem-ninfer.bat
 请求：950K 字符 filler（253,031 token），`max_tokens 256`、`temperature 0`、
 `chat_template_kwargs.enable_thinking=false`。
 
-## 7. 注意事项
+## 8. 注意事项
 
 - `kernel_projection` 仍必须是 BF16：`dynamic grouped conv prepare` 没有量化内核，
   recipe 会跳过它；
