@@ -1,0 +1,63 @@
+schema_version: 1
+
+# Qwen3.8-Flash-Next GSQ-RCO Q2_0 with its n-gram table, every expert on two RTX 5090 (one pipeline
+# stage each), with the sampling of the Qwen3.8-27B campaigns but a smaller output limit: the two
+# benchmarks the GSQ-RCO card reports for this quantization that EvalScope scores without a code
+# sandbox.
+targets:
+  flash_next_api:
+    protocol: openai_chat
+    base_url: http://127.0.0.1:18080/v1
+    model: qwen3.8-flash-next
+    max_concurrency: 6
+    request:
+      timeout_seconds: 86400
+      retries: 2
+      retry_interval_seconds: 10
+
+suites:
+  text:
+    jobs:
+      - id: aime25
+        backend: evalscope
+        dataset: aime25
+        target: flash_next_api
+        max_concurrency: 6
+        generation: &generation
+          temperature: 1.0
+          top_p: 0.95
+          top_k: 20
+          presence_penalty: 0.0
+          frequency_penalty: 0.0
+          # Six sequences of 110,000 positions are what the two cards hold beside the weights; a
+          # 4,000-token margin covers the prompt and chat framing. The 27B campaigns give AIME
+          # 122,880 output tokens and GPQA-Diamond 245,760.
+          max_tokens: 106000
+          seed: 42
+          extra_body:
+            enable_thinking: true
+            min_p: 0.0
+        backend_args:
+          judge_strategy: rule
+          dataset_hub: modelscope
+
+      - id: gpqa_diamond
+        backend: evalscope
+        dataset: gpqa_diamond
+        target: flash_next_api
+        max_concurrency: 6
+        generation: *generation
+        backend_args:
+          few_shot_num: 0
+          judge_strategy: rule
+          dataset_hub: modelscope
+
+runtime:
+  max_parallel_jobs: 1
+  runs_dir: eval/runs
+  progress:
+    enabled: true
+    refresh_seconds: 1
+    heartbeat_seconds: 900
+  samples:
+    retention: all

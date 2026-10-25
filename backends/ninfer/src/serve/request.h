@@ -1,0 +1,286 @@
+#pragma once
+
+#include "product/media_acquire/source.h"
+
+#include <ninfer/types.h>
+
+// Internal, wire-format-independent representation of a generation request.
+//
+// OpenAI and Anthropic schemas map into this wire-independent value.
+// translate.cpp then produces the public PromptInput and RequestOptions consumed
+// by Engine; media sources remain unresolved until the product service acquires
+// owning bytes.
+
+#include <cstddef>
+#include <cstdint>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace ninfer::serve {
+
+// A structured API error mapped onto an error object + HTTP status. Wire-format
+// independent: each protocol layer renders it into its own error body shape.
+struct ApiError {
+    int status       = 400;
+    std::string type = "invalid_request_error";
+    std::string message;
+    std::string param; // optional
+    std::string code;  // optional
+};
+
+class ApiException : public std::runtime_error {
+public:
+    explicit ApiException(ApiError error)
+        : std::runtime_error(error.message), error_(std::move(error)) {}
+
+    [[nodiscard]] const ApiError& error() const noexcept { return error_; }
+
+private:
+    ApiError error_;
+};
+
+// Server-side context needed while parsing/validating a request.
+struct RequestLimits {
+    // --default-max-tokens: the fixed budget of a request that omits its limit. Unset, such a
+    // request receives the Engine's concurrent lane budget once its prompt is prepared.
+    std::optional<int> default_max_tokens;
+    int max_context = 8192; // --max-context, the upper bound of any derived budget
+    // Continue a trailing Chat Completions assistant message in place (--assistant-prefill).
+    bool assistant_prefill = false;
+    // Responses input: assistant message content or reasoning after function_call Items joins
+    // the run's assistant turn instead of failing (--lenient-assistant-history).
+    bool lenient_assistant_history = false;
+};
+
+enum class ContentKind {
+    Text,
+    Image,
+    Video,
+};
+
+struct CacheBoundary {
+    enum class Ttl : std::uint8_t {
+        Default,
+        FiveMinutes,
+        OneHour,
+    };
+
+    ninfer::PromptCacheMarkerKind kind       = ninfer::PromptCacheMarkerKind::SharedStablePrefix;
+    ninfer::SharedCandidateEvidence evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary;
+    Ttl ttl                                  = Ttl::Default;
+
+    [[nodiscard]] friend constexpr bool operator==(CacheBoundary, CacheBoundary) noexcept = default;
+};
+
+struct ContentPart {
+    ContentKind kind = ContentKind::Text;
+    std::string text;     // populated for Text
+    std::string type_raw; // original wire "type" string for diagnostics
+    ninfer::product::media_acquire::Source source;
+    ninfer::ImageResizePolicy image_resize_policy = ninfer::ImageResizePolicy::Downsize;
+    std::optional<CacheBoundary> cache_boundary_after;
+};
+
+struct ToolDefinition {
+    std::string name;
+    std::string description;
+    std::string input_schema_json;
+    bool strict = false;
+    std::optional<std::string> input_examples_json;
+    std::optional<CacheBoundary> cache_boundary_after;
+};
+
+struct ToolCall {
+    std::string id;
+    std::string name;
+    std::string arguments_json;
+};
+
+using ToolChoiceMode = ninfer::ToolChoiceMode;
+
+struct ToolChoice : ninfer::ToolChoice {
+    // Set when the caller selected one function: `tool_choice` naming it, or a forced choice over
+    // exactly one callable tool. Empty leaves the choice to the model.
+    std::string forced_name;
+};
+
+struct ChatTurn {
+    ChatRole role = ChatRole::User;
+    std::vector<ContentPart> content; // ordered parts; may be empty when wire content is empty
+    std::vector<ToolCall> tool_calls;
+    std::string tool_call_id; // populated for role=tool
+    // Optional protocol assertion for a tool result. Call-graph normalization verifies it against
+    // the function identified by tool_call_id before the Engine sees the history.
+    std::optional<std::string> tool_result_name;
+    bool tool_result_is_error = false;
+    std::string reasoning_content; // assistant thinking carried across turns (round-tripped to the
+                                   // template)
+    std::optional<CacheBoundary> cache_boundary_after;
+};
+
+// Sampling overrides that have an executable Engine meaning. Protocol-only
+// fields are normalized or rejected before this value is constructed.
+struct SamplingParams {
+    std::optional<double> temperature;
+    std::optional<double> top_p;
+    std::optional<double> min_p;
+    std::optional<int> top_k;
+    std::optional<double> presence_penalty;
+    std::optional<double> frequency_penalty;
+    std::optional<std::uint64_t> seed;
+};
+
+// Protocol-level effort vocabulary. Each wire adapter accepts the values from
+// its external contract; translation passes explicit values to the selected template.
+enum class RequestedReasoningEffort : std::uint8_t {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    XHigh,
+    Max,
+};
+
+[[nodiscard]] constexpr std::optional<RequestedReasoningEffort>
+parse_requested_reasoning_effort(std::string_view value) noexcept {
+    if (value == "none") { return RequestedReasoningEffort::None; }
+    if (value == "minimal") { return RequestedReasoningEffort::Minimal; }
+    if (value == "low") { return RequestedReasoningEffort::Low; }
+    if (value == "medium") { return RequestedReasoningEffort::Medium; }
+    if (value == "high") { return RequestedReasoningEffort::High; }
+    if (value == "xhigh") { return RequestedReasoningEffort::XHigh; }
+    if (value == "max") { return RequestedReasoningEffort::Max; }
+    return std::nullopt;
+}
+
+[[nodiscard]] constexpr std::string_view
+requested_reasoning_effort_name(RequestedReasoningEffort effort) noexcept {
+    switch (effort) {
+    case RequestedReasoningEffort::None:
+        return "none";
+    case RequestedReasoningEffort::Minimal:
+        return "minimal";
+    case RequestedReasoningEffort::Low:
+        return "low";
+    case RequestedReasoningEffort::Medium:
+        return "medium";
+    case RequestedReasoningEffort::High:
+        return "high";
+    case RequestedReasoningEffort::XHigh:
+        return "xhigh";
+    case RequestedReasoningEffort::Max:
+        return "max";
+    }
+    return {};
+}
+
+// Maximum tool-name length accepted at every protocol boundary and enforced on
+// model-generated tool-call names. The OpenAI schema allows 64 bytes, but agent
+// hosts synthesize longer names: VS Code Copilot wraps MCP tools as
+// "activate_fallback_mcp_<server>_<tool>" (67 bytes observed), and the Anthropic
+// adapter already accepted 128. 256 keeps real client names valid while still
+// bounding prompt rendering and the streaming parser.
+inline constexpr std::size_t kMaximumToolNameLength = 256;
+
+// The sampler's candidate domain: each block reduces its vocabulary tile to 20 candidates
+// (kSamplerFastCandidates), and the runtime contract accepts top_k in [1,20]. A request top_k above
+// it is clamped rather than refused: llama.cpp and Ollama default to 40 (Strata caps at 64), and
+// with top_p or min_p active over the full vocabulary the nucleus almost always closes inside 20
+// candidates, so the wider value selects the same token nearly always. The effective value is what
+// reaches the Engine and the request log. Negative values stay errors.
+inline constexpr int kSamplerTopKCap = 20;
+
+[[nodiscard]] constexpr int clamp_request_top_k(int top_k) noexcept {
+    return top_k > kSamplerTopKCap ? kSamplerTopKCap : top_k;
+}
+
+// One piece of a raw prompt: text the artifact's tokenizer encodes, or a token id used as it is.
+struct RawPromptPiece {
+    std::string text;
+    std::optional<ninfer::TokenId> token;
+};
+
+struct GenerationRequest {
+    NgramSessionHints ngram_session;
+    std::vector<ChatTurn> messages;
+    // A raw prompt (llama.cpp's /completion, OpenAI's legacy /v1/completions) instead of messages:
+    // generation continues it directly, with no chat template and no reasoning block.
+    std::optional<std::vector<RawPromptPiece>> raw_prompt;
+    // llama.cpp's cache_prompt: false keeps the request out of the context cache, neither reusing
+    // a cached prefix nor retaining its own.
+    bool cache_prompt = true;
+    std::vector<ToolDefinition> tools;
+    std::size_t tool_name_max_length = kMaximumToolNameLength;
+    ToolChoice tool_choice;
+    std::vector<std::string> stop_strings;
+    bool stop_strings_apply_to_reasoning = false;
+    // Benchmark/serving extension shared with vLLM, SGLang and llama.cpp: suppress the
+    // checkpoint's default stop tokens so generation runs to the requested token budget.
+    // Caller-supplied stop tokens and stop strings still apply.
+    bool ignore_eos = false;
+    int max_tokens                       = 0; // resolved budget; zero means immediate output limit
+    // The request omitted its limit and the server has no fixed default: GenerationService replaces
+    // max_tokens (then the --max-context upper bound) with Engine::concurrent_output_budget().
+    bool derive_output_budget = false;
+    std::optional<bool> enable_thinking;      // unset => use the server default
+    std::optional<std::uint32_t> thinking_budget;
+    std::optional<RequestedReasoningEffort> reasoning_effort;
+    std::optional<bool> preserve_thinking;
+    std::string chat_template_kwargs_json;
+    // NInfer extension: name of a phantom-kv graft loaded with --graft. Unset => use the server's
+    // --default-graft (if any); an empty name explicitly selects no graft.
+    std::optional<std::string> graft;
+    ninfer::PromptContinuationMode continuation = ninfer::PromptContinuationMode::NewAssistantTurn;
+    bool private_cache_boundary_at_prompt_end   = false;
+    bool allow_engine_automatic_shared_prefixes = true;
+    // False asks for at most one tool call per assistant turn. Decoding is not constrained; the
+    // serving layer keeps the first call and drops the rest, which is the part of the contract a
+    // client can actually observe.
+    bool parallel_tool_calls = true;
+    SamplingParams sampling;
+    // Sampling from the token after the reasoning block closes (a `post_thinking` object).
+    std::optional<SamplingParams> post_thinking;
+    StructuredOutputOptions structured_output;
+    // Each generated content token's log probability, with `top_logprobs` (0 to
+    // kMaximumTokenLogprobs) of its most likely alternatives in the response.
+    bool logprobs    = false;
+    int top_logprobs = 0;
+
+    // The alternatives each reported token carries, absent unless the request asked for logprobs.
+    [[nodiscard]] std::optional<int> reported_top_logprobs() const noexcept {
+        return logprobs ? std::optional<int>(top_logprobs) : std::nullopt;
+    }
+
+    [[nodiscard]] bool uses_tools() const noexcept {
+        return !tools.empty() && tool_choice.mode != ToolChoiceMode::None;
+    }
+
+    [[nodiscard]] std::size_t media_item_count() const noexcept {
+        std::size_t count = 0;
+        for (const ChatTurn& message : messages) {
+            for (const ContentPart& part : message.content) {
+                if (part.kind == ContentKind::Image || part.kind == ContentKind::Video) { ++count; }
+            }
+        }
+        return count;
+    }
+
+    [[nodiscard]] bool has_tool_history() const noexcept {
+        for (const ChatTurn& message : messages) {
+            if (!message.tool_calls.empty() || message.role == ChatRole::Tool) { return true; }
+        }
+        return false;
+    }
+};
+
+// The output limit of a request that omitted one.
+inline void apply_default_output_limit(GenerationRequest& request, const RequestLimits& limits) {
+    request.derive_output_budget = !limits.default_max_tokens.has_value();
+    request.max_tokens           = limits.default_max_tokens.value_or(limits.max_context);
+}
+
+} // namespace ninfer::serve

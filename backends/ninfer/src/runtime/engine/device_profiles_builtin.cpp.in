@@ -1,0 +1,20 @@
+#include "runtime/engine/device_profiles_builtin.h"
+
+#include <string>
+
+namespace ninfer::runtime {
+
+// Generated from src/runtime/engine/device_profiles.json at configure time, in parts that MSVC's
+// string-literal limits admit (src/runtime/CMakeLists.txt).
+std::string_view compiled_device_route_profiles_json() {
+    static const std::string json = [] {
+        constexpr std::string_view parts[] = {
+@NINFER_DEVICE_PROFILES_PARTS@        };
+        std::string joined;
+        for (const std::string_view part : parts) { joined += part; }
+        return joined;
+    }();
+    return json;
+}
+
+} // namespace ninfer::runtime

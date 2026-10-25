@@ -1,8 +1,4 @@
-﻿[submodule "llamacpp"]
+[submodule "llamacpp"]
 	path = backends/llamacpp
 	url = https://github.com/ggml-org/llama.cpp.git
-	shallow = true
-[submodule "ninfer"]
-	path = backends/ninfer
-	url = https://github.com/melis2023/ninfer-all.git
 	shallow = true

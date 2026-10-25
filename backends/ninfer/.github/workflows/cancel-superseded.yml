@@ -1,0 +1,34 @@
+# Cancels a pull request's runs that are still queued or in progress once it is merged or closed.
+# Its CI runs sit in their own concurrency group (refs/pull/N/merge), so master's run of the merge
+# does not cancel them, and they would otherwise build on to the end for nothing.
+#
+# pull_request_target runs in this repository with a token that can cancel runs, also for a pull
+# request from a fork; it checks out no code, so nothing from the pull request runs here.
+name: Cancel superseded runs
+
+on:
+  pull_request_target:
+    types: [closed]
+
+permissions:
+  actions: write
+
+jobs:
+  cancel:
+    name: Cancel the pull request's runs
+    runs-on: ubuntu-24.04
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          runs="$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$SHA&per_page=100" \
+            --jq '.workflow_runs[] | select(.status != "completed") | "\(.id) \(.name)"')"
+          while read -r id name; do
+            [[ -n "$id" && "$id" != "$GITHUB_RUN_ID" ]] || continue
+            if gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$id/cancel" --silent; then
+              echo "cancelled $name ($id)"
+            else
+              echo "could not cancel $name ($id)"
+            fi
+          done <<< "$runs"

@@ -1,0 +1,219 @@
+# Continuous integration, all of it without a GPU: GitHub-hosted runners have none, so the CUDA
+# builds compile every target and run the test suite with each GPU test skipping itself (exit 77).
+# A green run of this workflow on master is what publishes the container image (docker.yml).
+#
+#   * docs/config-calculator.test.mjs -- pins the published calculator's arithmetic against the
+#     engine's own figures.
+#
+#   * scripts/check-linux-scripts.sh -- the guard over the shell scripts shipped in the Linux
+#     release archive. Running it *here* rather than only on the Windows box is the point: two
+#     launchers once shipped with CRLF that made them unparseable on Linux, and every tool on the
+#     Windows box called the tree clean because Git Bash strips CR on read. Only real Linux bash
+#     saw it.
+#
+#   * tests/host/test_host_kv_clamp.cpp -- pins the pinned-host-KV-cache clamp arithmetic
+#     (src/core/host_kv_clamp.h) used by the Windows startup path in program_impl.h.
+#
+#   * the Python suites under tests/ (artifact framing and conversion), on CPU PyTorch.
+#
+#   * tests/test_docker_build_cache.sh -- the Dockerfile's incremental build cache.
+#
+#   * the CUDA build of every target for sm_86 and sm_120a in the Dockerfile's toolchain stage,
+#     then CTest. The toolchain stage is published as ghcr.io/<owner>/<repo>-toolchain once per
+#     change of its definition (.github/scripts/toolchain-image.sh); ccache carries over between
+#     runs; the binaries go to the image.
+name: CI
+
+on:
+  pull_request:
+  push:
+    # ci/** runs the whole workflow on a branch without a pull request; only master publishes.
+    branches: [master, 'ci/**']
+
+# A newer push to a branch or pull request cancels the run still going for the older one; a merged
+# or closed pull request's runs are cancelled by cancel-superseded.yml.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  calculator:
+    name: Config calculator arithmetic
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+      # No dependencies and no build step: the test loads the page's own <script> into a vm
+      # sandbox, which is what keeps docs/config-calculator.html a single file.
+      - name: Run docs/config-calculator.test.mjs
+        run: node docs/config-calculator.test.mjs
+      # The arithmetic tests never call render(), which is where most of the page's code is.
+      - name: Run docs/config-calculator.render.test.mjs
+        run: node docs/config-calculator.render.test.mjs
+
+  host-kv-clamp:
+    name: Host KV clamp arithmetic
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build and run tests/host/test_host_kv_clamp.cpp
+        run: |
+          g++ -std=c++20 -Wall -Wextra -Isrc tests/host/test_host_kv_clamp.cpp \
+              -o test_host_kv_clamp
+          ./test_host_kv_clamp
+
+  linux-scripts:
+    name: Linux launcher and downloader guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # The checkout must not normalize line endings, or the CRLF check tests nothing. Git's
+      # default is to write out whatever .gitattributes says, which is exactly what a release
+      # archive would carry, so this is the honest input.
+      - name: Run scripts/check-linux-scripts.sh
+        run: bash scripts/check-linux-scripts.sh
+      # bash -n on every shell script in the tree, under real Linux bash rather than Git Bash.
+      # This is the check that would have caught the CRLF breakage directly.
+      - name: Parse every shell script
+        run: |
+          status=0
+          while IFS= read -r script; do
+            if ! bash -n "$script"; then
+              echo "::error file=$script::does not parse under bash -n"
+              status=1
+            fi
+          done < <(git ls-files '*.sh')
+          exit $status
+
+  python:
+    name: Python suites (CPU)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          # The wheels (CPU PyTorch is most of them) come from the cache; the key follows this file,
+          # where the package list lives.
+          cache: pip
+          cache-dependency-path: .github/workflows/ci.yml
+      - name: Install CPU PyTorch and the test dependencies
+        run: |
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install numpy safetensors pytest jinja2 gguf tokenizers transformers
+      - name: Run tests/artifact and tests/convert
+        run: python -m pytest -q tests/artifact tests/convert
+
+  docker-build-cache:
+    name: Dockerfile build cache
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      # This job publishes the toolchain image when its definition changes, and only this one, so a
+      # change leaves one version behind rather than one per job.
+      - name: Toolchain image
+        id: toolchain
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUSH: ${{ github.event_name == 'push' && '1' || '0' }}
+        run: echo "ref=$(.github/scripts/toolchain-image.sh)" >> "$GITHUB_OUTPUT"
+      - name: Run tests/test_docker_build_cache.sh
+        env:
+          NINFER_TOOLCHAIN_IMAGE: ${{ steps.toolchain.outputs.ref }}
+        run: bash tests/test_docker_build_cache.sh docker
+
+  cuda:
+    name: CUDA build and tests (sm_${{ matrix.arch }}, no GPU)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    permissions:
+      contents: read
+      packages: read
+      statuses: write
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: ['86', '120a']
+    steps:
+      # The runner's disk (about 80 GB free) holds the toolchain, a build tree and ccache with room
+      # to spare, so nothing is deleted to make space; the free space is logged.
+      - name: Cache location
+        run: |
+          # Outside the workspace, and without '..': actions/cache refuses such a path and saves nothing.
+          echo "CCACHE_HOST_DIR=$RUNNER_TEMP/ccache" >> "$GITHUB_ENV"
+          df -h /
+      - uses: actions/checkout@v5
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      # Published once per change of the toolchain stage (by the build-cache job) and pulled after
+      # that; a run that finds it missing builds it for itself. Rebuilding it took 3-4 minutes a job,
+      # and keeping its layers in the Actions cache saved nothing while it filled the 10 GB budget
+      # that ccache needs.
+      - name: Toolchain image
+        run: .github/scripts/toolchain-image.sh
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_HOST_DIR }}
+          key: ccache-sm${{ matrix.arch }}-${{ github.sha }}
+          restore-keys: ccache-sm${{ matrix.arch }}-
+      # A step timeout below the job's, so that a cold build which runs out of time still saves
+      # its ccache and the next run continues from there.
+      - name: Build every target
+        timeout-minutes: 320
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$CCACHE_HOST_DIR"
+          docker run --rm -v "$PWD:/src" -v "$CCACHE_HOST_DIR:/ccache" -w /src \
+            -e CCACHE_DIR=/ccache -e CCACHE_MAXSIZE=4G -e NINFER_CUDA_ARCH=${{ matrix.arch }} \
+            -e NINFER_MULTICALL=ON -e NINFER_BUILD_DIR=/src/build-ci ninfer-toolchain:ci bash -c \
+            'ccache --zero-stats && scripts/build-native.sh configure && scripts/build-native.sh build && ccache --show-stats' \
+            > build-ci.log 2>&1 &
+          build=$!
+          context="build progress (sm_${{ matrix.arch }})"
+          .github/scripts/build-progress.sh "$build" build-ci.log "$context" &
+          tail -n +1 -f build-ci.log --pid="$build" &
+          status=0
+          wait "$build" || status=$?
+          state=success; (( status == 0 )) || state=failure
+          gh api --silent -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA" -f state=$state \
+            -f context="$context" -f description="finished, exit $status" || true
+          exit "$status"
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_HOST_DIR }}
+          key: ccache-sm${{ matrix.arch }}-${{ github.sha }}
+      - name: Run CTest
+        run: |
+          # No driver on the runner: the toolkit's stub libcuda lets the binaries load, cuInit fails,
+          # and every test that needs a device skips itself.
+          docker run --rm -v "$PWD:/src" -w /src -e NINFER_BUILD_DIR=/src/build-ci \
+            ninfer-toolchain:ci bash -c 'mkdir -p /tmp/stub && \
+              ln -s /usr/local/cuda/lib64/stubs/libcuda.so /tmp/stub/libcuda.so.1 && \
+              LD_LIBRARY_PATH=/tmp/stub scripts/build-native.sh test'
+      - name: Stage the image binaries
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src ninfer-toolchain:ci \
+            docker/stage-dist.sh build-ci ${{ matrix.arch }} dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-sm${{ matrix.arch }}
+          path: dist/
+          # Only the publishing run that follows reads them.
+          retention-days: 1

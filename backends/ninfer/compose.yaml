@@ -1,0 +1,35 @@
+# NInfer on one NVIDIA GPU. Needs the NVIDIA Container Toolkit on the host and a driver of the
+# CUDA 13 branch (580 or newer).
+#
+#   docker compose run --rm ninfer download qwen38-27b    fetch the model into ./models
+#   docker compose up -d                                  serve it on http://localhost:8080/v1
+#
+# Every NINFER_* variable scripts/run.sh documents can be set under `environment`.
+services:
+  ninfer:
+    image: ghcr.io/iamwavecut/ninfer-all:latest
+    command: ["run", "qwen38-27b"]
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./models:/models          # .ninfer artifacts
+      - ./grafts:/grafts          # optional prompt grafts: grafts/<model>/NAME.bin + NAME.json
+      - ninfer-cache:/cache       # device profiles from calibration
+    # environment:
+    #   NINFER_SPEC: mtp
+    #   NINFER_CONTEXT: "131072"
+    #   NINFER_DEFAULT_GRAFT: v1
+    # The tuned profile pins host memory for the context cache.
+    ulimits:
+      memlock: -1
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  ninfer-cache:
