@@ -692,14 +692,13 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
         force_selection = false;
     }
     if (end == begin && !force_selection) { return true; }
-    // Begin the swap at 80% of the window so the transfer overlaps the decode that
-    // follows instead of stalling the request at 100%. Selection is unchanged; only
-    // the trigger moves earlier. A completed swap compacts the view back to
-    // selected_tokens, which leaves the reserve free for the next segment.
-    const std::uint32_t reselect_high_water =
-        kvmem_window_tokens - kvmem_window_tokens / 5;
+    // Reselect once the window is full: W = B + R. Compaction then lands on B and leaves the
+    // whole reserve free for the next segment, so consecutive reselections are separated by a
+    // full R of growth. Starting at 80% of W instead thrashes whenever B > 4R, because the
+    // compaction target itself sits above the high-water mark and every append reselects
+    // without removing anything (issue #6).
     const bool reselecting =
-        force_selection || compact_position(sequence, end) > reselect_high_water;
+        force_selection || compact_position(sequence, end) > kvmem_window_tokens;
     long long reselect_score_us = 0;
     long long reselect_select_us = 0;
     if (reselecting) {
