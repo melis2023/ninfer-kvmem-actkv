@@ -43,22 +43,6 @@ Q3/Q4 块存储后，256K 窗口下省出来的显存留给 KV 和 CUDA Graph，
 `--no-cuda-graph`。两个启动器启动后的 free 分别是 **863.8 MiB**（DFlash2 + nvfp4 KV）
 和 **1,001.8 MiB**（MTP + int8 KV）。
 
-#### 256K 速度对比（两个启动器，prefill 取第一遍）
-
-同一 950K 字符 prompt（253,031 token）、输出 256 token、temperature 0、thinking off，
-RTX 5060 Ti 16 GB：
-
-| 启动器 | 草稿 | KV | B/R | prefill（第一遍） | decode | 接受率 | wall |
-|---|---|---|---:|---:|---:|---:|---:|
-| `start-kvmem-ninfer-dflash.bat` | dflash2 draft 5 | nvfp4 | 36,480/16,384 | **872.5 tok/s**（290 s） | 34.8 tok/s | 20.2%（88/435） | **584.0 s** |
-| `start-kvmem-ninfer.bat` | MTP draft 3 adaptive | int8 | 36,864/16,384 | 803.3 tok/s（315 s） | **47.5 tok/s** | **40.7%**（140/344） | 630.9 s |
-
-- **DFlash2 prefill 快 8.6%、总 wall 少 7.4%**（长 prompt 下 prefill 占绝对主导）；
-- **MTP decode 快 36.5%**，接受率高 20.5 个点；
-- 256K 长 prompt + 短输出（报告/问答）选 DFlash2；长输出、多轮对话选 MTP；
-- 两个启动器都不需要 `--no-cuda-graph`；prefill 只算第一遍，第二遍是 hidden replay
-  （不计 token，但计入 wall）。
-
 同模型不同量化的历史对照（B/R=77,824、nvfp4 KV、253K prompt，prefill 为两遍口径）：
 
 | 草稿 | prefill | decode | wall |
