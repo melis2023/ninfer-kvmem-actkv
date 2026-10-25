@@ -68,6 +68,29 @@ RTX 5060 Ti 16 GB：
 
 q3blocks 比 nvfp4full prefill 快约 21%；q3km 与 q3blocks 同属 Q3 家族，作为默认推荐。
 
+#### 128K 严谨对比（同条件、无 ngram）
+
+126,668 token prompt，同一目标模型 q3km，`--kv-dtype nvfp4`，B/R=36,480/16,384，
+`--ngram-draft-tokens 0`，只换草稿：
+
+| 草稿 | 第一遍 prefill | decode | 接受率 | wall |
+|---|---:|---:|---:|---:|
+| dflash2 + **q3km** | 904.8 tok/s（140 s） | 42.8 tok/s | 23.4%（137/585） | 282.8 s |
+| dflash2 + **q4km** | 904.8 tok/s（140 s） | 43.6 tok/s | 24.2%（139/575） | 282.4 s |
+| **MTP + q3km**（draft 3） | 904.8 tok/s（140 s） | **47.7 tok/s** | **40.8%**（140/343） | 280.9 s |
+
+- **q3 与 q4 草稿几乎无差别**：decode ±1.9%，接受率 ±0.8 个点，q4 工件还多占约 0.18 GB
+  → 推荐 q3km；
+- **MTP decode 快 11.5%**、接受率高 17.4 个点；prefill 三组完全相同，说明 prefill
+  由目标模型决定，换草稿不影响；
+- 三组 wall 都在 281–283 s，其中约一半是 query replay；decode 只占 6 s，
+  所以长 prompt 场景优先看 prefill。
+
+> **两遍 prefill 的来源**：prompt 超过 KVMem 窗口、且 query 覆盖整段用户消息时，
+> 引擎会在 prefill 末尾回卷到 `query_begin` 重跑一遍（`memory_query_probe`），用来算
+> mean-Q 检索打分。单条巨型消息是最坏情况（第二遍≈整段）；多轮“长历史 + 短问题”
+> 只重跑最后一轮。prefill 速度按第一遍计，wall 含两遍。
+
 启动参数：
 
 ```bat

@@ -86,6 +86,22 @@ thinking off，RTX 5060 Ti 16 GB。prefill 取**第一遍**（第二遍是 hidde
 | 长输出、多轮对话 | MTP draft 3：接受率 40.7%，decode 47.5 vs 34.8 |
 | 显存紧张 | 两者共用 q3km 工件；DFlash2 权重多约 1.1 GiB，MTP 的 free 更高 |
 
+## 5.1 128K：同条件、无 ngram（2026-10-26）
+
+为了排除 ngram 与 KV 精度的干扰，再跑一组严格对照：同一目标模型、`--kv-dtype nvfp4`、
+B/R=36,480/16,384、`--ngram-draft-tokens 0`、126,668 token prompt，只换草稿。
+
+| 草稿 | 第一遍 prefill | decode | 接受率 | wall |
+|---|---:|---:|---:|---:|
+| dflash2 + q3km | 904.8 tok/s（140 s） | 42.8 tok/s | 23.4%（137/585） | 282.8 s |
+| dflash2 + q4km | 904.8 tok/s（140 s） | 43.6 tok/s | 24.2%（139/575） | 282.4 s |
+| MTP + q3km（draft 3） | 904.8 tok/s（140 s） | **47.7 tok/s** | **40.8%**（140/343） | 280.9 s |
+
+- q3 与 q4 草稿在噪声内（decode ±1.9%、接受率 ±0.8 个点），q4 多占约 0.18 GB；
+- MTP decode 快 11.5%、接受率高 17.4 个点；
+- 三组 prefill 完全相同（904.8 tok/s），说明 prefill 由目标模型决定，换草稿不影响；
+- wall 约 281–283 s，其中约一半是 query replay；decode 仅约 6 s。
+
 ## 6. 复现
 
 ```bat
