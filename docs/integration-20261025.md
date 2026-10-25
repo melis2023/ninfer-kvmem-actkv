@@ -257,3 +257,34 @@ CONFLICT files: 891
 - q4/d5 在 77,824 下 free 仅 267.7 MiB，长跑余量最小，不建议作为 128K 档首选。
 
 推荐 128K prompt：**q3blocks + draft 5 + B/R 77,824**（当前 bat）。
+
+## 10. 128K 召回（NIAH，2026-10-25）
+
+条件：q3blocks + nvfp4 KV + dflash2 draft 5，max_tokens 256，B/R 61,440/16,384 = 77,824，prompt ≈ 137,47x token。
+
+needle：
+
+```text
+The secret verification code for station 2047 is BLUEBIRD-42.
+```
+
+问题：`What is the secret verification code for station 2047? Answer with the exact code only.`
+
+| 深度 | prompt_n | prefill tok/s | decode tok/s | 回答 | hit |
+|---:|---:|---:|---:|---|:-:|
+| 5% | 137,476 | 400.6 | 38.0 | `BLUEBIRD-42` | ✅ |
+| 50% | 137,471 | 399.6 | 37.9 | `BLUEBIRD-42` | ✅ |
+| 95% | 137,471 | 400.5 | 37.7 | `BLUEBIRD-42` | ✅ |
+
+结论：
+
+- **3/3 命中**，包括 5% 处（该位置已在 77,824 设备窗口之外，必须靠 KVMem 召回）；
+- 5% 命中说明 ranker / Host 召回能取回早期被驱逐的块；
+- decode 37.7–38.0 tok/s 是 **7 token 短回答**的速率（draft 15，接受 4），不代表 256 token 的吞吐；
+- prefill 稳定在 399.6–400.6 tok/s，wall ≈ 344s。
+
+局限：
+
+- 单 needle、单次、filler 重复度高；完整 NIAH 需要多 needle、随机位置、非重复 filler；
+- 5% 命中只证明该 fact 被召回，不代表所有早期块都能召回；
+- 回答无 thinking，max_tokens 256 足够。
