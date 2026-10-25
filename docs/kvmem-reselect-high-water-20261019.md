@@ -1,5 +1,10 @@
 # KVMem 重选水位提前到 80%（2026-10-19）
 
+> **2026-10-26 已回退**：80% 水位在 `B > 4R` 时每个 chunk 都空转重选（issue #6），
+> 密集重选还会把 `removed_tokens` 推到 checkpoint 前沿之前、使 253K prefill 崩溃。
+> 现在任何 B/R 都回到 `compact_position > W` 的原始 100% 触发，见第 11 节；
+> 第 1–10 节保留为当时的数据记录。
+
 ## 1. 动机
 
 窗口 `W = B + R = 36,864 + 16,384 = 53,248` token，原来在 `compact_position > W`
@@ -170,47 +175,106 @@ curl.exe -s -X POST http://127.0.0.1:18200/v1/chat/completions `
 python niah33_262k.py
 ```
 
-## 11. 2026-10-25 修复：B > 4R 的 reselect thrash
+## 11. 2026-10-26 结论：放弃 80%，回到 100%
 
 ### 触发条件
 
-80% 水位是 `W - W/5`，而重选后视图压到 `B = selected_tokens`。如果
-`B > W - W/5`，压缩结果本身就在水位之上，下一步立即再次触发，形成 no-op 重选：
+80% 水位是 `W - W/5`，重选后视图压到 `B = selected_tokens`。当 `B > W - W/5` 时，
+压缩结果本身就落在水位之上：
 
 ```text
 B > W - W/5,  W = B + R
-=> B > 4/5 (B + R)
+=> B > 4 / 5 (B + R)
 => B > 4R
 ```
 
-### 修法
+于是每个 prefill chunk（256 token）都会触发一次重选：一次 200 ms 级的全窗口 restore
+只换来 256 token 的前进。issue #6 报的就是这个。
 
-- `KvmemWindowState` 增加 `last_reselect_visible`；
-- 触发条件改为：
+### 试过但不采用的三种修法
 
-  ```cpp
-  visible > reselect_high_water &&
-  visible - last_reselect_visible > reserve_tokens / 2
-  ```
+| 方案 | 做法 | 结果 |
+|---|---|---|
+| 增长门限 v1 | `last_reselect_visible` + `R/2`，基线取 `compact_position` | 253K prefill 崩溃 |
+| 增长门限 v2 | 基线改成 `selected_tokens` / `0` | 同样崩溃 |
+| 条件回退 | `B > 4R` 用 100%，否则 80% | 能跑，但要维护两套触发点 |
 
-- 每次 reselect/compaction 完成后，把 `last_reselect_visible` 设为当前
-  `compact_position`；
-- checkpoint restore 也更新基线；
-- 启动时如果 `B > 4R`，打印 WARN，并给出推荐的 reserve。
+两版增长门限的崩溃点相同：
+
+```text
+ERROR engine | worker crash: position precedes compact KV append frontier
+```
+
+密集重选把 `removed_tokens` 推高，checkpoint restore 回到旧前缀时
+`prepare_window(frontier, frontier, true)` 里的 `compact_position(frontier)` 落在
+append frontier 之前。换基线不解决，因为问题出在重选频率本身。
+
+条件回退版在 256K NIAH 上 3/3、也不再崩溃，但保留两套触发点没有收益：
+80% 的收益（10-19 记录的 256K 端到端 −12%）是真实的，代价却是每次改 KVMem 都要
+同时验证两条路径，而且 `B > 4R` 永远走不到 80%。
+
+### 最终代码
+
+```cpp
+if (end == begin && !force_selection) { return true; }
+const bool reselecting =
+    force_selection || compact_position(sequence, end) > kvmem_window_tokens;
+```
+
+- 任何 B/R 都只在窗口满（`W = B + R`）时重选；
+- 两次重选之间至少增长一个 R，不会出现 no-op；
+- 不新增状态，不碰 pending / checkpoint 路径；
+- 启动时不再有 `B > 4R` 的 WARN（它只为 80% 水位存在）。
 
 ### 验证
 
-5 轮 `/v1/responses` + `prompt_cache_key`，B=67,584 / R=16,384（B/R=4.12），
-输入从 68,186 增长到 102,976：
+**会话（B/R = 55,296/13,312 = 4.15，61K prompt，1 轮）**
 
-| 版本 | reselect 次数 | 说明 |
-|---|---:|---|
-| 修复后 | 21 | 约每 8K 增长一次，未出现 no-op 连续触发 |
-| 修复前 | 待补 | 后台对比运行中 |
+| 版本 | reselect | wall | 回答 |
+|---|---:|---:|---|
+| 80% 水位（旧二进制） | 55 | 82.2 s | `391` |
+| 100%（本版） | **0** | **75.8 s** | `391` |
 
-安全配置 B/R=2.23 启动无 WARN，行为不变；B/R=4.12 启动出现：
+61K prompt 未到 `W = 68,608`，本版不触发任何重选；旧版从 54,784 开始每 chunk 一次。
+启动 `probe measured 117.3 MiB`、`free 587.7 MiB`，无 WARN、无报错。
 
-```text
-WARN engine | KVMem B/R is 4.12 (> 4): the 80% reselect high-water is in the thrash regime;
-set --kvmem-gen-reserve to at least 16897 to avoid repeated reselections
-```
+**5 轮会话（B/R=4.15，68,186 → 102,976）**
+
+| 版本 | reselect | 5 轮总 wall |
+|---|---:|---:|
+| 80% 水位（旧二进制） | 759 | 634.2 s |
+
+100% 版在同配置下的重选数与 `(输入 − W) / R` 同阶（每轮 0–2 次）。
+这组 5 轮对比在回退后没有重跑。
+
+**256K NIAH（条件回退版，B/R=4.15）**
+
+| 项 | 值 |
+|---|---:|
+| 命中 | **3/3**（BLUEBIRD-42 / MAPLE-91 / REDWOOD-77） |
+| reselect | 29 次（两遍 prefill 各 14 次 + 1 次 restore） |
+| 触发点 | 68,608 = W，之后每次 +13,312 = R |
+| prefill（报告值） | 404.2 tok/s |
+| wall | 627.5 s |
+
+该次运行在 `B > 4R` 下走的就是 100% 这段代码，所以 3/3 的召回结论对最终版同样成立：
+5% 和 50% 两个 needle 都在 68,608 窗口之外，仍靠 KVMem 召回，没有为了少重选牺牲窗口。
+
+> 253K prompt 的 prefill 实际跑两遍（一遍计入 token，一遍 hidden replay），报告值约为
+> 瞬时速度的一半；370.5 tok/s 那次运行也有同样现象，与本改动无关。
+
+### 行为矩阵
+
+| 场景 | 80%（10-19 之后） | 100%（本版） |
+|---|---|---|
+| B ≤ 4R，长请求 | 80% W 触发 | 满 W 触发 |
+| B > 4R | 每 chunk 一次 no-op 重选 | 满 W 触发 |
+| checkpoint restore | 可能撞 append frontier | 同 80% 之前 |
+| 额外状态 | `last_reselect_visible`（已删） | 无 |
+
+### 代价
+
+- 平均可见窗口回到 `(W + B) / 2`，比 80% 水位大约 12%（B/R=2.23 时）；
+- 10-19 记录的 256K 端到端 −12% 不再有；
+- 换来单一触发点、`B > 4R` 不 thrash、不会踩 checkpoint 前沿。
+

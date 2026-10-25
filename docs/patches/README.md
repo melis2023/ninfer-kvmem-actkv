@@ -1,5 +1,9 @@
 # ninfer 子模块补丁
 
+> 2026-10-25 起 `backends/ninfer` 已 vendor 进主仓库，不再是 git 子模块；GitHub 主仓库
+> 可以直接浏览引擎源码。下面的补丁仍按顺序记录引擎相对上游 `8319e8f5` 的改动，恢复步骤
+> 只适用于把引擎当子模块使用的旧 clone。
+
 `backends/ninfer` 指向本地 commit `18e3c7c8`。上游 `iamwavecut/ninfer-all.git` 对当前账号只读（push 返回 403），所以这个 commit 不在任何远程上。新建 clone 后需要按下面的步骤恢复。
 
 ## 恢复步骤
@@ -11,7 +15,7 @@ git checkout 8319e8f5          # 所有补丁的基线
 for p in ../../docs/patches/000*.patch; do git am "$p"; done
 ```
 
-应用后的 HEAD 应当是 `18e3c7c8`，`git log --oneline -10` 能看到 10 个补丁提交。
+应用后的 HEAD 应当是 `2cc993e7`（2026-10-25），`git log --oneline -14` 能看到 13 个补丁提交。
 
 ## 补丁一览
 
@@ -28,7 +32,8 @@ for p in ../../docs/patches/000*.patch; do git am "$p"; done
 | `0009-feat-nvfp4-register-DFlash2-drafter-matrices-on-both.patch` | NVFP4 线性表注册 DFlash2 五个几何（own + unified） | 本地 |
 | `0010-feat-nvfp4-serve-the-DFlash2-drafter-s-NVFP4-project.patch` | 动态卷积 add 接受 NVFP4 父权重；补两个转换 recipe | 本地 |
 | `0011-feat-startup-calibrate-the-CUDA-graph-allowance-from.patch` | CUDA Graph 启动校准：最小 KV 探针实测，按 256 MiB 规划 | 本地 |
-| `0012-fix-kvmem-gate-the-80-reselect-on-growth-since-the-l.patch` | 80% 重选增加增长门限，避免 B>4R 空转 | 本地 |
+| `0012-fix-kvmem-reselect-at-the-full-window-again-dropping.patch` | 撤销 0002 的 80% 水位，回到满窗口 W 才重选 | 本地 |
+| `0013-fix-startup-confirm-an-above-floor-CUDA-graph-probe-.patch` | 探针读数高于 256 MiB 时复测一次取较小值 | 本地 |
 
 ## 已验证的基线
 
@@ -48,6 +53,9 @@ for p in ../../docs/patches/000*.patch; do git am "$p"; done
   原样导入）与 `dflash2_nvfp4.py`（重新量化，conv 保持 BF16）。
 - 0011 只改启动与容量规划，不依赖 0009/0010；在 0001–0010 之后按编号应用。探针实测
   90–143.5 MiB，规划 256 MiB；`--cuda-graph-allowance-mib` 仍优先，`--no-cuda-graph` 跳过。
-- 0012 修 B>4R 的 no-op 重选；`B <= 4R` 行为不变；启动会在 B>4R 时打 WARN 并给出推荐
-  `--kvmem-gen-reserve`。
+- 0012 撤销 0002 的 80% 水位：任何 B/R 都只在 `compact_position > W` 时重选，两次重选
+  之间至少增长一个 R。代价是拿不到“提前交换与 decode 重叠”，换来的是 `B > 4R` 不再
+  thrash（issue #6），也不再触发 checkpoint 前沿冲突。
+- 0013 只影响启动探针的读数稳定性：首次实测超过 256 MiB 时复测一次取较小值，避免
+  WDDM 抖动把规划值抬高到容量上限之外。
 - 若上游后续改动了 `src/serve/translate.cpp` 或 `src/models/qwen3_5/frontend/chat_template.cpp`，0005 可能需要手工解冲突。

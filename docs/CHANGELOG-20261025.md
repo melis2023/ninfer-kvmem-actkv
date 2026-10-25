@@ -7,6 +7,8 @@
 | 修复 | Jinja 模板 trim 后 cache boundary 丢失 |
 | 功能 | CUDA Graph 启动校准（探针实测，替代拓扑盲预留） |
 | 配置 | DFlash2 启动器切到 q3blocks + 自动校准 |
+| 回退 | KVMem 重选回到满窗口 100%，放弃 80% 水位（issue #6） |
+| 修复 | CUDA Graph 探针读数抖动（高于 256 MiB 时复测） |
 | 测试 | 128K / 256K 速度、NIAH 召回、q3/q4/nvfp4、MTP vs DFlash2 |
 | 归档 | 本地 git 裸仓库 + 二进制备份 |
 
@@ -70,6 +72,18 @@ planning allowance 256 MiB
 3. 1 页 + max_context 报 “Paged KV physical pages are below logical capacity” → 用 KVMem 窗口作探针逻辑容量；
 4. WDDM 把 free delta 夹到 0，校准被静默跳过 → 返回 `optional`，成功但 measured=0 时仍用 256 MiB 下限。
 
+**探针读数抖动（0013，2026-10-26 凌晨）**：连续 6 次启动同一配置，实测值为
+0.0 / 83.3 / 90.0 / 117.3 / 135.6 / **288.6** MiB。dedicated delta 会把 WDDM 的
+换出与延迟加载模块一起算进去。288.6 那次把规划值抬到 288.6 MiB，B/R=4.12 的配置因此
+启动失败：
+
+```text
+FATAL server failed during startup | requested Engine runtime reservation requires
+2403183872 bytes, but only 2353864704 bytes are available for runtime capacity
+```
+
+现在首次读数高于 256 MiB 时会复测一次并取较小值；256 MiB 下限不变，常规配置的规划不变。
+
 ---
 
 ## 3. DFlash2 启动器
@@ -97,6 +111,45 @@ set "MODEL=...q3blocks.ninfer"
 | B=65,536 / R=16,384 | 81,920 | 385 MiB | ✅ |
 | B=69,632 / R=16,384 | 86,016 | 313 MiB | ✅ 极限 |
 | B=73,728 / R=16,384 | 90,112 | — | ❌ 差 13 MiB |
+
+---
+
+## 3.5 KVMem 重选回到 100%（issue #6，2026-10-26）
+
+**背景**：0002 把重选水位从满窗口 `W` 提前到 `W - W/5`，为的是让交换和 decode 重叠。
+当 `B > 4R` 时，压缩目标 `B` 本身就高于 80% 水位，于是每个 256-token chunk 都触发一次
+重选、每次只前进一个 chunk，就是 issue #6 的 thrash。
+
+**试过并放弃的方案**：
+
+| 方案 | 结果 |
+|---|---|
+| 增长门限 v1（基线 `compact_position`） | 253K prefill 崩溃 `position precedes compact KV append frontier` |
+| 增长门限 v2（基线 `selected_tokens` / 0） | 同样崩溃 |
+| 条件回退（`B > 4R` 用 100%，否则 80%） | 3/3 通过，但保留两套触发点 |
+
+**最终改动**（0012，`kvmem_window.cpp`）：任何 B/R 都只在 `compact_position > W` 时重选。
+
+```cpp
+const bool reselecting =
+    force_selection || compact_position(sequence, end) > kvmem_window_tokens;
+```
+
+- 两次重选之间至少增长一个 R，不会 no-op；
+- 不新增状态，不碰 checkpoint 路径；
+- 启动时不再有 `B > 4R` 的 WARN（它只为 80% 水位存在）。
+
+**验证**：
+
+| 场景 | 80% 水位 | 100% |
+|---|---:|---:|
+| 61K prompt，B/R=4.15，reselect | 55 | **0** |
+| 61K prompt，B/R=4.15，wall | 82.2 s | **75.8 s** |
+| 5 轮会话，B/R=4.15，reselect | 759 | 未重跑 |
+| 256K NIAH，B/R=4.15 | 3/3（条件回退版） | 同代码路径 |
+
+**代价**：平均可见窗口回到 `(W + B) / 2`，B/R=2.23 时约大 12%；10-19 记录的 256K
+端到端 −12% 不再有。换来单一触发点和 `B > 4R` 不 thrash。
 
 ---
 
@@ -169,27 +222,26 @@ MTP 接受率高 17.7 个点，decode 快 3.8%；prefill/wall 基本相同。
 
 ## 5. Git / 备份
 
-本地提交：
+本地提交（主仓库，引擎已 vendor）：
 
 ```text
-主仓库   27010d4  chore(workers): keep the q3blocks launcher at B=36,480
-          c1733df  docs: compare MTP 3 and DFlash2 5 at 256K
-          b4db89d  docs: compare q3 and nvfp4 at 256K
-          64c0d7e  docs: record the 256K three-needle NIAH run
-          ecbeb5b  docs: record the 128K NIAH recall run
-          915ed20  docs: record the 128K prompt sweep
-          8db32a4  feat(workers): run q3blocks with calibrated CUDA graphs at 77,824
-子模块   815302a5  feat(startup): calibrate the CUDA graph allowance from a minimal KV probe
-          8e6bb068  fix(jinja): keep cache boundaries through template trimming
+183d3af  fix(startup): confirm an above-floor CUDA graph probe with a second probe
+731bbbc  fix(kvmem): reselect at the full window again, dropping the 80% high-water
+60de31d  vendor: fold the ninfer engine into the main repository
+7ab2762  docs(patches): add 0012 KVMem reselect growth gate
 ```
 
-标签：`local-20261025`（主仓库 + 子模块）
+- `backends/ninfer` 不再是子模块，GitHub 主仓库可以直接浏览引擎源码；
+- 子模块 fork `melis2023/ninfer-all` 的 `dflash2-kvmem-fixes-20261018` 已强制更新为
+  `4be30d4f`（撤销了会崩溃的增长门限），只作历史备份。
+
+标签：`local-20261025`
 
 本地裸仓库：
 
 ```text
 I:\model\backup\local-git\kvmem-llama.cpp.git
-I:\model\backup\local-git\infer.git
+I:\model\backup\local-git\ninfer.git
 ```
 
 二进制备份：
@@ -198,13 +250,16 @@ I:\model\backup\local-git\infer.git
 I:\model\backup\20261025-post-integration\
 ```
 
-未 push GitHub。
+已 push GitHub：`https://github.com/melis2023/ninfer-kvmem-actkv`。
 
 ---
 
 ## 6. 未完成 / 限制
 
+- 80% 水位已回退：平均可见窗口回到 `(W + B) / 2`，10-19 的 256K −12% 收益不再有；
 - 128K / 256K 不是全驻留，仍是 77,824 窗口 + Host 召回；
+- 256K prompt 的 prefill 会跑两遍（第二遍是 hidden replay，不计 token），报告速度约为
+  瞬时速度的一半；这是既有行为，待单独排查；
 - DFlash2 接受率随上下文下降：8.7K 43.6% → 128K 36.3% → 256K 33.5%；
 - MTP 3 在 256K 更稳（51.2%），但未验证短上下文/创意任务；
 - NVFP4 drafter 的 32-token A16 前向在 256K prefill 下慢于 q3 GGUF blocks；

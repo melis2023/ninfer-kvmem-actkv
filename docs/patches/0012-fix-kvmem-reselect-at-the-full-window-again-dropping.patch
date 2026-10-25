@@ -1,0 +1,51 @@
+From 6cfa5b492f9c7464b4083d65e5ff05a44aff2fb4 Mon Sep 17 00:00:00 2001
+From: kvmem <kvmem@local>
+Date: Mon, 26 Oct 2026 00:05:33 +0800
+Subject: [PATCH 12/13] fix(kvmem): reselect at the full window again, dropping
+ the 80% high-water
+
+The 80% high-water mark (W - W/5) only works while the compaction target B
+sits below it. B > W - W/5 is exactly B > 4R, and in that regime compaction
+lands above the mark, so every append reselected without removing anything:
+issue #6's thrash, one full-window restore per 256-token chunk.
+
+Gate on the regime was tried first, then a growth gate on top of it; both
+kept the early swap for narrow budgets. Neither is worth the coupling:
+frequent reselections push removed_tokens past the checkpoint frontier and
+the 253K prefill aborted in restore with 'position precedes compact KV append
+frontier'. Reselecting only at W is the pre-80% behavior, it separates two
+reselections by a full reserve of growth for every B/R, and it needs no new
+state. The early-swap overlap is gone; the startup warning that explained a
+B > 4R budget is gone with it.
+---
+ src/models/qwen3_5/program/storage/kvmem_window.cpp | 13 ++++++-------
+ 1 file changed, 6 insertions(+), 7 deletions(-)
+
+diff --git a/src/models/qwen3_5/program/storage/kvmem_window.cpp b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+index 2a21931f..dd1aedca 100644
+--- a/src/models/qwen3_5/program/storage/kvmem_window.cpp
++++ b/src/models/qwen3_5/program/storage/kvmem_window.cpp
+@@ -692,14 +692,13 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
+         force_selection = false;
+     }
+     if (end == begin && !force_selection) { return true; }
+-    // Begin the swap at 80% of the window so the transfer overlaps the decode that
+-    // follows instead of stalling the request at 100%. Selection is unchanged; only
+-    // the trigger moves earlier. A completed swap compacts the view back to
+-    // selected_tokens, which leaves the reserve free for the next segment.
+-    const std::uint32_t reselect_high_water =
+-        kvmem_window_tokens - kvmem_window_tokens / 5;
++    // Reselect once the window is full: W = B + R. Compaction then lands on B and leaves the
++    // whole reserve free for the next segment, so consecutive reselections are separated by a
++    // full R of growth. Starting at 80% of W instead thrashes whenever B > 4R, because the
++    // compaction target itself sits above the high-water mark and every append reselects
++    // without removing anything (issue #6).
+     const bool reselecting =
+-        force_selection || compact_position(sequence, end) > reselect_high_water;
++        force_selection || compact_position(sequence, end) > kvmem_window_tokens;
+     long long reselect_score_us = 0;
+     long long reselect_select_us = 0;
+     if (reselecting) {
+-- 
+2.53.0.windows.1
+

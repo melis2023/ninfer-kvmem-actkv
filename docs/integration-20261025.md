@@ -371,3 +371,14 @@ q3blocks + nvfp4 KV + B/R 77,824：
 | 256K | 33.5% | 51.2% |
 
 DFlash2 的接受率随上下文明显下降，MTP 更稳。256K 长报告场景建议优先试 MTP draft 3。
+
+## 12. KVMem 重选回退到 100%（2026-10-26）
+
+issue #6 的 80% 水位 thrash 最终按“回到满窗口触发”处理：
+
+- 任何 B/R 都只在 `compact_position > W` 时重选，代码与 80% 之前一致；
+- 增长门限与条件回退都被放弃（前者在 253K prefill 崩溃，后者要维护两套触发点）；
+- B/R=4.15、61K prompt：旧版 55 次 reselect / 82.2s → 新版 **0 次 / 75.8s**；
+- B/R=4.15、253K NIAH：3/3，触发点严格落在 `W=68,608` 和每次 `+R`。
+
+细节、崩溃日志与 5 轮 A/B 见 `docs/kvmem-reselect-high-water-20261019.md` 第 11 节。
