@@ -62,6 +62,7 @@ q3blocks 比 nvfp4full prefill 快约 21%；q3km 与 q3blocks 同属 Q3 家族�
 | dflash2 + **q3km** | 904.8 tok/s（140 s） | 42.8 tok/s | 23.4%（137/585） | 282.8 s |
 | dflash2 + **q4km** | 904.8 tok/s（140 s） | 43.6 tok/s | 24.2%（139/575） | 282.4 s |
 | **MTP + q3km**（draft 3） | 904.8 tok/s（140 s） | **47.7 tok/s** | **40.8%**（140/343） | 280.9 s |
+
 dflash2在代码上效果要好于mtp，目前仍有少许bug，等待后续修复。
 
 启动参数：
