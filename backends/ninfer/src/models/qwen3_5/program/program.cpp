@@ -3,6 +3,9 @@
 #include "models/qwen3_5/program/graft_injection.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/program_impl.h"
+#include "core/startup.h"
+#include <algorithm>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -755,6 +758,31 @@ std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
         std::make_unique<detail::ProgramImpl>(parameters, *plan.impl_, device, startup_observer);
     plan.impl_.reset();
     return std::unique_ptr<Program>(new Program(std::move(impl)));
+}
+
+std::optional<std::size_t> measure_cuda_graph_bytes(const execution::Parameters& parameters,
+                                                    DeviceContext& device,
+                                                    const EngineOptions& options) {
+    if (!options.use_cuda_graph) return std::nullopt;
+    auto probe_options = options;
+    // The probe measures the graph set only; its own reservation must not feed back into the
+    // plan. The context-cache shape stays exactly as configured because the plan validates its
+    // Host inventory whether or not the cache is captured.
+    probe_options.cuda_graph_allowance_bytes = 0;
+    try {
+        const auto pages = std::max<std::uint32_t>(1U, options.max_concurrency);
+        auto plan = detail::make_graph_probe_plan(parameters, device, probe_options, pages);
+        auto probe = create_program(parameters, SequencePlan(std::move(plan)), device,
+                                    StartupObserver{});
+        const auto measured = probe->memory_summary().cuda_graph_measured_bytes;
+        probe.reset();
+        device.synchronize();
+        return measured;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "CUDA graph probe failed: %s\n", error.what());
+        device.synchronize();
+        return std::nullopt;
+    }
 }
 
 void Program::inject_graft(const PromptGraft& graft) {

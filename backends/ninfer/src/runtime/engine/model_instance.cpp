@@ -853,8 +853,25 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
             graft_main_pages += (graft.n_slots + page_tokens - 1U) / page_tokens;
         }
     }
-    const EngineOptions planning_options =
+    EngineOptions planning_options =
         artifact_scoped_disk_tier(options, instance->model->info().artifact_id);
+    // The topology formula must cover every shape a driver could materialize, so it over-reserves
+    // long DFlash2 windows. Measure the configured graph set on a minimal physical KV probe and
+    // use that value for the final capacity plan; a failed probe keeps the static allowance.
+    if (options.use_cuda_graph && options.cuda_graph_allowance_bytes == 0) {
+        const auto measured = models::qwen3_5::measure_cuda_graph_bytes(
+            instance->parameters, device, planning_options);
+        if (measured.has_value()) {
+            constexpr std::size_t kMinimumGraphAllowance = 256ULL << 20;
+            const auto allowance = std::max(*measured, kMinimumGraphAllowance);
+            options.cuda_graph_allowance_bytes          = allowance;
+            planning_options.cuda_graph_allowance_bytes = allowance;
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "CUDA graph probe measured %.1f MiB; planning allowance %.1f MiB",
+                               static_cast<double>(*measured) / 1048576.0,
+                               static_cast<double>(allowance) / 1048576.0);
+        }
+    }
     const auto curve = models::qwen3_5::make_sequence_planner(
         instance->parameters, device, planning_options, graft_main_pages).capacity_curve();
     std::vector<std::size_t> free_by_rank =

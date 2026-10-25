@@ -1484,6 +1484,26 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
 }
 
 std::unique_ptr<SequencePlanImpl>
+make_graph_probe_plan(const execution::Parameters& parameters, DeviceContext& device,
+                      const EngineOptions& options, std::uint32_t main_page_groups) {
+    auto planner = make_sequence_planner_impl(parameters, device, options, 0);
+    auto inputs  = planner->inputs;
+    // A KVMem window is the capacity the masked-draft graph profiles are built from; using it as
+    // the probe's logical capacity keeps every profile while avoiding a full max-context KV pool.
+    const bool windowed = (inputs.speculative_backend == SpeculativeBackend::DFlash ||
+                           inputs.speculative_backend == SpeculativeBackend::DFlash2) &&
+                          inputs.kvmem_window_tokens != 0 &&
+                          inputs.kvmem_window_tokens < inputs.capacity;
+    if (windowed) inputs.capacity = inputs.kvmem_window_tokens;
+    const auto pages = std::max(page_count(inputs.capacity), main_page_groups);
+    if (pages == 0) { throw std::invalid_argument("CUDA graph probe needs a physical KV page"); }
+    // Keep the planner's logical capacity so every graph profile is captured, but allocate only
+    // the pages that capacity needs. The capacity-curve minimum deliberately does not apply: this
+    // plan is never served.
+    return build_sequence_candidate(inputs, pages);
+}
+
+std::unique_ptr<SequencePlanImpl>
 finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl> planner,
                             std::uint32_t main_page_groups) {
     if (planner == nullptr || planner->minimum == nullptr) {

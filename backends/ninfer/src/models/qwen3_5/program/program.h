@@ -1418,6 +1418,15 @@ struct RuntimeContractAccess {
                                                  DeviceContext& device,
                                                  const EngineOptions& options);
 
+// Measures the CUDA Graph driver-state footprint with a minimal physical KV probe: the plan keeps
+// the full logical context so every graph profile is captured, but allocates only enough pages for
+// the configured lanes. The probe is destroyed before the caller plans final capacity. Returns
+// nullopt when graphs are disabled or the probe cannot be built; a successful probe may report 0
+// when WDDM clamps the free-memory delta, which the caller treats as "captured but unmeasured".
+[[nodiscard]] std::optional<std::size_t>
+measure_cuda_graph_bytes(const execution::Parameters& parameters, DeviceContext& device,
+                         const EngineOptions& options);
+
 [[nodiscard]] std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
                                                       SequencePlan&& plan, DeviceContext& device,
                                                       const StartupObserver& startup_observer);
