@@ -859,10 +859,20 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     // long DFlash2 windows. Measure the configured graph set on a minimal physical KV probe and
     // use that value for the final capacity plan; a failed probe keeps the static allowance.
     if (options.use_cuda_graph && options.cuda_graph_allowance_bytes == 0) {
-        const auto measured = models::qwen3_5::measure_cuda_graph_bytes(
+        constexpr std::size_t kMinimumGraphAllowance = 256ULL << 20;
+        auto measured = models::qwen3_5::measure_cuda_graph_bytes(
             instance->parameters, device, planning_options);
         if (measured.has_value()) {
-            constexpr std::size_t kMinimumGraphAllowance = 256ULL << 20;
+            // WDDM eviction around graph preparation can inflate the dedicated delta a probe
+            // observes: one graph set has been reported anywhere between 0 and 289 MiB across
+            // starts. Confirm an above-floor reading with a second probe and keep the smaller
+            // value; the floor already covers the steady-state graph set, and an inflated
+            // allowance can push a tight capacity plan past the device limit.
+            if (*measured > kMinimumGraphAllowance) {
+                const auto second = models::qwen3_5::measure_cuda_graph_bytes(
+                    instance->parameters, device, planning_options);
+                if (second.has_value() && *second < *measured) { *measured = *second; }
+            }
             const auto allowance = std::max(*measured, kMinimumGraphAllowance);
             options.cuda_graph_allowance_bytes          = allowance;
             planning_options.cuda_graph_allowance_bytes = allowance;
