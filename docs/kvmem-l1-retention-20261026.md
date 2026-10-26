@@ -1,8 +1,9 @@
-# KVMem L1 retention + masked-draft checkpoint fixes (2026-10-26)
+# KVMem L1 retention, structural prompt pins, and masked-draft checkpoint fixes (2026-10-26)
 
 本文档说明本次本地提交的内容、验证结果和回退方式。
 
-- 本地标签：`kvmem-l1-20261026`
+- 本地标签：`kvmem-l1-20261026`（基础 L1 + checkpoint 修复）
+- 本地标签：`kvmem-prompt-pin-20261027`（结构化 tools / brief pin）
 - 改动前备份：`I:\llama\kvmem-backup-20261026-210823`（6.19 GiB，含 `.git` / build / workers）
 - 远程：**未推送**，仅本地提交
 
@@ -47,7 +48,30 @@ KVMEM_ENDPOINT frontier=5301
 
 这是**软 pin**：thinking 页仍在 Host archive 中，只有在非 thinking 页不够时才会被选中；不会物理删除，也不影响 DFlash2 的 target 验证正确性。
 
-### 1.3 新增参数
+### 1.3 结构化 prompt pin（2026-10-27）
+
+在 L1 的页级机制上，增加两个**内置**的 prompt 保留类别，不新增命令行参数：
+
+| 类别 | 预算 | 页选择 |
+|---|---:|---|
+| tools schema | B 的 **8%** | 从 tools 区间开头取整页；超出时保留前面的定义 |
+| 第一条 user brief | B 的 **4%** | brief 较短时全保留；超过预算时保留第一页 + 末尾若干页（长粘贴内容通常任务在末尾） |
+
+- `tools_region` / `first_user_region` 由 chat template 和 tokenizer 逐级传到 `PreparedPromptData`；
+- 在 lane 绑定后的 commit 阶段调用 `ProgramImpl::retain_prompt_spans()`，写入独立的 `tool_pages` / `brief_pages`；
+- `prepare_window()` 的 mandatory 分配顺序：
+
+```text
+sink > tools > brief > recent > answer > 普通检索 > demoted thinking
+```
+
+- tools/brief 页不会被 answer 的“保最新”上限挤掉；
+- 混合页整页 pin；
+- tools/brief 页从 `demoted_pages` 中移除；
+- 随 checkpoint 保存/恢复；恢复时如果当前请求已经带 prompt spans，优先保留当前请求的，不被旧 checkpoint 覆盖；
+- 如果模板没有暴露 tools 区间，退化为原来的位置 sink。
+
+### 1.4 新增参数
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
@@ -67,7 +91,7 @@ KVMEM_RESELECT logical=9216 ... selected=...,82,...
 
 ## 2. 测试结果
 
-构建：Release，`CMAKE_CUDA_ARCHITECTURES=120a`，产物 `apps/ninfer-serve.exe` 549,998,592 字节，已复制到 `workers/ninfer/ninfer-kvmem-server.exe`。
+构建：Release，`CMAKE_CUDA_ARCHITECTURES=120a`，产物 `apps/ninfer-serve.exe` 550,006,784 字节，已复制到 `workers/ninfer/ninfer-kvmem-server.exe`。
 
 ### 2.1 小窗口强制驱逐（B=4096 / R=4096 / W=8192）
 
@@ -93,24 +117,37 @@ decode 203.6 tok/s（短请求）
 dflash2 accepted 4/7 (57.1%)
 ```
 
+### 2.4 结构化 prompt pin
+
+| 测试 | 结果 |
+|---|---|
+| 单工具短请求 | `KVMEM_PROMPT_PIN tools=2/40 brief=9/20 pages=15`；工具调用 `write` 参数完整 `{"file_path":"ok.txt","content":"OK"}` |
+| 55K prompt + 单工具 | `KVMEM_PROMPT_PIN tools=2/40 brief=20/20 pages=871`；`KVMEM_RESELECT logical=48640 selected=507`，selected 以 `0,1` 开头（tools 页） |
+| 长 prompt DFlash2 | prefill 431.8 tok/s；decode 30–33 tok/s（输出很短）；无错误 |
+| 短 HTML 请求 | decode 96.0 tok/s，接受率 93.5% |
+| 工具调用 | decode 80.8–92.8 tok/s，接受率 87.5–92.9%，required 字段完整 |
+
+结论：tools span 能正确提取；结构化页进入 mandatory；不再出现“工具调用缺 `file_path`/`content`”的 schema 漂移（本次样本内）。
+
 测试日志：
 
-- `C:\Users\zhuan\AppData\Local\Temp\opencode\kvmem_test_server.err.log`（小窗口）
-- `C:\Users\zhuan\AppData\Local\Temp\opencode\kvmem_real_server.err.log`（真实窗口）
-- `C:\Users\zhuan\AppData\Local\Temp\opencode\kvmem_final2_server.err.log`（最终 smoke）
+- `C:\Users\zhuan\AppData\Local\Temp\opencode\kvmem_structural_server.err.log`
+- `C:\Users\zhuan\AppData\Local\Temp\opencode\kvmem_tailpin_server.err.log`
+- `C:\Users\zhuan\AppData\Local\Temp\opencode\kvmem_final5_server.err.log`
 
 ---
 
 ## 3. 当前运行状态
 
-- 18200 已恢复为原配置：q4km / B=32,448 / R=16,384 / recent 1,024 / rk8v4 / DFlash2；
-- **L1 默认关闭**，当前进程未带 `--kvmem-pin-answer`；
-- 新二进制已就位，参数可用。
+- 18200 使用新二进制，配置：q4km / B=32,448 / R=16,384 / recent 1,024 / rk8v4 / DFlash2；
+- **L1 已启用**：`--kvmem-pin-answer --kvmem-pin-ratio 20`；
+- 结构化 tools/brief pin **内置生效**，无额外参数；
+- 当前进程未加 `--kvmem-verify-transfers`，需要看 `KVMEM_PROMPT_PIN` 日志时再临时加。
 
-启用方式（重启后生效）：
+关闭 L1（保留结构化 pin）：
 
 ```bat
---kvmem-pin-answer --kvmem-pin-ratio 20
+去掉 --kvmem-pin-answer --kvmem-pin-ratio 20
 ```
 
 ---
@@ -129,8 +166,16 @@ dflash2 accepted 4/7 (57.1%)
 
 ### 4.2 回退本次提交
 
+只回退结构化 prompt pin、保留基础 L1：
+
 ```powershell
 cd I:\llama\kvmem-llama.cpp-multi-backend-framework
+git reset --hard kvmem-l1-20261026
+```
+
+完整回退（连 L1 一起）：
+
+```powershell
 git reset --hard kvmem-l1-20261026^
 ```
 
@@ -182,6 +227,8 @@ Copy-Item `
 
 - 磁盘 tier 的 floor 修复只做了编译验证；本次测试未启用 `--kvmem-disk-path`。
 - L1 是页粒度（64 token），thinking/answer 同页时整页 pin。
+- 结构化 tools pin 上限是 B 的 8%；工具 schema 超过该预算时只保留前面的定义，剩余部分仍靠检索。38 工具以上的 harness 建议压缩 schema 或提高 B。
+- brief 超过 4% B 时保留第一页 + 末尾页；长粘贴内容中间的段落不保证常驻。
 - L1 只影响 reselect / history reuse；单轮短请求不会触发。
 - 画质 A/B（同 prompt、开/关 pin、多轮 HTML 动画）尚未做；本次验证的是机制正确性和 DFlash2 运行正常。
 - pinned 页若在 checkpoint 时不在 resident view，恢复后要等下一次 reselect 才召回；上一轮答案通常仍在 recent 中，测试中已覆盖。

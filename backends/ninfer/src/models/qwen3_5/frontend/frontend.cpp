@@ -1135,6 +1135,14 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         if (processed.memory_query) {
             result.memory_query = TokenSpan{processed.memory_query->begin, processed.memory_query->count};
         }
+        if (processed.first_user_region) {
+            result.first_user_region = TokenSpan{processed.first_user_region->begin,
+                                                 processed.first_user_region->count};
+        }
+        if (processed.tools_region) {
+            result.tools_region = TokenSpan{processed.tools_region->begin,
+                                            processed.tools_region->count};
+        }
         result.token_types         = std::move(processed.token_types);
         result.positions           = std::move(processed.positions);
         result.rope_delta          = processed.rope_delta;
@@ -1179,6 +1187,14 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         result.token_ids                   = std::move(encoded.input_ids);
         if (encoded.memory_query) {
             result.memory_query = TokenSpan{encoded.memory_query->begin, encoded.memory_query->count};
+        }
+        if (encoded.first_user_region) {
+            result.first_user_region = TokenSpan{encoded.first_user_region->begin,
+                                                 encoded.first_user_region->count};
+        }
+        if (encoded.tools_region) {
+            result.tools_region = TokenSpan{encoded.tools_region->begin,
+                                            encoded.tools_region->count};
         }
         result.identity.rewrite_checkpoint = encoded.rewrite_checkpoint;
         result.identity.rewrite_execution_frontiers =

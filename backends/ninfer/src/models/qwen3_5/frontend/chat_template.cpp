@@ -380,6 +380,26 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
     result.rewrite_execution_boundaries = layout.execution_boundaries;
     result.message_boundaries.resize(messages.size() + 1);
     result.cache_boundaries.resize(options.cache_markers.size());
+    // The union of the rendered tool-definition regions. A template that folds tools into the
+    // system preamble without input provenance leaves this empty; KVMem then falls back to the
+    // positional sink.
+    if (!tool_tags.empty()) {
+        std::optional<text::ByteSpan> tools;
+        const auto include_tool = [&](text::ByteSpan bytes) {
+            if (!tools) {
+                tools = bytes;
+            } else {
+                tools->begin = std::min(tools->begin, bytes.begin);
+                tools->end   = std::max(tools->end, bytes.end);
+            }
+        };
+        for (const auto tag : tool_tags) {
+            if (const auto region = unique_output_region(output, tag); region) {
+                include_tool(*region);
+            }
+        }
+        result.tools_region = tools;
+    }
 
     // Only requested/structural boundaries need proof, independent of history length.
     std::map<std::size_t, std::optional<std::size_t>> prefix_cache;
@@ -432,6 +452,12 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
         content_regions[i] = extent;
         if (extent) message_blocks[i] = containing_message(layout, *extent);
         if (message_blocks[i]) ++block_users[*message_blocks[i]];
+    }
+    for (std::size_t i = 0; i < messages.size(); ++i) {
+        if (real_user(messages[i])) {
+            result.first_user_region = content_regions[i];
+            break;
+        }
     }
     for (std::size_t i = messages.size(); i > 0; --i) {
         if (real_user(messages[i - 1])) {

@@ -120,6 +120,12 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
         sequence.lane                          = lane;
         transaction.root_continuation_index.reset();
         start_sequence(lane, sequence, transaction);
+        // The lane is now bound: publish the current prompt's structural retention spans before
+        // the first prefill chunk. Doing this at materialization is too early (the continuation
+        // slot is still unbound).
+        if (requests[lane].prefill) {
+            retain_prompt_spans(sequence, requests[lane].prefill->prompt);
+        }
         credit_active_ownership_transfers(baseline);
         detail::PhysicalResources actual         = owner_exclusive_resources(sequence);
         actual.device.active_lanes               = 1;

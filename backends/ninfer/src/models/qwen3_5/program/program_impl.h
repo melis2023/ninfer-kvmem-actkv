@@ -475,6 +475,8 @@ struct KvmemPrefixCheckpoint {
     std::vector<std::uint64_t> resident_pages;
     std::vector<std::uint32_t> pinned_pages;
     std::vector<std::uint32_t> demoted_pages;
+    std::vector<std::uint32_t> tool_pages;
+    std::vector<std::uint32_t> brief_pages;
     std::vector<float> mean_tail;
     std::shared_ptr<PinnedHostBuffer> state;
     // Idle-only attachment in the same disk account as native KV. Active
@@ -564,6 +566,10 @@ struct KvmemWindowState {
     // stay retrieved only as a last resort. Both survive history retention and checkpoints.
     std::vector<std::uint32_t> pinned_pages;
     std::vector<std::uint32_t> demoted_pages;
+    // Structural pins: declared tool definitions and the first real user brief. They are kept
+    // separate from answer pins so answer growth can never evict the schema/brief.
+    std::vector<std::uint32_t> tool_pages;
+    std::vector<std::uint32_t> brief_pages;
     std::vector<KvmemHostRecord> archive;
     std::vector<std::uint64_t> host_versions;
     kvmem::MemoryStamp stamp;
@@ -900,6 +906,7 @@ public:
                                       runtime::CommitObservation observation,
                                       runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] DiscardResult abort_pending(PendingBatch&& pending) noexcept;
+    void retain_prompt_spans(SequenceState& sequence, const PreparedPromptData& prompt) noexcept;
     void retain_generated_spans(SequenceHandle sequence, std::uint32_t generated_begin,
                                 std::uint32_t thinking_end) noexcept;
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;

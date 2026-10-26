@@ -668,6 +668,88 @@ bool ProgramImpl::prepare_memory_append(SequenceState& sequence, std::uint32_t b
     return prepare_memory_append(sequence, begin, end, false);
 }
 
+void ProgramImpl::retain_prompt_spans(SequenceState& sequence,
+                                      const PreparedPromptData& prompt) noexcept {
+    try {
+        if (!kvmem_window_tokens) { return; }
+        const std::uint32_t total_pages = kv_pages_for_tokens(prompt.token_ids.size());
+        if (total_pages == 0) { return; }
+        const std::uint32_t keep = kvmem_options.selected_tokens / page_tokens;
+        // Structural budgets are internal: tools are the contract the model must keep obeying,
+        // the first user turn is the task. Both are page-granular and capped so they can never
+        // crowd out the retrieval window on their own.
+        const std::uint32_t tool_cap  = keep * 8U / 100U;
+        const std::uint32_t brief_cap = keep * 4U / 100U;
+
+        const auto span_pages = [&](const TokenSpan& span, std::uint32_t cap, bool pin_tail,
+                                    std::vector<std::uint32_t>& pages) {
+            if (span.count == 0 || cap == 0) { return; }
+            const std::uint64_t token_end = std::min<std::uint64_t>(
+                static_cast<std::uint64_t>(span.begin) + span.count, prompt.token_ids.size());
+            if (token_end <= span.begin) { return; }
+            const std::uint32_t first = span.begin / page_tokens;
+            const std::uint32_t last =
+                static_cast<std::uint32_t>((token_end + page_tokens - 1U) / page_tokens);
+            if (last <= first) { return; }
+            if (last - first <= cap) {
+                for (auto page = first; page < last; ++page) pages.push_back(page);
+                return;
+            }
+            if (!pin_tail) {
+                for (auto page = first; page < first + cap; ++page) pages.push_back(page);
+                return;
+            }
+            // A long first user turn usually carries the actual instruction at its end (the
+            // beginning is often pasted context). Keep the first page and the trailing pages.
+            pages.push_back(first);
+            const std::uint32_t tail_begin = last - (cap - 1U);
+            for (auto page = tail_begin; page < last; ++page) pages.push_back(page);
+        };
+        std::vector<std::uint32_t> tools;
+        std::vector<std::uint32_t> brief;
+        if (prompt.tools_region) span_pages(*prompt.tools_region, tool_cap, false, tools);
+        if (prompt.first_user_region) span_pages(*prompt.first_user_region, brief_cap, true, brief);
+
+        const auto replace = [total_pages](std::vector<std::uint32_t>& destination,
+                                           std::vector<std::uint32_t> source) {
+            source.erase(std::remove_if(source.begin(), source.end(),
+                                        [total_pages](std::uint32_t page) {
+                                            return page >= total_pages;
+                                        }),
+                         source.end());
+            std::sort(source.begin(), source.end());
+            source.erase(std::unique(source.begin(), source.end()), source.end());
+            destination.swap(source);
+        };
+        auto& window = sequence.window;
+        replace(window.tool_pages, std::move(tools));
+        replace(window.brief_pages, std::move(brief));
+
+        // Structural pins outrank the soft thinking demotion: a page that carries a tool
+        // definition or the first brief is never demoted, even if it also contains thinking.
+        if (!window.tool_pages.empty() || !window.brief_pages.empty()) {
+            std::vector<std::uint32_t> structural = window.tool_pages;
+            structural.insert(structural.end(), window.brief_pages.begin(), window.brief_pages.end());
+            std::sort(structural.begin(), structural.end());
+            structural.erase(std::unique(structural.begin(), structural.end()), structural.end());
+            std::vector<std::uint32_t> demoted_only;
+            std::set_difference(window.demoted_pages.begin(), window.demoted_pages.end(),
+                                structural.begin(), structural.end(),
+                                std::back_inserter(demoted_only));
+            window.demoted_pages.swap(demoted_only);
+        }
+        if (kvmem_options.verify_transfers) {
+            std::fprintf(stderr, "KVMEM_PROMPT_PIN tools=%zu/%u brief=%zu/%u pages=%u\n",
+                         window.tool_pages.size(), tool_cap, window.brief_pages.size(), brief_cap,
+                         total_pages);
+        }
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "KVMEM_PROMPT_PIN skipped: %s\n", error.what());
+    } catch (...) {
+        std::fprintf(stderr, "KVMEM_PROMPT_PIN skipped: unknown error\n");
+    }
+}
+
 void ProgramImpl::retain_generated_spans(SequenceHandle sequence, std::uint32_t generated_begin,
                                          std::uint32_t thinking_end) noexcept {
     try {
@@ -809,25 +891,34 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
         }
         std::sort(core.begin(), core.end());
         core.erase(std::unique(core.begin(), core.end()), core.end());
-        // Pinned response-tail pages join the mandatory set after sink/media/recent. If B is too
-        // small, the newest pins survive and retrieval history keeps the remaining room.
+        // Structural pins outrank the answer tail: tools first, then the first user brief, then
+        // the L1 answer. The answer keeps its previous newest-page rule; structural spans keep
+        // their leading pages so a truncated schema still starts at the tool header.
         std::vector<std::uint64_t> mandatory = core;
-        if (count != 0 && !state.pinned_pages.empty()) {
-            std::vector<std::uint64_t> pinned;
-            pinned.reserve(state.pinned_pages.size());
-            for (const auto id : state.pinned_pages) {
-                if (id < count) pinned.push_back(id);
+        const auto add_pages = [&](const std::vector<std::uint32_t>& source, bool newest) {
+            std::vector<std::uint64_t> pages;
+            pages.reserve(source.size());
+            for (const auto id : source) {
+                if (id < count) pages.push_back(id);
             }
-            std::sort(pinned.begin(), pinned.end());
-            pinned.erase(std::unique(pinned.begin(), pinned.end()), pinned.end());
-            const auto room = keep > core.size() ? keep - core.size() : 0U;
-            if (pinned.size() > room) {
-                pinned.erase(pinned.begin(), pinned.end() - static_cast<std::ptrdiff_t>(room));
+            std::sort(pages.begin(), pages.end());
+            pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+            const auto room = keep > mandatory.size() ? keep - mandatory.size() : 0U;
+            if (pages.size() > room) {
+                if (newest) {
+                    pages.erase(pages.begin(),
+                                pages.end() - static_cast<std::ptrdiff_t>(room));
+                } else {
+                    pages.resize(room);
+                }
             }
-            mandatory.insert(mandatory.end(), pinned.begin(), pinned.end());
+            mandatory.insert(mandatory.end(), pages.begin(), pages.end());
             std::sort(mandatory.begin(), mandatory.end());
             mandatory.erase(std::unique(mandatory.begin(), mandatory.end()), mandatory.end());
-        }
+        };
+        add_pages(state.tool_pages, false);
+        add_pages(state.brief_pages, false);
+        add_pages(state.pinned_pages, true);
         std::vector<std::uint64_t> selected;
         const bool query_complete = state.query_tokens != 0 &&
             (state.query_replayed || begin >= state.query_end) &&
@@ -1061,6 +1152,12 @@ std::unique_ptr<KvmemPrefixCheckpoint> ProgramImpl::capture_memory_checkpoint(Se
     for (const auto id : window.demoted_pages) {
         if (id < checkpoint_pages) checkpoint->demoted_pages.push_back(id);
     }
+    for (const auto id : window.tool_pages) {
+        if (id < checkpoint_pages) checkpoint->tool_pages.push_back(id);
+    }
+    for (const auto id : window.brief_pages) {
+        if (id < checkpoint_pages) checkpoint->brief_pages.push_back(id);
+    }
     std::array<std::byte*, 1> host{static_cast<std::byte*>(checkpoint->state->data())};
     state_images->copy_to_host_segments(state_store->physical_slot(sequence.state.write),
         host, bytes, compute_streams);
@@ -1213,6 +1310,12 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
     }
     for (const auto id : checkpoint.demoted_pages) {
         if (id < pages) window.demoted_pages.push_back(id);
+    }
+    for (const auto id : checkpoint.tool_pages) {
+        if (id < pages && window.tool_pages.empty()) window.tool_pages.push_back(id);
+    }
+    for (const auto id : checkpoint.brief_pages) {
+        if (id < pages && window.brief_pages.empty()) window.brief_pages.push_back(id);
     }
     if (frontier % page_tokens) window.host_versions.back() = frontier % page_tokens;
     // A consumed history has one archive. Rewinding explicitly revokes later states

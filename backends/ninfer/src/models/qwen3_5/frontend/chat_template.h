@@ -116,6 +116,10 @@ struct RenderedChat {
     std::vector<text::ByteSpan> literal_spans;
     // Actual last user content provenance from Jinja input regions, not text search.
     std::optional<text::ByteSpan> memory_query;
+    // First real user content and the union of the declared tool definitions. KVMem uses these
+    // to keep the task brief and the tool schema resident across reselects.
+    std::optional<text::ByteSpan> first_user_region;
+    std::optional<text::ByteSpan> tools_region;
 
     bool starts_in_reasoning = false;
     std::vector<MediaPlaceholderByteSpec> media_placeholders;
