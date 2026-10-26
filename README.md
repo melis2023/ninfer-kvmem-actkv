@@ -90,7 +90,26 @@ DFlash2 + nvfp4 KV **863.8 MiB**，MTP + int8 KV **1,001.8 MiB**。
 （`--kvmem-budget`/`--kvmem-gen-reserve` 按显卡调整；B/R 不再要求小于 4；不要加
 `--no-cuda-graph`。）
 
-### 3. CUDA Graph 探针校准（+ 读数复测）
+### 3. KV 精度：`rk8v4` 与 `nvfp4`
+
+KVMem 下这两种 KV 精度都已支持，可任意搭配 DFlash2 / MTP 草稿：
+
+| | `nvfp4` | `rk8v4` |
+|---|---|---|
+| 存储格式 | NVFP4 group16（4-bit + E4M3 块缩放） | 旋转 INT8 key + packed int4 value，group64 |
+| 52,864 窗口 runtime | **1.62 GiB** | 1.99 GiB |
+| 启动 free（同配置） | **835.8 MiB** | 645.9 MiB |
+| decode（鹈鹕，draft 4） | **73.2 tok/s** | 68.6 tok/s |
+| 接受率（同任务） | **58.6%** | 51.3% |
+
+- `nvfp4` 显存最省，是 16 GB 卡的默认推荐，今天所有测试都用它；
+- `rk8v4` 的 **key 保持 INT8**（只把 value 压到 4-bit），理论上长上下文检索更稳，
+  代价是多约 0.37 GiB 显存、decode 慢约 6%；
+- 两者都支持 KVMem 的 B/R 窗口和全部草稿后端，切换只需 `--kv-dtype nvfp4|rk8v4`；
+- 单个 72 token 提示词、thinking 开的鹈鹕测试；输出长度随采样变化，decode 是可比值，
+  接受率有约 ±3 个点的噪声。
+
+### 4. CUDA Graph 探针校准（+ 读数复测）
 
 旧代码按拓扑盲预留约 **1 GiB** 给 CUDA Graph，实际只占 **90–145 MiB**，导致 KV 少给、
 长上下文启动失败，只能 `--no-cuda-graph`。现在启动时用最小 KV 探针实测整套图，按
@@ -106,7 +125,7 @@ WDDM 下探针读数会抖动（同一配置连续启动实测过 0.0 / 83.3 / 9
 - 256K 窗口下 `nvfp4` / `q4km` / `q3km` 等草稿都能加载，不再启动即爆显存；
 - 开图 decode 比关图快约 6%，KV 容量比盲预留多约 700–800 MiB。
 
-### 4. KVMem 驱逐回到满窗口 100%（issue #6）
+### 5. KVMem 驱逐回到满窗口 100%（issue #6）
 
 80% 水位（`W - W/5`）在 `B > 4R` 时会让每个 256-token chunk 都空转重选一次。现在任何
 B/R 都只在窗口满 `W = B + R` 时重选：
@@ -119,7 +138,7 @@ const bool reselecting =
 实测（B/R=4.15，61K prompt）：旧版 55 次 reselect / 82.2 s → 新版 **0 次 / 75.8 s**；
 253K NIAH 仍 3/3。代价是不再有“提前交换与 decode 重叠”。
 
-### 5. Jinja 模板 cache boundary
+### 6. Jinja 模板 cache boundary
 
 `trim_blocks` / `lstrip_blocks` / `{%- -%}` 折叠源码后，落在折叠区的 cache marker 无法
 解析，prefix cache 命中下降。现在折叠边界跟随 `string_part` 传递，marker 偏移可唯一
