@@ -457,6 +457,16 @@ bool ProgramImpl::restore_prefix_from_disk(SequenceState& sequence, RequestContr
     }
     if (is_masked_draft_backend(speculative_backend)) {
         sequence.dflash_context_frontier = frontier;
+        // The restored ring snapshot and the other restore paths (reselect, query restore,
+        // checkpoint recovery) all publish the same readable span. A stale floor left behind by
+        // this sequence slot would otherwise hide part of the ring after a disk restore.
+        const std::uint64_t recent_tokens = std::max<std::uint64_t>(
+            static_cast<std::uint64_t>(kvmem_options.recent_blocks()) *
+                static_cast<std::uint64_t>(kPageTokens),
+            masked_draft_ring_capacity());
+        sequence.dflash_context_floor = frontier > recent_tokens
+            ? static_cast<std::uint32_t>(frontier - recent_tokens) : 0U;
+        clamp_masked_draft_floor(sequence);
     }
     refresh_state_views(sequence);
     // The StateImage carries the hidden of the token before the frontier, which the MTP bridge

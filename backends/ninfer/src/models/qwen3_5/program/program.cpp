@@ -559,6 +559,10 @@ DiscardResult Program::abort_pending(PendingBatch&& pending) noexcept {
 }
 
 FinishResult Program::finish(SequenceHandle sequence) noexcept { return impl_->finish(sequence); }
+void Program::retain_generated_spans(SequenceHandle sequence, std::uint32_t generated_begin,
+                                     std::uint32_t thinking_end) noexcept {
+    impl_->retain_generated_spans(sequence, generated_begin, thinking_end);
+}
 
 AbortResult Program::abort(SequenceHandle sequence) noexcept { return impl_->abort(sequence); }
 

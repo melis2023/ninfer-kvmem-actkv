@@ -1503,6 +1503,12 @@ private:
                 throw std::logic_error("terminal-pending request has invalid ownership");
             }
             const FinishReason reason = *request->terminal_reason;
+            // KVMem L1 retention: the non-thinking tail of this response is the cross-turn
+            // payload; fully-thinking pages are soft-demoted. Program no-ops unless
+            // --kvmem-pin-answer is enabled.
+            instance_.program->retain_generated_spans(
+                *request->sequence, request->prompt_summary.prompt_tokens,
+                request->prompt_summary.prompt_tokens + request->output.reasoning_tokens());
             // Where the finishing session will be retained, read before finish() settles the lane.
             std::optional<std::uint32_t> publication;
             std::optional<std::uint32_t> retained_source;

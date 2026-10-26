@@ -473,6 +473,8 @@ struct KvmemPrefixCheckpoint {
     std::vector<TokenId> prefix;
     ResidentPrefixIdentity prefix_identity;
     std::vector<std::uint64_t> resident_pages;
+    std::vector<std::uint32_t> pinned_pages;
+    std::vector<std::uint32_t> demoted_pages;
     std::vector<float> mean_tail;
     std::shared_ptr<PinnedHostBuffer> state;
     // Idle-only attachment in the same disk account as native KV. Active
@@ -557,6 +559,11 @@ struct KvmemWindowState {
     // packed data AND scales. They never contain a second allocation of device KV.
     std::vector<std::uint32_t> pages;
     std::vector<std::uint32_t> media_pages;
+    // Logical page ids of the last response's non-thinking tail (final answer and tool-call
+    // payload) and of fully-thinking pages. Pinned pages join the mandatory set; demoted pages
+    // stay retrieved only as a last resort. Both survive history retention and checkpoints.
+    std::vector<std::uint32_t> pinned_pages;
+    std::vector<std::uint32_t> demoted_pages;
     std::vector<KvmemHostRecord> archive;
     std::vector<std::uint64_t> host_versions;
     kvmem::MemoryStamp stamp;
@@ -893,6 +900,8 @@ public:
                                       runtime::CommitObservation observation,
                                       runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] DiscardResult abort_pending(PendingBatch&& pending) noexcept;
+    void retain_generated_spans(SequenceHandle sequence, std::uint32_t generated_begin,
+                                std::uint32_t thinking_end) noexcept;
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
@@ -1830,6 +1839,12 @@ private:
     // re-clamped after every such transition. decode_dflash_batch re-clamps each round as a
     // backstop.
     void clamp_masked_draft_floor(SequenceState& sequence) noexcept;
+    // The DFlash2 conditioning ring lags one round behind the target: decode_dflash_batch
+    // records the committed features in pending_features and the next round appends them. A
+    // checkpoint captured at that boundary would otherwise store an incomplete ring while
+    // claiming the full frontier. This appends the gap (when it fits the last round's feature
+    // window) before the StateImage snapshot is taken.
+    void sync_masked_draft_frontier(SequenceState& sequence);
     // Capacity of the masked-draft conditioning ring (`draft.sliding_window`). Ring rows live in
     // their own device allocation and are appended every round, so paged-block eviction cannot
     // stale a row and the floor only has to stay within the ring.

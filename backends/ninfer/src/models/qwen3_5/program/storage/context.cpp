@@ -1176,6 +1176,36 @@ std::uint32_t ProgramImpl::masked_draft_ring_capacity() const noexcept {
     return draft ? draft->sliding_window.value_or(0U) : 0U;
 }
 
+void ProgramImpl::sync_masked_draft_frontier(SequenceState& sequence) {
+    if (speculative_backend != SpeculativeBackend::DFlash2 || !io.dflash_decode || !dflash) {
+        return;
+    }
+    // pending_features is the last decode round's target hidden. A prefill checkpoint owns its
+    // features in prefill_features, so only close a decode-round gap here. If the sequence is
+    // still prefilling, or the two frontiers disagree, leave the checkpoint validation to reject
+    // the capture instead of appending the wrong feature rows.
+    if (requests[sequence.lane].prefill.has_value() ||
+        sequence.execution_frontier != sequence.text_kv_valid || sequence.state.fork_pending) {
+        return;
+    }
+    const std::uint32_t frontier = sequence.text_kv_valid;
+    if (frontier <= sequence.dflash_context_frontier) { return; }
+    const std::uint32_t gap = frontier - sequence.dflash_context_frontier;
+    const std::uint32_t widest = widest_verify_window() + 1U;
+    if (gap > widest) {
+        throw std::logic_error("masked-draft checkpoint gap exceeds the last round's features");
+    }
+    const std::array<std::uint32_t, 1> lanes{sequence.lane};
+    const std::array<std::uint32_t, 1> starts{sequence.dflash_context_frontier};
+    const std::array<std::uint32_t, 1> counts{gap};
+    enqueue_dflash_context_append(lanes, starts, counts);
+    device.synchronize();
+    sequence.dflash_context_frontier = frontier;
+    if (kvmem_options.verify_transfers) {
+        std::fprintf(stderr, "KVMEM_DFLASH_SYNC frontier=%u gap=%u\n", frontier, gap);
+    }
+}
+
 void ProgramImpl::refresh_state_views(SequenceState& sequence) {
     sequence.tail_hidden               = {};
     sequence.rewrite_checkpoint_hidden = {};

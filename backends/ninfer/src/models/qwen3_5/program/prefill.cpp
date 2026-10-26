@@ -1022,7 +1022,15 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
                 if (cancelled[row] || !requests[lanes[row]].sampling_host.token_counts) {
                     continue;
                 }
-                const auto count = static_cast<std::int32_t>(accepted_tokens[row]);
+                // The licensed span is accepted drafts plus the terminal token. The dense
+                // finalize path counts that whole span (speculative_store_accept_result); the
+                // sparse DFlash2 path publishes its counts here, so it must include the terminal
+                // token too or every round under-counts one token for frequency/presence
+                // penalties.
+                const auto count = std::min<std::int32_t>(
+                    static_cast<std::int32_t>(accepted_tokens[row]) + 1,
+                    static_cast<std::int32_t>(verify_drafts) + 1);
+                if (count <= 0) { continue; }
                 Tensor ids       = io.dflash_decode->narrowed(verify_drafts)
                                        .licensed_tokens.slice(1, static_cast<std::int32_t>(row), 1)
                                        .slice(0, 0, count)

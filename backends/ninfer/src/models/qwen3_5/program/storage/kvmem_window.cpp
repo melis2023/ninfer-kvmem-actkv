@@ -6,9 +6,11 @@
 #include "kvmem/prefix_checkpoint.hpp"
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <iterator>
 #include <utility>
 
 namespace ninfer::models::qwen3_5::detail {
@@ -666,6 +668,82 @@ bool ProgramImpl::prepare_memory_append(SequenceState& sequence, std::uint32_t b
     return prepare_memory_append(sequence, begin, end, false);
 }
 
+void ProgramImpl::retain_generated_spans(SequenceHandle sequence, std::uint32_t generated_begin,
+                                         std::uint32_t thinking_end) noexcept {
+    try {
+        if (!kvmem_window_tokens || !kvmem_options.pin_answer || !valid_sequence(sequence)) { return; }
+        const std::uint32_t lane = ContractAccess::lane(sequence).value;
+        RequestControl& request  = requests[lane];
+        SequenceState& state     = active_sequence(lane);
+        if (request.lifecycle != Lifecycle::Finishable || !state.window.statistics) { return; }
+        const std::uint32_t frontier =
+            std::min(state.text_kv_valid, state.execution_frontier);
+        if (frontier == 0) { return; }
+        generated_begin = std::min(generated_begin, frontier);
+        thinking_end    = std::clamp(thinking_end, generated_begin, frontier);
+
+        auto& window = state.window;
+        // Only whole pages are classified: a page that contains both a thinking tail and the
+        // first answer token is pinned, never demoted. The page with the prompt/thinking boundary
+        // is likewise left alone.
+        std::vector<std::uint32_t> new_pinned;
+        std::vector<std::uint32_t> new_demoted;
+        const std::uint32_t first_demote = (generated_begin + page_tokens - 1U) / page_tokens;
+        const std::uint32_t last_demote  = thinking_end / page_tokens;
+        for (auto page = first_demote; page < last_demote; ++page) new_demoted.push_back(page);
+        const std::uint32_t first_pin = thinking_end / page_tokens;
+        const std::uint32_t last_pin  = (frontier + page_tokens - 1U) / page_tokens;
+        for (auto page = first_pin; page < last_pin; ++page) new_pinned.push_back(page);
+
+        const auto merge = [](std::vector<std::uint32_t>& destination,
+                              const std::vector<std::uint32_t>& source) {
+            destination.insert(destination.end(), source.begin(), source.end());
+            std::sort(destination.begin(), destination.end());
+            destination.erase(std::unique(destination.begin(), destination.end()), destination.end());
+        };
+        merge(window.pinned_pages, new_pinned);
+        merge(window.demoted_pages, new_demoted);
+        // A mixed page is pinned; remove it from the demoted set so the mandatory path wins.
+        std::vector<std::uint32_t> demoted_only;
+        std::set_difference(window.demoted_pages.begin(), window.demoted_pages.end(),
+                            window.pinned_pages.begin(), window.pinned_pages.end(),
+                            std::back_inserter(demoted_only));
+        window.demoted_pages.swap(demoted_only);
+
+        // Keep pinned pages bounded: a percentage of B, leaving at least two pages for
+        // sink/recent. The newest pages survive when the cap is exceeded.
+        const std::uint32_t keep    = kvmem_options.selected_tokens / page_tokens;
+        const std::uint32_t percent =
+            std::min<std::uint32_t>(50U, std::max<std::uint32_t>(1U, kvmem_options.pin_answer_percent));
+        const std::uint32_t reserve = std::min<std::uint32_t>(keep, 2U);
+        const std::uint32_t cap =
+            std::min(keep > reserve ? keep - reserve : 0U, keep * percent / 100U);
+        if (window.pinned_pages.size() > cap) {
+            window.pinned_pages.erase(window.pinned_pages.begin(),
+                                      window.pinned_pages.end() - static_cast<std::ptrdiff_t>(cap));
+        }
+
+        const std::uint32_t pages = kv_pages_for_tokens(frontier);
+        const auto prune = [pages](std::vector<std::uint32_t>& values) {
+            values.erase(std::remove_if(values.begin(), values.end(),
+                                        [pages](std::uint32_t page) { return page >= pages; }),
+                         values.end());
+        };
+        prune(window.pinned_pages);
+        prune(window.demoted_pages);
+        if (kvmem_options.verify_transfers) {
+            std::fprintf(stderr,
+                         "KVMEM_PIN begin=%u thinking_end=%u frontier=%u pinned=%zu demoted=%zu\n",
+                         generated_begin, thinking_end, frontier, window.pinned_pages.size(),
+                         window.demoted_pages.size());
+        }
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "KVMEM_PIN skipped: %s\n", error.what());
+    } catch (...) {
+        std::fprintf(stderr, "KVMEM_PIN skipped: unknown error\n");
+    }
+}
+
 bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, std::uint32_t end,
                                   bool force_selection, bool allow_pending) {
     if (!kvmem_window_tokens) { return true; }
@@ -705,31 +783,51 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
         // A reselection replaces the selected blocks, but the masked-draft conditioning ring is
         // its own device allocation that every round appends to unconditionally, so paged-block
         // eviction cannot stale a ring row. The floor only has to stay within the ring: a floor at
-        // `end - ring` leaves the whole ring readable (the kernel clamps the span to the ring
+        // `begin - ring` leaves the whole ring readable (the kernel clamps the span to the ring
         // width), while the KVMem recent-page span silently hides most of it and drags acceptance
-        // down with it.
+        // down with it. `begin` (the committed frontier) is the right anchor; using `end` would
+        // mask the oldest `width` ring rows the round is about to verify against.
         const std::uint64_t recent_tokens = std::max<std::uint64_t>(
             static_cast<std::uint64_t>(kvmem_options.recent_blocks()) * page_tokens,
             masked_draft_ring_capacity());
         sequence.dflash_context_floor =
-            end > recent_tokens ? static_cast<std::uint32_t>(end - recent_tokens) : 0U;
+            begin > recent_tokens ? static_cast<std::uint32_t>(begin - recent_tokens) : 0U;
         clamp_masked_draft_floor(sequence);
         auto backend = std::make_shared<WindowMemoryBackend>(*this, sequence, end);
         const auto count = kv_pages_for_tokens(begin);
         const auto keep = std::min(count, kvmem_options.selected_tokens / page_tokens);
         auto& state = sequence.window;
-        std::vector<std::uint64_t> mandatory;
+        std::vector<std::uint64_t> core;
         if (count == 0) {
-            mandatory.push_back(0);
+            core.push_back(0);
         } else {
             const auto sink_keep = std::min(kvmem_options.sink_blocks(), count);
-            for (std::uint32_t id = 0; id < sink_keep; ++id) mandatory.push_back(id);
-            for (const auto id : state.media_pages) if (id < count) mandatory.push_back(id);
+            for (std::uint32_t id = 0; id < sink_keep; ++id) core.push_back(id);
+            for (const auto id : state.media_pages) if (id < count) core.push_back(id);
             const auto recent_keep = std::min(kvmem_options.recent_blocks(), count);
-            for (std::uint32_t i = 0; i < recent_keep; ++i) mandatory.push_back(count - 1 - i);
+            for (std::uint32_t i = 0; i < recent_keep; ++i) core.push_back(count - 1 - i);
         }
-        std::sort(mandatory.begin(), mandatory.end());
-        mandatory.erase(std::unique(mandatory.begin(), mandatory.end()), mandatory.end());
+        std::sort(core.begin(), core.end());
+        core.erase(std::unique(core.begin(), core.end()), core.end());
+        // Pinned response-tail pages join the mandatory set after sink/media/recent. If B is too
+        // small, the newest pins survive and retrieval history keeps the remaining room.
+        std::vector<std::uint64_t> mandatory = core;
+        if (count != 0 && !state.pinned_pages.empty()) {
+            std::vector<std::uint64_t> pinned;
+            pinned.reserve(state.pinned_pages.size());
+            for (const auto id : state.pinned_pages) {
+                if (id < count) pinned.push_back(id);
+            }
+            std::sort(pinned.begin(), pinned.end());
+            pinned.erase(std::unique(pinned.begin(), pinned.end()), pinned.end());
+            const auto room = keep > core.size() ? keep - core.size() : 0U;
+            if (pinned.size() > room) {
+                pinned.erase(pinned.begin(), pinned.end() - static_cast<std::ptrdiff_t>(room));
+            }
+            mandatory.insert(mandatory.end(), pinned.begin(), pinned.end());
+            std::sort(mandatory.begin(), mandatory.end());
+            mandatory.erase(std::unique(mandatory.begin(), mandatory.end()), mandatory.end());
+        }
         std::vector<std::uint64_t> selected;
         const bool query_complete = state.query_tokens != 0 &&
             (state.query_replayed || begin >= state.query_end) &&
@@ -748,6 +846,17 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
                     config.attention->num_attention_heads, config.attention->num_key_value_heads,
                     kvmem_options.score_agg_max ? kvmem::GqaScoreAggregation::Max : kvmem::GqaScoreAggregation::Mean});
             const auto score_ended = std::chrono::steady_clock::now();
+            // Soft thinking demotion: fully-thinking pages stay retrievable, but only after every
+            // non-demoted page. A page that is also mandatory (sink/media/recent/pinned) is not
+            // penalised.
+            if (!state.demoted_pages.empty()) {
+                for (const auto id : state.demoted_pages) {
+                    if (id < scores.size() &&
+                        std::find(mandatory.begin(), mandatory.end(), id) == mandatory.end()) {
+                        scores[id] = -1.0e30F;
+                    }
+                }
+            }
             state.selector->set_retrieval_scores(scores);
             const std::vector<std::uint32_t> required(mandatory.begin(), mandatory.end());
             const auto ids = state.selector->pick_topk_blocks(required);
@@ -769,8 +878,19 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
             }
         } else {
             selected = mandatory;
-            for (auto id = count; id-- > 0 && selected.size() < keep;) {
-                if (std::find(selected.begin(), selected.end(), id) == selected.end()) selected.push_back(id);
+            const auto is_demoted = [&state](std::uint32_t id) {
+                return std::binary_search(state.demoted_pages.begin(), state.demoted_pages.end(), id);
+            };
+            // Fill from the newest non-demoted pages first; only if the window still has room do
+            // demoted thinking pages become eligible. This keeps the fallback path (no completed
+            // retrieval query) from treating thinking as ordinary recent history.
+            for (int pass = 0; pass < 2 && selected.size() < keep; ++pass) {
+                for (auto id = count; id-- > 0 && selected.size() < keep;) {
+                    if ((pass == 0) == is_demoted(id)) { continue; }
+                    if (std::find(selected.begin(), selected.end(), id) == selected.end()) {
+                        selected.push_back(id);
+                    }
+                }
             }
             std::sort(selected.begin(), selected.end());
         }
@@ -911,6 +1031,9 @@ std::unique_ptr<KvmemPrefixCheckpoint> ProgramImpl::capture_memory_checkpoint(Se
     auto& window = sequence.window;
     auto checkpoint = std::make_unique<KvmemPrefixCheckpoint>();
     const auto frontier = sequence.text_kv_valid;
+    // DFlash2 defers its ring append to the next round; close that gap before the StateImage
+    // snapshot so the restored ring actually covers the full checkpoint frontier.
+    sync_masked_draft_frontier(sequence);
     if (!frontier || frontier > sequence.ledger.size() || frontier != window.statistics_frontier ||
         !sequence.tail_hidden_valid || sequence.state.fork_pending ||
         (backend_kv_pages && kvmem_backend_frontier(sequence) != frontier)) {
@@ -929,6 +1052,15 @@ std::unique_ptr<KvmemPrefixCheckpoint> ProgramImpl::capture_memory_checkpoint(Se
     const auto descriptor = backend.descriptor();
     checkpoint->identity = {descriptor.identity, descriptor.layout, backend.stamp()};
     checkpoint->resident_pages = backend.snapshot().resident;
+    // Retention policy is a property of the logical prefix, not of the resident view: keep it
+    // with the checkpoint so a restored history still pins the answer and demotes thinking.
+    const auto checkpoint_pages = kv_pages_for_tokens(frontier);
+    for (const auto id : window.pinned_pages) {
+        if (id < checkpoint_pages) checkpoint->pinned_pages.push_back(id);
+    }
+    for (const auto id : window.demoted_pages) {
+        if (id < checkpoint_pages) checkpoint->demoted_pages.push_back(id);
+    }
     std::array<std::byte*, 1> host{static_cast<std::byte*>(checkpoint->state->data())};
     state_images->copy_to_host_segments(state_store->physical_slot(sequence.state.write),
         host, bytes, compute_streams);
@@ -1074,6 +1206,14 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
     window.archive.resize(pages);
     window.host_versions.resize(pages);
     window.payload_bytes = pages * backend.page_bytes;
+    window.pinned_pages.clear();
+    window.demoted_pages.clear();
+    for (const auto id : checkpoint.pinned_pages) {
+        if (id < pages) window.pinned_pages.push_back(id);
+    }
+    for (const auto id : checkpoint.demoted_pages) {
+        if (id < pages) window.demoted_pages.push_back(id);
+    }
     if (frontier % page_tokens) window.host_versions.back() = frontier % page_tokens;
     // A consumed history has one archive. Rewinding explicitly revokes later states
     // before their payload/statistics can be overwritten; no full-history COW is needed.

@@ -99,6 +99,9 @@ std::string serve_usage_text(const char* argv0) {
            "                                page; positive values round down, minimum one page\n"
            "  --kvmem-recent-tokens N       always-kept newest suffix; default 64 (one page);\n"
            "                                minimum 64; values round down to whole pages\n"
+           "  --kvmem-pin-answer            pin the non-thinking tail of the last response;\n"
+           "                                demotes fully-thinking pages (soft, page granular)\n"
+           "  --kvmem-pin-ratio N           cap pinned pages at N% of B, 1..50 (default 20)\n"
            "  --kvmem-sessions N            retained Host histories, 1..16 (default 4)\n"
            "  --kvmem-disk-path PATH        Ephemeral active/idle KV spill directory\n"
            "  --kvmem-disk-mib N            Shared SSD payload quota D, MiB\n"
@@ -688,6 +691,19 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.kvmem.recent_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--kvmem-recent-tokens"), "kvmem-recent-tokens"));
             recent_tokens_explicit = true;
+            continue;
+        }
+        if (arg == "--kvmem-pin-answer") {
+            options.kvmem.pin_answer = true;
+            continue;
+        }
+        if (arg == "--kvmem-pin-ratio") {
+            const auto percent = parse_nonnegative_int(
+                require_value("--kvmem-pin-ratio"), "kvmem-pin-ratio");
+            if (percent < 1 || percent > 50) {
+                throw std::invalid_argument("--kvmem-pin-ratio must be in 1..50");
+            }
+            options.kvmem.pin_answer_percent = static_cast<std::uint32_t>(percent);
             continue;
         }
         if (arg == "--kvmem-sessions") {

@@ -1058,6 +1058,8 @@ void HttpServer::handle_props(const httplib::Request& req, httplib::Response& re
         {"reserve_tokens", options.kvmem.reserve_tokens},
         {"sink_tokens", options.kvmem.sink_tokens},
         {"recent_tokens", options.kvmem.recent_tokens},
+        {"pin_answer", options.kvmem.pin_answer},
+        {"pin_answer_percent", options.kvmem.pin_answer_percent},
         {"host_payload_budget_bytes", options.kvmem.host_bytes}};
     if (options.kvmem.selected_tokens) {
         props["kvmem"]["usage"] = kvmem_status_json(service.runtime_stats().kvmem);

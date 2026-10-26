@@ -1133,6 +1133,12 @@ public:
            runtime::CommitObservation observation  = runtime::CommitObservation::AllRows,
            runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] DiscardResult abort_pending(PendingBatch&& pending) noexcept;
+    // L1 retention for KVMem histories: mark the generated [begin, thinking_end) span as
+    // thinking (soft-demoted) and [thinking_end, execution_frontier) as the response tail
+    // (pinned). Call immediately before finish(), while the lane is Finishable. No-op unless
+    // KvmemOptions::pin_answer is set and KVMem is enabled.
+    void retain_generated_spans(SequenceHandle sequence, std::uint32_t generated_begin,
+                                std::uint32_t thinking_end) noexcept;
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
     // The Device KV lease of an active sequence is extended on demand at a decode-round boundary.
