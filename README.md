@@ -1,83 +1,26 @@
 # KVMem + ActKV · ninfer 后端
 
-基于 [kvmem-llama.cpp](https://github.com/kvmem/kvmem-llama.cpp) 与 **ActKV**（[arXiv:2609.31395](https://arxiv.org/pdf/2609.31395)，中国科学技术大学提出）技术开发：
+基于 [kvmem-llama.cpp](https://github.com/kvmem/kvmem-llama.cpp) 与 **ActKV**
+（[arXiv:2609.31395](https://arxiv.org/pdf/2609.31395)，中国科学技术大学提出）：
 
-- **KVMem**：把长上下文稀疏化成固定窗口（`budget` 选取历史块 B + `gen_reserve` 追加工作区 R），Host/磁盘归档历史 KV，用一个固定大小的注意力窗口换来 200K/262K 的可用上下文。
-- **ActKV**：面向行动的检索保持策略（LRFU 历史排序等），提升长会话中关键块的召回率。
+- **KVMem**：把长上下文稀疏成固定窗口（`budget` 历史块 B + `gen_reserve` 工作区 R），
+  Host/磁盘归档其余 KV，用固定大小的注意力窗口换取 200K/262K 可用上下文。
+- **ActKV**：面向行动的检索保持策略（LRFU 历史排序等），提升长会话关键块召回。
 
-**QQ 交流群：1040777853**
+QQ 交流群：**1040777853**。本项目仅供研究学习，稳定使用请前往 kvmem 原作者。
 
-本项目仅供研究学习，稳定使用可前往kvmem原作者。
+**所有修补、测速与召回数据汇总在 [docs/CHANGELOG.md](docs/CHANGELOG.md)。**
 
-## 2026-10-26 更新：q3km 直通草稿、DFlash2 代码加速、不再需要 `--no-cuda-graph`
+## 当前推荐（2026-10-26）
 
-### 结论速览
-
-| 项 | 结论 |
+| 项 | 推荐 |
 |---|---|
-| 推荐草稿 | **q3km**（直通 GGUF 块，统一量化精度） |
-| 代码任务 | **DFlash2 比 MTP 快 20%+**（decode 87 vs 72 tok/s） |
-| WebUI 鹈鹕骑车 | **DFlash2 ≈ 90 tok/s，MTP ≈ 60 tok/s** |
-| CUDA Graph | **不需要 `--no-cuda-graph`** |
-| KVMem 驱逐 | 满窗口 100%（issue #6） |
-| draft 长度 | **4** 最佳（3–7 扫描峰值） |
-
-### 1. DFlash2 在代码任务上快于 MTP
-
-128K 代码 prompt（148,774 token 的 Python 模块补函数）、同目标模型 q3km、ngram 0、
-`--kv-dtype nvfp4`、B/R=36,480/16,384：
-
-| 后端 | 第一遍 prefill | decode | 接受率 | wall |
-|---|---:|---:|---:|---:|
-| **dflash2 + q3km，draft 4** | 826.5 tok/s（180 s） | **87.1 tok/s** | 82.1%（92/112） | 350.7 s |
-| MTP + q3km，draft 3 | 826.5 tok/s（180 s） | 72.2 tok/s | **86.9%**（86/99） | 349.5 s |
-
-- prefill 完全相同（由目标模型决定），差距全在 decode：**DFlash2 快 20.6%**；
-- MTP 接受率高 4.8 个点，但每轮草稿数少，decode 仍落后；
-- **WebUI 同一鹈鹕骑车提示词：DFlash2 ≈ 90 tok/s，MTP ≈ 60 tok/s**（思考开）；
-- 总结类任务相反（DFlash2 28.3% / 43.8 vs MTP 40.8% / 47.7），所以
-  “**代码用 DFlash2、开放式生成用 MTP**”是最稳的组合。
-
-### 2. 推荐草稿：q3km（直通草稿，统一量化精度）
-
-**当前引擎已经支持直通草稿**：草稿权重按源工件的 GGUF 块格式直接加载，不再统一重化成
-Q8/NVFP4。q3km 工件里的 DFlash2 草稿实际精度：
-
-| 张量 | 精度 |
-|---|---|
-| `attention/output`、`mlp/down`（各 5 个） | `Q4_K` |
-| `feature_projection`、`candidate_selector/hidden_projection` | `Q3_K` |
-| conv `kernel_projection` / `base_kernel`、norm、codebook | BF16（prepare 路径没有量化内核） |
-
-**为什么这样做：降低显存占用。** 直通保留源块字节，不再为第二种精度另存一份；省出来的
-显存留给 KV 和 CUDA Graph，开图也不需要 `--no-cuda-graph`。启动 free：
-DFlash2 + nvfp4 KV **863.8 MiB**，MTP + int8 KV **1,001.8 MiB**。
-
-128K 同条件对照（除注明外 draft 5）：
-
-| 草稿 | 第一遍 prefill | decode | 接受率 | wall |
-|---|---:|---:|---:|---:|
-| dflash2 + q3km | 904.8 tok/s | 42.8 | 23.4% | 282.8 s |
-| dflash2 + q4km | 904.8 tok/s | 43.6 | 24.2% | 282.4 s |
-| dflash2 + q3km（draft 4） | 904.8 tok/s | 45.8 | 28.3% | 288.5 s |
-| dflash2 + q3km（draft 3） | 904.8 tok/s | 46.1 | 34.9% | 288.4 s |
-| dflash2 + 混合 NVFP4 草稿 | 844.5 tok/s | 40.7 | 23.8% | 296.7 s |
-| MTP + q3km（draft 3） | 904.8 tok/s | 47.7 | 40.8% | 280.9 s |
-
-- q3 与 q4 草稿在噪声内（decode ±1.9%），q4 多占约 0.18 GB → **推荐 q3km**；
-- 混合 NVFP4 草稿比直通慢（prefill −6.7%、decode −4.9%），接受率相同；
-- 历史对照（B/R=77,824、253K prompt、两遍口径）：q3blocks 404 tok/s / nvfp4full 334 tok/s。
-
-`--draft-tokens` 扫描（鹈鹕 SVG、ngram 0、nvfp4）：
-
-| draft | 3 | 4 | 5 | 6 | 7 |
-|---|---:|---:|---:|---:|---:|
-| decode | 68.8 | **71.4** | 70.6 | 67.8 | 64.0 |
-| 接受率 | 65.7% | 54.9% | 48.4% | 42.4% | 38.1% |
-
-→ 通用 **draft 4**；要最高接受率/更短草稿环用 draft 3。
-
-推荐参数（16 GB，日常）：
+| 工件 | `Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp-q3km.ninfer` |
+| 草稿 | **q3km 直通**（Q4_K×10 + Q3_K×2，conv/norm BF16） |
+| 草稿后端 | **DFlash2**，`draft 4`，`ngram 0`（agent 可用 15） |
+| KV | `nvfp4`，B/R = 36,480 / 16,384（W=52,864） |
+| CUDA Graph | **开**；探针校准 256 MiB，不需要 `--no-cuda-graph` |
+| 驱逐 | 满窗口 100% |
 
 ```bat
 --max-context 262144 --prefill-chunk 256 ^
@@ -87,306 +30,125 @@ DFlash2 + nvfp4 KV **863.8 MiB**，MTP + int8 KV **1,001.8 MiB**。
 --default-reasoning-effort medium --default-thinking-budget 16384
 ```
 
-（`--kvmem-budget`/`--kvmem-gen-reserve` 按显卡调整；B/R 不再要求小于 4；不要加
-`--no-cuda-graph`。）
+16 GB 卡启动 free 约 780–955 MiB；B/R 按显卡调整，不要再加 `--no-cuda-graph`。
 
-### 3. KV 精度：`rk8v4` 与 `nvfp4`
+## 性能
 
-KVMem 下这两种 KV 精度都已支持，可任意搭配 DFlash2 / MTP 草稿：
+### 128K 代码（148,774 token，补函数，256 token 输出）
+
+| 后端 | prefill | decode | 接受率 | wall |
+|---|---:|---:|---:|---:|
+| **DFlash2 + q3km，draft 4** | 826.5 | **87.1 tok/s** | 82.1% | 350.7 s |
+| MTP + q3km，draft 3 | 826.5 | 72.2 tok/s | **86.9%** | 349.5 s |
+
+### 128K 总结（126,668 token）
+
+| 后端 | prefill | decode | 接受率 | wall |
+|---|---:|---:|---:|---:|
+| DFlash2 + q3km，draft 4 | 904.8 | 45.8 | 28.3% | 288.5 s |
+| **MTP + q3km，draft 3** | 904.8 | **47.7** | **40.8%** | 280.9 s |
+
+### 256K（253,031 token，两个启动器）
+
+| 启动器 | 草稿 | KV | prefill（第一遍） | decode | 接受率 | wall |
+|---|---|---|---:|---:|---:|---:|
+| dflash | draft 5 | nvfp4 | **872.5** | 34.8 | 20.2% | 584.0 s |
+| mtp | draft 3 adaptive | int8 | 803.3 | **47.5** | **40.7%** | 630.9 s |
+
+### 鹈鹕 HTML draft 扫描（72 token prompt，ngram 0）
+
+| draft | 3 | 4 | 5 | 6 | 7 |
+|---|---:|---:|---:|---:|---:|
+| decode | 68.8 | **71.4** | 70.6 | 67.8 | 64.0 |
+| 接受率 | **65.7%** | 54.9% | 48.4% | 42.4% | 38.1% |
+
+### 短 prompt / agent
+
+| 场景 | decode | 接受率 |
+|---|---:|---:|
+| WebUI 鹈鹕（2 工具，thinking 209） | **96.0 tok/s** | 76.7% |
+| harness（38 工具，thinking 4,826） | 68.2 tok/s | 51.9% |
+| agent 9.8K（ngram 0） | 87.8 tok/s | 70.8% |
+| agent 9.8K（ngram 31 仲裁） | 89.2 tok/s | 68.1% |
+
+### KV 精度
 
 | | `nvfp4` | `rk8v4` |
-|---|---|---|
-| 存储格式 | NVFP4 group16（4-bit + E4M3 块缩放） | 旋转 INT8 key + packed int4 value，group64 |
+|---|---:|---:|
 | 52,864 窗口 runtime | **1.62 GiB** | 1.99 GiB |
-| 启动 free（同配置） | **835.8 MiB** | 645.9 MiB |
-| decode（鹈鹕，draft 4） | **73.2 tok/s** | 68.6 tok/s |
-| 接受率（同任务） | **58.6%** | 51.3% |
+| 启动 free | **835.8 MiB** | 645.9 MiB |
+| 鹈鹕 decode（draft 4） | **73.2 tok/s** | 68.6 tok/s |
+| 接受率 | **58.6%** | 51.3% |
 
-- `nvfp4` 显存最省，是 16 GB 卡的默认推荐，今天所有测试都用它；
-- `rk8v4` 的 **key 保持 INT8**（只把 value 压到 4-bit），理论上长上下文检索更稳，
-  代价是多约 0.37 GiB 显存、decode 慢约 6%；
-- 两者都支持 KVMem 的 B/R 窗口和全部草稿后端，切换只需 `--kv-dtype nvfp4|rk8v4`；
-- 单个 72 token 提示词、thinking 开的鹈鹕测试；输出长度随采样变化，decode 是可比值，
-  接受率有约 ±3 个点的噪声。
+`nvfp4` 是 16 GB 卡默认；`rk8v4` 的 key 保持 INT8，理论长上下文检索更稳，代价是多约
+0.37 GiB、decode 慢约 6%。
 
-### 4. CUDA Graph 探针校准（+ 读数复测）
+### 召回
 
-旧代码按拓扑盲预留约 **1 GiB** 给 CUDA Graph，实际只占 **90–145 MiB**，导致 KV 少给、
-长上下文启动失败，只能 `--no-cuda-graph`。现在启动时用最小 KV 探针实测整套图，按
-`max(实测, 256 MiB)` 规划。
-
-WDDM 下探针读数会抖动（同一配置连续启动实测过 0.0 / 83.3 / 90.0 / 117.3 / 135.6 /
-288.6 MiB），288.6 那次会把规划值抬高到容量之外。现在首次读数高于 256 MiB 时会
-**复测一次取较小值**。
-
-效果：
-
-- **不需要再写 `--no-cuda-graph`**，开图即可；
-- 256K 窗口下 `nvfp4` / `q4km` / `q3km` 等草稿都能加载，不再启动即爆显存；
-- 开图 decode 比关图快约 6%，KV 容量比盲预留多约 700–800 MiB。
-
-### 5. KVMem 驱逐回到满窗口 100%（issue #6）
-
-80% 水位（`W - W/5`）在 `B > 4R` 时会让每个 256-token chunk 都空转重选一次。现在任何
-B/R 都只在窗口满 `W = B + R` 时重选：
-
-```cpp
-const bool reselecting =
-    force_selection || compact_position(sequence, end) > kvmem_window_tokens;
-```
-
-实测（B/R=4.15，61K prompt）：旧版 55 次 reselect / 82.2 s → 新版 **0 次 / 75.8 s**；
-253K NIAH 仍 3/3。代价是不再有“提前交换与 decode 重叠”。
-
-### 6. Jinja 模板 cache boundary
-
-`trim_blocks` / `lstrip_blocks` / `{%- -%}` 折叠源码后，落在折叠区的 cache marker 无法
-解析，prefix cache 命中下降。现在折叠边界跟随 `string_part` 传递，marker 偏移可唯一
-解析。
-
-详细数据：[docs/integration-20261025.md](docs/integration-20261025.md)、
-[docs/kvmem-reselect-high-water-20261019.md](docs/kvmem-reselect-high-water-20261019.md)、
-[docs/cuda-graph-calibration.md](docs/cuda-graph-calibration.md)。
-
-## 2026-10-23 更新：DFlash2 NVFP4 草稿支持
-
-ninfer 后端现在可以直接加载 **NVFP4 编码的 DFlash2 草稿**，`attention/output` 与
-`mlp/down` 以 NVFP4 权重跑在动态卷积的 finish 路径上。
-
-**DFlash2 草稿推荐地址**（ModelOpt NVFP4，原样导入、无损）：
-
-<https://huggingface.co/maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal/tree/main>
-
-### 引擎改动
-
-| commit | 内容 |
+| 测试 | 结果 |
 |---|---|
-| `f4d18713` | NVFP4 线性表注册 DFlash2 的五个几何（Feature/QKV/AttnOut/ConvProj/Selector），own 与 unified 两条调度同时生效 |
-| `18e3c7c8` | 动态卷积的 add 路径接受 NVFP4 父权重；补上 `dflash2_import_nvfp4.py` 与 `dflash2_nvfp4.py` 两个转换配方 |
+| 256K NIAH，33 针 | **33/33**（同轮 / 终轮严格 / 并集） |
+| 256K 跨工具 `send_alert` | **14/14** |
+| 256K 三针（5% / 50% / 95%） | **3/3** |
+| 128K NIAH（5% / 50% / 95%） | **3/3** |
+| LongMemEval 54 题 | **54/60**（ActKV） |
+| Agent 220K | **30/30** 逐轮工具召回 |
 
-约束（NVFP4 导入路径）：`kernel_projection` 仍必须是 BF16（prepare 路径没有 NVFP4
-内核），QKV 仍是 Q8（融合 attention 输入只对 `4096x5120` 放行 NVFP4，本模型是
-`6144x5120`）。如果走 **GGUF 直通**（`dflash2_gguf_blocks.py`），`attention/output`
-与 `mlp/down` 保持源块类型（Q2_K/Q3_K/Q4_K），草稿不再混用 Q8/NVFP4，详见
-[docs/dflash2-nvfp4-20261023.md](docs/dflash2-nvfp4-20261023.md) 的“直通草稿模式”。
+## 关键修补
 
-### 256K 实测（RTX 5060 Ti 16 GB，nvfp4 KV）
+完整原因、提交和验证数据见 [docs/CHANGELOG.md](docs/CHANGELOG.md)。
 
-条件：`--max-context 262144 --kvmem-budget 36864 --kvmem-gen-reserve 16384
---kv-dtype nvfp4`，prompt 257,089 token，输出 256，temperature 0。
-
-| 后端 | draft | CUDA graphs | decode | 接受率 | prefill |
-|---|---|---|---:|---:|---:|
-| dflash2 | 4 | 关（当时） | **55.1 tok/s** | 44.8% | 419 tok/s |
-| mtp | 3 | 开 | 50.2 tok/s | 48.7% | 432 tok/s |
-| mtp | 3 | 关 | 47.7 tok/s | 48.7% | 431 tok/s |
-
-DFlash2 权重比 MTP 多约 1.1 GiB。**2026-10-26 起不再需要 `--no-cuda-graph`**：探针校准
-后开图也不会 OOM，见本文开头的更新。接受率约 44.8%，参数层面已基本榨干。DFlash2 比 MTP
-开图快约 9.8%，比 MTP 关图快约 15.5%。
-
-推荐参数（旧配置，保留作历史；新配置见 2026-10-26 节）：
-
-```
---max-context 262144 --kvmem-budget 36864 --kvmem-gen-reserve 16384 \
---kv-dtype nvfp4 --spec dflash2 --draft-tokens 5 --full-draft-head
-```
-
-详细说明（转换用法、`.safetensors` 限制、参数规律）见
-[docs/dflash2-nvfp4-20261023.md](docs/dflash2-nvfp4-20261023.md)。
-可下载Releases内tool进行转换。
-
-## 2026-10-22 更新：sm70 / sm75 源码支持
-
-ninfer 后端新增 **sm75（RTX 20 系、TITAN RTX、T4）** 与 **sm70（Tesla V100）** 的构建支持。召回与驱逐保持 ActKV 不变。
-
-### 改动范围
-
-最小移植，不升级上游 210 个提交：
-
-| 项 | 内容 |
+| 类别 | 结论 |
 |---|---|
-| 新增文件 | 31 个（sm70 整套 GEMM、sm75 MMA、`pre_sm80.cuh` / `sm70_emulation.cuh` 兼容层） |
-| 接入修改 | 8 处（CMake 白名单、`mma.cuh`、`memory.cuh`、sources、`QType`、2 个 codec） |
-| GPU profile | 9 个（V100×2、TITAN RTX、2060S、2070、2070S、2080Ti、Quadro RTX 6000、T4） |
-| ActKV | **未改动**：LRFU 公式、mean-Q 打分、sink/recent 逻辑与 10-21 版一致 |
+| KVMem 驱逐 | 满窗口 100%；61K 从 55 次重选降到 **0 次**，wall 82.2 → 75.8 s |
+| KVMem 召回 | ActKV LRFU；LongMemEval 54/60 vs EMA 50/60 |
+| KVMem 传输 | 差异 restore；64K 163 ms → **33–51 ms** |
+| DFlash2 × KVMem | envelope/floor/slot 修复；越窗接受率 1.5% → **42%** |
+| DFlash2 bypass | 按期望收益判定；误关草稿 **0 次** |
+| ngram 仲裁 | copy 只在收益 > 1.3× 草稿时触发；鹈鹕 74.7 vs 72.1 tok/s |
+| CUDA Graph | 探针校准；省 **700–800 MiB**，开图 +6% |
+| NVFP4 | Blackwell 保留 scale `0x7F` → 0（仅编译验证） |
+| 模板缓存 | Jinja trim 后 cache boundary 不再丢失 |
+| 平台 | sm70/sm75 源码支持（未真机验证） |
 
-### 构建
+## 模型转换
 
-```bash
-# RTX 20 系（sm75，CUDA 13.x 支持 compute_75）
-cmake -S backends/ninfer -B build-sm75 -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=75
-cmake --build build-sm75 --target ninfer-serve
-
-# V100（sm70，必须 CUDA 12.x；CUDA 13 已移除 Volta）
-cmake -S backends/ninfer -B build-sm70 -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=70 \
-  -DCMAKE_CUDA_COMPILER="C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.4/bin/nvcc.exe"
-cmake --build build-sm70 --target ninfer-serve
-```
-
-启动参数与现有配置一致，不需要 `--kvmem-query-scorer`（本地版本默认即 mean-Q cosine）。
-
-### 验证
-
-| 项 | 结果 |
-|---|---|
-| sm120a 编译 | 0 错误 |
-| 64K | prefill 427.1 tok/s / decode 45.5 tok/s / 接受率 48.1% |
-| 256K NIAH | 33/33、14/14、80 工具调用 |
-| sm75 / sm70 运行 | **未验证**（本机只有 sm120a） |
-
-### 块大小不可调
-
-尝试把页大小从 64 改到 32，编译期被断言挡住：
-
-```cpp
-static_assert(kCausalPromptI8FastBc == kPagedKVPageSize);
-```
-
-页大小同时是 fast prompt 内核的 K 方向 tile，改它需要重写 MMA 迭代与共享内存预算。48 更不可行：页表索引是 `position >> 6`，要求 2 的幂。
-
-### 文档
-
-- [sm70/sm75 移植与块大小结论（2026-10-22）](docs/kvmem-sm75-sm70-port-20261022.md)
-- [子模块 patch 恢复说明](docs/patches/README.md)
-
-## 2026-10-21 更新：ActKV LRFU 与增量 restore，新版需自行git编译。
-
-### 打分与驱逐
-
-召回打分保持不变：64-token 块的 mean key 与 query 均值的余弦，prefill 结束后一次性计算。
-
-驱逐改用 ActKV Algorithm 1（[arXiv 2609.31395](https://arxiv.org/pdf/2609.31395)）：
-
-```
-hit : KS_t = λ·KS_{t-1} + score
-miss: KS_t = λ·KS_{t-1}
-```
-
-新块从 0 开始，首次命中时被当前分数点亮。与之前 EMA（`λ·KS + (1-λ)·score`）的差别在于：EMA 是加权平均，ActKV 是衰减累积和，后者让「偶尔命中但单次分高」的块活得更久。
-
-### 增量 restore
-
-`start_restore` 不再 `truncate(0)` 后全量重映射：
-
-- 选中页按 id 稳定排序，同一逻辑页在重选后保持物理槽位；
-- 只对变化的槽位做 H2D，也只读变化的 host 记录；
-- 变化超过一半时自动回退全量，避免差异比全量还贵。
-
-| 64K 场景 | 全量 | 增量 |
-|---|---:|---:|
-| restore 页数 | 576 | **124–181** |
-| read | 69 ms | **14–21 ms** |
-| sync | 94 ms | **20–29 ms** |
-| 总耗时 | 163 ms | **33–51 ms** |
-
-256K 时 `changed` 中位数 495/576，自动回退全量，行为与之前一致。
-
-### 256K 召回（NIAH 33 针）
-
-| 指标 | 结果 |
-|---|---:|
-| 同轮 / 终轮严格 / 并集 | 33/33 |
-| 跨工具（send_alert） | 14/14 |
-| 工具调用 | 80 |
-| 端到端（到 final sweep） | 595.8 s |
-
-### LongMemEval 上下文扫描
-
-同一组实例（idx 0,1,2）、20 题、`What exactly did the user say` probe，对比 ActKV 与 EMA：
-
-| 上下文 | ActKV | EMA |
-|---|---:|---:|
-| 128K | **20/20** | 19/20 |
-| 192K | **18/20** | 16/20 |
-| 240K | **16/20** | 15/20 |
-| 合计 | **54/60** | 50/60 |
-
-- **最佳工作区间：128K–192K**；
-- 192K 开始掉分（ActKV 100% → 90%），240K 明显劣化（80%）；
-- 240K 的 4 道失败里 3 道是模型拒答，不是 KV 淘汰。
-
-### 旧更新日志
-
-- 2026-10-18 DFlash2 × KVMem 修复：[docs/dflash2-kvmem-fixes-20261018.md](docs/dflash2-kvmem-fixes-20261018.md)
-- 2026-10-19 召回传输优化（DMA 4.0 → 14.1 GB/s）：[docs/kvmem-recall-opt-20261019.md](docs/kvmem-recall-opt-20261019.md)
-- 2026-10-19 重选水位提前到 80%：[docs/kvmem-reselect-high-water-20261019.md](docs/kvmem-reselect-high-water-20261019.md)
-
-## GGUF → .ninfer 模型转换
-
-转换工具可在Releases中下载（Python 3.11 + PyTorch/NumPy）。
-`qwen3_8_27b_gguf` 配方把 Qwen3.8-27B GGUF **按自身块格式直接转换**（不做反量化），
-可选加入 MTP 头、DFlash2 草稿与视觉投影器。在 `backends/ninfer` 目录下运行：
+转换工具从 Releases 下载（Python 3.11 + PyTorch/NumPy）。在 `backends/ninfer` 下运行：
 
 ```bash
 python3 -m tools.convert \
   --model /path/to/conversion-input/metadata \
   --recipe qwen3_8_27b_gguf \
   --source gguf=Qwen3.8-27B-GSQ-RCO-IQ3_XXS-Uncensored-MTP.gguf \
-  --source dflash2=Qwen3.8-27B-DFlash2-Q4_K_M.gguf \
+  --source dflash2=Qwen3.8-27B-DFlash2-Q3_K_M.gguf \
   --source vision=mmproj-Qwen3.8-27B-Q8_0.gguf \
   --components text,vision,mtp,dflash2 \
-  --name qwen3.8-27b \
+  --name qwen3.8-27b-q3km \
   --out model.ninfer
 ```
 
-- `--model` 只需要基础检查点的配置与分词器（准备转换输入时生成的 `metadata` 目录）。
-- `dflash2` 源支持三种 safetensors 布局和 GGUF：ModelOpt NVFP4（推荐，原样导入）、
-  BF16（重新量化）、per-row FP8（重新量化）。
-- 不需要的组件可省略（例如纯文本去掉 `vision`）；`mtp` 组件要求 `-mtp` GGUF
-  （`blk.64.nextn.*`）。
-- CPU 转换追加 `--device cpu`。
-
-### DFlash2 NVFP4 草稿
-
-推荐使用 ModelOpt NVFP4 目录，并加 `--override` 走无损导入：
-
-```bash
-python3 -m tools.convert \
-  --model /path/to/conversion-input/metadata \
-  --recipe qwen3_8_27b_gguf \
-  --source gguf=Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf \
-  --source dflash2=/path/to/Qwen3.8-27B-DFlash2-NVFP4-RTNcal \
-  --override tools/convert/recipes/dflash2_import_nvfp4.py \
-  --components text,mtp,dflash2 \
-  --device cpu \
-  --name qwen3.8-27b-dflash2-nvfp4 \
-  --out model.ninfer
-```
-
-| 源格式 | 特征 | 处理 |
-|---|---|---|
-| ModelOpt NVFP4 | `quant_algo=NVFP4`；`weight`(U8) + `weight_scale`(E4M3) + `weight_scale_2`(F32) | 原样导入 |
-| BF16 | 普通 BF16 权重 | 重新量化为 NVFP4 |
-| per-row FP8 | `quant_method=fp8`，每行一个 `weight_scale` | 重新量化为 NVFP4 |
-| **128×128 block FP8** | `weight_block_size=[128,128]`，scale 名 `weight_scale_inv` | **不支持**，报 `missing ... weight_scale`，需先反量化成 BF16 |
-| **GGUF NVFP4** | ggml type 40（64 元素/36 字节 super-block） | **不支持直通导入** |
-
-> 推荐草稿地址：<https://huggingface.co/maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal/tree/main>
->
-> 详细说明见 [docs/dflash2-nvfp4-20261023.md](docs/dflash2-nvfp4-20261023.md)。
+- `dflash2` 源支持 GGUF、ModelOpt NVFP4、BF16、per-row FP8；
+- 直通草稿用 `dflash2_gguf_blocks.py`（默认配方）；
+- NVFP4 草稿走 `--override tools/convert/recipes/dflash2_import_nvfp4.py`，
+  详见 [docs/dflash2-nvfp4-20261023.md](docs/dflash2-nvfp4-20261023.md)；
+- `kernel_projection` 与 conv 必须保持 BF16（prepare 路径没有量化内核）。
 
 ## 快速开始
 
-1. 下载 `.ninfer` 模型（或按上文自行转换）。
+1. 下载 `.ninfer` 工件，或按上文自行转换。
 2. 双击 `workers/ninfer/start-kvmem-ninfer-dflash.bat`（DFlash2）或
-   `start-kvmem-ninfer.bat`（MTP）。
-   - 模型路径、启动目录与参数都在 bat 文件里，直接编辑即可。
-   - 显存 16 GiB 推荐：`--max-context 262144 --kvmem-budget 36864
-     --kvmem-gen-reserve 16384 --kvmem-host-mib 12288`。
+   `start-kvmem-ninfer.bat`（MTP）。模型路径和参数都在 bat 里。
 3. 服务地址 `http://127.0.0.1:18200`，OpenAI 兼容 API。
-
 
 ## 文档
 
-- [DFlash2 NVFP4 草稿支持（2026-10-23）](docs/dflash2-nvfp4-20261023.md)
-- [DFlash2 × KVMem 修复记录（2026-10-18）](docs/dflash2-kvmem-fixes-20261018.md)
-- [召回传输优化：带宽基准、256K A/B 与逐次对比（2026-10-19）](docs/kvmem-recall-opt-20261019.md)
-- [后端能力与启动说明](docs/multi-backend.md)
-- [仓库结构与构建](docs/multi-backend-repository.md)
-- [后端差异](docs/multi-backend-differences.md)
-- [sm70/sm75 移植与块大小结论（2026-10-22）](docs/kvmem-sm75-sm70-port-20261022.md)
-- [子模块 patch 恢复说明](docs/patches/README.md)
-
+| 文档 | 内容 |
+|---|---|
+| [docs/CHANGELOG.md](docs/CHANGELOG.md) | **所有修补、测速、召回总览** |
+| [docs/dflash2-passthrough-20261026.md](docs/dflash2-passthrough-20261026.md) | q3km 直通、draft 扫描、bypass/floor 细节 |
+| [docs/dflash2-kvmem-fixes-20261018.md](docs/dflash2-kvmem-fixes-20261018.md) | DFlash2 × KVMem 首次修复 |
+| [docs/kvmem-reselect-high-water-20261019.md](docs/kvmem-reselect-high-water-20261019.md) | 驱逐水位与 issue #6 |
+| [docs/kvmem-actkv-lrfu-20261020.md](docs/kvmem-actkv-lrfu-20261020.md) | ActKV LRFU 与 LongMemEval |
+| [docs/cuda-graph-calibration.md](docs/cuda-graph-calibration.md) | Graph 探针与启动数据 |
+| [docs/multi-backend.md](docs/multi-backend.md) | 后端能力与启动说明 |
+| [docs/multi-backend-repository.md](docs/multi-backend-repository.md) | 仓库结构与构建 |
