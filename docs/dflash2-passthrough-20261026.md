@@ -234,3 +234,33 @@ workers\ninfer\start-kvmem-ninfer.bat
   输入只对 `4096x5120` 放行 NVFP4，本模型是 `6144x5120`）；
 - 换 q4km 工件时同样适用：`attention/output`、`mlp/down` 会是 `gguf_q4_k`，
   `feature_projection` / selector 随源工件而定。
+
+### 6.3 draft_bypass 的触发条件（2026-10-26 修复）
+
+原逻辑：连续 6 轮 `accepted == 0` 就关掉草稿（切到 width=2 的无草稿路径），每 64 轮才探测一次。
+
+问题在于判定用“连续零接受”，而不是期望收益。d4 下每轮期望是
+`1 + p1 + p1·p2 + …`；即使 `p1 = 0.4` 也有约 **1.4 token/轮**，草稿仍是赚的，
+但 6 连零在 `p1 = 0.4` 时每轮约 4.7%，几十轮必然触发。结果是：
+
+- 思考阶段被误关草稿，decode 掉到普通解码的 ~40 tok/s；
+- 回答开始后还要等最多 64 轮才恢复，短回答可能整段用不上 DFlash2。
+
+修复（`decode.cpp`）：
+
+- 用 `MtpAdaptiveSignal` 的按位置 EMA 算 `expected_tokens`；
+- 只有 `expected < 1.15`（宽验证 + 草稿自身开销的盈亏线）连续 6 轮才 bypass；
+- 探测间隔 64 → **16 轮**，探针一旦回本立即恢复；
+- 日志改为打印 `expected=`，区分“真没用”和“被误关”。
+
+实测（鹈鹕 SVF、draft 4、ngram 0、nvfp4）：
+
+| | 修复前 | 修复后 |
+|---|---:|---:|
+| `DFLASH_BYPASS` 事件 | 1–3 | **0** |
+| decode | 73.2 tok/s | 73.1 tok/s |
+| 接受率 | 58.6% | 55.3%¹ |
+
+¹ 两次输出长度不同（19,723 vs 14,357 token），接受率有采样噪声。
+
+代码任务（148,774 token prompt）：接受率 82.1% 不变，bypass 0，无回归。

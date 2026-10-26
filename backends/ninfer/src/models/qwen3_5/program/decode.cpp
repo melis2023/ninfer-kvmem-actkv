@@ -96,16 +96,20 @@ namespace ninfer::models::qwen3_5::detail {
 
 namespace {
 
-// DFlash/DFlash2 auto-bypass: a streak of neural rounds that accepted nothing switches the
-// request to the ordinary decode path, which is cheaper than paying the full drafter plus a
-// widened verification for a single committed token. Six empty rounds cost well under a second
-// at decode latencies while keeping the drafter for requests where it earns its keep.
+// DFlash/DFlash2 auto-bypass: a request whose neural drafter cannot repay its own cost switches
+// to the ordinary decode path. The decision weighs expected committed tokens per round
+// (1 + p1 + p1*p2 + ...) against a break-even estimate, not a run of empty rounds: a width-k round
+// that commits only the anchor still beats the draftless path while the survival tail is alive,
+// and six empty rounds happen regularly on low-entropy text even at a healthy p1.
 constexpr std::uint8_t kDraftBypassStrikeLimit = 6;
+// Rough break-even against one draftless round: verification grows ~1.1x with the draft window and
+// the drafter itself costs a few percent, so drafting must add more than this to stay on.
+constexpr float kDraftBypassExpectedTokens = 1.15F;
 // A bypassed request runs draftless rounds (k = 1, verify width 2: the anchor alone is verified
 // and the drafter is skipped entirely). The content that made the drafter hopeless can give way to
 // something predictable later in the same request, so every this many draftless rounds the drafter
-// is given one more chance.
-constexpr std::uint8_t kDraftBypassProbeRounds = 64;
+// is given one more chance. Sixteen rounds keeps the recovery gap under a second of decode.
+constexpr std::uint8_t kDraftBypassProbeRounds = 16;
 
 DecodeGraphProfile& select_graph_profile(DecodeGraphFamily& family, std::uint32_t batch_size,
                                          std::uint32_t frontier, const char* label,
@@ -1168,22 +1172,33 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             } else if (!matches[row].tokens.empty()) {
                 record_ngram_round(request, matches[row], extent,
                                    static_cast<std::uint32_t>(accepted_i));
-            } else if (accepted_i == 0) {
-                // An empty neural round paid the drafter and a widened verification for one
-                // committed token. After a short streak the request moves to the ordinary
-                // decode path (decode_raw routes it there), which ngram copy rounds can no
-                // longer accelerate but which stops subsidizing the drafter.
-                if (request.draft_bypass_strikes != UINT8_MAX) { ++request.draft_bypass_strikes; }
-                if (request.draft_bypass_strikes >= kDraftBypassStrikeLimit &&
-                    !request.draft_bypass) {
-                    request.draft_bypass = true;
-                    std::fprintf(stderr,
-                                 "KVMEM_DFLASH_BYPASS lane=%u accepted=0/%u "
-                                 "consecutive_empty_neural_rounds=%u\n",
-                                 lanes[row], extent, request.draft_bypass_strikes);
-                }
             } else {
-                request.draft_bypass_strikes = 0;
+                // Neural round. Judge the drafter by its expected committed tokens, not by a run of
+                // empty rounds: with a live survival tail even a width-k round that commits only
+                // the anchor beats the draftless path. The per-position estimate is the one
+                // adaptive MTP uses.
+                request.mtp_signal.observe(extent, static_cast<std::uint32_t>(accepted_i));
+                const float expected =
+                    request.mtp_signal.expected_tokens(draft_window, draft_window);
+                if (expected < kDraftBypassExpectedTokens) {
+                    if (request.draft_bypass_strikes != UINT8_MAX) {
+                        ++request.draft_bypass_strikes;
+                    }
+                    if (request.draft_bypass_strikes >= kDraftBypassStrikeLimit &&
+                        !request.draft_bypass) {
+                        request.draft_bypass = true;
+                        std::fprintf(stderr,
+                                     "KVMEM_DFLASH_BYPASS lane=%u accepted=%d/%u expected=%.3f "
+                                     "neural_rounds_below_break_even=%u\n",
+                                     lanes[row], accepted_i, extent,
+                                     static_cast<double>(expected),
+                                     request.draft_bypass_strikes);
+                    }
+                } else {
+                    request.draft_bypass_strikes = 0;
+                    // A probe that clears the bar brings the drafter back immediately.
+                    request.draft_bypass = false;
+                }
             }
             sequence.dflash_context_frontier = base_E;
             request.pending                  = PendingCandidate{
