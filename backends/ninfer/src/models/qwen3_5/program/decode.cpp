@@ -206,6 +206,7 @@ void ProgramImpl::install_sampling(SequenceState& sequence, RequestControl& requ
             std::vector<std::uint64_t>(mtp_controller.has_value() ? draft_window : 0U, 0),
     };
     request.mtp_signal.reset();
+    request.ngram_signal.reset();
     const bool penalties = request.sampling_host.presence_penalty != 0.0F ||
                            request.sampling_host.frequency_penalty != 0.0F;
     if (penalties) { CUDA_CHECK(cudaMemsetAsync(counts.data, 0, counts.bytes(), device.stream)); }
@@ -355,6 +356,7 @@ NgramProposer::Match ProgramImpl::propose_ngram_one(std::uint32_t lane,
 
 void ProgramImpl::record_ngram_round(RequestControl& request, const NgramProposer::Match& match,
                                      std::uint32_t drafted, std::uint32_t accepted) noexcept {
+    request.ngram_signal.observe(drafted, accepted);
     request.speculative_stats.ngram_rounds += 1;
     request.speculative_stats.ngram_drafted_tokens += drafted;
     request.speculative_stats.ngram_accepted_tokens += accepted;
@@ -677,8 +679,18 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
     // A copy proposal for any row makes this a copy round, verified at the ngram window; rows
     // without one verify their neural drafts inside it. Otherwise a fixed policy verifies the
     // whole draft window, and adaptive MTP the width its controller selects, never below the
-    // narrowest width it captured.
-    const std::vector<NgramProposer::Match> matches = propose_ngram(lanes, budgets);
+    // narrowest width it captured. A match only wins the round while its measured yield beats
+    // that row's neural expected tokens; a rejected match falls back to the drafter.
+    std::vector<NgramProposer::Match> matches = propose_ngram(lanes, budgets);
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        RequestControl& request = requests[lanes[row]];
+        const auto length       = static_cast<std::uint32_t>(matches[row].tokens.size());
+        if (length == 0) { continue; }
+        if (!request.ngram_signal.should_copy(
+                length, request.mtp_signal.expected_tokens(draft_window, available[row]))) {
+            matches[row].tokens.clear();
+        }
+    }
     const bool copy_round =
         std::any_of(matches.begin(), matches.end(),
                     [](const NgramProposer::Match& match) { return !match.tokens.empty(); });
@@ -899,8 +911,21 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
     // A copy proposal for any row makes this a copy round at the ngram window, on the frame
     // viewed at that width. At batch>1 the drafter also runs and the copy payload overlays it on
     // the device, so a row without a copy keeps its neural proposal; at batch one the copy alone
-    // is verified.
-    const std::vector<NgramProposer::Match> matches = propose_ngram(lanes, budgets);
+    // is verified. A match only wins the round while its measured yield beats the row's neural
+    // expected tokens (1.0 when the drafter is bypassed); a rejected match falls back to the
+    // drafter, or to the draftless path when every row is bypassed.
+    std::vector<NgramProposer::Match> matches = propose_ngram(lanes, budgets);
+    for (std::size_t row = 0; row < lanes.size(); ++row) {
+        RequestControl& request = requests[lanes[row]];
+        const auto length       = static_cast<std::uint32_t>(matches[row].tokens.size());
+        if (length == 0) { continue; }
+        const float neural = request.draft_bypass
+                                 ? 1.0F
+                                 : request.mtp_signal.expected_tokens(draft_window, draft_window);
+        if (!request.ngram_signal.should_copy(length, neural)) {
+            matches[row].tokens.clear();
+        }
+    }
     const bool copy_round =
         std::any_of(matches.begin(), matches.end(),
                     [](const NgramProposer::Match& match) { return !match.tokens.empty(); });

@@ -682,6 +682,10 @@ struct RequestControl {
     bool draft_bypass                = false;
     // Adaptive MTP: how far this request's drafts survive.
     MtpAdaptiveSignal mtp_signal;
+    // Copy rounds compete with the neural drafter for the next round. The signal keeps the
+    // measured committed tokens per drafted token so a short or stale match cannot outrank a
+    // drafter that still repays its cost.
+    NgramCopySignal ngram_signal;
     detail::PhysicalResources active_resources;
     detail::PhysicalResources optional_resources;
     bool publish_continuation = true;

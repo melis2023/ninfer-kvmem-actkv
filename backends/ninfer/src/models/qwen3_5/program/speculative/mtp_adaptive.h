@@ -98,6 +98,67 @@ private:
     std::array<std::uint8_t, kAdaptiveMtpMaximumDrafts> success_streak_{};
 };
 
+// A copy (n-gram) round commits the leading run of a matched continuation that survives
+// verification, so its yield is prefix-shaped and varies with the match length. The engine tracks
+// the committed tokens per drafted token and only spends the wider n-gram verification when the
+// measured yield still beats the neural drafter's expected tokens. A rejected match is retried
+// after a bounded run, so predictable content later in the request is not starved.
+class NgramCopySignal final {
+public:
+    void reset() noexcept { *this = NgramCopySignal{}; }
+
+    void observe(std::uint32_t drafted, std::uint32_t accepted) noexcept {
+        if (drafted == 0) { return; }
+        const float sample_drafted  = static_cast<float>(drafted);
+        const float sample_accepted = static_cast<float>(std::min(accepted, drafted));
+        if (observations_ == 0) {
+            drafted_  = sample_drafted;
+            accepted_ = sample_accepted;
+        } else {
+            drafted_  += kAlpha * (sample_drafted - drafted_);
+            accepted_ += kAlpha * (sample_accepted - accepted_);
+        }
+        if (observations_ != UINT16_MAX) { ++observations_; }
+        skipped_ = 0;
+    }
+
+    // `length` is the matched continuation the round would verify. `neural_expected` is the
+    // committed tokens of one neural round at its own width (1.0 when the drafter is bypassed).
+    [[nodiscard]] bool should_copy(std::uint32_t length, float neural_expected) noexcept {
+        if (length == 0) { return false; }
+        if (observations_ < kColdStartRounds) {
+            skipped_ = 0;
+            return true;
+        }
+        if (skipped_ >= kProbeRounds || expected(length) > neural_expected * kAdvantage) {
+            skipped_ = 0;
+            return true;
+        }
+        if (skipped_ != UINT8_MAX) { ++skipped_; }
+        return false;
+    }
+
+    [[nodiscard]] float expected(std::uint32_t length) const noexcept {
+        if (length == 0 || drafted_ <= 0.0F) { return 0.0F; }
+        const float rate = std::clamp(accepted_ / drafted_, 0.0F, 1.0F);
+        return static_cast<float>(length) * rate;
+    }
+
+private:
+    static constexpr float kAlpha                   = 0.25F;
+    // The n-gram round verifies at its full window (32 columns) and skips the drafter, while a
+    // neural round verifies 5 columns and pays the drafter. Copy must add this much more than one
+    // neural round to win on wall time, not just on token count.
+    static constexpr float kAdvantage               = 1.3F;
+    static constexpr std::uint16_t kColdStartRounds = 2;
+    static constexpr std::uint8_t kProbeRounds      = 8;
+
+    float drafted_              = 0.0F;
+    float accepted_             = 0.0F;
+    std::uint16_t observations_ = 0;
+    std::uint8_t skipped_       = 0;
+};
+
 // Round cost by batch size and verification width, in seconds once measured. A width without
 // enough rounds is priced from the relative shape below, scaled by the most-run width of its batch
 // size; with nothing measured every width is priced in the shape's own units.
