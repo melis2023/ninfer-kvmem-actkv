@@ -9,23 +9,34 @@
 
 本项目仅供研究学习，稳定使用可前往kvmem原作者。
 
-## 2026-10-26 更新：不再需要 `--no-cuda-graph`，推荐草稿换成 q3km
+## 2026-10-26 更新：q3km 直通草稿、DFlash2 代码加速、不再需要 `--no-cuda-graph`
 
-### 1. CUDA Graph 探针校准（+ 读数复测）
+### 结论速览
 
-旧代码按拓扑盲预留约 **1 GiB** 给 CUDA Graph，实际只占 **90–145 MiB**，导致 KV 少给、
-长上下文启动失败，只能 `--no-cuda-graph`。现在启动时用最小 KV 探针实测整套图，按
-`max(实测, 256 MiB)` 规划。
+| 项 | 结论 |
+|---|---|
+| 推荐草稿 | **q3km**（直通 GGUF 块，统一量化精度） |
+| 代码任务 | **DFlash2 比 MTP 快 20%+**（decode 87 vs 72 tok/s） |
+| WebUI 鹈鹕骑车 | **DFlash2 ≈ 90 tok/s，MTP ≈ 60 tok/s** |
+| CUDA Graph | **不需要 `--no-cuda-graph`** |
+| KVMem 驱逐 | 满窗口 100%（issue #6） |
+| draft 长度 | **4** 最佳（3–7 扫描峰值） |
 
-WDDM 下探针读数会抖动（同一配置连续启动实测过 0.0 / 83.3 / 90.0 / 117.3 / 135.6 /
-288.6 MiB），288.6 那次会把规划值抬高到容量之外。现在首次读数高于 256 MiB 时会
-**复测一次取较小值**。
+### 1. DFlash2 在代码任务上快于 MTP
 
-效果：
+128K 代码 prompt（148,774 token 的 Python 模块补函数）、同目标模型 q3km、ngram 0、
+`--kv-dtype nvfp4`、B/R=36,480/16,384：
 
-- **不需要再写 `--no-cuda-graph`**，开图即可；
-- 256K 窗口下 `nvfp4` / `q4km` / `q3km` 等草稿都能加载，不再出现启动即爆显存；
-- 开图 decode 比关图快约 6%，且 KV 容量比盲预留多约 700–800 MiB。
+| 后端 | 第一遍 prefill | decode | 接受率 | wall |
+|---|---:|---:|---:|---:|
+| **dflash2 + q3km，draft 4** | 826.5 tok/s（180 s） | **87.1 tok/s** | 82.1%（92/112） | 350.7 s |
+| MTP + q3km，draft 3 | 826.5 tok/s（180 s） | 72.2 tok/s | **86.9%**（86/99） | 349.5 s |
+
+- prefill 完全相同（由目标模型决定），差距全在 decode：**DFlash2 快 20.6%**；
+- MTP 接受率高 4.8 个点，但每轮草稿数少，decode 仍落后；
+- **WebUI 同一鹈鹕骑车提示词：DFlash2 ≈ 90 tok/s，MTP ≈ 60 tok/s**（思考开）；
+- 总结类任务相反（DFlash2 28.3% / 43.8 vs MTP 40.8% / 47.7），所以
+  “**代码用 DFlash2、开放式生成用 MTP**”是最稳的组合。
 
 ### 2. 推荐草稿：q3km（直通草稿，统一量化精度）
 
@@ -38,76 +49,64 @@ Q8/NVFP4。q3km 工件里的 DFlash2 草稿实际精度：
 | `feature_projection`、`candidate_selector/hidden_projection` | `Q3_K` |
 | conv `kernel_projection` / `base_kernel`、norm、codebook | BF16（prepare 路径没有量化内核） |
 
-**为什么这样做：降低显存占用。** 直通保留源块字节，不再为第二种精度另存一份；草稿按
-Q3/Q4 块存储后，256K 窗口下省出来的显存留给 KV 和 CUDA Graph，开图也不需要
-`--no-cuda-graph`。两个启动器启动后的 free 分别是 **863.8 MiB**（DFlash2 + nvfp4 KV）
-和 **1,001.8 MiB**（MTP + int8 KV）。
+**为什么这样做：降低显存占用。** 直通保留源块字节，不再为第二种精度另存一份；省出来的
+显存留给 KV 和 CUDA Graph，开图也不需要 `--no-cuda-graph`。启动 free：
+DFlash2 + nvfp4 KV **863.8 MiB**，MTP + int8 KV **1,001.8 MiB**。
 
-同模型不同量化的历史对照（B/R=77,824、nvfp4 KV、253K prompt，prefill 为两遍口径）：
-
-| 草稿 | prefill | decode | wall |
-|---|---:|---:|---:|
-| q3blocks | 404 tok/s | 46.6 tok/s | 627 s |
-| nvfp4full | 334 tok/s | 46.4 tok/s | 759 s |
-
-q3blocks 比 nvfp4full prefill 快约 21%；q3km 与 q3blocks 同属 Q3 家族，作为默认推荐。
-
-#### 128K 严谨对比（同条件、无 ngram）
-
-126,668 token prompt，同一目标模型 q3km，`--kv-dtype nvfp4`，B/R=36,480/16,384，
-`--ngram-draft-tokens 0`，只换草稿：
+128K 同条件对照（除注明外 draft 5）：
 
 | 草稿 | 第一遍 prefill | decode | 接受率 | wall |
 |---|---:|---:|---:|---:|
-| dflash2 + **q3km**（draft 5） | 904.8 tok/s（140 s） | 42.8 tok/s | 23.4%（137/585） | 282.8 s |
-| dflash2 + **q4km**（draft 5） | 904.8 tok/s（140 s） | 43.6 tok/s | 24.2%（139/575） | 282.4 s |
-| dflash2 + q3km（**draft 4**） | 904.8 tok/s（140 s） | 45.8 tok/s | 28.3%（135/477） | 288.5 s |
-| dflash2 + q3km（**draft 3**） | 904.8 tok/s（140 s） | 46.1 tok/s | 34.9%（130/373） | 288.4 s |
-| dflash2 + **混合 NVFP4 草稿**（draft 5） | 844.5 tok/s（150 s） | 40.7 tok/s | 23.8% | 296.7 s |
-| **MTP + q3km**（draft 3） | 904.8 tok/s（140 s） | **47.7 tok/s** | **40.8%**（140/343） | 280.9 s |
+| dflash2 + q3km | 904.8 tok/s | 42.8 | 23.4% | 282.8 s |
+| dflash2 + q4km | 904.8 tok/s | 43.6 | 24.2% | 282.4 s |
+| dflash2 + q3km（draft 4） | 904.8 tok/s | 45.8 | 28.3% | 288.5 s |
+| dflash2 + q3km（draft 3） | 904.8 tok/s | 46.1 | 34.9% | 288.4 s |
+| dflash2 + 混合 NVFP4 草稿 | 844.5 tok/s | 40.7 | 23.8% | 296.7 s |
+| MTP + q3km（draft 3） | 904.8 tok/s | 47.7 | 40.8% | 280.9 s |
 
-dflash2在代码上效果要好于mtp，目前仍有少许bug，等待后续修复。
+- q3 与 q4 草稿在噪声内（decode ±1.9%），q4 多占约 0.18 GB → **推荐 q3km**；
+- 混合 NVFP4 草稿比直通慢（prefill −6.7%、decode −4.9%），接受率相同；
+- 历史对照（B/R=77,824、253K prompt、两遍口径）：q3blocks 404 tok/s / nvfp4full 334 tok/s。
 
-**接受率怎么提**：
+`--draft-tokens` 扫描（鹈鹕 SVG、ngram 0、nvfp4）：
 
-| 场景 | 配置 |
-|---|---|
-| 开放式生成 / 总结 | dflash2 + **draft 3**（或直接用 MTP） |
-| 复制 / 抽取 / 代码修改 | dflash2 + draft 5 + `--ngram-draft-tokens 31` |
-| 追求 decode 速度 | MTP draft 3 + `--adaptive-mtp` |
+| draft | 3 | 4 | 5 | 6 | 7 |
+|---|---:|---:|---:|---:|---:|
+| decode | 68.8 | **71.4** | 70.6 | 67.8 | 64.0 |
+| 接受率 | 65.7% | 54.9% | 48.4% | 42.4% | 38.1% |
 
-Draft 精度不是瓶颈（Q4_K 23.4% vs NVFP4 23.8%）；Q8 草稿（2.05 GB）会让权重涨到
-13.0 GiB，B/R=36,480 启动差 184 MiB，只能配更小窗口。DFlash2 目前是固定 draft 长度，
-没有 MTP 的 `--adaptive-mtp`；按上面的曲线，做自适应宽度预计能到 40% 附近。
+→ 通用 **draft 4**；要最高接受率/更短草稿环用 draft 3。
 
-#### 代码任务：接受率明显更高（128K 代码 prompt）
-
-同一套 148,774 token 的 Python 模块补函数任务（`max_tokens 256`、greedy、ngram 0）：
-
-| 后端 | 接受率 | decode | wall |
-|---|---:|---:|---:|
-| dflash2 + q3km，draft 4 | **82.1%**（92/112） | **86.3–87.1 tok/s** | 350.7 s |
-| MTP + q3km，draft 3 | 86.9%（86/99） | 72.2–76.7 tok/s | 349.5–368.3 s |
-
-两组第一遍 prefill 都是 **826.5 tok/s（180 s）**，完全相同；DFlash2 decode 快约 20%，
-接受率低 4.8 个点。
-
-同样是 draft 4/总结任务只有 28.3%：**接受率主要由任务可预测性决定**，不是 KVMem 的
-bug。排查中确实发现一处 floor 不一致（restore / checkpoint recovery 只用 recent 页，
-没有算 DFlash2 的 2048 滑动窗口），已统一成 `max(recent, ring)`，但实测前后都是
-135/477，说明它在本流程里没有生效，属于防御性修正。
-
-启动参数：
+推荐参数（16 GB，日常）：
 
 ```bat
---max-context 262144 --prefill-chunk 256 --full-draft-head ^
---kvmem-budget 55296 --kvmem-gen-reserve 13312 --kvmem-host-mib 12288 --kvmem-lrfu ^
---kv-dtype nvfp4 --spec dflash2 --draft-tokens 5 --ngram-draft-tokens 31
+--max-context 262144 --prefill-chunk 256 ^
+--kvmem-budget 36480 --kvmem-gen-reserve 16384 --kvmem-host-mib 12288 --kvmem-lrfu ^
+--kv-dtype nvfp4 --spec dflash2 --draft-tokens 4 --ngram-draft-tokens 0 ^
+--vision --vision-residency cpu --vision-max-merged 256 ^
+--default-reasoning-effort medium --default-thinking-budget 16384
 ```
 
-（`--kvmem-budget`/`--kvmem-gen-reserve` 按显卡调整；B/R 不再要求小于 4。）
+（`--kvmem-budget`/`--kvmem-gen-reserve` 按显卡调整；B/R 不再要求小于 4；不要加
+`--no-cuda-graph`。）
 
-### 3. KVMem 驱逐回到满窗口 100%（issue #6）
+### 3. CUDA Graph 探针校准（+ 读数复测）
+
+旧代码按拓扑盲预留约 **1 GiB** 给 CUDA Graph，实际只占 **90–145 MiB**，导致 KV 少给、
+长上下文启动失败，只能 `--no-cuda-graph`。现在启动时用最小 KV 探针实测整套图，按
+`max(实测, 256 MiB)` 规划。
+
+WDDM 下探针读数会抖动（同一配置连续启动实测过 0.0 / 83.3 / 90.0 / 117.3 / 135.6 /
+288.6 MiB），288.6 那次会把规划值抬高到容量之外。现在首次读数高于 256 MiB 时会
+**复测一次取较小值**。
+
+效果：
+
+- **不需要再写 `--no-cuda-graph`**，开图即可；
+- 256K 窗口下 `nvfp4` / `q4km` / `q3km` 等草稿都能加载，不再启动即爆显存；
+- 开图 decode 比关图快约 6%，KV 容量比盲预留多约 700–800 MiB。
+
+### 4. KVMem 驱逐回到满窗口 100%（issue #6）
 
 80% 水位（`W - W/5`）在 `B > 4R` 时会让每个 256-token chunk 都空转重选一次。现在任何
 B/R 都只在窗口满 `W = B + R` 时重选：
@@ -120,7 +119,7 @@ const bool reselecting =
 实测（B/R=4.15，61K prompt）：旧版 55 次 reselect / 82.2 s → 新版 **0 次 / 75.8 s**；
 253K NIAH 仍 3/3。代价是不再有“提前交换与 decode 重叠”。
 
-### 4. Jinja 模板 cache boundary
+### 5. Jinja 模板 cache boundary
 
 `trim_blocks` / `lstrip_blocks` / `{%- -%}` 折叠源码后，落在折叠区的 cache marker 无法
 解析，prefix cache 命中下降。现在折叠边界跟随 `string_part` 传递，marker 偏移可唯一
