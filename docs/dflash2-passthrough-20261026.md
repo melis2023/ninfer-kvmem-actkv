@@ -250,7 +250,7 @@ workers\ninfer\start-kvmem-ninfer.bat
 
 - 用 `MtpAdaptiveSignal` 的按位置 EMA 算 `expected_tokens`；
 - 只有 `expected < 1.15`（宽验证 + 草稿自身开销的盈亏线）连续 6 轮才 bypass；
-- 探测间隔 64 → **16 轮**，探针一旦回本立即恢复；
+- 探测间隔 64 → **约 10 轮**（strike 从 6 涨到 16），探针未回本立即重新 bypass；
 - 日志改为打印 `expected=`，区分“真没用”和“被误关”。
 
 实测（鹈鹕 SVF、draft 4、ngram 0、nvfp4）：

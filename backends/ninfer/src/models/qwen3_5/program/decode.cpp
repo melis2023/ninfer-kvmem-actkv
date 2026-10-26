@@ -1163,11 +1163,12 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             if (draftless_round) {
                 // No drafter ran, so this round says nothing about the neural proposal's value.
                 // Probe it again after a long draftless stretch: the content that starved it may
-                // have given way to something predictable.
+                // have given way to something predictable. The strike count is kept, so a probe
+                // that still misses the break-even re-bypasses on that same round instead of
+                // drafting for another six.
                 if (request.draft_bypass_strikes != UINT8_MAX) { ++request.draft_bypass_strikes; }
                 if (request.draft_bypass_strikes >= kDraftBypassProbeRounds) {
-                    request.draft_bypass         = false;
-                    request.draft_bypass_strikes = 0;
+                    request.draft_bypass = false;
                 }
             } else if (!matches[row].tokens.empty()) {
                 record_ngram_round(request, matches[row], extent,
