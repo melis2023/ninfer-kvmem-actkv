@@ -687,12 +687,9 @@ void ProgramImpl::retain_prompt_spans(SequenceState& sequence,
             system_end ? (system_end + page_tokens - 1U) / page_tokens : 0U;
         const std::uint32_t tool_pages_needed = prompt.tools_region
             ? (prompt.tools_region->count + page_tokens - 1U) / page_tokens : 0U;
-        const std::uint32_t brief_pages_needed = prompt.first_user_region
-            ? (prompt.first_user_region->count + page_tokens - 1U) / page_tokens : 0U;
         const std::uint32_t system_cap = std::min(system_pages_needed,
             keep * (prompt.tools_region ? 10U : 40U) / 100U);
         const std::uint32_t tool_cap   = std::min(tool_pages_needed, keep * 40U / 100U);
-        const std::uint32_t brief_cap  = std::min(brief_pages_needed, keep * 8U / 100U);
 
         const auto span_pages = [&](const TokenSpan& span, std::uint32_t cap, bool pin_tail,
                                     std::vector<std::uint32_t>& pages) {
@@ -720,10 +717,8 @@ void ProgramImpl::retain_prompt_spans(SequenceState& sequence,
         };
         std::vector<std::uint32_t> system;
         std::vector<std::uint32_t> tools;
-        std::vector<std::uint32_t> brief;
         if (system_end) span_pages(TokenSpan{0, system_end}, system_cap, false, system);
         if (prompt.tools_region) span_pages(*prompt.tools_region, tool_cap, false, tools);
-        if (prompt.first_user_region) span_pages(*prompt.first_user_region, brief_cap, true, brief);
 
         const auto replace = [total_pages](std::vector<std::uint32_t>& destination,
                                            std::vector<std::uint32_t> source) {
@@ -739,7 +734,8 @@ void ProgramImpl::retain_prompt_spans(SequenceState& sequence,
         auto& window = sequence.window;
         replace(window.system_pages, std::move(system));
         replace(window.tool_pages, std::move(tools));
-        replace(window.brief_pages, std::move(brief));
+        // Brief pin is disabled: keep only the system preamble and tool schema.
+        window.brief_pages.clear();
 
         // Structural pins outrank the soft thinking demotion: a page that carries the system
         // preamble, a tool definition or the first brief is never demoted, even if it also
@@ -762,7 +758,7 @@ void ProgramImpl::retain_prompt_spans(SequenceState& sequence,
                          "KVMEM_PROMPT_PIN system=%zu/%u tools=%zu/%u brief=%zu/%u pages=%u\n",
                          window.system_pages.size(), system_cap,
                          window.tool_pages.size(), tool_cap,
-                         window.brief_pages.size(), brief_cap, total_pages);
+                         window.brief_pages.size(), 0U, total_pages);
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "KVMEM_PROMPT_PIN skipped: %s\n", error.what());
@@ -789,14 +785,10 @@ void ProgramImpl::retain_generated_spans(SequenceHandle sequence, std::uint32_t 
         // Only whole pages are classified: a page that contains both a thinking tail and the
         // first answer token is pinned, never demoted. The page with the prompt/thinking boundary
         // is likewise left alone.
-        std::vector<std::uint32_t> new_pinned;
         std::vector<std::uint32_t> new_demoted;
         const std::uint32_t first_demote = (generated_begin + page_tokens - 1U) / page_tokens;
         const std::uint32_t last_demote  = thinking_end / page_tokens;
         for (auto page = first_demote; page < last_demote; ++page) new_demoted.push_back(page);
-        const std::uint32_t first_pin = thinking_end / page_tokens;
-        const std::uint32_t last_pin  = (frontier + page_tokens - 1U) / page_tokens;
-        for (auto page = first_pin; page < last_pin; ++page) new_pinned.push_back(page);
 
         const auto merge = [](std::vector<std::uint32_t>& destination,
                               const std::vector<std::uint32_t>& source) {
@@ -804,10 +796,10 @@ void ProgramImpl::retain_generated_spans(SequenceHandle sequence, std::uint32_t 
             std::sort(destination.begin(), destination.end());
             destination.erase(std::unique(destination.begin(), destination.end()), destination.end());
         };
-        // Only the newest answer is structural state: replace the previous
-        // answer's pages instead of accumulating every turn's tail. Thinking
-        // pages stay demoted and are never part of this set.
-        window.pinned_pages = std::move(new_pinned);
+        // Answer pin is disabled: the newest answer tail stays resident through
+        // recent_blocks, not through a structural summary set. Thinking pages
+        // are still demoted so they lose to every ordinary page.
+        window.pinned_pages.clear();
         merge(window.demoted_pages, new_demoted);
         // A mixed page is pinned; remove it from the demoted set so the mandatory path wins.
         std::vector<std::uint32_t> demoted_only;
@@ -815,28 +807,6 @@ void ProgramImpl::retain_generated_spans(SequenceHandle sequence, std::uint32_t 
                             window.pinned_pages.begin(), window.pinned_pages.end(),
                             std::back_inserter(demoted_only));
         window.demoted_pages.swap(demoted_only);
-
-        // Automatic answer budget: the newest non-thinking tail takes what is
-        // actually left under the structural cap, so a short final answer pins
-        // only its own pages. --kvmem-keep-ratio remains an explicit upper bound.
-        const std::uint32_t keep    = kvmem_options.selected_tokens / page_tokens;
-        const std::uint32_t reserve = std::min<std::uint32_t>(keep, 2U);
-        const std::uint32_t structural = static_cast<std::uint32_t>(
-            window.system_pages.size() + window.tool_pages.size() + window.brief_pages.size());
-        const std::uint32_t structural_cap = keep * 65U / 100U;
-        const std::uint32_t structural_room =
-            structural_cap > structural ? structural_cap - structural : 0U;
-        const std::uint32_t available =
-            keep > structural + reserve ? keep - structural - reserve : 0U;
-        const std::uint32_t auto_cap = std::min(available, structural_room);
-        const std::uint32_t percent = kvmem_options.keep_answer_percent;
-        const std::uint32_t cap = percent
-            ? std::min(auto_cap, keep * std::min<std::uint32_t>(percent, 50U) / 100U)
-            : auto_cap;
-        if (window.pinned_pages.size() > cap) {
-            window.pinned_pages.erase(window.pinned_pages.begin(),
-                                      window.pinned_pages.end() - static_cast<std::ptrdiff_t>(cap));
-        }
 
         const std::uint32_t pages = kv_pages_for_tokens(frontier);
         const auto prune = [pages](std::vector<std::uint32_t>& values) {
