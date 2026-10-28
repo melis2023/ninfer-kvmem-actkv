@@ -511,12 +511,17 @@ struct KvmemOptions {
     // default so the legacy position-only policy is unchanged.
     bool keep = false;
     std::uint32_t keep_answer_percent = 20;
-    // Decode pressure: rank the resident working set by accumulated accepted
-    // query attention instead of re-running the prompt query. Pressure never
+    // Decode pressure: rank the resident working set by native accepted-output
+    // page attention instead of re-running the prompt query. Pressure never
     // recalls a cold page; only sink/recent/media/pins and already resident
-    // pages are eligible. The ratio is sampled every N accepted tokens.
+    // pages are eligible. Samples follow 0.19: one accepted non-thinking row
+    // every 16 output tokens, exponential output decay 0.5.
     bool decode_pressure = true;
-    std::uint32_t decode_pressure_interval = 16;
+    // Graph propagation of one-hop current-Query mass. Zero is an exact bypass.
+    double graph_alpha = 0.2;
+    // Query recall scores the last N accepted prompt rows, independent of
+    // generation length. 0.19 default is 512.
+    std::uint32_t query_tokens = 512;
     std::uint32_t selected_tokens = 0; // B; zero disables KVMem
     std::uint32_t reserve_tokens = 0;  // R; also covers each prefill chunk
     // Whole-page rounding uses this backend's fixed 64-token page.

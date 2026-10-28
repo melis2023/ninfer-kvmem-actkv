@@ -90,6 +90,7 @@ public:
     }
 
     void set_memory_statistics(const MemoryStatistics* value) noexcept { statistics_ = value; }
+    void capture_attention_tokens(const Tensor& ids);
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
     void set_cache_position_shift(std::uint32_t shift) noexcept { cache_position_shift_ = shift; }
 

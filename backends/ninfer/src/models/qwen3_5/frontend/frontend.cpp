@@ -1132,6 +1132,10 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         } catch (const fi::ProcessorError& error) { throw_processor_error(error); }
         result.token_ids.assign(processed.input_ids.begin(), processed.input_ids.end());
         result.starts_in_reasoning = processed.starts_in_reasoning;
+        const auto memory_open = impl_->tokenizer->encode(" thinking");
+        const auto memory_close = impl_->tokenizer->encode("</think>");
+        if (memory_open.size() == 1) { result.memory_think_open = memory_open[0]; }
+        if (memory_close.size() == 1) { result.memory_think_close = memory_close[0]; }
         if (processed.memory_query) {
             result.memory_query = TokenSpan{processed.memory_query->begin, processed.memory_query->count};
         }
@@ -1219,6 +1223,15 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     const bool is_direct_graft = graft && graft->kind != GraftKind::PrefillKV;
     if (options.continuation == PromptContinuationMode::NewAssistantTurn && !message_boundaries.empty())
         result.memory_input_end = message_boundaries.back().value_or(0);
+    for (std::size_t i = 0; i + 1 < message_boundaries.size(); ++i) {
+        if ((message_boundaries[i] || i == 0) && message_boundaries[i + 1]) {
+            const auto begin = message_boundaries[i].value_or(0);
+            const auto end = *message_boundaries[i + 1];
+            if (begin < end && end <= result.token_ids.size()) {
+                result.memory_messages.push_back({begin, end - begin});
+            }
+        }
+    }
     if (impl_->ngram_archive_enabled) {
         const std::span<const TokenId> tokens(result.token_ids);
         auto add = [&](std::span<const TokenId> span, NgramSourceKind kind, int priority) {

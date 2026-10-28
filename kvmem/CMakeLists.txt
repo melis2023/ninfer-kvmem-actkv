@@ -21,6 +21,7 @@ add_library(kvmem
     src/host/session_memory.cpp
     src/host/rope.cpp
   src/host/prefix_checkpoint.cpp
+  src/host/graph_recall.cpp
 )
 set_target_properties(kvmem PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(kvmem PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)

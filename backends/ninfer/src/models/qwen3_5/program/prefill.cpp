@@ -753,6 +753,21 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             sequence.window.publication_order = request_plan.publication_order;
             sequence.window.update_session_index = staged.prompt.context_cache.update_session_index;
             sequence.window.media_pages = memory_image_pages(staged.prompt);
+            sequence.window.graph.reserve_extra(sequence.window.feedback.snapshot().bytes());
+            sequence.window.feedback.finish_output();
+            sequence.window.graph.include_feedback(sequence.window.feedback.snapshot().bytes());
+            sequence.window.output_begin = prompt_tokens;
+            sequence.window.think_open = staged.prompt.memory_think_open;
+            sequence.window.think_close = staged.prompt.memory_think_close;
+            sequence.window.attention_scope = {staged.prompt.starts_in_reasoning, 0};
+            std::vector<kvmem::GraphMessageSpan> graph_messages;
+            for (const auto& span : staged.prompt.memory_messages) {
+                graph_messages.push_back({span.begin, span.begin + span.count, true});
+            }
+            if (staged.prompt.memory_input_end) {
+                graph_messages.push_back({staged.prompt.memory_input_end, capacity, false});
+            }
+            sequence.window.graph.set_messages(graph_messages);
             reserve_memory_history(sequence, request, staged.prompt);
         }
         if (staged.disk_restore_frontier != 0) {
@@ -1151,7 +1166,6 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             sequence.ledger_frontier    = pending.base_S + committed;
             sequence.text_kv_valid      = sequence.execution_frontier;
             sequence.tail_hidden_valid  = true;
-            note_accepted_tokens(sequence, committed, width);
 
             if (speculative_backend == SpeculativeBackend::Mtp) {
                 sequence.mtp_kv_valid = sequence.execution_frontier;
@@ -1250,7 +1264,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
         // Prefill attention addresses its KV through the shared step table-row scalars. Another
         // lane's staging or capture can rebind them between this lane's steps, so every step
         // binds its own rows before any Prefill or MTP-bridge work.
-        const auto query = staged.prompt.memory_query.value_or(qwen3_5::TokenSpan{});
+        const auto query = bounded_memory_query(staged.prompt);
         prepare_memory_statistics(sequence, static_cast<std::uint32_t>(query.begin),
                                    static_cast<std::uint32_t>(query.begin + query.count));
         auto step_tokens = kvmem_window_tokens
@@ -1264,7 +1278,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             const auto chunk_end = std::min(staged.prompt_tokens, staged.cursor + step_tokens);
             const auto mapped_end = std::min(capacity, chunk_end +
                 (chunk_end == staged.prompt_tokens ? lead : 0U));
-            if (!prepare_window(sequence, staged.cursor, mapped_end, false, true)) {
+            if (!prepare_window(sequence, staged.cursor, mapped_end, false, true,
+                            kvmem::SelectionReason::Query)) {
                 staged.waiting_for_storage = true;
                 staged.elapsed_seconds += std::chrono::duration<double>(Clock::now() - started).count();
                 return runtime::PrefillStepResult{.summary = summary, .timing = timing.finish()};
@@ -1583,18 +1598,15 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             }
         }
 
-        if (kvmem_options.lrfu && sequence.window.query_tokens &&
+        if (kvmem_options.lrfu && sequence.window.selector &&
+            !sequence.window.selector->retrieval_checkpoint().committed &&
+            sequence.window.query_tokens &&
             sequence.window.query_tokens == sequence.window.query_end - sequence.window.query_begin) {
             // Accept the final input view once; pressure reselections reuse its history.
             auto& window = sequence.window;
-            const auto& config = parameters.model.config().text;
-            std::vector<std::uint32_t> counts(config.full_attention_layers, window.query_tokens);
-            window.selector->set_retrieval_scores(kvmem::mean_key_retrieval_scores(
-                *window.statistics, window.selector->block_count(), {window.query_sum.data(), counts.data(),
-                    config.full_attention_layers, config.attention->head_dim,
-                    config.attention->num_attention_heads, config.attention->num_key_value_heads,
-                    kvmem_options.score_agg_max ? kvmem::GqaScoreAggregation::Max : kvmem::GqaScoreAggregation::Mean}));
-            if (sequence.window.selector->commit_retrieval_round()) {
+            score_memory_query(sequence, {});
+            const bool committed = window.selector->commit_retrieval_round();
+            if (committed) {
                 const auto end = staged.prompt.memory_input_end ? staged.prompt.memory_input_end : staged.prompt_tokens;
                 window.history_input.assign(staged.prompt.token_ids.begin(), staged.prompt.token_ids.begin() + end);
                 window.history_input_identity.assign(staged.prompt);
@@ -1604,7 +1616,7 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             if (kvmem_options.verify_transfers) {
                 const auto history = sequence.window.selector->retrieval_checkpoint();
                 std::fprintf(stderr, "KVMEM_LRFU round=%llu committed=%d blocks=%zu\n",
-                    static_cast<unsigned long long>(history.round), int(history.committed), history.scores->size());
+                    static_cast<unsigned long long>(history.round), int(committed), history.scores->size());
             }
         }
         copy_round_token();

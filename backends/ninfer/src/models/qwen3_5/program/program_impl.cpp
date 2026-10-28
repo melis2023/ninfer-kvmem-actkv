@@ -592,10 +592,16 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
     if (!plan.persistent.memory_statistics.empty()) {
         const auto& config = parameters.model.config().text;
+        const auto query_workspace = plan.persistent.memory_query_workspace.bind(backing);
+        memory_query_scorer = std::make_unique<kvmem::PageSoftmaxCuda>(
+            device.rank(0).device, query_workspace.data, query_workspace.bytes(),
+            (capacity + 63U) / 64U, config.attention->num_attention_heads,
+            config.attention->num_key_value_heads, config.attention->head_dim);
         memory_statistics.emplace();
         memory_statistics->key_width = config.attention->key_width();
         memory_statistics->query_width = config.attention->query_width();
         memory_statistics->layers = config.full_attention_layers;
+        memory_statistics->query_columns = std::min(plan.prefill_chunk, plan.capacity);
         memory_statistics->columns = (std::min(plan.prefill_chunk, plan.capacity) + 126U) / 64U;
         memory_statistics->ranks.resize(device.size());
         memory_candidate_statistics = *memory_statistics;
@@ -603,8 +609,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         memory_statistics_host = std::make_unique<PinnedHostBuffer>(
             memory_statistics->key_bytes() + memory_statistics->query_bytes());
         memory_candidate_host = std::make_unique<PinnedHostBuffer>(
-            memory_candidate_statistics->key_bytes() +
-            memory_candidate_statistics->query_bytes());
+            memory_candidate_statistics->key_bytes());
         memory_statistics_ranges = {0, static_cast<std::int32_t>(capacity), 0, 0};
         for (std::size_t rank = 0; rank < device.size(); ++rank) {
             const auto& layout = plan.persistent.memory_statistics[rank];
@@ -615,9 +620,23 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             if (!layout.layers) { continue; }
             stats.key_sums = layout.key_sums.bind(backings[rank]);
             stats.query_sums = layout.query_sums.bind(backings[rank]);
+            stats.attention_queries = layout.attention_queries.bind(backings[rank]);
+            stats.attention_rows = layout.attention_rows.bind(backings[rank]);
+            stats.attention_positions = layout.attention_positions.bind(backings[rank]);
+            stats.attention_scratch = layout.attention_scratch.bind(backings[rank]);
+            stats.attention_norms = layout.attention_norms.bind(backings[rank]);
+            stats.attention_output = layout.attention_output.bind(backings[rank]);
+            if (rank == 0) stats.attention_tokens = layout.attention_tokens.bind(backings[rank]);
             stats.ranges = layout.ranges.bind(backings[rank]);
             candidates.key_sums = layout.candidate_keys.bind(backings[rank]);
             candidates.query_sums = stats.query_sums;
+            candidates.attention_queries = stats.attention_queries;
+            candidates.attention_tokens = stats.attention_tokens;
+            candidates.attention_rows = stats.attention_rows;
+            candidates.attention_positions = stats.attention_positions;
+            candidates.attention_scratch = stats.attention_scratch;
+            candidates.attention_norms = stats.attention_norms;
+            candidates.attention_output = stats.attention_output;
             candidates.ranges = stats.ranges;
             candidates.candidate_origin = layout.candidate_origin.bind(backings[rank]);
             DeviceBinding binding(device.rank(rank).device);

@@ -268,6 +268,16 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
 
 TextContext::~TextContext() = default;
 
+void TextContext::capture_attention_tokens(const Tensor& ids) {
+    if (!statistics_) return;
+    auto tokens = statistics_->ranks.front().attention_tokens;
+    if (!tokens.data || ids.dtype != DType::I32 || !ids.is_contiguous() ||
+        ids.numel() > tokens.numel())
+        throw std::logic_error("KVMem consumed token capture exceeds its planned capacity");
+    CUDA_CHECK(cudaMemcpyAsync(tokens.data, ids.data, ids.bytes(), cudaMemcpyDeviceToDevice,
+                               ctx_.stream));
+}
+
 void TextContext::set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot) {
     if (source_slot < 0 || source_slot >= state_.slot_count() || destination_slot < 0 ||
         destination_slot >= state_.slot_count()) {
@@ -734,6 +744,7 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
 
         Tensor x = work_.alloc(DType::BF16, {dimension(config_.hidden_size), batch});
         embed_tokens(ids, *embed_, parameters_.text.token_embedding_signs, x, stream);
+        capture_attention_tokens(ids);
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
         ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, hidden, stream);
@@ -788,6 +799,7 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor x        = work_.alloc(DType::BF16, {dimension(config_.hidden_size), columns});
         Tensor flat_ids = ids.view({columns});
         embed_tokens(flat_ids, *embed_, parameters_.text.token_embedding_signs, x, stream);
+        capture_attention_tokens(flat_ids);
         if constexpr (Tap::enabled) { tap.begin(x); }
         run_layers(x, Phase::Verify, tap);
         if constexpr (requires { tap.capture_positions(cache_positions, stream); }) {
@@ -945,6 +957,17 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     text_qk_norm_rope(rope_for_op, *config_.rope_parameters, *config_.attention,
                       config_.rms_norm_eps, p.query_norm, p.key_norm, q, k, qn, kn, rope_yarn_,
                       s, statistics, statistics_layer);
+    if (statistics && statistics->attention_queries.data) {
+        const std::int32_t selected[]{0, static_cast<std::int32_t>(config_.full_attention_layers / 2),
+            static_cast<std::int32_t>(config_.full_attention_layers - 1)};
+        for (std::int32_t slot = 0; slot < 3; ++slot) {
+            if (selected[slot] != fidx || (slot && selected[slot] == selected[slot - 1])) continue;
+            auto capture = statistics->attention_queries.slice(2, slot, 1).slice(1, 0, T)
+                .view({dimension(config_.attention->query_width()), T});
+            CUDA_CHECK(cudaMemcpyAsync(capture.data, qn.data, capture.bytes(),
+                                       cudaMemcpyDeviceToDevice, s));
+        }
+    }
 
     Tensor a = results.attention.view({dimension(config_.attention->head_dim),
                                        dimension(config_.attention->num_attention_heads), T});
@@ -1607,6 +1630,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
             Tensor x = roots.residual;
             embed_tokens(ids_device, *embed_, parameters_.text.token_embedding_signs, x, s);
+            capture_attention_tokens(ids_device);
             const auto visual_count = static_cast<std::int32_t>(local_scatter_indices.size());
             if (overlay_staging) {
                 // Stage the shifted MTP column even when this unit contains only

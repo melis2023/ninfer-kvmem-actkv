@@ -9,6 +9,8 @@
 #include "kvmem/raw_kv_store.hpp"
 #include "kvmem/kvmem_store.hpp"
 #include "kvmem/mean_key_retrieval.hpp"
+#include "kvmem/graph_recall.hpp"
+#include "kvmem/page_softmax_cuda.hpp"
 #include "kvmem/spill_io.hpp"
 #include "core/disk_kv_bridge.h"
 #include "core/gdn_replay_records.h"
@@ -582,15 +584,22 @@ struct KvmemWindowState {
     std::uint32_t swaps = 0;
     std::unique_ptr<kvmem::RawKvStore> statistics;
     std::unique_ptr<kvmem::KvMemStore> selector;
-    std::vector<float> query_sum;
+    // Accepted prompt Query rows, one `query_width` row per layer and token.
+    std::vector<std::vector<float>> query_rows;
+    // Native attention feedback, current request's consumed-token scope and the
+    // thought-token ids that mark which accepted rows count as output.
+    kvmem::GraphSnapshot graph;
+    kvmem::AttentionFeedback feedback;
+    kvmem::OutputSampleState attention_scope;
+    std::uint32_t output_begin = 0;
+    std::int32_t think_open = -1, think_close = -1;
     std::uint32_t statistics_frontier = 0;
     std::uint32_t query_tokens = 0;
     std::uint32_t query_begin = 0, query_end = 0;
-    // Decode pressure: exponential moving sum of accepted-query page mass over
-    // resident pages, indexed by logical page id. It is process-local ranking
-    // state, not part of the native KV payload; a restored history rebuilds it.
-    std::vector<double> attention_mass;
-    std::uint32_t accepted_since_sample = 0;
+    // Query admission is frozen before a resident view is restored; the native
+    // restore path only consumes these ids.
+    std::vector<std::uint32_t> query_selected;
+    std::vector<std::uint32_t> query_required;
     // Long prompts retain the pre-query boundary for selection/replay; short prompts
     // retain the input prefix before its final token for request-to-request reuse.
     std::unique_ptr<KvmemPrefixCheckpoint> prefix_checkpoint;
@@ -1123,6 +1132,10 @@ public:
     Tensor prefill_hidden;
     std::optional<execution::MemoryStatistics> memory_statistics;
     std::optional<execution::MemoryStatistics> memory_candidate_statistics;
+    std::unique_ptr<kvmem::PageSoftmaxCuda> memory_query_scorer;
+    // Parent account for every lane's graph and feedback snapshots.
+    std::shared_ptr<kvmem::GraphStatisticsBudget> memory_graph_budget =
+        std::make_shared<kvmem::GraphStatisticsBudget>(256u << 20);
     std::unique_ptr<PinnedHostBuffer> memory_candidate_host;
     std::unique_ptr<PinnedHostBuffer> memory_statistics_host;
     // Reused transfer staging is bounded by the physical window. Durable history
@@ -1951,9 +1964,10 @@ private:
                                bool allow_pending);
     bool prepare_window(SequenceState& sequence, std::uint32_t begin, std::uint32_t end,
                         bool force_selection = false, bool allow_pending = false,
-                        bool pressure = false);
+                        kvmem::SelectionReason reason = kvmem::SelectionReason::PrefillPressure);
     void archive_memory_window(SequenceState& sequence);
     bool memory_query_probe(const SequenceState& sequence, std::uint32_t prompt_tokens) const;
+    qwen3_5::TokenSpan bounded_memory_query(const PreparedPromptData& prompt) const;
     [[nodiscard]] std::uint32_t memory_checkpoint_frontier(const SequenceState& sequence,
         std::uint32_t prompt_tokens, bool allow_reuse) const;
     void capture_memory_prefix(SequenceState& sequence, std::uint32_t chunk_tokens);
@@ -1986,8 +2000,10 @@ private:
                                   std::uint32_t end, std::uint32_t first_column,
                                   std::uint32_t row_width);
     void read_memory_candidates();
-    void prepare_memory_feedback(SequenceState& sequence, std::uint32_t begin, std::uint32_t end);
-    void note_accepted_tokens(SequenceState& sequence, std::uint32_t accepted, std::uint32_t width);
+    std::vector<double> score_memory_query(SequenceState& sequence,
+                                           const std::vector<std::uint32_t>& mandatory);
+    void observe_memory_attention(SequenceState& sequence, std::uint32_t begin, std::uint32_t end,
+                                  std::uint32_t first_column, std::uint32_t row_width, bool prefill);
     [[nodiscard]] std::vector<std::uint32_t> memory_image_pages(const PreparedPromptData& prompt) const;
 
     [[nodiscard]] std::uint32_t compact_position(const SequenceState& sequence,

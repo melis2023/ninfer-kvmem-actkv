@@ -500,7 +500,8 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             throw std::logic_error("ordinary batch row is not decode-ready");
         }
         if (kvmem_window_tokens) {
-            prepare_window(sequence, sequence.execution_frontier, sequence.execution_frontier + 1);
+            prepare_window(sequence, sequence.execution_frontier, sequence.execution_frontier + 1,
+                       false, false, kvmem::SelectionReason::DecodePressure);
         }
         maximum_frontier = std::max(maximum_frontier, compact_position(sequence, sequence.execution_frontier));
     }
@@ -587,7 +588,6 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             commit_memory_candidates(sequence, base_E, base_E + 1, static_cast<std::uint32_t>(row), 1);
             sequence.text_kv_valid = base_E + 1;
             commit_sequence_kv(sequence, sequence.text_kv_valid, 0);
-            note_accepted_tokens(sequence, 1, 1);
             sequence.tail_hidden_valid = true;
             sequence.ledger.push_back(token);
             sequence.prefix_identity.append_generated(1, sequence.rope_delta);
@@ -667,7 +667,8 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         if (kvmem_window_tokens) {
             prepare_window(sequence, sequence.execution_frontier,
                 std::min(capacity, sequence.execution_frontier +
-                    std::max(draft_window, ngram_draft_window) + draft_window));
+                    std::max(draft_window, ngram_draft_window) + draft_window),
+                false, false, kvmem::SelectionReason::DecodePressure);
         }
         maximum_frontier = std::max(maximum_frontier, compact_position(sequence, sequence.execution_frontier));
         signals[row]     = &request.mtp_signal;
@@ -1004,7 +1005,8 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         // width, exactly like the MTP batch does.
         if (kvmem_window_tokens) {
             prepare_window(sequence, sequence.execution_frontier,
-                           std::min(capacity, sequence.execution_frontier + width));
+                           std::min(capacity, sequence.execution_frontier + width),
+                           false, false, kvmem::SelectionReason::DecodePressure);
         }
         const std::uint32_t max_by_budget = budgets[row].generated_tokens_remaining > 1
                                                 ? budgets[row].generated_tokens_remaining - 1U

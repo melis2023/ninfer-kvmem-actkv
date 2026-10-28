@@ -854,7 +854,8 @@ void ProgramImpl::retain_generated_spans(SequenceHandle sequence, std::uint32_t 
 }
 
 bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, std::uint32_t end,
-                                  bool force_selection, bool allow_pending, bool pressure) {
+                                  bool force_selection, bool allow_pending,
+                                  kvmem::SelectionReason reason) {
     if (!kvmem_window_tokens) { return true; }
     if (!sequence.kv || begin != sequence.text_kv_valid || end < begin || end > capacity ||
         end - begin > kvmem_options.reserve_tokens) {
@@ -957,52 +958,27 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
         const bool query_complete = state.query_tokens != 0 &&
             (state.query_replayed || begin >= state.query_end) &&
             state.query_tokens == state.query_end - state.query_begin;
-        if (pressure && kvmem_options.decode_pressure) {
-            // DecodePressure ranks only what is already resident. Unlike Query
-            // recall it never selects a cold page, so a stale prompt query can
-            // not swap distant history in during generation.
-            selected = mandatory;
-            std::vector<std::pair<double, std::uint64_t>> ranked;
-            ranked.reserve(state.pages.size());
-            for (const auto id : state.pages) {
-                if (id >= count ||
-                    std::find(selected.begin(), selected.end(), id) != selected.end()) {
-                    continue;
+        bool query_ready = query_complete && state.selector && state.statistics &&
+            state.statistics_frontier == begin && state.selector->total_tokens() == begin &&
+            state.query_rows.size() == parameters.model.config().text.full_attention_layers;
+        if (query_ready) {
+            const auto width = parameters.model.config().text.attention->query_width();
+            for (const auto& rows : state.query_rows) {
+                if (rows.size() != std::size_t(state.query_tokens) * width) {
+                    query_ready = false;
+                    break;
                 }
-                const double score = id < state.attention_mass.size()
-                    ? state.attention_mass[id] : 0.0;
-                ranked.emplace_back(score, id);
             }
-            std::sort(ranked.begin(), ranked.end(),
-                [](const auto& a, const auto& b) {
-                    if (a.first != b.first) return a.first > b.first;
-                    return a.second > b.second;
-                });
-            for (const auto& entry : ranked) {
-                if (selected.size() >= keep) { break; }
-                selected.push_back(entry.second);
-            }
-            std::sort(selected.begin(), selected.end());
-            std::fprintf(stderr,
-                "KVMEM_PRESSURE logical=%u resident=%zu selected=%zu\n",
-                begin, state.pages.size(), selected.size());
-        } else if (query_complete) {
-            if (!state.selector || state.statistics_frontier != begin ||
-                state.selector->total_tokens() != begin) {
-                throw std::logic_error("KVMem retrieval index does not match the evaluated prefix");
-            }
+        }
+        if (reason == kvmem::SelectionReason::Query && query_ready) {
             const auto& config = parameters.model.config().text;
-            std::vector<std::uint32_t> counts(config.full_attention_layers, state.query_tokens);
+            const std::vector<std::uint32_t> required(mandatory.begin(), mandatory.end());
             const auto score_started = std::chrono::steady_clock::now();
-            auto scores = kvmem::mean_key_retrieval_scores(
-                *state.statistics, count, {state.query_sum.data(), counts.data(),
-                    config.full_attention_layers, config.attention->head_dim,
-                    config.attention->num_attention_heads, config.attention->num_key_value_heads,
-                    kvmem_options.score_agg_max ? kvmem::GqaScoreAggregation::Max : kvmem::GqaScoreAggregation::Mean});
+            auto scores = score_memory_query(sequence, required);
             const auto score_ended = std::chrono::steady_clock::now();
             // Soft thinking demotion: fully-thinking pages stay retrievable, but only after every
             // non-demoted page. A page that is also mandatory (sink/media/recent/pinned) is not
-            // penalised.
+            // penalised. This is query admission only; pressure ranks native attention.
             if (!state.demoted_pages.empty()) {
                 for (const auto id : state.demoted_pages) {
                     if (id < scores.size() &&
@@ -1010,9 +986,8 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
                         scores[id] = -1.0e30F;
                     }
                 }
+                state.selector->set_retrieval_scores(scores);
             }
-            state.selector->set_retrieval_scores(scores);
-            const std::vector<std::uint32_t> required(mandatory.begin(), mandatory.end());
             const auto ids = state.selector->pick_topk_blocks(required);
             const auto select_ended = std::chrono::steady_clock::now();
             reselect_score_us = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -1031,22 +1006,68 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
                 std::fprintf(stderr, "\n");
             }
         } else {
-            selected = mandatory;
-            const auto is_demoted = [&state](std::uint32_t id) {
-                return std::binary_search(state.demoted_pages.begin(), state.demoted_pages.end(), id);
-            };
-            // Fill from the newest non-demoted pages first; only if the window still has room do
-            // demoted thinking pages become eligible. This keeps the fallback path (no completed
-            // retrieval query) from treating thinking as ordinary recent history.
-            for (int pass = 0; pass < 2 && selected.size() < keep; ++pass) {
-                for (auto id = count; id-- > 0 && selected.size() < keep;) {
-                    if ((pass == 0) == is_demoted(id)) { continue; }
-                    if (std::find(selected.begin(), selected.end(), id) == selected.end()) {
-                        selected.push_back(id);
-                    }
+            // Pressure ranks only what is already resident. Unlike Query recall it
+            // never selects a cold page, so a stale prompt query can not swap
+            // distant history in during generation. Required pages that the
+            // working set no longer holds are dropped, never recalled.
+            std::vector<std::uint32_t> candidates;
+            std::vector<std::uint64_t> starts;
+            candidates.reserve(state.pages.size());
+            starts.reserve(state.pages.size());
+            for (auto id : state.pages) {
+                if (id < count) {
+                    candidates.push_back(id);
+                    starts.push_back(std::uint64_t(id) * 64);
                 }
             }
-            std::sort(selected.begin(), selected.end());
+            const std::vector<std::uint32_t> required(mandatory.begin(), mandatory.end());
+            if (!kvmem_options.decode_pressure) {
+                // Explicit rollback path: newest resident pages first, then
+                // demoted thinking pages. This is not the product policy.
+                selected = mandatory;
+                const auto is_demoted = [&state](std::uint32_t id) {
+                    return std::binary_search(state.demoted_pages.begin(),
+                                              state.demoted_pages.end(), id);
+                };
+                for (int pass = 0; pass < 2 && selected.size() < keep; ++pass) {
+                    for (auto id = count; id-- > 0 && selected.size() < keep;) {
+                        if ((pass == 0) == is_demoted(id)) { continue; }
+                        if (std::find(selected.begin(), selected.end(), id) == selected.end()) {
+                            selected.push_back(id);
+                        }
+                    }
+                }
+                std::sort(selected.begin(), selected.end());
+            } else {
+                if (!required.empty() && candidates.empty()) {
+                    throw std::logic_error("KVMem pressure has no resident candidates");
+                }
+                // Mandatory pages participate only while resident. A page that
+                // fell out of the working set is never recalled by pressure; the
+                // next Query admission can bring it back.
+                std::vector<std::uint32_t> resident_required;
+                resident_required.reserve(required.size());
+                for (const auto id : required) {
+                    if (std::find(candidates.begin(), candidates.end(), id) != candidates.end()) {
+                        resident_required.push_back(id);
+                    }
+                }
+                if (resident_required.size() != required.size() && kvmem_options.verify_transfers) {
+                    std::fprintf(stderr,
+                        "KVMEM_PRESSURE cold_mandatory=%zu resident=%zu\n",
+                        required.size() - resident_required.size(), resident_required.size());
+                }
+                const auto scores = state.feedback.pressure_scores(starts);
+                const auto ids = kvmem::pressure_selection(candidates, scores, resident_required,
+                                                           std::max(1U, keep));
+                selected.assign(ids.begin(), ids.end());
+                if (kvmem_options.verify_transfers) {
+                    std::fprintf(stderr,
+                        "KVMEM_PRESSURE phase=%s logical=%u candidates=%zu selected=%zu graph=0\n",
+                        reason == kvmem::SelectionReason::DecodePressure ? "decode" : "prefill",
+                        begin, candidates.size(), ids.size());
+                }
+            }
         }
         const kvmem::MemoryBudget budget{kvmem_options.selected_tokens, kvmem_options.reserve_tokens,
             kvmem_window_tokens, memory_retained_budget};
@@ -1065,7 +1086,7 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
                 static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - plan_started).count()),
                 selected.size());
-            return prepare_window(sequence, begin, end, false, allow_pending, pressure);
+            return prepare_window(sequence, begin, end, false, allow_pending, reason);
         }
         kvmem::MemorySession session(backend);
         session.prepare(backend->stamp(), selected, mandatory, budget);
@@ -1109,11 +1130,9 @@ bool ProgramImpl::prepare_decode_memory(SequenceHandle handle) {
     if (memory_pending(handle)) return false;
     auto& sequence = active_sequence(ContractAccess::lane(handle).value);
     const auto append = backend_kv_pages ? std::max(draft_window, ngram_draft_window) + draft_window : 1U;
-    prepare_memory_feedback(sequence, sequence.execution_frontier,
-        std::min(capacity, sequence.execution_frontier + std::max(append, widest_verify_window())));
     return prepare_window(sequence, sequence.execution_frontier,
         std::min(capacity, sequence.execution_frontier + append), false, true,
-        kvmem_options.decode_pressure);
+        kvmem::SelectionReason::DecodePressure);
 }
 std::uint32_t ProgramImpl::memory_control_chunk() const noexcept {
     return memory_io ? std::min(prefill_chunk, kvmem_options.reserve_tokens) : UINT32_MAX;
@@ -1124,7 +1143,8 @@ bool ProgramImpl::prepare_control_memory(SequenceHandle handle, std::uint32_t to
     if (memory_pending(handle)) return false;
     auto& sequence = active_sequence(ContractAccess::lane(handle).value);
     return prepare_window(sequence, sequence.execution_frontier,
-                          sequence.execution_frontier + tokens, false, true);
+                          sequence.execution_frontier + tokens, false, true,
+                          kvmem::SelectionReason::DecodePressure);
 }
 bool ProgramImpl::cancel_memory_ready(SequenceHandle handle) noexcept {
     if (!memory_io || !valid_sequence(handle)) return true;
@@ -1262,6 +1282,14 @@ const KvmemPrefixCheckpoint* ProgramImpl::memory_checkpoint(const KvmemWindowSta
 void ProgramImpl::capture_memory_endpoint(SequenceState& sequence, const RequestControl& request) noexcept {
     if (!kvmem_window_tokens || !request.allow_memory_reuse || !sequence.window.statistics ||
         request.lifecycle != Lifecycle::Finishable) return;
+    try {
+        sequence.window.graph.reserve_extra(sequence.window.feedback.snapshot().bytes());
+        sequence.window.feedback.finish_output();
+        sequence.window.graph.include_feedback(sequence.window.feedback.snapshot().bytes());
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "KVMEM_ATTENTION finish failed: %s\n", error.what());
+        return;
+    }
     const auto frontier = sequence.execution_frontier;
     if (sequence.text_kv_valid != frontier || !sequence.tail_hidden_valid ||
         sequence.state.fork_pending || (backend_kv_pages && kvmem_backend_frontier(sequence) != frontier)) return;
@@ -1279,11 +1307,27 @@ void ProgramImpl::capture_memory_endpoint(SequenceState& sequence, const Request
     }
 }
 
+qwen3_5::TokenSpan ProgramImpl::bounded_memory_query(const PreparedPromptData& prompt) const {
+    const auto source = prompt.memory_query.value_or(qwen3_5::TokenSpan{});
+    auto bounded = kvmem::bounded_query(source.begin, source.count, prompt.token_ids.size(),
+                                        kvmem_options.query_tokens);
+    // Never start inside a vision span: its placeholder rows are not query text.
+    for (const auto& item : prompt.vision_items) {
+        for (const auto& span : item.token_spans) {
+            if (span.begin <= bounded.begin && bounded.begin < span.begin + span.count) {
+                bounded.begin = std::min(bounded.end, span.begin + span.count);
+            }
+        }
+    }
+    return {bounded.begin, bounded.end - bounded.begin};
+}
+
 bool ProgramImpl::memory_same_query(const KvmemWindowState& window, const PreparedPromptData& prompt,
                                     std::uint32_t frontier) const {
     if (!prompt.memory_query || !window.query_tokens ||
         window.query_tokens != window.query_end - window.query_begin) return false;
-    const auto& query = *prompt.memory_query;
+    const auto query = bounded_memory_query(prompt);
+    if (query.begin == 0 && query.count == 0) return false;
     // The caller's exact checkpoint match proves all tokens/positions through this range.
     if (query.begin != window.query_begin || query.count != window.query_tokens) return false;
     // LCP boundary: a reuse may not restore past the evaluated frontier. The replay itself
@@ -1435,7 +1479,8 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
         }
         session.publish();
     } else {
-        prepare_window(sequence, frontier, frontier, true, allow_pending);
+        prepare_window(sequence, frontier, frontier, true, allow_pending,
+                       kvmem::SelectionReason::Query);
     }
     sequence.tail_hidden_valid = true;
 }
@@ -1613,12 +1658,12 @@ bool ProgramImpl::restore_memory_history(SequenceState& sequence, RequestControl
     window.removed_tokens = 0;
     window.reconstruction_frontier = 0;
     window.query_replayed = same_query;
-    const auto query = staged.prompt.memory_query.value_or(qwen3_5::TokenSpan{});
+    const auto query = bounded_memory_query(staged.prompt);
     window.query_begin = static_cast<std::uint32_t>(query.begin);
     window.query_end = static_cast<std::uint32_t>(query.begin + query.count);
     if (!same_query) {
         window.query_tokens = 0;
-        std::fill(window.query_sum.begin(), window.query_sum.end(), 0.0F);
+        for (auto& rows : window.query_rows) rows.clear();
     }
     // The durable archive already covers the quoted prefix. This is not a
     // native allocation frontier; force-selection creates only B resident rows.

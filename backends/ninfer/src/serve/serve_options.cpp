@@ -102,7 +102,9 @@ std::string serve_usage_text(const char* argv0) {
            "  --kvmem-decode-pressure       rank resident pages by accepted attention;\n"
            "                                never recalls cold pages (default on)\n"
            "  --no-kvmem-decode-pressure    disable decode pressure\n"
-           "  --kvmem-decode-pressure-interval N  accepted-token stride (default 16)\n"
+           "  --kvmem-query-tokens N        Query rows scored at admission (default 512)\n"
+           "  --kvmem-graph-alpha X         one-hop Query mass propagation [0,1] (default 0.2)\n"
+           "  --no-kvmem-graph              disable Query graph propagation\n"
            "  --kvmem-keep                  retain system prompt, tool schema, first brief\n"
            "                                and the non-thinking answer tail; demotes thinking\n"
            "  --kvmem-keep-ratio N          cap answer retention at N% of B, 1..50 (default 20)\n"
@@ -707,15 +709,25 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.kvmem.decode_pressure = false;
             continue;
         }
-        if (arg == "--kvmem-decode-pressure-interval") {
-            const auto interval = parse_nonnegative_int(
-                require_value("--kvmem-decode-pressure-interval"),
-                "kvmem-decode-pressure-interval");
-            if (interval < 1 || interval > 4096) {
-                throw std::invalid_argument(
-                    "--kvmem-decode-pressure-interval must be in 1..4096");
+        if (arg == "--kvmem-query-tokens") {
+            const auto tokens = parse_nonnegative_int(
+                require_value("--kvmem-query-tokens"), "kvmem-query-tokens");
+            if (tokens < 1 || tokens > 8192) {
+                throw std::invalid_argument("--kvmem-query-tokens must be in 1..8192");
             }
-            options.kvmem.decode_pressure_interval = static_cast<std::uint32_t>(interval);
+            options.kvmem.query_tokens = static_cast<std::uint32_t>(tokens);
+            continue;
+        }
+        if (arg == "--kvmem-graph-alpha") {
+            const auto value = require_value("--kvmem-graph-alpha");
+            options.kvmem.graph_alpha = std::stod(std::string(value));
+            if (!(options.kvmem.graph_alpha >= 0.0 && options.kvmem.graph_alpha <= 1.0)) {
+                throw std::invalid_argument("--kvmem-graph-alpha must be in 0..1");
+            }
+            continue;
+        }
+        if (arg == "--no-kvmem-graph") {
+            options.kvmem.graph_alpha = 0.0;
             continue;
         }
         if (arg == "--kvmem-keep" || arg == "--kvmem-pin-answer") {

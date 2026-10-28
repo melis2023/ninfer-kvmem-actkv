@@ -165,12 +165,19 @@ struct PreparedPromptData {
     // Exact token range from frontend provenance. Absent means no trusted query;
     // retrieval keeps its recency fallback. Raw token input explicitly uses all rows.
     std::optional<TokenSpan> memory_query;
+    // Proven message spans in token coordinates. Graph propagation discounts
+    // mass that crosses a message boundary; an empty list uses coefficient 1.
+    std::vector<TokenSpan> memory_messages;
     // First real user content and the declared tool-definition union. KVMem structural pins
     // use these spans; an absent span falls back to the positional sink.
     std::optional<TokenSpan> first_user_region;
     std::optional<TokenSpan> tools_region;
     // Proven message boundary before a transient generation header; zero uses all input.
     std::uint32_t memory_input_end = 0;
+    // Thought delimiters, when each is one token; accepted output sampling excludes
+    // rows strictly inside an open thought span.
+    std::int32_t memory_think_open = -1;
+    std::int32_t memory_think_close = -1;
 
     std::vector<std::uint8_t> token_types;
     std::vector<std::int32_t> positions;
