@@ -108,7 +108,8 @@ std::string serve_usage_text(const char* argv0) {
            "  --no-kvmem-graph              disable Query graph propagation\n"
            "  --kvmem-keep                  retain system prompt, tool schema, first brief\n"
            "                                and the non-thinking answer tail; demotes thinking\n"
-           "  --kvmem-keep-ratio N          cap answer retention at N% of B, 1..50 (default 20)\n"
+           "  --kvmem-keep-ratio N          optional cap on the newest answer tail, 1..50;\n"
+           "                                omit for automatic (structural budget only)\n"
            "  --kvmem-pin-answer            alias for --kvmem-keep\n"
            "  --kvmem-pin-ratio N           alias for --kvmem-keep-ratio\n"
            "  --kvmem-sessions N            retained Host histories, 1..16 (default 4)\n"
@@ -598,6 +599,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     bool vision_max_merged_explicit   = false;
     bool sink_tokens_explicit         = false;
     bool recent_tokens_explicit       = false;
+    bool keep_ratio_explicit          = false;
     std::optional<std::size_t> kv_headroom_mib;
     // Last flag seen that belongs to only one prefix-cache mode, for the cross-mode error.
     const char* legacy_cache_flag  = nullptr;
@@ -753,6 +755,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument(arg + " must be in 1..50");
             }
             options.kvmem.keep_answer_percent = static_cast<std::uint32_t>(percent);
+            keep_ratio_explicit = true;
             continue;
         }
         if (arg == "--kvmem-sessions") {
@@ -1947,6 +1950,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     if (options.kvmem.disk_path.empty() != (options.kvmem.disk_bytes == 0) ||
         options.kvmem.host_bytes > UINT64_MAX - options.kvmem.disk_bytes)
         throw std::invalid_argument("KVMem SSD requires both --kvmem-disk-path and --kvmem-disk-mib");
+    // Omitted --kvmem-keep-ratio means automatic: the newest non-thinking answer
+    // tail takes only the structural budget it actually needs.
+    if (!keep_ratio_explicit) { options.kvmem.keep_answer_percent = 0; }
     return options;
 }
 

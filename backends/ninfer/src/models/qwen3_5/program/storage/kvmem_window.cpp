@@ -804,7 +804,10 @@ void ProgramImpl::retain_generated_spans(SequenceHandle sequence, std::uint32_t 
             std::sort(destination.begin(), destination.end());
             destination.erase(std::unique(destination.begin(), destination.end()), destination.end());
         };
-        merge(window.pinned_pages, new_pinned);
+        // Only the newest answer is structural state: replace the previous
+        // answer's pages instead of accumulating every turn's tail. Thinking
+        // pages stay demoted and are never part of this set.
+        window.pinned_pages = std::move(new_pinned);
         merge(window.demoted_pages, new_demoted);
         // A mixed page is pinned; remove it from the demoted set so the mandatory path wins.
         std::vector<std::uint32_t> demoted_only;
@@ -813,21 +816,23 @@ void ProgramImpl::retain_generated_spans(SequenceHandle sequence, std::uint32_t 
                             std::back_inserter(demoted_only));
         window.demoted_pages.swap(demoted_only);
 
-        // Keep pinned pages bounded: a percentage of B, leaving at least two pages for
-        // sink/recent. The newest pages survive when the cap is exceeded.
+        // Automatic answer budget: the newest non-thinking tail takes what is
+        // actually left under the structural cap, so a short final answer pins
+        // only its own pages. --kvmem-keep-ratio remains an explicit upper bound.
         const std::uint32_t keep    = kvmem_options.selected_tokens / page_tokens;
-        const std::uint32_t percent =
-            std::min<std::uint32_t>(50U, std::max<std::uint32_t>(1U, kvmem_options.keep_answer_percent));
         const std::uint32_t reserve = std::min<std::uint32_t>(keep, 2U);
-        // The answer tail is the last claimant of B. Structural pins (system, tools,
-        // brief) are already mandatory, so the answer cap follows what is actually
-        // left instead of reserving a fixed fraction that may not exist.
         const std::uint32_t structural = static_cast<std::uint32_t>(
             window.system_pages.size() + window.tool_pages.size() + window.brief_pages.size());
+        const std::uint32_t structural_cap = keep * 65U / 100U;
+        const std::uint32_t structural_room =
+            structural_cap > structural ? structural_cap - structural : 0U;
         const std::uint32_t available =
             keep > structural + reserve ? keep - structural - reserve : 0U;
-        const std::uint32_t cap =
-            std::min({available, keep * percent / 100U, keep * 35U / 100U});
+        const std::uint32_t auto_cap = std::min(available, structural_room);
+        const std::uint32_t percent = kvmem_options.keep_answer_percent;
+        const std::uint32_t cap = percent
+            ? std::min(auto_cap, keep * std::min<std::uint32_t>(percent, 50U) / 100U)
+            : auto_cap;
         if (window.pinned_pages.size() > cap) {
             window.pinned_pages.erase(window.pinned_pages.begin(),
                                       window.pinned_pages.end() - static_cast<std::ptrdiff_t>(cap));

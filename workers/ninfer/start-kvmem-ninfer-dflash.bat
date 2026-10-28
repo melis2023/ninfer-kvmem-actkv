@@ -28,7 +28,7 @@ cd /d "%BIN%"
   "%MODEL%" ^
   --port 18200 --model-id ninfer-27b --host 0.0.0.0 ^
     --max-context 262144 ^
-    --prefill-chunk 256  --kvmem-keep --kvmem-keep-ratio 35 ^
+    --prefill-chunk 256  --kvmem-keep ^
     --kvmem-budget 39040 --kvmem-gen-reserve 4096 --kvmem-host-mib 12288 ^
   --kvmem-lrfu ^
   --kv-dtype int8  --temperature 0.7 --top-p 0.95 --top-k 20 --min-p 0.0 ^
