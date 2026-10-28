@@ -1619,6 +1619,20 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                     static_cast<unsigned long long>(history.round), int(committed), history.scores->size());
             }
         }
+        // 0.19 ranks the admitted Query before generation. This fork evaluates
+        // the prompt first, so the equivalent boundary is the completed prefill:
+        // force one Query reselection so a restored history's newest-only
+        // working set can cold-recall the pages the new question needs.
+        const auto admitted_frontier = sequence.text_kv_valid;
+        if (kvmem_window_tokens && sequence.kv && admitted_frontier &&
+            admitted_frontier == sequence.execution_frontier &&
+            sequence.window.query_tokens &&
+            sequence.window.query_tokens ==
+                sequence.window.query_end - sequence.window.query_begin &&
+            !sequence.window.query_replayed) {
+            prepare_window(sequence, admitted_frontier, admitted_frontier, true, false,
+                           kvmem::SelectionReason::Query);
+        }
         copy_round_token();
         if (request.logprobs) { fetch_logprobs(1); }
         std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> initial_drafts{};

@@ -207,31 +207,46 @@ checkpoint capture/restore 已经同步。
 
 ---
 
-## 4. Decode pressure（0.19 边驱逐策略的本地移植）
+## 4. Decode pressure（0.19 边驱逐策略的原样移植）
 
 参数：
 
 ```text
 --kvmem-decode-pressure          默认开启
---no-kvmem-decode-pressure       关闭
---kvmem-decode-pressure-interval N   默认 16
+--no-kvmem-decode-pressure       关闭（回退到最新页优先）
+--kvmem-query-tokens N           Query 召回评分行数，默认 512
+--kvmem-graph-alpha X            一阶 Query 质量传播，默认 0（关闭）
+--no-kvmem-graph                 关闭图传播
 ```
 
-行为：
+行为（与 0.19 一致）：
 
-- 每 N 个 accepted token 采样本轮 query 的最后一层 normalized Q；
-- 对 resident 页的 Mean-K 做 cosine，softmax（温度 8），EMA 累积（半衰约 8192 token）；
-- 窗口满时 `prepare_window` 走 pressure 分支：
-  - `selected = mandatory`（sink/media/recent/system/tools/brief/answer）；
-  - 其余 resident 页按 `attention_mass` 排序填充；
-  - **不 cold recall**；
-- 与 0.19 的差异：
-  - 0.19 用 native page attention 的 token log-sum-exp；
-  - **当前版本仍是 `accepted-Q × Mean-K` 近似**，不是逐 token/head 的 native attention；
-  - native page-mass kernel 尚未实现（需要新增 CUDA op）；当前先验证 pressure 路径和默认开启；
-  - `attention_mass` 不随 checkpoint 保存，restore 后重建；
-- **默认开启**，可用 `--no-kvmem-decode-pressure` 关闭；
-- LongMemEval 输出 1024 < R 时通常不触发，主要用于 DSH 长输出或小 R 场景。
+- 每 16 个 **非 thinking** accepted token 采样一行已消费 token，排除 `thinking` 内部行；
+- 对 0、中间、最后一层（spread3）用 post-RoPE Q 与 native K 计算每页 token log-sum-exp；
+- 每页跨完整可见 cache 归一化，再对 head 平均；三种 KV 编码由 `attention_page_mass` 原生解码
+  （BF16 / int8 家族 / nvfp4 家族 / fp8 / rk8v4 / rk4v4 / rk4v4-e8）；
+- `AttentionFeedback::observe_output` 累积 pending 质量，`finish_output(decay=.5)` 衰减合并；
+- `pressure_scores(candidates, decay=.5)` 只用 output / output_samples；无 output 时回退
+  prefill exposure（`mass/exposure`）；
+- 窗口满时 `pressure_selection` 只对 **resident** 页排序，mandatory 先占位；
+  **绝不 cold recall**；本地 L1 pin 页若已不在工作集则丢弃并记日志，不会召回；
+- 除 Query 召回外，prefill/decode 的重选统一走 pressure；
+- checkpoint 仍不保存 graph/attention_mass（沿用本地 0.18 约定），恢复后从新的 prefill
+  exposure 重建。
+
+Query 召回（prefill 完成后的首次选择）：
+
+- 0.19 的两种 scorer 均可用：
+  - `--kvmem-query-scorer page-softmax`（默认）：GPU page-softmax，逐 token/head 的
+    softmax 质量，FP16 边界与 host 参考一致；
+  - `--kvmem-query-scorer meanq-cosine`：0.19 的 host scorer，先对 Query 行取均值，
+    再与每页 mean-K 做 cosine；248K 级长历史下 deep 语义召回更稳。
+- 只保留用户消息最后 `--kvmem-query-tokens` 行（默认 512）；
+- 分数经一阶图传播（`--kvmem-graph-alpha`，默认 0；本地没有 admission 前的历史图，
+  当前 prefill 图不能用于 Query，否则会按本 prompt 的 exposure 而非 Query 排序）；
+- Query 允许 cold recall，pressure 不允许；
+- prefill 完成后强制一次 Query 重选（等价 0.19 的 admission 时点），
+  这样 history restore 后的"最新页"窗口能换回问题真正需要的早期页。
 
 启动示例：
 

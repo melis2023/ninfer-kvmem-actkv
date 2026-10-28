@@ -102,8 +102,9 @@ std::string serve_usage_text(const char* argv0) {
            "  --kvmem-decode-pressure       rank resident pages by accepted attention;\n"
            "                                never recalls cold pages (default on)\n"
            "  --no-kvmem-decode-pressure    disable decode pressure\n"
+           "  --kvmem-query-scorer NAME      page-softmax (default) | meanq-cosine\n"
            "  --kvmem-query-tokens N        Query rows scored at admission (default 512)\n"
-           "  --kvmem-graph-alpha X         one-hop Query mass propagation [0,1] (default 0.2)\n"
+           "  --kvmem-graph-alpha X         one-hop Query mass propagation [0,1] (default 0)\n"
            "  --no-kvmem-graph              disable Query graph propagation\n"
            "  --kvmem-keep                  retain system prompt, tool schema, first brief\n"
            "                                and the non-thinking answer tail; demotes thinking\n"
@@ -707,6 +708,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (arg == "--no-kvmem-decode-pressure") {
             options.kvmem.decode_pressure = false;
+            continue;
+        }
+        if (arg == "--kvmem-query-scorer") {
+            const auto name = require_value("--kvmem-query-scorer");
+            if (name == "page-softmax") {
+                options.kvmem.query_meanq_cosine = false;
+            } else if (name == "meanq-cosine") {
+                options.kvmem.query_meanq_cosine = true;
+            } else {
+                throw std::invalid_argument("--kvmem-query-scorer must be page-softmax or meanq-cosine");
+            }
             continue;
         }
         if (arg == "--kvmem-query-tokens") {

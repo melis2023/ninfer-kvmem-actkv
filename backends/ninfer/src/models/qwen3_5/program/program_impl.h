@@ -1967,6 +1967,7 @@ private:
                         kvmem::SelectionReason reason = kvmem::SelectionReason::PrefillPressure);
     void archive_memory_window(SequenceState& sequence);
     bool memory_query_probe(const SequenceState& sequence, std::uint32_t prompt_tokens) const;
+    void reset_memory_attention(KvmemWindowState& window, std::uint32_t frontier);
     qwen3_5::TokenSpan bounded_memory_query(const PreparedPromptData& prompt) const;
     [[nodiscard]] std::uint32_t memory_checkpoint_frontier(const SequenceState& sequence,
         std::uint32_t prompt_tokens, bool allow_reuse) const;

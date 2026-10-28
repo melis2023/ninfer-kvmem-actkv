@@ -166,7 +166,10 @@ std::vector<double> ProgramImpl::score_memory_query(SequenceState& sequence,
         config.attention->num_key_value_heads, config.attention->head_dim, layers.data()};
     const auto aggregation = kvmem_options.score_agg_max
         ? kvmem::GqaScoreAggregation::Max : kvmem::GqaScoreAggregation::Mean;
-    auto scores = memory_query_scorer->score(*state.statistics, query, frame, aggregation);
+    auto scores = kvmem_options.query_meanq_cosine
+        ? kvmem::mean_query_cosine_scores(*state.statistics, query, frame.starts.size(),
+                                          aggregation)
+        : memory_query_scorer->score(*state.statistics, query, frame, aggregation);
     if (kvmem_options.graph_alpha > 0) {
         scores = kvmem::propagate_query_scores(scores, frame, state.graph,
                                                kvmem_options.graph_alpha);

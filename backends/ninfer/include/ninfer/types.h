@@ -518,7 +518,14 @@ struct KvmemOptions {
     // every 16 output tokens, exponential output decay 0.5.
     bool decode_pressure = true;
     // Graph propagation of one-hop current-Query mass. Zero is an exact bypass.
-    double graph_alpha = 0.2;
+    // Local 0.18 has no pre-admission history graph, so the default is a bypass;
+    // propagating the current prefill graph would rank pages by this prompt's
+    // exposure rather than by the Query.
+    double graph_alpha = 0.0;
+    // Query recall ranking. PageSoftmax is 0.19's default; MeanQCosine is the
+    // 0.19 host scorer that averages the admitted Query rows before comparing
+    // them with each page's mean K.
+    bool query_meanq_cosine = false;
     // Query recall scores the last N accepted prompt rows, independent of
     // generation length. 0.19 default is 512.
     std::uint32_t query_tokens = 512;

@@ -4,6 +4,7 @@
 
 #include "core/paged_kv_cache.h"
 #include "kvmem/prefix_checkpoint.hpp"
+#include "kvmem/query_policy.hpp"
 
 #include <atomic>
 #include <algorithm>
@@ -1307,15 +1308,29 @@ void ProgramImpl::capture_memory_endpoint(SequenceState& sequence, const Request
     }
 }
 
-qwen3_5::TokenSpan ProgramImpl::bounded_memory_query(const PreparedPromptData& prompt) const {
-    const auto source = prompt.memory_query.value_or(qwen3_5::TokenSpan{});
+void ProgramImpl::reset_memory_attention(KvmemWindowState& window, std::uint32_t frontier) {
+    // Prefix checkpoints do not carry graph or feedback state (local 0.18
+    // convention). After any rewind the accepted attention prefix must match the
+    // restored index exactly; older contributions are discarded rather than
+    // replayed against a different token range.
+    window.graph = kvmem::GraphSnapshot{};
+    window.graph.block_tokens = page_tokens;
+    window.graph.accepted_through = frontier;
+    window.graph.completed_through = std::uint64_t(frontier) / page_tokens * page_tokens;
+    window.graph.set_budget(
+        std::make_shared<kvmem::GraphStatisticsBudget>(32u << 20, memory_graph_budget));
+    window.feedback.restore({});
+    window.attention_scope = {};
+}
+
+qwen3_5::TokenSpan ProgramImpl::bounded_memory_query(const PreparedPromptData& prompt) const {    const auto source = prompt.memory_query.value_or(qwen3_5::TokenSpan{});
     auto bounded = kvmem::bounded_query(source.begin, source.count, prompt.token_ids.size(),
                                         kvmem_options.query_tokens);
     // Never start inside a vision span: its placeholder rows are not query text.
     for (const auto& item : prompt.vision_items) {
         for (const auto& span : item.token_spans) {
             if (span.begin <= bounded.begin && bounded.begin < span.begin + span.count) {
-                bounded.begin = std::min(bounded.end, span.begin + span.count);
+                bounded.begin = std::min<std::uint64_t>(bounded.end, span.begin + span.count);
             }
         }
     }
@@ -1413,6 +1428,7 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
     window.selector->truncate_to(frontier);
     if (preserve_view) window.selector->restore_retrieval(checkpoint.history);
     window.statistics_frontier = frontier;
+    reset_memory_attention(window, frontier);
     window.archive.resize(pages);
     window.host_versions.resize(pages);
     window.payload_bytes = pages * backend.page_bytes;
@@ -1658,6 +1674,7 @@ bool ProgramImpl::restore_memory_history(SequenceState& sequence, RequestControl
     window.removed_tokens = 0;
     window.reconstruction_frontier = 0;
     window.query_replayed = same_query;
+    reset_memory_attention(window, *frontier);
     const auto query = bounded_memory_query(staged.prompt);
     window.query_begin = static_cast<std::uint32_t>(query.begin);
     window.query_end = static_cast<std::uint32_t>(query.begin + query.count);
