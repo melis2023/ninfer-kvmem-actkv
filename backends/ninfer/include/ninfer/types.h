@@ -504,12 +504,19 @@ struct KvmemOptions {
     double lrfu_lambda = 0.5;
     double lrfu_top_fraction = 0.9;
     bool score_agg_max = false;
-    // L1 retention: pin the non-thinking tail of the last response (final answer and tool-call
-    // payload) and demote the fully-thinking pages. Both are page-granular and soft: demoted
-    // pages stay retrievable as a last resort, pinned pages are admitted to the mandatory set.
-    // Disabled by default so the legacy position-only policy is unchanged.
-    bool pin_answer = false;
-    std::uint32_t pin_answer_percent = 20;
+    // One switch for structural retention: the system preamble, declared tool
+    // definitions, the first user brief, and the non-thinking tail of the last
+    // response (final answer and tool-call payload). The answer tail is bounded
+    // by keep_answer_percent; thinking-only pages are demoted. Disabled by
+    // default so the legacy position-only policy is unchanged.
+    bool keep = false;
+    std::uint32_t keep_answer_percent = 20;
+    // Decode pressure: rank the resident working set by accumulated accepted
+    // query attention instead of re-running the prompt query. Pressure never
+    // recalls a cold page; only sink/recent/media/pins and already resident
+    // pages are eligible. The ratio is sampled every N accepted tokens.
+    bool decode_pressure = true;
+    std::uint32_t decode_pressure_interval = 16;
     std::uint32_t selected_tokens = 0; // B; zero disables KVMem
     std::uint32_t reserve_tokens = 0;  // R; also covers each prefill chunk
     // Whole-page rounding uses this backend's fixed 64-token page.

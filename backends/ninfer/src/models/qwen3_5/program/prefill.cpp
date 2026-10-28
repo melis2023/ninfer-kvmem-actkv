@@ -1151,6 +1151,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
             sequence.ledger_frontier    = pending.base_S + committed;
             sequence.text_kv_valid      = sequence.execution_frontier;
             sequence.tail_hidden_valid  = true;
+            note_accepted_tokens(sequence, committed, width);
 
             if (speculative_backend == SpeculativeBackend::Mtp) {
                 sequence.mtp_kv_valid = sequence.execution_frontier;

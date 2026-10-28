@@ -134,7 +134,7 @@ void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
                            .view({dimension(attention.query_width()), 1});
         ops::token_sums(normalized_key.view({dimension(attention.key_width()), tokens}),
                         origin, statistics->ranges.slice(0, 0, 2), block, k_sum, stream);
-        if (block != 1) {
+        if (block != 1 || statistics->capture_query) {
             ops::token_sums(normalized_query.view({dimension(attention.query_width()), tokens}),
                             origin, statistics->ranges.slice(0, 2, 2), 0, q_sum, stream);
         }

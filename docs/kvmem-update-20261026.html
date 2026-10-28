@@ -1,0 +1,684 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KVMem + ninfer + DFlash2 · 2026-10-26</title>
+<style>
+  :root{
+    --bg:#070b16;
+    --panel:rgba(255,255,255,.045);
+    --line:rgba(255,255,255,.11);
+    --text:#e7eefb;
+    --muted:#93a4c3;
+    --cyan:#67e8f9;
+    --violet:#a78bfa;
+    --green:#34d399;
+    --amber:#fbbf24;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{
+    margin:0;background:var(--bg);color:var(--text);overflow:hidden;
+    font-family:"Segoe UI","Microsoft YaHei","PingFang SC",system-ui,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  body::before{
+    content:"";position:fixed;inset:-20%;z-index:0;
+    background:
+      radial-gradient(circle at 18% 12%,rgba(103,232,249,.13),transparent 34%),
+      radial-gradient(circle at 82% 78%,rgba(167,139,250,.13),transparent 36%),
+      radial-gradient(circle at 55% 45%,rgba(52,211,153,.05),transparent 42%);
+    pointer-events:none;
+  }
+  .deck{position:relative;z-index:1;height:100%;width:100%}
+  .slide{
+    position:absolute;inset:0;display:none;flex-direction:column;justify-content:center;
+    padding:clamp(28px,5.2vh,64px) clamp(28px,6vw,96px);
+  }
+  .slide.active{display:flex;animation:slideIn .32s ease}
+  .slide.center{align-items:center;text-align:center}
+  .slide.center .pills{justify-content:center}
+  .slide.center .compare{margin-left:auto;margin-right:auto}
+  @keyframes slideIn{from{transform:translateY(8px)}to{transform:none}}
+
+  .kicker{
+    display:inline-flex;align-items:center;gap:8px;width:max-content;
+    font-size:clamp(11px,1.05vw,14px);letter-spacing:.16em;text-transform:uppercase;
+    color:var(--cyan);border:1px solid rgba(103,232,249,.28);
+    background:rgba(103,232,249,.06);padding:7px 12px;border-radius:999px;
+  }
+  .kicker::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--cyan);
+    box-shadow:0 0 12px var(--cyan)}
+  h1{
+    margin:18px 0 10px;font-size:clamp(2.4rem,5.6vw,5.6rem);line-height:1.02;
+    letter-spacing:-.035em;font-weight:800;color:#f4f8ff;
+  }
+  h1 .grad{background:linear-gradient(115deg,var(--cyan),var(--violet) 62%,#f0abfc);
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  h2{
+    margin:0 0 6px;font-size:clamp(1.7rem,3.2vw,3.1rem);line-height:1.12;
+    letter-spacing:-.025em;font-weight:750;color:#f4f8ff;
+  }
+  .sub{color:var(--muted);font-size:clamp(.95rem,1.35vw,1.28rem);line-height:1.65;max-width:64ch}
+  .speedup{
+    display:flex;align-items:center;gap:16px;width:max-content;margin-top:22px;
+    padding:12px 20px;border-radius:16px;border:1px solid rgba(52,211,153,.32);
+    background:linear-gradient(90deg,rgba(52,211,153,.13),rgba(103,232,249,.05));
+    box-shadow:0 0 34px rgba(52,211,153,.09);
+  }
+  .speedup-num{
+    font-size:clamp(1.85rem,2.75vw,2.9rem);font-weight:850;line-height:1;letter-spacing:-.045em;
+    background:linear-gradient(120deg,#34d399,#67e8f9);-webkit-background-clip:text;
+    background-clip:text;color:transparent;
+  }
+  .speedup-cap{font-size:clamp(.8rem,1vw,.96rem);color:#d7e6f8;line-height:1.45}
+  .speedup-cap span{color:var(--muted);font-size:.9em}
+  .pills{display:flex;flex-wrap:wrap;gap:10px;margin-top:26px}
+  .pill{
+    padding:10px 16px;border-radius:999px;border:1px solid var(--line);
+    background:var(--panel);color:#dbe6f8;font-size:clamp(.8rem,1.05vw,1rem);
+    display:flex;align-items:center;gap:9px;
+  }
+  .dot{width:8px;height:8px;border-radius:50%;background:var(--cyan)}
+  .dot.v{background:var(--violet)} .dot.g{background:var(--green)} .dot.a{background:var(--amber)}
+
+  .hero{display:grid;grid-template-columns:1.15fr .85fr;gap:clamp(24px,4vw,64px);align-items:center}
+  .hero-copy{padding-left:clamp(0px,3.5vw,64px)}
+  .window{
+    border:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.05),rgba(255,255,255,.015));
+    border-radius:26px;padding:28px;display:flex;flex-direction:column;gap:18px;
+    margin-left:-56px;width:calc(100% + 56px);
+  }
+  .window-title{font-size:13px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
+  .blocks{display:flex;gap:8px;align-items:stretch;height:156px}
+  .blk{border-radius:8px;border:1px solid rgba(255,255,255,.1);display:flex;flex-direction:column;
+    align-items:center;justify-content:center;gap:3px;padding:8px 6px;color:#dbe6f8;overflow:hidden}
+  .blk b{font-size:clamp(1rem,1.35vw,1.28rem);font-weight:800;letter-spacing:.04em}
+  .blk span{font-size:clamp(.82rem,1.02vw,.98rem);color:#cfe0f5;font-variant-numeric:tabular-nums}
+  .blk.b{flex:4;background:linear-gradient(180deg,rgba(103,232,249,.32),rgba(103,232,249,.08))}
+  .blk.r{flex:2;background:linear-gradient(180deg,rgba(167,139,250,.34),rgba(167,139,250,.08))}
+  .blk.host{flex:2;background:repeating-linear-gradient(135deg,rgba(255,255,255,.06) 0 6px,rgba(255,255,255,.015) 6px 12px)}
+  .legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--muted)}
+  .legend span::before{content:"";display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:6px;vertical-align:1px}
+  .legend .l1::before{background:var(--cyan)} .legend .l2::before{background:var(--violet)}
+  .legend .l3::before{background:#64748b}
+
+  .stat-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:clamp(14px,1.8vw,24px);margin-top:clamp(20px,3.2vh,36px)}
+  .stat{
+    border:1px solid var(--line);background:var(--panel);border-radius:20px;
+    padding:clamp(18px,2vw,28px);display:flex;flex-direction:column;gap:8px;min-height:180px;
+    position:relative;overflow:hidden;
+  }
+  .stat::after{content:"";position:absolute;inset:auto 0 0 0;height:2px;
+    background:linear-gradient(90deg,var(--cyan),transparent)}
+  .stat .label{font-size:clamp(.78rem,1vw,.95rem);color:var(--muted);letter-spacing:.02em}
+  .stat .big{font-size:clamp(2.3rem,3.7vw,4rem);font-weight:800;line-height:1;letter-spacing:-.04em;
+    background:linear-gradient(120deg,var(--cyan),var(--violet));-webkit-background-clip:text;
+    background-clip:text;color:transparent}
+  .stat .unit{font-size:clamp(.8rem,1vw,1rem);color:var(--muted);font-weight:500}
+  .stat .note{font-size:clamp(.76rem,.95vw,.92rem);color:#b9c7df;line-height:1.45;margin-top:auto}
+  .stat .badge{width:max-content;font-size:11px;padding:5px 9px;border-radius:999px;
+    background:rgba(52,211,153,.1);color:var(--green);border:1px solid rgba(52,211,153,.25)}
+
+  .compare{
+    width:100%;max-width:1180px;border-collapse:separate;border-spacing:0 9px;
+    margin-top:clamp(18px,2.4vh,28px);font-size:clamp(.92rem,1.12vw,1.08rem);
+  }
+  .compare th{
+    text-align:left;padding:0 18px 4px;color:var(--muted);font-size:.76em;
+    letter-spacing:.14em;text-transform:uppercase;font-weight:600;
+  }
+  .compare th:nth-child(n+2),.compare td:nth-child(n+2){text-align:right}
+  .compare td{
+    padding:clamp(10px,1.2vh,15px) 18px;background:rgba(255,255,255,.04);
+    border-top:1px solid var(--line);border-bottom:1px solid var(--line);color:#c9d7ee;
+  }
+  .compare td:first-child{
+    border-left:1px solid var(--line);border-radius:12px 0 0 12px;
+    color:#e8f0ff;font-weight:600;
+  }
+  .compare td:last-child{
+    border-right:1px solid var(--line);border-radius:0 12px 12px 0;
+  }
+  .compare td.win{color:var(--cyan);font-weight:800;font-size:1.1em;letter-spacing:-.01em}
+  .compare td.lose{color:var(--amber);font-weight:700}
+  .up{
+    display:inline-block;color:#34d399;background:rgba(52,211,153,.1);
+    border:1px solid rgba(52,211,153,.26);padding:4px 10px;border-radius:999px;
+    font-size:.86em;font-weight:800;white-space:nowrap;
+  }
+  .down{
+    display:inline-block;color:#fbbf24;background:rgba(251,191,36,.1);
+    border:1px solid rgba(251,191,36,.24);padding:4px 10px;border-radius:999px;
+    font-size:.86em;font-weight:800;white-space:nowrap;
+  }
+
+  .fix-grid{display:grid;grid-template-columns:1fr 1fr;gap:clamp(12px,1.5vw,20px);margin-top:clamp(18px,2.6vh,30px)}
+  .fix{
+    border:1px solid var(--line);background:var(--panel);border-radius:18px;
+    padding:clamp(16px,1.7vw,24px);display:flex;gap:14px;align-items:flex-start;
+  }
+  .fix .ico{
+    flex:0 0 38px;height:38px;border-radius:11px;display:grid;place-items:center;
+    background:rgba(103,232,249,.1);border:1px solid rgba(103,232,249,.22);
+    color:var(--cyan);font-weight:800;font-size:15px;
+  }
+  .fix.v .ico{background:rgba(167,139,250,.1);border-color:rgba(167,139,250,.22);color:var(--violet)}
+  .fix.g .ico{background:rgba(52,211,153,.1);border-color:rgba(52,211,153,.22);color:var(--green)}
+  .fix.a .ico{background:rgba(251,191,36,.1);border-color:rgba(251,191,36,.22);color:var(--amber)}
+  .fix h3{margin:0 0 5px;font-size:clamp(.95rem,1.2vw,1.15rem);font-weight:700}
+  .fix p{margin:0;color:var(--muted);font-size:clamp(.78rem,.98vw,.94rem);line-height:1.55}
+  .fix strong{color:#eaf2ff;font-weight:650}
+
+  .foot{
+    position:absolute;left:clamp(28px,6vw,96px);right:clamp(28px,6vw,96px);bottom:clamp(16px,2.4vh,28px);
+    display:flex;justify-content:space-between;align-items:center;color:#6b7c99;
+    font-size:clamp(10px,.9vw,12px);letter-spacing:.04em;
+  }
+  .foot .brand{display:flex;gap:8px;align-items:center}
+  .foot .brand i{width:6px;height:6px;border-radius:50%;background:var(--cyan);display:inline-block;
+    box-shadow:0 0 10px var(--cyan)}
+  .foot > span:last-child{display:none}
+
+  .nav{position:fixed;right:clamp(16px,2.2vw,30px);bottom:clamp(14px,2.2vh,26px);
+    display:flex;gap:8px;align-items:center;z-index:20}
+  .nav button{
+    width:40px;height:40px;border-radius:12px;border:1px solid var(--line);
+    background:rgba(255,255,255,.05);color:var(--text);cursor:pointer;font-size:16px;
+    transition:.18s;backdrop-filter:blur(8px);
+  }
+  .nav button:hover{background:rgba(103,232,249,.12);border-color:rgba(103,232,249,.4)}
+  .nav .page{min-width:54px;text-align:center;color:var(--muted);font-size:12px;
+    font-variant-numeric:tabular-nums}
+
+  .convert-grid{display:grid;grid-template-columns:1.2fr .8fr;gap:clamp(16px,2vw,28px);
+    margin-top:clamp(18px,2.4vh,28px);align-items:stretch}
+  .code{
+    margin:0;padding:18px 20px;border-radius:16px;border:1px solid var(--line);
+    background:rgba(0,0,0,.3);color:#cfe0f5;
+    font-family:"Cascadia Code","Consolas","SFMono-Regular",monospace;
+    font-size:clamp(.68rem,.82vw,.82rem);line-height:1.65;white-space:pre;overflow:auto;
+  }
+  .code .k{color:var(--cyan)}
+  .code .c{color:#6b7c99}
+  .convert-points{display:flex;flex-direction:column;gap:8px}
+  .convert-points div{
+    display:flex;gap:12px;padding:10px 13px;border:1px solid var(--line);border-radius:11px;
+    background:var(--panel);font-size:clamp(.74rem,.9vw,.9rem);
+  }
+  .convert-points b{color:var(--cyan);font-weight:700;min-width:58px;flex:0 0 auto}
+  .convert-points span{color:var(--muted);line-height:1.5}
+  .convert-points code{color:#dbe6f8;background:rgba(255,255,255,.06);padding:1px 5px;border-radius:5px;font-size:.92em}
+  .convert-foot{display:flex;gap:clamp(12px,2vw,28px);margin-top:clamp(20px,3vh,32px);flex-wrap:wrap}
+  .convert-foot div{display:flex;align-items:baseline;gap:8px;padding:10px 16px;
+    border:1px solid var(--line);border-radius:12px;background:var(--panel)}
+  .convert-foot b{font-size:clamp(1.2rem,1.8vw,1.7rem);color:var(--cyan);font-weight:800}
+  .convert-foot span{color:var(--muted);font-size:clamp(.76rem,.92vw,.9rem)}
+
+  /* 仿工具窗口 */
+  .app{
+    border:1px solid var(--line);border-radius:18px;overflow:hidden;
+    background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.02));
+    box-shadow:0 22px 50px -30px rgba(0,0,0,.8);
+  }
+  .app-bar{
+    display:flex;align-items:center;gap:12px;padding:11px 15px;
+    border-bottom:1px solid var(--line);background:rgba(255,255,255,.035);
+  }
+  .app-dots{display:flex;gap:5px}
+  .app-dots i{width:8px;height:8px;border-radius:50%;background:rgba(255,255,255,.16)}
+  .app-dots i:first-child{background:rgba(248,113,113,.5)}
+  .app-dots i:nth-child(2){background:rgba(251,191,36,.5)}
+  .app-dots i:last-child{background:rgba(52,211,153,.5)}
+  .app-title{font-size:11px;letter-spacing:.16em;text-transform:uppercase;color:var(--muted)}
+  .app-tag{
+    margin-left:auto;font-size:10.5px;padding:4px 9px;border-radius:999px;
+    color:var(--cyan);border:1px solid rgba(103,232,249,.25);background:rgba(103,232,249,.07);
+    white-space:nowrap;
+  }
+  .app-body{display:flex;flex-direction:column;gap:9px;padding:clamp(14px,1.6vw,20px)}
+  .app-row{display:grid;grid-template-columns:64px minmax(0,1fr) auto;gap:10px;align-items:center}
+  .app-key{font-size:11.5px;color:var(--muted);letter-spacing:.04em}
+  .app-slot{
+    display:flex;align-items:center;justify-content:space-between;gap:10px;
+    padding:9px 11px;border-radius:10px;border:1px solid var(--line);
+    background:rgba(0,0,0,.26);font-size:12px;color:#dbe6f8;min-width:0;
+  }
+  .app-slot span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .app-slot b{font-weight:500;font-size:10.5px;color:#8095b6;white-space:nowrap}
+  .ok{
+    font-size:10px;padding:3px 7px;border-radius:999px;color:var(--green);
+    border:1px solid rgba(52,211,153,.28);background:rgba(52,211,153,.09);white-space:nowrap;
+  }
+  .app-chips{display:flex;gap:7px;flex-wrap:wrap;margin-top:3px}
+  .chip{
+    font-size:10.5px;padding:4px 10px;border-radius:999px;color:#8fa2c0;
+    border:1px solid var(--line);background:rgba(255,255,255,.03);
+  }
+  .chip.on{color:var(--cyan);border-color:rgba(103,232,249,.3);background:rgba(103,232,249,.08)}
+  .chip.on::before{content:"✓ ";font-size:.95em}
+  .app-actions{
+    display:flex;align-items:center;gap:12px;margin-top:7px;
+    padding-top:11px;border-top:1px dashed rgba(255,255,255,.12);
+  }
+  .out{flex:1;min-width:0;display:flex;align-items:baseline;gap:8px;font-size:11.5px;color:var(--muted)}
+  .out b{color:#e8f0ff;font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .btn{
+    flex:0 0 auto;padding:9px 20px;border-radius:10px;font-size:12px;font-weight:800;
+    color:#04101c;background:linear-gradient(120deg,var(--cyan),var(--violet));
+    box-shadow:0 8px 22px -10px rgba(103,232,249,.7);
+  }
+
+  .steps{display:flex;flex-direction:column;gap:8px;height:100%}
+  .step-line{display:flex;gap:12px;align-items:flex-start;padding:9px 11px;
+    border:1px solid transparent;border-radius:12px;background:rgba(255,255,255,.028)}
+  .step-line > b{
+    flex:0 0 32px;height:32px;display:grid;place-items:center;border-radius:10px;
+    font-size:11.5px;color:var(--cyan);border:1px solid rgba(103,232,249,.26);
+    background:rgba(103,232,249,.07);font-weight:700;
+  }
+  .step-line h3{margin:0 0 2px;font-size:clamp(.85rem,1.02vw,1rem);color:#eef4ff;font-weight:700}
+  .step-line p{margin:0;font-size:clamp(.72rem,.86vw,.84rem);color:var(--muted);line-height:1.5}
+
+  .flow{display:flex;align-items:stretch;justify-content:center;gap:clamp(8px,1.4vw,20px);
+    margin:clamp(26px,3.6vh,44px) auto 0;flex-wrap:nowrap;width:100%;max-width:1120px}
+  .step{
+    flex:1 1 0;min-height:190px;
+    border:1px solid var(--line);border-radius:20px;padding:clamp(18px,2vw,26px);
+    background:linear-gradient(180deg,rgba(255,255,255,.06),rgba(255,255,255,.015));
+    display:flex;flex-direction:column;gap:8px;position:relative;overflow:hidden;text-align:left;
+  }
+  .step::after{content:"";position:absolute;inset:auto 0 0 0;height:2px;
+    background:linear-gradient(90deg,var(--cyan),transparent)}
+  .step .num{font-size:11px;letter-spacing:.18em;color:var(--cyan);font-weight:700}
+  .step h3{margin:0;font-size:clamp(1rem,1.3vw,1.24rem);font-weight:750;color:#f4f8ff}
+  .step p{margin:0;color:var(--muted);font-size:clamp(.78rem,.95vw,.92rem);line-height:1.6}
+  .arrow{display:flex;align-items:center;color:rgba(103,232,249,.55);
+    font-size:clamp(1.1rem,1.6vw,1.6rem);font-weight:300;flex:0 0 auto}
+
+  .roadmap{display:grid;grid-template-columns:repeat(3,1fr);gap:clamp(14px,1.8vw,22px);margin-top:clamp(14px,2vh,24px)}
+  .road{border:1px dashed rgba(255,255,255,.18);border-radius:16px;padding:clamp(14px,1.5vw,20px);
+    background:rgba(255,255,255,.025);min-height:104px;display:flex;flex-direction:column;gap:6px}
+  .road .idx{font-size:11px;letter-spacing:.14em;color:var(--muted)}
+  .road h3{margin:0;font-size:clamp(.98rem,1.2vw,1.16rem)}
+  .road p{margin:0;color:var(--muted);font-size:clamp(.78rem,.96vw,.92rem);line-height:1.55}
+  .hint{margin-top:18px;color:#6b7c99;font-size:clamp(.76rem,.92vw,.9rem)}
+
+  @media (max-width:1000px){
+    .hero{grid-template-columns:1fr}
+    .window{margin-left:0;width:100%}
+    .stat-grid,.roadmap{grid-template-columns:1fr}
+    .fix-grid{grid-template-columns:1fr}
+    .flow{flex-direction:column;align-items:center}
+    .arrow{transform:rotate(90deg)}
+    .convert-grid{grid-template-columns:1fr}
+  }
+  @media print{
+    body{background:#fff;color:#111;overflow:visible}
+    body::before{display:none}
+    .nav{display:none}
+    .slide{display:flex!important;position:relative;min-height:100vh;page-break-after:always;
+      color:#111}
+    .sub,.stat .note,.fix p,.road p,.foot{color:#444}
+    .stat,.fix,.road,.window,.pill{border-color:#d5dbe7;background:#f7f9fc}
+    .stat .big{background:none;color:#0b63c5}
+  }
+</style>
+</head>
+<body>
+<div class="deck">
+
+  <!-- 1 -->
+  <section class="slide active">
+    <div class="hero">
+      <div class="hero-copy">
+        <div class="kicker">2026-10-26 update</div>
+        <h1>KVMem + ninfer<br><span class="grad">DFlash2</span></h1>
+        <p class="sub">
+          用固定窗口换 26 万 token 长上下文，用 DFlash2 草稿换 decode 速度。<br>
+          直通草稿 · draft 4 · ngram 31 · rk8v4<br>
+          B/R = 36,384 / 16,384 · 5060 Ti 16 GB
+        </p>
+        <div class="speedup">
+          <div class="speedup-num">28%+</div>
+          <div class="speedup-cap">DFlash2 加载后<br><span>综合 decode 提速</span></div>
+        </div>
+        <div class="pills">
+          <span class="pill"><i class="dot"></i>KVMem 稀疏窗口</span>
+          <span class="pill"><i class="dot v"></i>ninfer 推理引擎</span>
+          <span class="pill"><i class="dot g"></i>DFlash2 直通草稿</span>
+          <span class="pill"><i class="dot a"></i>CUDA Graph 校准</span>
+        </div>
+      </div>
+      <div class="window">
+        <div class="window-title">KVMem window</div>
+        <div class="blocks">
+          <div class="blk b"><b>B</b><span>36,384</span></div>
+          <div class="blk r"><b>R</b><span>16,384</span></div>
+          <div class="blk host"><b>Host</b><span>按需召回</span></div>
+        </div>
+        <div class="legend">
+          <span class="l1">选中历史</span>
+          <span class="l2">生成预留</span>
+          <span class="l3">按需召回</span>
+        </div>
+      </div>
+    </div>
+    <div class="foot">
+      <span class="brand"><i></i>KVMem · ninfer · DFlash2</span>
+      <span>1 / 6</span>
+    </div>
+  </section>
+
+  <!-- 2 -->
+  <section class="slide center">
+    <div class="kicker">speed</div>
+    <h2>MTP vs DFlash2：快多少</h2>
+    <p class="sub">q3km 直通草稿 · draft 4 · ngram 31 · rk8v4 KV · B/R = 36,384 / 16,384</p>
+
+    <table class="compare">
+      <thead>
+        <tr><th>场景</th><th>MTP</th><th>DFlash2</th><th>差异</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>128K 代码 · decode</td>
+          <td>72.2 tok/s</td>
+          <td class="win">87.1 tok/s</td>
+          <td><span class="up">+20.6%</span></td>
+        </tr>
+        <tr>
+          <td>WebUI 鹈鹕 · decode</td>
+          <td>71 tok/s</td>
+          <td class="win">96.0 tok/s</td>
+          <td><span class="up">+35.2%</span></td>
+        </tr>
+        <tr>
+          <td>DeepSeek harness 鹈鹕 · decode</td>
+          <td>54 tok/s</td>
+          <td class="win">66 tok/s</td>
+          <td><span class="up">+22.2%</span></td>
+        </tr>
+        <tr>
+          <td>256K · prefill</td>
+          <td>803.3 tok/s</td>
+          <td class="win">854.8 tok/s</td>
+          <td><span class="up">+6.4%</span></td>
+        </tr>
+        <tr>
+          <td>256K · decode</td>
+          <td>47.5 tok/s</td>
+          <td class="win">50.5 tok/s</td>
+          <td><span class="up">+6.3%</span></td>
+        </tr>
+        <tr>
+          <td>256K · 接受率</td>
+          <td>40.7%</td>
+          <td class="lose">37.8%</td>
+          <td><span class="down">−2.9 pt</span></td>
+        </tr>
+      </tbody>
+    </table>
+
+    <div class="pills" style="margin-top:22px">
+      <span class="pill"><i class="dot"></i>draft 4 是峰值</span>
+      <span class="pill"><i class="dot v"></i>q3km 直通省显存</span>
+      <span class="pill"><i class="dot g"></i>ngram 仲裁后不再抢草稿</span>
+    </div>
+    <p class="hint">128K 代码为早期 120 token 样本；最新 512 token 复测两者接近，MTP 略快 3–7%。256K 的 MTP 行为旧启动器（int8 KV），非单变量对比。</p>
+
+    <div class="foot">
+      <span class="brand"><i></i>实测：RTX 5060 Ti 16 GB · Qwen3.8-27B IQ3_S</span>
+      <span>2 / 6</span>
+    </div>
+  </section>
+
+  <!-- 3 -->
+  <section class="slide">
+    <div class="kicker">fixes</div>
+    <h2>这次修了什么</h2>
+    <p class="sub">四个直接影响启动与 decode 的问题，已经全部落地并验证。</p>
+
+    <div class="fix-grid">
+      <div class="fix">
+        <div class="ico">01</div>
+        <div>
+          <h3>CUDA Graph 探针：显存算准了</h3>
+          <p>旧版按拓扑盲预留约 <strong>1 GiB</strong>，实际 Graph 只占 <strong>60–157 MiB</strong>。
+             现在启动时用最小 KV 探针实测，规划 <strong>max(实测, 256 MiB)</strong>，省下
+             <strong>700–800 MiB</strong>；读数高于 256 MiB 时复测取小，避免 WDDM 抖动把容量顶爆。</p>
+        </div>
+      </div>
+      <div class="fix v">
+        <div class="ico">02</div>
+        <div>
+          <h3>DFlash2 模型可正常加载</h3>
+          <p>草稿改为 <strong>q3km 直通</strong>：Q4_K×10 + Q3_K×2，不再混用 Q8/NVFP4；
+             修复 envelope、masked-draft floor、state fork 槽位。启动 free <strong>863.8 MiB</strong>，
+             长上下文不再启动即失败。</p>
+        </div>
+      </div>
+      <div class="fix g">
+        <div class="ico">03</div>
+        <div>
+          <h3>bypass 不再误关草稿</h3>
+          <p>从“连续 6 轮零接受”改成按<strong>期望收益</strong>判定：只有
+             <strong>expected &lt; 1.15</strong> 才关。思考阶段不再掉到 40 tok/s，
+             实测误关 <strong>0 次</strong>。</p>
+        </div>
+      </div>
+      <div class="fix a">
+        <div class="ico">04</div>
+        <div>
+          <h3>ngram 不再抢 DFlash</h3>
+          <p>copy 轮只在<strong>收益 &gt; 1.3× 草稿</strong>时触发，短匹配自动回退。
+             鹈鹕 <strong>74.7 vs 72.1 tok/s</strong>，agent 9.8K <strong>89.2 vs 87.8</strong>。</p>
+        </div>
+      </div>
+    </div>
+
+    <p class="hint">另：NVFP4 Blackwell 保留 scale <code>0x7F</code> 映射为 0（编译验证）；KVMem 驱逐回到满窗口 100%。</p>
+
+    <div class="foot">
+      <span class="brand"><i></i>全部改动已编译 · 已在 16 GB 卡实测</span>
+      <span>3 / 6</span>
+    </div>
+  </section>
+
+  <!-- 4 -->
+  <section class="slide">
+    <div class="kicker">tooling</div>
+    <h2>GGUF → .ninfer 转换工具</h2>
+    <p class="sub">选主模型、选草稿、勾组件，点一下合并。目标权重按源 GGUF 块直通，不做反量化。</p>
+
+    <div class="convert-grid">
+      <div class="app">
+        <div class="app-bar">
+          <span class="app-dots"><i></i><i></i><i></i></span>
+          <span class="app-title">ninfer converter</span>
+          <span class="app-tag">recipe · qwen3_8_27b_gguf</span>
+        </div>
+        <div class="app-body">
+          <div class="app-row">
+            <div class="app-key">主模型</div>
+            <div class="app-slot"><span>Qwen3.8-27B-IQ3_S-mtp.gguf</span><b>IQ3_S</b></div>
+            <div class="ok">已选</div>
+          </div>
+          <div class="app-row">
+            <div class="app-key">草稿</div>
+            <div class="app-slot"><span>MTP head（随主模型）</span><b>自动</b></div>
+            <div class="ok">已选</div>
+          </div>
+          <div class="app-row">
+            <div class="app-key">视觉</div>
+            <div class="app-slot"><span>mmproj-Q8_0.gguf</span><b>可选</b></div>
+            <div class="ok">已选</div>
+          </div>
+          <div class="app-row">
+            <div class="app-key">DFlash2</div>
+            <div class="app-slot"><span>DFlash2-Q3_K_M.gguf</span><b>Q4_K×10 + Q3_K×2</b></div>
+            <div class="ok">已选</div>
+          </div>
+
+          <div class="app-chips">
+            <span class="chip on">text</span>
+            <span class="chip on">vision</span>
+            <span class="chip on">mtp</span>
+            <span class="chip on">dflash2</span>
+          </div>
+
+          <div class="app-actions">
+            <div class="out"><span>输出</span><b>qwen3.8-27b-q3km.ninfer</b></div>
+            <div class="btn">合并</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="steps">
+        <div class="step-line">
+          <b>01</b>
+          <div><h3>选主模型</h3><p>目标 GGUF，例如 IQ3_S / IQ4_XS</p></div>
+        </div>
+        <div class="step-line">
+          <b>02</b>
+          <div><h3>选草稿</h3><p>DFlash2 或 MTP，GGUF、NVFP4 均可</p></div>
+        </div>
+        <div class="step-line">
+          <b>03</b>
+          <div><h3>勾组件</h3><p>text / vision / mtp / dflash2 按需</p></div>
+        </div>
+        <div class="step-line">
+          <b>04</b>
+          <div><h3>点合并</h3><p>进度跑完，得到单个 .ninfer</p></div>
+        </div>
+        <p class="hint" style="margin-top:auto">命令行等价：<code>python3 -m tools.convert</code> 加 <code>--recipe</code> / <code>--source</code> / <code>--out</code>。</p>
+      </div>
+    </div>
+
+    <p class="hint">转换工具从 Releases 下载；完整参数见 README 与 tools/convert/recipes/README.md。</p>
+
+    <div class="foot">
+      <span class="brand"><i></i>KVMem · ninfer · DFlash2</span>
+      <span>4 / 6</span>
+    </div>
+  </section>
+
+  <!-- 5 -->
+  <section class="slide center">
+    <div class="kicker">one click</div>
+    <h2>选模型 → 一键合并 <span class="grad">.ninfer</span></h2>
+    <p class="sub">主模型、草稿、视觉投影器在同一个界面里选好，点一下合并，得到单个可加载的 .ninfer 文件。</p>
+
+    <div class="flow">
+      <div class="step">
+        <div class="num">01</div>
+        <h3>选主模型</h3>
+        <p>目标 GGUF，例如<br>Qwen3.8-27B IQ3_S</p>
+      </div>
+      <div class="arrow">→</div>
+      <div class="step">
+        <div class="num">02</div>
+        <h3>选草稿</h3>
+        <p>DFlash2 / MTP 头<br>GGUF、NVFP4 都行</p>
+      </div>
+      <div class="arrow">→</div>
+      <div class="step">
+        <div class="num">03</div>
+        <h3>一键合并</h3>
+        <p>输出单个 .ninfer<br>直接给 ninfer 加载</p>
+      </div>
+    </div>
+
+    <div class="pills" style="margin-top:clamp(22px,3vh,34px)">
+      <span class="pill"><i class="dot"></i>不需要命令行</span>
+      <span class="pill"><i class="dot v"></i>权重直通不反量化</span>
+      <span class="pill"><i class="dot g"></i>组件可勾选</span>
+    </div>
+    <p class="hint">组件按需勾：text / vision / mtp / dflash2，不用可以不加。</p>
+
+    <div class="foot">
+      <span class="brand"><i></i>转换工具 · 一键合并</span>
+      <span>5 / 6</span>
+    </div>
+  </section>
+
+  <!-- 6 -->
+  <section class="slide">
+    <div class="kicker">verify</div>
+    <h2>转换后检查什么</h2>
+    <p class="sub">三步确认工件能加载、显存算得准、速度符合预期。</p>
+
+    <div class="roadmap">
+      <div class="road">
+        <div class="idx">01 / INSPECT</div>
+        <h3>看格式分布</h3>
+        <p><code>tools/artifact/inspect.py</code>：目标 IQ3_S，草稿 Q4_K×10 + Q3_K×2。</p>
+      </div>
+      <div class="road">
+        <div class="idx">02 / START</div>
+        <h3>看启动 free</h3>
+        <p>探针 60–157 MiB，规划 256 MiB；DFlash2 启动 free 约 863.8 MiB。</p>
+      </div>
+      <div class="road">
+        <div class="idx">03 / RUN</div>
+        <h3>跑短请求</h3>
+        <p>WebUI 鹈鹕 96 tok/s / 76.7%；8K 上下文即可复现。</p>
+      </div>
+    </div>
+    <p class="hint">若启动 OOM：先看 free 与 B/R，再降 prefill-chunk 或换更小工件。</p>
+
+    <div class="foot">
+      <span class="brand"><i></i>转换后验证</span>
+      <span>6 / 6</span>
+    </div>
+  </section>
+
+</div>
+
+<div class="nav">
+  <button id="prev" aria-label="上一页">←</button>
+  <span class="page" id="page">1 / 6</span>
+  <button id="next" aria-label="下一页">→</button>
+</div>
+
+<script>
+  const slides = Array.from(document.querySelectorAll('.slide'));
+  const page = document.getElementById('page');
+  let index = 0;
+
+  function show(n) {
+    index = Math.max(0, Math.min(slides.length - 1, n));
+    slides.forEach((s, i) => s.classList.toggle('active', i === index));
+    page.textContent = (index + 1) + ' / ' + slides.length;
+  }
+
+  document.getElementById('prev').addEventListener('click', () => show(index - 1));
+  document.getElementById('next').addEventListener('click', () => show(index + 1));
+
+  document.addEventListener('keydown', (event) => {
+    if (['ArrowRight', 'PageDown', ' ', 'Enter'].includes(event.key)) {
+      event.preventDefault(); show(index + 1);
+    } else if (['ArrowLeft', 'PageUp', 'Backspace'].includes(event.key)) {
+      event.preventDefault(); show(index - 1);
+    } else if (event.key === 'Home') {
+      show(0);
+    } else if (event.key === 'End') {
+      show(slides.length - 1);
+    }
+  });
+
+  let touchX = null;
+  document.addEventListener('touchstart', (e) => { touchX = e.touches[0].clientX; }, {passive:true});
+  document.addEventListener('touchend', (e) => {
+    if (touchX === null) return;
+    const dx = e.changedTouches[0].clientX - touchX;
+    if (Math.abs(dx) > 50) show(index + (dx < 0 ? 1 : -1));
+    touchX = null;
+  }, {passive:true});
+
+  const hashPage = parseInt((location.hash || '').replace('#', ''), 10);
+  show(Number.isFinite(hashPage) && hashPage > 0 ? hashPage - 1 : 0);
+</script>
+</body>
+</html>

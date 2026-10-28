@@ -11,6 +11,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -125,14 +126,70 @@ std::vector<const ToolDefinition*> effective_tools(const GenerationRequest& requ
     return tools;
 }
 
+// Long-payload tools (write/edit) are more reliable when the short path argument is
+// rendered before the payload. The same applies to shell/grep tools: the short
+// description/pattern is easier to emit before a long command. Property order does
+// not affect JSON Schema validation; this only changes the prompt.
+RequestJson order_tool_schema_properties(RequestJson schema, std::string_view tool_name) {
+    if (!schema.is_object() || !schema.contains("properties") ||
+        !schema["properties"].is_object()) {
+        return schema;
+    }
+    const auto promoted = [tool_name](std::string_view key) {
+        if (key == "file_path" || key == "path" || key == "file") { return true; }
+        if (tool_name == "pwsh" && key == "description") { return true; }
+        if (tool_name == "grep" && key == "pattern") { return true; }
+        return false;
+    };
+    RequestJson properties = RequestJson::object();
+    for (auto& [key, value] : schema["properties"].items()) {
+        if (promoted(key)) { properties[key] = std::move(value); }
+    }
+    for (auto& [key, value] : schema["properties"].items()) {
+        if (!properties.contains(key)) { properties[key] = std::move(value); }
+    }
+    schema["properties"] = std::move(properties);
+
+    if (schema.contains("required") && schema["required"].is_array()) {
+        RequestJson required = RequestJson::array();
+        for (const auto& item : schema["required"]) {
+            if (item.is_string() && promoted(item.get<std::string>())) {
+                required.push_back(item);
+            }
+        }
+        for (const auto& item : schema["required"]) {
+            bool seen = false;
+            for (const auto& existing : required) {
+                if (existing == item) { seen = true; break; }
+            }
+            if (!seen) { required.push_back(item); }
+        }
+        schema["required"] = std::move(required);
+    }
+    return schema;
+}
+
 // The members follow the order the Qwen templates were trained on, name, description and
 // parameters; `strict` is the server's enforcement flag for the output contract, and the frontend
 // leaves it out of the rendered prompt.
 std::string render_tool_definition(const ToolDefinition& tool) {
     using Json  = RequestJson;
-    Json schema = Json::parse(tool.input_schema_json);
+    Json schema = order_tool_schema_properties(Json::parse(tool.input_schema_json), tool.name);
     Json function{{"name", tool.name}};
-    if (!tool.description.empty()) { function["description"] = tool.description; }
+    std::string description = tool.description;
+    // Path + long payload tools: state the order explicitly. The path argument is short and
+    // required, and models that write the payload first tend to omit it entirely.
+    if (schema.contains("properties") && schema["properties"].contains("file_path") &&
+        (schema["properties"].contains("content") ||
+         schema["properties"].contains("new_string"))) {
+        description +=
+            " Always provide file_path first; it is required even when the payload is long.";
+    }
+    if (tool.name == "pwsh" || tool.name == "grep") {
+        description +=
+            " All required arguments must be present; never send an empty object.";
+    }
+    if (!description.empty()) { function["description"] = std::move(description); }
     function["parameters"] = std::move(schema);
     if (tool.input_examples_json) {
         function["input_examples"] = Json::parse(*tool.input_examples_json);

@@ -603,7 +603,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         memory_statistics_host = std::make_unique<PinnedHostBuffer>(
             memory_statistics->key_bytes() + memory_statistics->query_bytes());
         memory_candidate_host = std::make_unique<PinnedHostBuffer>(
-            memory_candidate_statistics->key_bytes());
+            memory_candidate_statistics->key_bytes() +
+            memory_candidate_statistics->query_bytes());
         memory_statistics_ranges = {0, static_cast<std::int32_t>(capacity), 0, 0};
         for (std::size_t rank = 0; rank < device.size(); ++rank) {
             const auto& layout = plan.persistent.memory_statistics[rank];

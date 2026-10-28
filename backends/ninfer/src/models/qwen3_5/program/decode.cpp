@@ -587,6 +587,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             commit_memory_candidates(sequence, base_E, base_E + 1, static_cast<std::uint32_t>(row), 1);
             sequence.text_kv_valid = base_E + 1;
             commit_sequence_kv(sequence, sequence.text_kv_valid, 0);
+            note_accepted_tokens(sequence, 1, 1);
             sequence.tail_hidden_valid = true;
             sequence.ledger.push_back(token);
             sequence.prefix_identity.append_generated(1, sequence.rope_delta);

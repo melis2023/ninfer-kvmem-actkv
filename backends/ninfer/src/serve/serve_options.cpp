@@ -99,9 +99,15 @@ std::string serve_usage_text(const char* argv0) {
            "                                page; positive values round down, minimum one page\n"
            "  --kvmem-recent-tokens N       always-kept newest suffix; default 64 (one page);\n"
            "                                minimum 64; values round down to whole pages\n"
-           "  --kvmem-pin-answer            pin the non-thinking tail of the last response;\n"
-           "                                demotes fully-thinking pages (soft, page granular)\n"
-           "  --kvmem-pin-ratio N           cap pinned pages at N% of B, 1..50 (default 20)\n"
+           "  --kvmem-decode-pressure       rank resident pages by accepted attention;\n"
+           "                                never recalls cold pages (default on)\n"
+           "  --no-kvmem-decode-pressure    disable decode pressure\n"
+           "  --kvmem-decode-pressure-interval N  accepted-token stride (default 16)\n"
+           "  --kvmem-keep                  retain system prompt, tool schema, first brief\n"
+           "                                and the non-thinking answer tail; demotes thinking\n"
+           "  --kvmem-keep-ratio N          cap answer retention at N% of B, 1..50 (default 20)\n"
+           "  --kvmem-pin-answer            alias for --kvmem-keep\n"
+           "  --kvmem-pin-ratio N           alias for --kvmem-keep-ratio\n"
            "  --kvmem-sessions N            retained Host histories, 1..16 (default 4)\n"
            "  --kvmem-disk-path PATH        Ephemeral active/idle KV spill directory\n"
            "  --kvmem-disk-mib N            Shared SSD payload quota D, MiB\n"
@@ -693,17 +699,36 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             recent_tokens_explicit = true;
             continue;
         }
-        if (arg == "--kvmem-pin-answer") {
-            options.kvmem.pin_answer = true;
+        if (arg == "--kvmem-decode-pressure") {
+            options.kvmem.decode_pressure = true;
             continue;
         }
-        if (arg == "--kvmem-pin-ratio") {
-            const auto percent = parse_nonnegative_int(
-                require_value("--kvmem-pin-ratio"), "kvmem-pin-ratio");
-            if (percent < 1 || percent > 50) {
-                throw std::invalid_argument("--kvmem-pin-ratio must be in 1..50");
+        if (arg == "--no-kvmem-decode-pressure") {
+            options.kvmem.decode_pressure = false;
+            continue;
+        }
+        if (arg == "--kvmem-decode-pressure-interval") {
+            const auto interval = parse_nonnegative_int(
+                require_value("--kvmem-decode-pressure-interval"),
+                "kvmem-decode-pressure-interval");
+            if (interval < 1 || interval > 4096) {
+                throw std::invalid_argument(
+                    "--kvmem-decode-pressure-interval must be in 1..4096");
             }
-            options.kvmem.pin_answer_percent = static_cast<std::uint32_t>(percent);
+            options.kvmem.decode_pressure_interval = static_cast<std::uint32_t>(interval);
+            continue;
+        }
+        if (arg == "--kvmem-keep" || arg == "--kvmem-pin-answer") {
+            options.kvmem.keep = true;
+            continue;
+        }
+        if (arg == "--kvmem-keep-ratio" || arg == "--kvmem-pin-ratio") {
+            const auto percent = parse_nonnegative_int(
+                require_value(arg.c_str()), arg.c_str());
+            if (percent < 1 || percent > 50) {
+                throw std::invalid_argument(arg + " must be in 1..50");
+            }
+            options.kvmem.keep_answer_percent = static_cast<std::uint32_t>(percent);
             continue;
         }
         if (arg == "--kvmem-sessions") {

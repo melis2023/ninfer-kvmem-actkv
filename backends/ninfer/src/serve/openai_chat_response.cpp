@@ -155,6 +155,10 @@ materialize_tool_calls(const std::vector<ninfer::GeneratedToolCall>& generated) 
     std::vector<ToolCall> calls;
     calls.reserve(generated.size());
     for (const ninfer::GeneratedToolCall& call : generated) {
+        // A model that decides to call a tool but emits an empty argument object
+        // cannot satisfy any real schema. Drop it so the client never executes an
+        // empty call and never turns it into a ToolArgsError.
+        if (call.arguments_json.empty() || call.arguments_json == "{}") { continue; }
         calls.push_back(ToolCall{.id             = new_openai_chat_tool_call_id(),
                                  .name           = call.name,
                                  .arguments_json = call.arguments_json});
@@ -289,11 +293,11 @@ std::string make_chat_completion_response(const OpenAIChatResponseIdentity& iden
                                           const GenerationOutcome& outcome,
                                           std::optional<int> top_logprobs) {
     Json message = {{"role", "assistant"}, {"content", outcome.text}, {"refusal", nullptr}};
-    const bool has_tool_calls = !outcome.tool_calls.empty();
+    const std::vector<ToolCall> calls = materialize_tool_calls(outcome.tool_calls);
+    const bool has_tool_calls = !calls.empty();
     // vLLM/SGLang-compatible reasoning_content preserves the Engine's Reasoning/Content split.
     if (!outcome.reasoning.empty()) { message["reasoning_content"] = outcome.reasoning; }
     if (has_tool_calls) {
-        const std::vector<ToolCall> calls = materialize_tool_calls(outcome.tool_calls);
         message["content"]    = outcome.text.empty() ? Json(nullptr) : Json(outcome.text);
         message["tool_calls"] = tool_calls_json(calls, false);
     }
@@ -444,8 +448,8 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
                                include_usage_, output_timings));
     }
 
-    if (!outcome.tool_calls.empty()) {
-        const std::vector<ToolCall> calls = materialize_tool_calls(outcome.tool_calls);
+    const std::vector<ToolCall> calls = materialize_tool_calls(outcome.tool_calls);
+    if (!calls.empty()) {
         events.push_back(chunk(identity_, Json{{"tool_calls", tool_calls_json(calls, true)}},
                                nullptr, include_usage_, output_timings));
         events.push_back(chunk(identity_, Json::object(), "tool_calls", include_usage_,

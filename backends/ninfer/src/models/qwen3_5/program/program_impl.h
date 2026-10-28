@@ -475,6 +475,7 @@ struct KvmemPrefixCheckpoint {
     std::vector<std::uint64_t> resident_pages;
     std::vector<std::uint32_t> pinned_pages;
     std::vector<std::uint32_t> demoted_pages;
+    std::vector<std::uint32_t> system_pages;
     std::vector<std::uint32_t> tool_pages;
     std::vector<std::uint32_t> brief_pages;
     std::vector<float> mean_tail;
@@ -566,8 +567,10 @@ struct KvmemWindowState {
     // stay retrieved only as a last resort. Both survive history retention and checkpoints.
     std::vector<std::uint32_t> pinned_pages;
     std::vector<std::uint32_t> demoted_pages;
-    // Structural pins: declared tool definitions and the first real user brief. They are kept
-    // separate from answer pins so answer growth can never evict the schema/brief.
+    // Structural pins: the system preamble, declared tool definitions and the
+    // first real user brief. They are kept separate from answer pins so answer
+    // growth can never evict the schema/brief.
+    std::vector<std::uint32_t> system_pages;
     std::vector<std::uint32_t> tool_pages;
     std::vector<std::uint32_t> brief_pages;
     std::vector<KvmemHostRecord> archive;
@@ -583,6 +586,11 @@ struct KvmemWindowState {
     std::uint32_t statistics_frontier = 0;
     std::uint32_t query_tokens = 0;
     std::uint32_t query_begin = 0, query_end = 0;
+    // Decode pressure: exponential moving sum of accepted-query page mass over
+    // resident pages, indexed by logical page id. It is process-local ranking
+    // state, not part of the native KV payload; a restored history rebuilds it.
+    std::vector<double> attention_mass;
+    std::uint32_t accepted_since_sample = 0;
     // Long prompts retain the pre-query boundary for selection/replay; short prompts
     // retain the input prefix before its final token for request-to-request reuse.
     std::unique_ptr<KvmemPrefixCheckpoint> prefix_checkpoint;
@@ -1942,7 +1950,8 @@ private:
     bool prepare_memory_append(SequenceState& sequence, std::uint32_t begin, std::uint32_t end,
                                bool allow_pending);
     bool prepare_window(SequenceState& sequence, std::uint32_t begin, std::uint32_t end,
-                        bool force_selection = false, bool allow_pending = false);
+                        bool force_selection = false, bool allow_pending = false,
+                        bool pressure = false);
     void archive_memory_window(SequenceState& sequence);
     bool memory_query_probe(const SequenceState& sequence, std::uint32_t prompt_tokens) const;
     [[nodiscard]] std::uint32_t memory_checkpoint_frontier(const SequenceState& sequence,
@@ -1977,6 +1986,8 @@ private:
                                   std::uint32_t end, std::uint32_t first_column,
                                   std::uint32_t row_width);
     void read_memory_candidates();
+    void prepare_memory_feedback(SequenceState& sequence, std::uint32_t begin, std::uint32_t end);
+    void note_accepted_tokens(SequenceState& sequence, std::uint32_t accepted, std::uint32_t width);
     [[nodiscard]] std::vector<std::uint32_t> memory_image_pages(const PreparedPromptData& prompt) const;
 
     [[nodiscard]] std::uint32_t compact_position(const SequenceState& sequence,

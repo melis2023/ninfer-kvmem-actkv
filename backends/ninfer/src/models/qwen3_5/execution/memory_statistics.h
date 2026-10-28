@@ -18,6 +18,10 @@ struct MemoryStatisticsShard {
     Tensor candidate_origin;
     Tensor prefill_origin;
     std::uint32_t first_layer = 0;
+    // Decode pressure: accumulate the current round's query rows as well as
+    // their keys so the host can score the resident pages after the round.
+    // Prefill leaves this off; its query aggregate is summed separately.
+    bool capture_query = false;
 };
 
 struct MemoryStatistics {

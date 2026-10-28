@@ -671,15 +671,27 @@ bool ProgramImpl::prepare_memory_append(SequenceState& sequence, std::uint32_t b
 void ProgramImpl::retain_prompt_spans(SequenceState& sequence,
                                       const PreparedPromptData& prompt) noexcept {
     try {
-        if (!kvmem_window_tokens) { return; }
+        if (!kvmem_window_tokens || !kvmem_options.keep) { return; }
         const std::uint32_t total_pages = kv_pages_for_tokens(prompt.token_ids.size());
         if (total_pages == 0) { return; }
         const std::uint32_t keep = kvmem_options.selected_tokens / page_tokens;
-        // Structural budgets are internal: tools are the contract the model must keep obeying,
-        // the first user turn is the task. Both are page-granular and capped so they can never
-        // crowd out the retrieval window on their own.
-        const std::uint32_t tool_cap  = keep * 8U / 100U;
-        const std::uint32_t brief_cap = keep * 4U / 100U;
+        // Structural budgets are internal and derived from the actual prompt spans:
+        // the system preamble, the declared tool schema and the first user turn.
+        // The percentages are caps, not reservations, so a small prompt spends only
+        // the pages it really uses while a large schema cannot crowd out retrieval.
+        const std::uint32_t system_end = prompt.tools_region
+            ? prompt.tools_region->begin
+            : (prompt.first_user_region ? prompt.first_user_region->begin : 0U);
+        const std::uint32_t system_pages_needed =
+            system_end ? (system_end + page_tokens - 1U) / page_tokens : 0U;
+        const std::uint32_t tool_pages_needed = prompt.tools_region
+            ? (prompt.tools_region->count + page_tokens - 1U) / page_tokens : 0U;
+        const std::uint32_t brief_pages_needed = prompt.first_user_region
+            ? (prompt.first_user_region->count + page_tokens - 1U) / page_tokens : 0U;
+        const std::uint32_t system_cap = std::min(system_pages_needed,
+            keep * (prompt.tools_region ? 10U : 40U) / 100U);
+        const std::uint32_t tool_cap   = std::min(tool_pages_needed, keep * 40U / 100U);
+        const std::uint32_t brief_cap  = std::min(brief_pages_needed, keep * 8U / 100U);
 
         const auto span_pages = [&](const TokenSpan& span, std::uint32_t cap, bool pin_tail,
                                     std::vector<std::uint32_t>& pages) {
@@ -705,8 +717,10 @@ void ProgramImpl::retain_prompt_spans(SequenceState& sequence,
             const std::uint32_t tail_begin = last - (cap - 1U);
             for (auto page = tail_begin; page < last; ++page) pages.push_back(page);
         };
+        std::vector<std::uint32_t> system;
         std::vector<std::uint32_t> tools;
         std::vector<std::uint32_t> brief;
+        if (system_end) span_pages(TokenSpan{0, system_end}, system_cap, false, system);
         if (prompt.tools_region) span_pages(*prompt.tools_region, tool_cap, false, tools);
         if (prompt.first_user_region) span_pages(*prompt.first_user_region, brief_cap, true, brief);
 
@@ -722,13 +736,17 @@ void ProgramImpl::retain_prompt_spans(SequenceState& sequence,
             destination.swap(source);
         };
         auto& window = sequence.window;
+        replace(window.system_pages, std::move(system));
         replace(window.tool_pages, std::move(tools));
         replace(window.brief_pages, std::move(brief));
 
-        // Structural pins outrank the soft thinking demotion: a page that carries a tool
-        // definition or the first brief is never demoted, even if it also contains thinking.
-        if (!window.tool_pages.empty() || !window.brief_pages.empty()) {
-            std::vector<std::uint32_t> structural = window.tool_pages;
+        // Structural pins outrank the soft thinking demotion: a page that carries the system
+        // preamble, a tool definition or the first brief is never demoted, even if it also
+        // contains thinking.
+        if (!window.system_pages.empty() || !window.tool_pages.empty() ||
+            !window.brief_pages.empty()) {
+            std::vector<std::uint32_t> structural = window.system_pages;
+            structural.insert(structural.end(), window.tool_pages.begin(), window.tool_pages.end());
             structural.insert(structural.end(), window.brief_pages.begin(), window.brief_pages.end());
             std::sort(structural.begin(), structural.end());
             structural.erase(std::unique(structural.begin(), structural.end()), structural.end());
@@ -739,9 +757,11 @@ void ProgramImpl::retain_prompt_spans(SequenceState& sequence,
             window.demoted_pages.swap(demoted_only);
         }
         if (kvmem_options.verify_transfers) {
-            std::fprintf(stderr, "KVMEM_PROMPT_PIN tools=%zu/%u brief=%zu/%u pages=%u\n",
-                         window.tool_pages.size(), tool_cap, window.brief_pages.size(), brief_cap,
-                         total_pages);
+            std::fprintf(stderr,
+                         "KVMEM_PROMPT_PIN system=%zu/%u tools=%zu/%u brief=%zu/%u pages=%u\n",
+                         window.system_pages.size(), system_cap,
+                         window.tool_pages.size(), tool_cap,
+                         window.brief_pages.size(), brief_cap, total_pages);
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "KVMEM_PROMPT_PIN skipped: %s\n", error.what());
@@ -753,7 +773,7 @@ void ProgramImpl::retain_prompt_spans(SequenceState& sequence,
 void ProgramImpl::retain_generated_spans(SequenceHandle sequence, std::uint32_t generated_begin,
                                          std::uint32_t thinking_end) noexcept {
     try {
-        if (!kvmem_window_tokens || !kvmem_options.pin_answer || !valid_sequence(sequence)) { return; }
+        if (!kvmem_window_tokens || !kvmem_options.keep || !valid_sequence(sequence)) { return; }
         const std::uint32_t lane = ContractAccess::lane(sequence).value;
         RequestControl& request  = requests[lane];
         SequenceState& state     = active_sequence(lane);
@@ -796,10 +816,17 @@ void ProgramImpl::retain_generated_spans(SequenceHandle sequence, std::uint32_t 
         // sink/recent. The newest pages survive when the cap is exceeded.
         const std::uint32_t keep    = kvmem_options.selected_tokens / page_tokens;
         const std::uint32_t percent =
-            std::min<std::uint32_t>(50U, std::max<std::uint32_t>(1U, kvmem_options.pin_answer_percent));
+            std::min<std::uint32_t>(50U, std::max<std::uint32_t>(1U, kvmem_options.keep_answer_percent));
         const std::uint32_t reserve = std::min<std::uint32_t>(keep, 2U);
+        // The answer tail is the last claimant of B. Structural pins (system, tools,
+        // brief) are already mandatory, so the answer cap follows what is actually
+        // left instead of reserving a fixed fraction that may not exist.
+        const std::uint32_t structural = static_cast<std::uint32_t>(
+            window.system_pages.size() + window.tool_pages.size() + window.brief_pages.size());
+        const std::uint32_t available =
+            keep > structural + reserve ? keep - structural - reserve : 0U;
         const std::uint32_t cap =
-            std::min(keep > reserve ? keep - reserve : 0U, keep * percent / 100U);
+            std::min({available, keep * percent / 100U, keep * 35U / 100U});
         if (window.pinned_pages.size() > cap) {
             window.pinned_pages.erase(window.pinned_pages.begin(),
                                       window.pinned_pages.end() - static_cast<std::ptrdiff_t>(cap));
@@ -827,7 +854,7 @@ void ProgramImpl::retain_generated_spans(SequenceHandle sequence, std::uint32_t 
 }
 
 bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, std::uint32_t end,
-                                  bool force_selection, bool allow_pending) {
+                                  bool force_selection, bool allow_pending, bool pressure) {
     if (!kvmem_window_tokens) { return true; }
     if (!sequence.kv || begin != sequence.text_kv_valid || end < begin || end > capacity ||
         end - begin > kvmem_options.reserve_tokens) {
@@ -895,6 +922,10 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
         // the L1 answer. The answer keeps its previous newest-page rule; structural spans keep
         // their leading pages so a truncated schema still starts at the tool header.
         std::vector<std::uint64_t> mandatory = core;
+        // Structural pins and the answer tail share a hard ceiling so retrieval
+        // keeps at least the remaining 35% of B. Order is system -> tools ->
+        // brief -> answer; the last claimant is trimmed first.
+        const std::uint32_t structural_cap = keep * 65U / 100U;
         const auto add_pages = [&](const std::vector<std::uint32_t>& source, bool newest) {
             std::vector<std::uint64_t> pages;
             pages.reserve(source.size());
@@ -903,7 +934,9 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
             }
             std::sort(pages.begin(), pages.end());
             pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
-            const auto room = keep > mandatory.size() ? keep - mandatory.size() : 0U;
+            const auto room = std::min(
+                keep > mandatory.size() ? keep - mandatory.size() : 0U,
+                structural_cap > mandatory.size() ? structural_cap - mandatory.size() : 0U);
             if (pages.size() > room) {
                 if (newest) {
                     pages.erase(pages.begin(),
@@ -916,6 +949,7 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
             std::sort(mandatory.begin(), mandatory.end());
             mandatory.erase(std::unique(mandatory.begin(), mandatory.end()), mandatory.end());
         };
+        add_pages(state.system_pages, false);
         add_pages(state.tool_pages, false);
         add_pages(state.brief_pages, false);
         add_pages(state.pinned_pages, true);
@@ -923,7 +957,36 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
         const bool query_complete = state.query_tokens != 0 &&
             (state.query_replayed || begin >= state.query_end) &&
             state.query_tokens == state.query_end - state.query_begin;
-        if (query_complete) {
+        if (pressure && kvmem_options.decode_pressure) {
+            // DecodePressure ranks only what is already resident. Unlike Query
+            // recall it never selects a cold page, so a stale prompt query can
+            // not swap distant history in during generation.
+            selected = mandatory;
+            std::vector<std::pair<double, std::uint64_t>> ranked;
+            ranked.reserve(state.pages.size());
+            for (const auto id : state.pages) {
+                if (id >= count ||
+                    std::find(selected.begin(), selected.end(), id) != selected.end()) {
+                    continue;
+                }
+                const double score = id < state.attention_mass.size()
+                    ? state.attention_mass[id] : 0.0;
+                ranked.emplace_back(score, id);
+            }
+            std::sort(ranked.begin(), ranked.end(),
+                [](const auto& a, const auto& b) {
+                    if (a.first != b.first) return a.first > b.first;
+                    return a.second > b.second;
+                });
+            for (const auto& entry : ranked) {
+                if (selected.size() >= keep) { break; }
+                selected.push_back(entry.second);
+            }
+            std::sort(selected.begin(), selected.end());
+            std::fprintf(stderr,
+                "KVMEM_PRESSURE logical=%u resident=%zu selected=%zu\n",
+                begin, state.pages.size(), selected.size());
+        } else if (query_complete) {
             if (!state.selector || state.statistics_frontier != begin ||
                 state.selector->total_tokens() != begin) {
                 throw std::logic_error("KVMem retrieval index does not match the evaluated prefix");
@@ -1002,7 +1065,7 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
                 static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(
                     std::chrono::steady_clock::now() - plan_started).count()),
                 selected.size());
-            return prepare_window(sequence, begin, end, false, allow_pending);
+            return prepare_window(sequence, begin, end, false, allow_pending, pressure);
         }
         kvmem::MemorySession session(backend);
         session.prepare(backend->stamp(), selected, mandatory, budget);
@@ -1046,8 +1109,11 @@ bool ProgramImpl::prepare_decode_memory(SequenceHandle handle) {
     if (memory_pending(handle)) return false;
     auto& sequence = active_sequence(ContractAccess::lane(handle).value);
     const auto append = backend_kv_pages ? std::max(draft_window, ngram_draft_window) + draft_window : 1U;
+    prepare_memory_feedback(sequence, sequence.execution_frontier,
+        std::min(capacity, sequence.execution_frontier + std::max(append, widest_verify_window())));
     return prepare_window(sequence, sequence.execution_frontier,
-        std::min(capacity, sequence.execution_frontier + append), false, true);
+        std::min(capacity, sequence.execution_frontier + append), false, true,
+        kvmem_options.decode_pressure);
 }
 std::uint32_t ProgramImpl::memory_control_chunk() const noexcept {
     return memory_io ? std::min(prefill_chunk, kvmem_options.reserve_tokens) : UINT32_MAX;
@@ -1151,6 +1217,9 @@ std::unique_ptr<KvmemPrefixCheckpoint> ProgramImpl::capture_memory_checkpoint(Se
     }
     for (const auto id : window.demoted_pages) {
         if (id < checkpoint_pages) checkpoint->demoted_pages.push_back(id);
+    }
+    for (const auto id : window.system_pages) {
+        if (id < checkpoint_pages) checkpoint->system_pages.push_back(id);
     }
     for (const auto id : window.tool_pages) {
         if (id < checkpoint_pages) checkpoint->tool_pages.push_back(id);
@@ -1310,6 +1379,9 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
     }
     for (const auto id : checkpoint.demoted_pages) {
         if (id < pages) window.demoted_pages.push_back(id);
+    }
+    for (const auto id : checkpoint.system_pages) {
+        if (id < pages && window.system_pages.empty()) window.system_pages.push_back(id);
     }
     for (const auto id : checkpoint.tool_pages) {
         if (id < pages && window.tool_pages.empty()) window.tool_pages.push_back(id);
