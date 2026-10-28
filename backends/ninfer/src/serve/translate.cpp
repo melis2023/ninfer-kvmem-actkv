@@ -137,7 +137,8 @@ RequestJson order_tool_schema_properties(RequestJson schema, std::string_view to
     }
     const auto promoted = [tool_name](std::string_view key) {
         if (key == "file_path" || key == "path" || key == "file") { return true; }
-        if (tool_name == "pwsh" && key == "description") { return true; }
+        // No pwsh/description promotion: DSH already places `description` first,
+        // and forcing it here made the model emit only that field before stopping.
         if (tool_name == "grep" && key == "pattern") { return true; }
         return false;
     };
@@ -185,7 +186,7 @@ std::string render_tool_definition(const ToolDefinition& tool) {
         description +=
             " Always provide file_path first; it is required even when the payload is long.";
     }
-    if (tool.name == "pwsh" || tool.name == "grep") {
+    if (tool.name == "grep") {
         description +=
             " All required arguments must be present; never send an empty object.";
     }
