@@ -1451,12 +1451,13 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                     (!split_frontier || memory_frontier < *split_frontier)) {
                     split_frontier = memory_frontier;
                 }
-                // Frontend owns the exact generation opener/turn reconstruction
-                // boundary. Keep one bounded fallback when later serialization
-                // does not reproduce the generated endpoint byte for byte.
+                // The reuse boundary is the last message opener, not the prompt
+                // end: a later request that replaces the newest user message
+                // shares everything before this point. Capturing at the prompt
+                // end makes every such replacement a full re-prefill.
                 const auto memory_rewrite_frontier = kvmem_window_tokens && request.allow_memory_reuse &&
-                    staged.prompt.identity.rewrite_checkpoint
-                    ? staged.prompt.identity.rewrite_checkpoint->frontier : 0U;
+                    staged.prompt.memory_history_end
+                    ? std::min(staged.prompt.memory_history_end, staged.prompt_tokens) : 0U;
                 if (memory_rewrite_frontier > staged.cursor &&
                     (!split_frontier || memory_rewrite_frontier < *split_frontier)) {
                     split_frontier = memory_rewrite_frontier;

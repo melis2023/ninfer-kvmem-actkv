@@ -29,9 +29,9 @@ cd /d "%BIN%"
   --port 18200 --model-id ninfer-27b --host 0.0.0.0 ^
     --max-context 262144 ^
     --prefill-chunk 256  --kvmem-keep --kvmem-keep-ratio 35 ^
-    --kvmem-budget 40320 --kvmem-gen-reserve 4096 --kvmem-host-mib 12288 ^
+    --kvmem-budget 39040 --kvmem-gen-reserve 4096 --kvmem-host-mib 12288 ^
   --kvmem-lrfu ^
-  --kv-dtype rk8v4  --temperature 0.7 --top-p 0.95 --top-k 20 --min-p 0.0 ^
+  --kv-dtype int8  --temperature 0.7 --top-p 0.95 --top-k 20 --min-p 0.0 ^
   --spec dflash2 --draft-tokens 4 --ngram-draft-tokens 31 ^
   --vision --vision-residency cpu --vision-max-merged 256 ^
   --default-reasoning-effort xhigh --default-thinking-budget 16384

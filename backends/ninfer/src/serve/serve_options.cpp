@@ -711,7 +711,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             continue;
         }
         if (arg == "--kvmem-query-scorer") {
-            const auto name = require_value("--kvmem-query-scorer");
+            const std::string_view name = require_value("--kvmem-query-scorer");
             if (name == "page-softmax") {
                 options.kvmem.query_meanq_cosine = false;
             } else if (name == "meanq-cosine") {

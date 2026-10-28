@@ -174,6 +174,10 @@ struct PreparedPromptData {
     std::optional<TokenSpan> tools_region;
     // Proven message boundary before a transient generation header; zero uses all input.
     std::uint32_t memory_input_end = 0;
+    // End of the last completed message before the newest user/tool turn. A
+    // request that replaces that turn shares everything up to this point, so
+    // this is the reusable history boundary (zero means no earlier message).
+    std::uint32_t memory_history_end = 0;
     // Thought delimiters, when each is one token; accepted output sampling excludes
     // rows strictly inside an open thought span.
     std::int32_t memory_think_open = -1;
