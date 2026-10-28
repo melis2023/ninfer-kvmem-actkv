@@ -175,21 +175,12 @@ RequestJson order_tool_schema_properties(RequestJson schema, std::string_view to
 // leaves it out of the rendered prompt.
 std::string render_tool_definition(const ToolDefinition& tool) {
     using Json  = RequestJson;
-    Json schema = order_tool_schema_properties(Json::parse(tool.input_schema_json), tool.name);
+    // Preserve the frontend's schema order. Reordering short arguments ahead of
+    // long payloads made the model stop after the short argument (file_path /
+    // description), dropping content / command from the call.
+    Json schema = Json::parse(tool.input_schema_json);
     Json function{{"name", tool.name}};
     std::string description = tool.description;
-    // Path + long payload tools: state the order explicitly. The path argument is short and
-    // required, and models that write the payload first tend to omit it entirely.
-    if (schema.contains("properties") && schema["properties"].contains("file_path") &&
-        (schema["properties"].contains("content") ||
-         schema["properties"].contains("new_string"))) {
-        description +=
-            " Always provide file_path first; it is required even when the payload is long.";
-    }
-    if (tool.name == "grep") {
-        description +=
-            " All required arguments must be present; never send an empty object.";
-    }
     if (!description.empty()) { function["description"] = std::move(description); }
     function["parameters"] = std::move(schema);
     if (tool.input_examples_json) {
