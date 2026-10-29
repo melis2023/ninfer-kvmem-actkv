@@ -178,6 +178,10 @@ struct PreparedPromptData {
     // request that replaces that turn shares everything up to this point, so
     // this is the reusable history boundary (zero means no earlier message).
     std::uint32_t memory_history_end = 0;
+    // Start of the newest message window (last few user/assistant/tool
+    // messages). KVMem pins the actual pages of this span instead of a fixed
+    // recent-token reservation. Zero disables the dynamic window.
+    std::uint32_t memory_recent_begin = 0;
     // Thought delimiters, when each is one token; accepted output sampling excludes
     // rows strictly inside an open thought span.
     std::int32_t memory_think_open = -1;

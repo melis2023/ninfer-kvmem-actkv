@@ -736,6 +736,16 @@ void ProgramImpl::retain_prompt_spans(SequenceState& sequence,
         replace(window.tool_pages, std::move(tools));
         // Brief pin is disabled: keep only the system preamble and tool schema.
         window.brief_pages.clear();
+        // Dynamic recent window: pin the pages of the newest messages instead
+        // of reserving a fixed recent-token band. The actual message span is
+        // what the model needs to continue the current tool sequence.
+        std::vector<std::uint32_t> recent;
+        if (prompt.memory_recent_begin && prompt.memory_recent_begin < prompt.token_ids.size()) {
+            span_pages(TokenSpan{prompt.memory_recent_begin,
+                                 prompt.token_ids.size() - prompt.memory_recent_begin},
+                       keep * 50U / 100U, true, recent);
+        }
+        replace(window.pinned_pages, std::move(recent));
 
         // Structural pins outrank the soft thinking demotion: a page that carries the system
         // preamble, a tool definition or the first brief is never demoted, even if it also
@@ -796,10 +806,8 @@ void ProgramImpl::retain_generated_spans(SequenceHandle sequence, std::uint32_t 
             std::sort(destination.begin(), destination.end());
             destination.erase(std::unique(destination.begin(), destination.end()), destination.end());
         };
-        // Answer pin is disabled: the newest answer tail stays resident through
-        // recent_blocks, not through a structural summary set. Thinking pages
-        // are still demoted so they lose to every ordinary page.
-        window.pinned_pages.clear();
+        // Answer pin is disabled. The dynamic recent window (pinned_pages) is
+        // owned by retain_prompt_spans and must survive the generated turn.
         merge(window.demoted_pages, new_demoted);
         // A mixed page is pinned; remove it from the demoted set so the mandatory path wins.
         std::vector<std::uint32_t> demoted_only;

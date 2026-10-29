@@ -1227,6 +1227,10 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         message_boundaries.size() >= 2) {
         result.memory_history_end = message_boundaries[message_boundaries.size() - 2].value_or(0);
     }
+    if (options.continuation == PromptContinuationMode::NewAssistantTurn &&
+        message_boundaries.size() >= 8) {
+        result.memory_recent_begin = message_boundaries[message_boundaries.size() - 8].value_or(0);
+    }
     for (std::size_t i = 0; i + 1 < message_boundaries.size(); ++i) {
         if ((message_boundaries[i] || i == 0) && message_boundaries[i + 1]) {
             const auto begin = message_boundaries[i].value_or(0);
