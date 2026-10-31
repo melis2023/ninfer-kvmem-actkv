@@ -1728,8 +1728,14 @@ public:
     void release_slot(KVAddressSpaceHandle handle, std::uint32_t slot) {
         Address& address = require_active(handle);
         if (slot >= address.slots.size() || !address.slots[slot].valid()) { return; }
+        const LogicalKVPageHandle page = address.slots[slot];
         address.slots[slot] = {};
         address.free_slots.push_back(slot);
+        if (pages_->can_dematerialize(page)) {
+            pages_->dematerialize(page, address.reservation);
+        } else {
+            (void)pages_->release(page);
+        }
     }
 
     // order[i] is the slot that compact logical position i reads. The tail beyond

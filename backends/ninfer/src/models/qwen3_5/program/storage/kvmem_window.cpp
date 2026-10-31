@@ -203,10 +203,12 @@ public:
         const auto slot_capacity = static_cast<std::size_t>(p.kvmem_window_tokens / page_tokens);
         slot_pages_next = seq.window.slot_pages;
         if (slot_pages_next.empty()) slot_pages_next.assign(slot_capacity, UINT32_MAX);
-        for (auto& id : slot_pages_next) {
+        for (std::uint32_t slot = 0; slot < slot_pages_next.size(); ++slot) {
+            const auto id = slot_pages_next[slot];
             if (id != UINT32_MAX &&
                 std::find(selected.begin(), selected.end(), id) == selected.end()) {
-                id = UINT32_MAX;
+                evicted_slots.push_back(slot);
+                slot_pages_next[slot] = UINT32_MAX;
             }
         }
         std::vector<std::uint32_t> page_slot(count, UINT32_MAX);
@@ -618,6 +620,7 @@ private:
     std::vector<std::uint32_t> spill_ids, spill_slots, selected;
     std::vector<std::uint32_t> slot_order;      // selected[i] -> physical slot
     std::vector<std::uint32_t> slot_pages_next; // slot -> logical page
+    std::vector<std::uint32_t> evicted_slots;   // slots freed by this selection
     std::vector<DeviceKVPageHandle> sources, mtp_sources;
     std::vector<std::uint64_t> mtp_source_epochs;
     std::vector<std::uint64_t> source_epochs;
