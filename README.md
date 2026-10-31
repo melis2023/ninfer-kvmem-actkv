@@ -11,6 +11,63 @@ QQ 交流群：**1040777853**。本项目仅供研究学习，稳定使用请前
 
 **所有修补、测速与召回数据汇总在 [docs/CHANGELOG.md](docs/CHANGELOG.md)。**
 
+## 更新日志（2026-10-31）
+
+### 1. DFlash2 同步
+
+记录 `pending_features` 的捕获基准（`dflash_pending_base`），append 前校验起点一致；
+所有非 decode 的 frontier 改写点（复用、恢复、forced tokens、快照）同步重置标记。
+192K 262 轮 decode 零违约。
+
+### 2. 思考等级临时切换（dsh）
+
+dsh 聊天窗口可临时切换思考等级（off / low / medium / xhigh）：
+
+- `tool` 消息可携带 `reasoning_effort`，请求顶层未指定时生效（最后一条 tool 优先）；
+- pi-ai UA（`pi (...)`）省略 effort 时解析为 off，解决选 off 仍思考；
+- 顶层显式 effort 始终优先。
+
+注意：Qwen3.8 把思考指令渲染在 **system 开头**，切换等级会改变 prompt 前缀，
+**需要全量 prefill**（192K 约 5–7 分钟）。
+
+### 3. keep 动态开关
+
+`--kvmem-keep` 开启后，sink 和 recent 自动对齐实际上下文：
+
+- sink 取 `[0, first_user)` 的实际页（cap 10% B）；
+- recent 取最后 8 条消息的实际页（cap 15% B）；
+- recent 仅在请求带 tools 时启用，纯文本长对话回退固定 recent。
+
+实测 dsh 32 个工具：system 1,447 / tools 7,364 / task+brief 约 360 token，
+keep 实际占用约 25% B，剩余 75% 留给检索。
+
+### 4. 内核与上游 ninfer 同步
+
+- coupled drafts accept：单次采样同时完成接受判定和修正 token；
+- invariant attention 作为可选项保留（`--invariant-attention`，默认关）；
+- 移植 0.19 checkpoint / speculative store；
+- 修复 FFMPEG 路径转义与 tool schema 顺序。
+
+### 5. GPU 时钟下限
+
+新增 `--gpu-clock-floor-mhz`：NVML 锁 `[floor, max]`，不抬高硬件上限。
+**日常默认 0（不锁频）**；压测或长上下文可设 1500，实测负载 2790 MHz < 3090。
+
+### 6. KVMem 最新召回机制
+
+全量 page-softmax + graph 0.2（默认），动态 sink/recent，192K LongMemEval **20/20**。
+
+| 配置 | 召回 | write | prefill | recall decode |
+|---|---|---:|---:|---:|
+| **rk8v4 B=41600，keep 动态（gated）** | **20/20** | **356 s** | **579** | **95.3** |
+| rk8v4 B=41600，无 keep | 20/20 | 365 s | 530–750 | 91.3 |
+| rk8v4 B=41600，keep 旧（固定 cap） | 20/20 | 344 s | — | 96.3 |
+| rk8v4 B=41600，keep 全动态 | 19/20 | 373 s | 538 | 89.6 |
+| k8v4 B=38400，keep 全动态 | 19/20 | 454 s | 434 | 84.7 |
+
+结论：动态 recent 只服务于带工具的多任务对话；纯文本长对话保持固定 recent，
+避免最近 8 条大消息挤占长召回所需的检索页。
+
 ## 当前推荐（2026-10-26）
 
 | 项 | 推荐 |
@@ -100,63 +157,6 @@ DFlash2 行为 2026-10-26 复测（q3km、`ngram 0`、当前二进制）；MTP �
 | 128K NIAH（5% / 50% / 95%） | **3/3** |
 | LongMemEval 54 题 | **54/60**（ActKV） |
 | Agent 220K | **30/30** 逐轮工具召回 |
-
-## 更新日志（2026-10-31）
-
-### 1. DFlash2 同步
-
-记录 `pending_features` 的捕获基准（`dflash_pending_base`），append 前校验起点一致；
-所有非 decode 的 frontier 改写点（复用、恢复、forced tokens、快照）同步重置标记。
-192K 262 轮 decode 零违约。
-
-### 2. 思考等级临时切换（dsh）
-
-dsh 聊天窗口可临时切换思考等级（off / low / medium / xhigh）：
-
-- `tool` 消息可携带 `reasoning_effort`，请求顶层未指定时生效（最后一条 tool 优先）；
-- pi-ai UA（`pi (...)`）省略 effort 时解析为 off，解决选 off 仍思考；
-- 顶层显式 effort 始终优先。
-
-注意：Qwen3.8 把思考指令渲染在 **system 开头**，切换等级会改变 prompt 前缀，
-**需要全量 prefill**（192K 约 5–7 分钟）。
-
-### 3. keep 动态开关
-
-`--kvmem-keep` 开启后，sink 和 recent 自动对齐实际上下文：
-
-- sink 取 `[0, first_user)` 的实际页（cap 10% B）；
-- recent 取最后 8 条消息的实际页（cap 15% B）；
-- recent 仅在请求带 tools 时启用，纯文本长对话回退固定 recent。
-
-实测 dsh 32 个工具：system 1,447 / tools 7,364 / task+brief 约 360 token，
-keep 实际占用约 25% B，剩余 75% 留给检索。
-
-### 4. 内核与上游 ninfer 同步
-
-- coupled drafts accept：单次采样同时完成接受判定和修正 token；
-- invariant attention 作为可选项保留（`--invariant-attention`，默认关）；
-- 移植 0.19 checkpoint / speculative store；
-- 修复 FFMPEG 路径转义与 tool schema 顺序。
-
-### 5. GPU 时钟下限
-
-新增 `--gpu-clock-floor-mhz`：NVML 锁 `[floor, max]`，不抬高硬件上限。
-**日常默认 0（不锁频）**；压测或长上下文可设 1500，实测负载 2790 MHz < 3090。
-
-### 6. KVMem 最新召回机制
-
-全量 page-softmax + graph 0.2（默认），动态 sink/recent，192K LongMemEval **20/20**。
-
-| 配置 | 召回 | write | prefill | recall decode |
-|---|---|---:|---:|---:|
-| **rk8v4 B=41600，keep 动态（gated）** | **20/20** | **356 s** | **579** | **95.3** |
-| rk8v4 B=41600，无 keep | 20/20 | 365 s | 530–750 | 91.3 |
-| rk8v4 B=41600，keep 旧（固定 cap） | 20/20 | 344 s | — | 96.3 |
-| rk8v4 B=41600，keep 全动态 | 19/20 | 373 s | 538 | 89.6 |
-| k8v4 B=38400，keep 全动态 | 19/20 | 454 s | 434 | 84.7 |
-
-结论：动态 recent 只服务于带工具的多任务对话；纯文本长对话保持固定 recent，
-避免最近 8 条大消息挤占长召回所需的检索页。
 
 ## 关键修补
 
