@@ -104,7 +104,7 @@ std::string serve_usage_text(const char* argv0) {
            "  --no-kvmem-decode-pressure    disable decode pressure\n"
            "  --kvmem-query-scorer NAME      page-softmax (default) | meanq-cosine\n"
            "  --kvmem-query-tokens N        Query rows scored at admission (default 512)\n"
-           "  --kvmem-graph-alpha X         one-hop Query mass propagation [0,1] (default 0)\n"
+           "  --kvmem-graph-alpha X         one-hop Query mass propagation [0,1] (default 0.2)\n"
            "  --no-kvmem-graph              disable Query graph propagation\n"
            "  --kvmem-keep                  retain system prompt, tool schema, first brief\n"
            "                                and the non-thinking answer tail; demotes thinking\n"
@@ -257,6 +257,12 @@ std::string serve_usage_text(const char* argv0) {
            "                                weight-sized host memory, resume at bus speed)\n"
            "  --no-auto-resume              a request while suspended fails (503) instead of\n"
            "                                resuming the model (also per suspend request)\n"
+           "\n"
+           "EXECUTION\n"
+           "  --gpu-clock-floor-mhz N       NVML locked-clock floor while work runs\n"
+           "                                (0 = driver default; needs admin rights)\n"
+           "  --invariant-attention         fixed key segments: a column's attention\n"
+           "                                output is width/batch independent\n"
            "\n"
            "KV CACHE\n"
            "  --kv-capacity N|auto          shared KV capacity in tokens (default\n"
@@ -795,6 +801,15 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 throw std::invalid_argument(arg + " is out of range");
             }
             kv_headroom_mib = static_cast<std::size_t>(mib);
+            continue;
+        }
+        if (arg == "--gpu-clock-floor-mhz") {
+            options.gpu_clock_floor_mhz = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--gpu-clock-floor-mhz"), "gpu-clock-floor-mhz"));
+            continue;
+        }
+        if (arg == "--invariant-attention") {
+            options.invariant_attention = true;
             continue;
         }
         if (arg == "--max-concurrency") {

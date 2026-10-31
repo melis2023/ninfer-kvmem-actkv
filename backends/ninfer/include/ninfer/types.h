@@ -518,10 +518,11 @@ struct KvmemOptions {
     // every 16 output tokens, exponential output decay 0.5.
     bool decode_pressure = true;
     // Graph propagation of one-hop current-Query mass. Zero is an exact bypass.
-    // Local 0.18 has no pre-admission history graph, so the default is a bypass;
-    // propagating the current prefill graph would rank pages by this prompt's
-    // exposure rather than by the Query.
-    double graph_alpha = 0.0;
+    // 0.19's tuned value is 0.2: it reallocates a bounded share of each page's
+    // Query mass along the accepted history graph (one edge moves at most 10%),
+    // which recovers pages that are semantically related but share no literal
+    // Query term. Higher values let history override the current Query.
+    double graph_alpha = 0.2;
     // Query recall ranking. PageSoftmax is 0.19's default; MeanQCosine is the
     // 0.19 host scorer that averages the admitted Query rows before comparing
     // them with each page's mean K.
@@ -562,6 +563,11 @@ struct EngineOptions {
     std::string thinking_budget_message;
     EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
+    // NVML locked-clock floor held while work runs; 0 leaves clocks to the driver.
+    std::uint32_t gpu_clock_floor_mhz  = 0;
+    // Fixed attention key segments so a column's output is byte-identical across
+    // decode widths, verification windows and batch sizes.
+    bool invariant_attention           = false;
     // Empty or one entry keeps the single-device route and `device` selects it. Several entries
     // split the model's layers into that many pipeline stages, one per device, in the given order:
     // the first holds the embedding, head and round state. Matching compute capability is required

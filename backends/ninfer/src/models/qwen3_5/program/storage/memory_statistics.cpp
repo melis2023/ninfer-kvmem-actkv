@@ -136,7 +136,8 @@ void ProgramImpl::commit_memory_statistics(SequenceState& sequence, std::uint32_
 }
 
 std::vector<double> ProgramImpl::score_memory_query(SequenceState& sequence,
-                                     const std::vector<std::uint32_t>& mandatory) {
+                                     const std::vector<std::uint32_t>& mandatory,
+                                     const KvmemPrefixCheckpoint* prefix) {
     auto& state = sequence.window;
     if (!state.query_tokens || !state.statistics || !state.selector) {
         throw std::logic_error("KVMem Query scoring has no accepted index");
@@ -156,7 +157,9 @@ std::vector<double> ProgramImpl::score_memory_query(SequenceState& sequence,
     }
     const auto& policy = *state.selector;
     const auto& options = policy.config();
-    const auto frame = kvmem::query_score_frame(state.statistics_frontier, 64,
+    const auto frontier = prefix ? static_cast<std::uint32_t>(prefix->prefix.size())
+                                 : state.statistics_frontier;
+    const auto frame = kvmem::query_score_frame(frontier, 64,
         policy.budget_blocks(), options.sink_blocks, options.recent_blocks, mandatory);
     if (!memory_query_scorer) {
         throw std::logic_error("KVMem Query scorer lost its startup workspace");
@@ -166,14 +169,29 @@ std::vector<double> ProgramImpl::score_memory_query(SequenceState& sequence,
         config.attention->num_key_value_heads, config.attention->head_dim, layers.data()};
     const auto aggregation = kvmem_options.score_agg_max
         ? kvmem::GqaScoreAggregation::Max : kvmem::GqaScoreAggregation::Mean;
-    auto scores = kvmem_options.query_meanq_cosine
-        ? kvmem::mean_query_cosine_scores(*state.statistics, query, frame.starts.size(),
-                                          aggregation)
-        : memory_query_scorer->score(*state.statistics, query, frame, aggregation);
-    if (kvmem_options.graph_alpha > 0) {
-        scores = kvmem::propagate_query_scores(scores, frame, state.graph,
-                                               kvmem_options.graph_alpha);
+    // Replay scores the checkpoint's mean-K tail, not the live (post-probe) rows.
+    const auto previous = prefix ? state.statistics->mean_checkpoint(frontier)
+                                 : std::vector<float>{};
+    if (prefix) state.statistics->restore_mean_checkpoint(frontier, prefix->mean_tail);
+    std::vector<double> scores;
+    try {
+        scores = kvmem_options.query_meanq_cosine
+            ? kvmem::mean_query_cosine_scores(*state.statistics, query, frame.starts.size(),
+                                              aggregation)
+            : memory_query_scorer->score(*state.statistics, query, frame, aggregation);
+        // propagate_query_scores requires the graph to cover exactly this accepted prefix.
+        // A shorter graph is not an error: it just means there is no history to propagate.
+        const kvmem::GraphSnapshot& history = prefix ? prefix->graph : state.graph;
+        if (kvmem_options.graph_alpha > 0 && history.block_tokens != 0 &&
+            history.accepted_through == frontier) {
+            scores = kvmem::propagate_query_scores(scores, frame, history,
+                                                   kvmem_options.graph_alpha);
+        }
+    } catch (...) {
+        if (prefix) state.statistics->restore_mean_checkpoint(frontier, previous);
+        throw;
     }
+    if (prefix) state.statistics->restore_mean_checkpoint(frontier, previous);
     state.selector->set_retrieval_scores(scores);
     if (kvmem_options.verify_transfers) {
         std::fprintf(stderr,
@@ -246,7 +264,9 @@ void ProgramImpl::observe_memory_attention(SequenceState& sequence, std::uint32_
         rows = std::move(plan.rows);
         next_scope = plan.state;
         for (auto& row : rows) row += output_first;
-    } else if (prefill) {
+    } else if (prefill && !state.query_replay_active) {
+        // query_replayed also marks an already evaluated user Query on restore.
+        // Its new assistant prefix still needs feedback; suppress only actual replay.
         rows = kvmem::prefill_sample_rows(begin, accepted,
             state.feedback.snapshot().prefill_end, compact_position(sequence, begin),
             kvmem_window_tokens);

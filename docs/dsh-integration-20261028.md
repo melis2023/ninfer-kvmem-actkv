@@ -215,7 +215,7 @@ checkpoint capture/restore 已经同步。
 --kvmem-decode-pressure          默认开启
 --no-kvmem-decode-pressure       关闭（回退到最新页优先）
 --kvmem-query-tokens N           Query 召回评分行数，默认 512
---kvmem-graph-alpha X            一阶 Query 质量传播，默认 0（关闭）
+--kvmem-graph-alpha X            一阶 Query 质量传播，默认 0.2（关闭）
 --no-kvmem-graph                 关闭图传播
 ```
 
@@ -242,7 +242,7 @@ Query 召回（prefill 完成后的首次选择）：
   - `--kvmem-query-scorer meanq-cosine`：0.19 的 host scorer，先对 Query 行取均值，
     再与每页 mean-K 做 cosine；248K 级长历史下 deep 语义召回更稳。
 - 只保留用户消息最后 `--kvmem-query-tokens` 行（默认 512）；
-- 分数经一阶图传播（`--kvmem-graph-alpha`，默认 0；本地没有 admission 前的历史图，
+- 分数经一阶图传播（`--kvmem-graph-alpha`，默认 0.2；本地没有 admission 前的历史图，
   当前 prefill 图不能用于 Query，否则会按本 prompt 的 exposure 而非 Query 排序）；
 - Query 允许 cold recall，pressure 不允许；
 - prefill 完成后强制一次 Query 重选（等价 0.19 的 admission 时点），
