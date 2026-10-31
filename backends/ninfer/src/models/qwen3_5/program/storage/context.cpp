@@ -252,6 +252,8 @@ void ProgramImpl::retire_continuation_slot(std::uint32_t index) noexcept {
     sequence.text_kv_valid           = 0;
     sequence.mtp_kv_valid            = 0;
     sequence.dflash_context_frontier = 0;
+    sequence.dflash_pending_base     = 0;
+    sequence.dflash_pending_valid    = false;
     // A recycled slot starts with an empty draft ring. Without clearing the floor a stale value
     // from a longer previous request masks every ring row of the next (shorter) one, so the
     // draft silently reads nothing and acceptance collapses to ~0.
@@ -1512,6 +1514,8 @@ void ProgramImpl::set_backend_kv_valid(SequenceState& sequence, std::uint32_t fr
     }
     if (speculative_backend == SpeculativeBackend::DFlash) {
         sequence.dflash_context_frontier = frontier;
+        sequence.dflash_pending_base     = frontier;
+        sequence.dflash_pending_valid    = false;
     }
 }
 
@@ -1536,6 +1540,8 @@ void ProgramImpl::kvmem_set_backend_frontier(SequenceState& sequence,
     if (speculative_backend == SpeculativeBackend::DFlash ||
         speculative_backend == SpeculativeBackend::DFlash2) {
         sequence.dflash_context_frontier = frontier;
+        sequence.dflash_pending_base     = frontier;
+        sequence.dflash_pending_valid    = false;
     }
 }
 
@@ -1927,6 +1933,8 @@ void ProgramImpl::ordered_reset(SequenceState& sequence) {
     sequence.text_kv_valid           = 0;
     sequence.mtp_kv_valid            = 0;
     sequence.dflash_context_frontier = 0;
+    sequence.dflash_pending_base     = 0;
+    sequence.dflash_pending_valid    = false;
     sequence.dflash_context_floor    = 0;
     sequence.dflash_state_slot       = -1;
 }

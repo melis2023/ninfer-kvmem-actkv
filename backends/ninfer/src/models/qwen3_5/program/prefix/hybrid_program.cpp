@@ -889,6 +889,9 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
             sequence.mtp_kv_valid  = prepare_mtp ? reuse - 1U : 0U;
             sequence.dflash_context_frontier =
                 is_masked_draft_backend(speculative_backend) ? reuse : 0U;
+            // A reused prefix owns its ring rows; there is no live decode capture to append.
+            sequence.dflash_pending_base  = sequence.dflash_context_frontier;
+            sequence.dflash_pending_valid = false;
         }
         sequence.endpoint_valid    = false;
         sequence.tail_hidden_valid = false;

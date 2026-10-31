@@ -420,6 +420,9 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                     sequence.mtp_kv_valid = cursor;
                 } else if (is_masked_draft_backend(speculative_backend)) {
                     sequence.dflash_context_frontier = cursor;
+                    // Forced-token chunks append from prefill_features, not pending_features.
+                    sequence.dflash_pending_base  = cursor;
+                    sequence.dflash_pending_valid = false;
                 }
                 commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
                 settle_state_fork(sequence);

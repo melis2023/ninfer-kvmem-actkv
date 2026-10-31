@@ -10,6 +10,7 @@
 #include "kvmem/kvmem_store.hpp"
 #include "kvmem/mean_key_retrieval.hpp"
 #include "kvmem/graph_recall.hpp"
+#include "kvmem/checkpoint_policy.hpp"
 #include "kvmem/page_softmax_cuda.hpp"
 #include "kvmem/spill_io.hpp"
 #include "core/disk_kv_bridge.h"
@@ -471,6 +472,11 @@ struct DecodeGraphFamily {
 // output, sampling, and round-control state.
 struct KvmemPrefixCheckpoint {
     kvmem::LrfuState history;
+    // 0.19 Query replay restores the exact scoring state at the query boundary:
+    // mean-K tail, attention graph and feedback samples must travel together.
+    kvmem::GraphSnapshot graph;
+    kvmem::AttentionFeedbackSnapshot feedback;
+    kvmem::OutputSampleState attention_scope;
     kvmem::CheckpointIdentity identity;
     std::vector<TokenId> prefix;
     ResidentPrefixIdentity prefix_identity;
@@ -486,6 +492,11 @@ struct KvmemPrefixCheckpoint {
     // checkpoints use the existing pinned representation and GPU copy path.
     kvmem::SpillExtent cold_state;
     std::uint64_t state_bytes() const noexcept { return state ? state->size() : cold_state.size(); }
+    kvmem::CoverageInfo checkpoint_info() const noexcept {
+        return {prefix.size(), state_bytes(), 0,
+                state ? static_cast<const void*>(state->data()) : nullptr,
+                kvmem::CoveragePurpose::Periodic, 0};
+    }
 };
 
 enum class KvmemCheckpointKind : std::uint8_t { Base, Endpoint, InputFallback, Reconstruction };
@@ -497,6 +508,7 @@ struct KvmemHistoryMatch {
     std::size_t history;
     KvmemCheckpointKind kind;
     std::uint32_t frontier;
+    const KvmemPrefixCheckpoint* periodic = nullptr;
 };
 
 using KvmemHostRecord = kvmem::HostKvRecord;
@@ -575,6 +587,11 @@ struct KvmemWindowState {
     std::vector<std::uint32_t> system_pages;
     std::vector<std::uint32_t> tool_pages;
     std::vector<std::uint32_t> brief_pages;
+    // Keep-on only: actual page spans for the prompt's leading structure and the newest
+    // message window. Set from PreparedPromptData so the sink/recent reservation follows the
+    // real content instead of a fixed token count. Empty falls back to the fixed options.
+    std::vector<std::uint32_t> dynamic_sink_pages;
+    std::vector<std::uint32_t> dynamic_recent_pages;
     std::vector<KvmemHostRecord> archive;
     std::vector<std::uint64_t> host_versions;
     kvmem::MemoryStamp stamp;
@@ -586,6 +603,9 @@ struct KvmemWindowState {
     std::unique_ptr<kvmem::KvMemStore> selector;
     // Accepted prompt Query rows, one `query_width` row per layer and token.
     std::vector<std::vector<float>> query_rows;
+    // Periodic 0.19 checkpoint archive: spread restore points across a long
+    // prefix, bounded by count and bytes.
+    kvmem::CheckpointArchive<KvmemPrefixCheckpoint> periodic_checkpoints;
     // Native attention feedback, current request's consumed-token scope and the
     // thought-token ids that mark which accepted rows count as output.
     kvmem::GraphSnapshot graph;
@@ -610,6 +630,9 @@ struct KvmemWindowState {
     std::unique_ptr<KvmemPrefixCheckpoint> reconstruction_checkpoint;
     std::uint32_t reconstruction_frontier = 0;
     bool query_replayed = false;
+    // True only while an admitted Query is being replayed, so prefill feedback
+    // sampling does not run twice over the same rows.
+    bool query_replay_active = false;
     std::uint32_t pending_window_begin = 0, pending_window_end = 0;
     std::uint64_t pending_io_epoch = 0;
     std::unique_ptr<KvmemAppendPreparation> pending_append;
@@ -637,6 +660,12 @@ struct SequenceState {
     std::uint32_t text_kv_valid           = 0;
     std::uint32_t mtp_kv_valid            = 0;
     std::uint32_t dflash_context_frontier = 0;
+    // Logical position of pending_features column 0, i.e. the frontier the capture round
+    // verified from. The next append must start here; anything else would write target hidden
+    // rows under the wrong ring positions. Only valid while dflash_pending_valid is set: every
+    // consumer clears it, and a non-decode frontier rewrite (restore, reuse, reset) resets it.
+    std::uint32_t dflash_pending_base = 0;
+    bool dflash_pending_valid         = false;
     // Physical StateImage slot the masked-draft ring last wrote to. A state fork (checkpoint
     // capture between prefill chunks, or a Begin-boundary rewrite) moves the write slot; the
     // ring then follows with save_rewrite_checkpoint before the next append.
@@ -2001,8 +2030,11 @@ private:
                                   std::uint32_t end, std::uint32_t first_column,
                                   std::uint32_t row_width);
     void read_memory_candidates();
+    // `prefix` scores against a Query-replay checkpoint (mean tail + graph). A null
+    // prefix scores the live statistics frontier.
     std::vector<double> score_memory_query(SequenceState& sequence,
-                                           const std::vector<std::uint32_t>& mandatory);
+                                           const std::vector<std::uint32_t>& mandatory,
+                                           const KvmemPrefixCheckpoint* prefix = nullptr);
     void observe_memory_attention(SequenceState& sequence, std::uint32_t begin, std::uint32_t end,
                                   std::uint32_t first_column, std::uint32_t row_width, bool prefill);
     [[nodiscard]] std::vector<std::uint32_t> memory_image_pages(const PreparedPromptData& prompt) const;

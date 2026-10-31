@@ -567,6 +567,8 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                     throw std::logic_error("retained prefix has incomplete DFlash KV");
                 }
                 sequence.dflash_context_frontier = base;
+                sequence.dflash_pending_base     = base;
+                sequence.dflash_pending_valid    = false;
             }
             sequence.tail_hidden_valid =
                 base == prompt_tokens &&
@@ -663,6 +665,8 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                     throw std::logic_error("planned DFlash rewrite checkpoint is unavailable");
                 }
                 sequence.dflash_context_frontier = base;
+                sequence.dflash_pending_base     = base;
+                sequence.dflash_pending_valid    = false;
             }
             bind_sequence_kv(sequence);
             trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
@@ -695,6 +699,8 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                     throw std::logic_error("planned DFlash long anchor is unavailable");
                 }
                 sequence.dflash_context_frontier = base;
+                sequence.dflash_pending_base     = base;
+                sequence.dflash_pending_valid    = false;
             }
             bind_sequence_kv(sequence);
             trim_sequence_kv(sequence, base, backend_kv_valid(sequence));
@@ -1498,6 +1504,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 if (staged.prepare_mtp) { sequence.mtp_kv_valid = staged.cursor; }
                 if (is_masked_draft_backend(speculative_backend)) {
                     sequence.dflash_context_frontier = staged.cursor;
+                    // A prompt chunk appends from prefill_features; any decode capture is spent.
+                    sequence.dflash_pending_base  = staged.cursor;
+                    sequence.dflash_pending_valid = false;
                 }
                 commit_sequence_kv(sequence, sequence.text_kv_valid, backend_kv_valid(sequence));
 

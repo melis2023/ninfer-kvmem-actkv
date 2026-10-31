@@ -764,6 +764,9 @@ void ProgramImpl::publish_checkpoint_drop(SequenceState& sequence,
         sequence.mtp_draft_count = 0;
     } else if (is_masked_draft_backend(speculative_backend)) {
         sequence.dflash_context_frontier = retained->main_frontier;
+        // The ring comes from the restored image, not from pending_features.
+        sequence.dflash_pending_base  = retained->main_frontier;
+        sequence.dflash_pending_valid = false;
         // The ring snapshot covers the trailing window; reselected history below the recent
         // pages must not feed the draft. Keep the whole ring readable (the recent-page span is
         // one page by default), matching the reselect and query-restore paths.

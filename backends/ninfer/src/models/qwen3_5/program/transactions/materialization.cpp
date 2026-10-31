@@ -625,6 +625,9 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
         source.mtp_kv_valid = backend_frontier_at(speculative_backend, details.reuse_base);
     } else if (is_masked_draft_backend(speculative_backend)) {
         source.dflash_context_frontier = details.reuse_base;
+        // The truncated source keeps its ring, not the decode capture that preceded the reuse.
+        source.dflash_pending_base  = details.reuse_base;
+        source.dflash_pending_valid = false;
     }
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
     refresh_state_views(source);

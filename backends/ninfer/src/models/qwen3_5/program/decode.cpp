@@ -392,6 +392,10 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
         const std::uint32_t start = starts[row];
         const std::uint64_t end64 = static_cast<std::uint64_t>(start) + counts[row];
         const std::uint32_t end   = static_cast<std::uint32_t>(end64);
+        if (sequence.dflash_pending_valid && start != sequence.dflash_pending_base) {
+            throw std::logic_error(
+                "DFlash context append does not start at the captured feature base");
+        }
         if (!sequence.kv || text_kv_addresses->bound_row(sequence.kv->text) < 0 ||
             (backend_kv_cache() && (!sequence.kv->backend ||
                                     backend_kv_addresses->bound_row(*sequence.kv->backend) < 0)) ||
@@ -421,6 +425,11 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
         if (sequence.kv->backend) {
             backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend, end,
                                                           compute_streams);
+        }
+        if (kvmem_options.verify_transfers) {
+            std::fprintf(stderr,
+                         "KVMEM_DFLASH_APPEND lane=%u start=%u count=%u end=%u pending_base=%u\n",
+                         lane, start, counts[row], end, sequence.dflash_pending_base);
         }
         minimum_count = std::min(minimum_count, counts[row]);
         maximum_count = std::max(maximum_count, counts[row]);
@@ -455,6 +464,11 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
     execution::dflash_append_context(state, features, positions, device_counts,
                                      state_destination_tensor, table_rows,
                                      {minimum_count, maximum_count});
+    // The capture has been consumed: a second append before the next decode round would
+    // replay the same rows under new positions.
+    for (const std::uint32_t lane : lanes) {
+        active_sequence(lane).dflash_pending_valid = false;
+    }
 }
 
 void ProgramImpl::validate_licensed_tokens(std::span<const TokenId> tokens) const {
@@ -1065,6 +1079,18 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                     : (drafter_runs && !draftless_round ? draft_window : 0U);
             const std::uint32_t extent =
                 std::min({proposed, max_by_budget, capacity - frontier - 1U});
+            // The append below reads pending_features column 0 as position dflash_pending_base.
+            // If the ring frontier moved since the capture, those columns describe other
+            // positions and the ring would take target hidden rows at the wrong offsets.
+            if (sequence.dflash_pending_valid &&
+                sequence.dflash_context_frontier != sequence.dflash_pending_base) {
+                throw std::logic_error(
+                    "DFlash batch append would reuse target features from a different frontier");
+            }
+            if (frontier - sequence.dflash_context_frontier > widest_verify_window() + 1U) {
+                throw std::logic_error(
+                    "DFlash batch append exceeds the last round's captured feature window");
+            }
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
             // Compact coordinates: target_rope_positions below stays logical for RoPE.
             const bool logical_draft = speculative_backend == SpeculativeBackend::DFlash2;
@@ -1229,7 +1255,21 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                     request.draft_bypass = false;
                 }
             }
+            // The round's body appended the previous capture from append_start to base_E.
+            const std::uint32_t append_start = sequence.dflash_context_frontier;
+            const std::uint32_t append_count = base_E - append_start;
             sequence.dflash_context_frontier = base_E;
+            // This round's target pass has captured pending_features; column 0 is position
+            // base_E. The next append consumes it and then clears the flag.
+            sequence.dflash_pending_base  = base_E;
+            sequence.dflash_pending_valid = true;
+            if (kvmem_options.verify_transfers) {
+                std::fprintf(stderr,
+                             "KVMEM_DFLASH_ROUND lane=%u base=%u frontier=%u append_start=%u "
+                             "append_count=%u count=%d\n",
+                             lanes[row], base_E, base_E + static_cast<std::uint32_t>(count_i),
+                             append_start, append_count, count_i);
+            }
             request.pending                  = PendingCandidate{
                 .kind          = PendingKind::Speculative,
                 .base_E        = base_E,

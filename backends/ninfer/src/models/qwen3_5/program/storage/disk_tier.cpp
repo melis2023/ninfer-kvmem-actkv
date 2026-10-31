@@ -457,6 +457,9 @@ bool ProgramImpl::restore_prefix_from_disk(SequenceState& sequence, RequestContr
     }
     if (is_masked_draft_backend(speculative_backend)) {
         sequence.dflash_context_frontier = frontier;
+        // The ring comes from the restored snapshot, not from pending_features.
+        sequence.dflash_pending_base  = frontier;
+        sequence.dflash_pending_valid = false;
         // The restored ring snapshot and the other restore paths (reselect, query restore,
         // checkpoint recovery) all publish the same readable span. A stale floor left behind by
         // this sequence slot would otherwise hide part of the ring after a disk restore.

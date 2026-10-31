@@ -1049,6 +1049,8 @@ ContinuationHandle ProgramImpl::restore_continuation(std::span<const std::uint8_
         sequence.text_kv_valid           = session.text_kv_valid;
         sequence.mtp_kv_valid            = session.mtp_kv_valid;
         sequence.dflash_context_frontier = 0;
+        sequence.dflash_pending_base     = 0;
+        sequence.dflash_pending_valid    = false;
         sequence.rope_delta              = session.rope_delta;
         sequence.mtp_draft_count         = 0;
         sequence.tail_hidden_valid       = session.tail_hidden_valid != 0;
