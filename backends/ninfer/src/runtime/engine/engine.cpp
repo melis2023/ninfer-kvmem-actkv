@@ -2,6 +2,7 @@
 #include "text/structured_output.h"
 
 #include "core/device.h"
+#include "core/gpu_clock_floor.h"
 #include "core/nvtx.h"
 #include "core/startup.h"
 #include "runtime/contract/sampling.h"
@@ -270,7 +271,8 @@ public:
 
     explicit Impl(EngineOptions engine_options)
         : options(runtime::normalize_engine_options(std::move(engine_options))),
-          device(initialize_device(options)) {
+          device(initialize_device(options)),
+          clock_floor(device.device_ids(), options.gpu_clock_floor_mhz) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
         if (runtime::is_qwen4_exp_artifact(options.artifact_path)) {
             if (options.kvmem.selected_tokens != 0) {
@@ -439,6 +441,7 @@ public:
 
     EngineOptions options;
     DeviceContext device;
+    GpuClockFloor clock_floor;
     std::unique_ptr<runtime::ModelInstance> active;
     std::unique_ptr<runtime::Qwen4ExpInstance> flash;
     LoadSummary load;
@@ -727,6 +730,9 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
 
 GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options, OutputSink* sink,
                                   const CancellationView& cancellation) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    // 0.20 clock floor: hold the GPU clock for the whole synchronous generate.
+    const auto clock_hold = impl_->clock_floor.hold();
     const OutputConsumerMode consumer_mode =
         sink != nullptr ? OutputConsumerMode::Streaming : OutputConsumerMode::Aggregate;
     return submit(std::move(prompt), std::move(options), consumer_mode, {})

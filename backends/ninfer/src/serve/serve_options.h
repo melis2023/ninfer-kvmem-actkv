@@ -40,6 +40,10 @@ struct ServeOptions {
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
     KvmemOptions kvmem;
     std::optional<std::size_t> kv_headroom_mib;
+    // --gpu-clock-floor-mhz: NVML locked-clock floor while work runs (0 = driver default).
+    std::uint32_t gpu_clock_floor_mhz  = 0;
+    // --invariant-attention: fixed key segments, width-independent attention output.
+    bool invariant_attention           = false;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     // Admission waits behind the active set, so the deadline has to cover the generation

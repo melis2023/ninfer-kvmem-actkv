@@ -267,6 +267,8 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.artifact_path            = options.artifact_path;
     engine_options.chat_template_path       = options.chat_template_path;
     engine_options.device                   = options.device;
+    engine_options.gpu_clock_floor_mhz      = options.gpu_clock_floor_mhz;
+    engine_options.invariant_attention      = options.invariant_attention;
     engine_options.max_context              = options.max_context;
     engine_options.kv_capacity              = options.kv_capacity;
     engine_options.kvmem                    = options.kvmem;
