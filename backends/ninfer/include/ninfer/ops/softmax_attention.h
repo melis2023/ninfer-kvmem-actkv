@@ -30,7 +30,15 @@ struct CausalAttentionExecutionEnvelope {
     // row block, so a few query rows over a long context leave most SMs idle; small-T splits the
     // keys across CTAs instead. Workspace planning and execution must use the same hint.
     bool small_prefill = false;
+    // Invariant attention: a nonzero multiple of the page size fixes every split's key range to
+    // [s * segment_keys, (s + 1) * segment_keys), so a column's partials and output are the same
+    // bytes at any decode width, verification window or batch. Zero keeps the tuned splits.
+    std::uint32_t invariant_segment_keys = 0;
 };
+
+// The fewest keys (a multiple of the page size) that keep max_context within the small-T split
+// capacity, so every launch of one engine uses the same segments.
+std::uint32_t causal_attention_invariant_segment_keys(std::uint32_t max_context);
 
 struct ContextAttentionExecutionEnvelope {
     std::uint32_t min_context = 0;

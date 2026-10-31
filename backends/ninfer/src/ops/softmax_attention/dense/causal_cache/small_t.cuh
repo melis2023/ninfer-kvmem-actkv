@@ -102,8 +102,13 @@ __device__ __forceinline__ int causal_small_t_default_splits(int window) {
 // drops to the fewest whole waves that still keep every split within kCausalSmallTSplitKeyLimit.
 template <typename Geometry, bool Int8>
 __device__ __forceinline__ int causal_small_t_active_splits(int window, int launch_capacity,
-                                                            int tokens, int wave_splits = 0) {
+                                                            int tokens, int wave_splits = 0,
+                                                            int invariant_segment_keys = 0) {
     if (window <= 0) { return launch_capacity; }
+    // Invariant attention: the same key segment at every width and batch.
+    if (invariant_segment_keys > 0) {
+        return (window + invariant_segment_keys - 1) / invariant_segment_keys;
+    }
     int splits = 0;
     if constexpr (Int8) {
         if (tokens == 5 && window > 128 && window <= 512) {

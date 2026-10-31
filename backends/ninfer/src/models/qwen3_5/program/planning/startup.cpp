@@ -448,19 +448,24 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
     }
     const std::int32_t narrowest_drafts =
         *std::min_element(round_widths.begin(), round_widths.end()) - 1;
-    const ops::CausalAttentionExecutionEnvelope text_envelope{1, plan.capacity};
+    const std::uint32_t invariant_segment_keys =
+        plan.invariant_attention ? ops::causal_attention_invariant_segment_keys(plan.capacity) : 0U;
+    const ops::CausalAttentionExecutionEnvelope text_envelope{
+        1, plan.capacity, false, false, false, invariant_segment_keys};
     // Prefill chunks of 17 to 64 rows may take the chunked small-T route over a long context, and
     // wider ones run the selected prompt kernel, whose fast NVFP4 form may split keys into
     // workspace (see execution/text.cpp).
     const ops::CausalAttentionExecutionEnvelope prefill_envelope{
-        .min_visible_keys   = 1,
-        .max_visible_keys   = plan.capacity,
-        .fast_prompt_kernel = plan.fast_prefill_kernel,
-        .small_prefill      = true};
-    const ops::CausalAttentionExecutionEnvelope verify_envelope{.min_visible_keys = 1,
-                                                                .max_visible_keys = plan.capacity,
-                                                                .wide_verification =
-                                                                    plan.ngram_draft_window > 15};
+        .min_visible_keys        = 1,
+        .max_visible_keys        = plan.capacity,
+        .fast_prompt_kernel      = plan.fast_prefill_kernel,
+        .small_prefill           = true,
+        .invariant_segment_keys  = invariant_segment_keys};
+    const ops::CausalAttentionExecutionEnvelope verify_envelope{
+        .min_visible_keys        = 1,
+        .max_visible_keys        = plan.capacity,
+        .wide_verification       = plan.ngram_draft_window > 15,
+        .invariant_segment_keys  = invariant_segment_keys};
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
                            std::int32_t tokens) { (void)layout.alloc(dtype, {rows, tokens}); };
@@ -703,7 +708,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
         mtp_full_call(mtp_align, 1, text_envelope, false);
         WorkspaceLayoutBuilder mtp_proposal;
         proposal_scratch(mtp_proposal, 1);
-        const std::size_t accept = ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+        const std::size_t accept = ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(
             dimension(parameters.model.resources().public_token_count), narrowest_drafts,
             verify_drafts, 1, 1);
         out.mtp_round = std::max({accept, finish(mtp_batch), finish(mtp_ar), finish(mtp_proposal)});
@@ -749,7 +754,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
             WorkspaceLayoutBuilder proposal;
             proposal_scratch(proposal, batch);
             const std::size_t batch_accept =
-                ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(
                     dimension(parameters.model.resources().public_token_count), narrowest_drafts,
                     verify_drafts, batch, batch);
             const std::size_t gather = ops::logprob_topk_workspace_capacity_bytes(
@@ -930,7 +935,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
                         ? ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
                               dimension(parameters.model.resources().public_token_count), {false},
                               narrowest_drafts, verify_drafts, batch, batch)
-                        : ops::speculative_accept_greedy_drafts_workspace_capacity_bytes(
+                        : ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(
                               dimension(parameters.model.resources().public_token_count),
                               narrowest_drafts, verify_drafts, batch, batch);
                 // A copy round above batch one also runs the drafter at its own window, and a
@@ -1149,6 +1154,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->max_concurrency     = inputs.max_concurrency;
     impl->prefill_chunk       = inputs.prefill_chunk;
     impl->fast_prefill_kernel = inputs.fast_prefill_kernel;
+    impl->invariant_attention = inputs.invariant_attention;
     impl->draft_window        = inputs.draft_window;
     impl->lookup_ngram        = inputs.lookup_ngram;
     impl->mtp_policy          = inputs.mtp_policy;
@@ -1443,6 +1449,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .max_concurrency            = options.max_concurrency,
         .prefill_chunk              = effective_prefill_chunk(parameters, options),
         .fast_prefill_kernel        = options.fast_prefill_kernel,
+        .invariant_attention        = options.invariant_attention,
         .draft_window               = options.speculative.draft_tokens,
         .lookup_ngram               = options.speculative.lookup_ngram,
         .mtp_policy                 = options.speculative.mtp_policy,

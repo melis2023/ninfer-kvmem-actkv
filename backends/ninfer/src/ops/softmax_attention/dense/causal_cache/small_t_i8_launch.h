@@ -26,7 +26,8 @@ template <typename Geometry, int TokenTile, typename CacheInput>
 void launch_small_t_i8(bool multi_batch, bool masked, const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                        PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
                        std::int32_t logical_capacity, std::int32_t implementation_window,
-                       std::int32_t splits, std::int32_t wave_splits, Tensor& partial_acc,
+                       std::int32_t splits, std::int32_t wave_splits,
+                       std::int32_t invariant_segment_keys, Tensor& partial_acc,
                        Tensor& partial_m, Tensor& partial_l, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

@@ -485,6 +485,15 @@ const char* causal_attention_route_name(CausalAttentionRoute route) {
 
 } // namespace detail
 
+std::uint32_t causal_attention_invariant_segment_keys(std::uint32_t max_context) {
+    // The smallest geometry's split capacity, so one segment serves either geometry.
+    constexpr std::uint32_t kMaximumSegments = 85;
+    const std::uint32_t keys =
+        (max_context + kMaximumSegments - 1) / kMaximumSegments + kPagedKVPageSize - 1;
+    return std::max<std::uint32_t>(kPagedKVPageSize,
+                                   keys / kPagedKVPageSize * kPagedKVPageSize);
+}
+
 int causal_softmax_attention_route_family(AttentionHeadGeometry geometry,
                                           KvCacheStorage cache_storage,
                                           CausalAttentionExecutionEnvelope envelope,

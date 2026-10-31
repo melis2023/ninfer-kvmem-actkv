@@ -230,6 +230,13 @@ std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t 
         throw std::invalid_argument("causal_softmax_attention split capacity: invalid profile");
     }
     (void)paged_kv_storage_layout(cache_storage, kCausalHeadDim);
+    // Invariant attention: every launch uses the same key segments, whatever its
+    // width or batch, so a column's reduction order never changes.
+    if (envelope.invariant_segment_keys > 0) {
+        return static_cast<std::int32_t>(
+            (envelope.max_visible_keys + envelope.invariant_segment_keys - 1) /
+            envelope.invariant_segment_keys);
+    }
     const bool i8_family = kv_cache_is_int8_family(cache_storage);
     if (q_heads == CausalD256H24Kv4::QHeads) {
         const int capacity =
@@ -301,7 +308,8 @@ void causal_attention_small_t_launch_for(const Tensor& q, CacheInput input, cons
             if (kv_cache_is_int8_family(cache.storage)) {                                          \
                 launch_small_t_i8<Geometry, (TOKENS), CacheInput>(                                 \
                     MultiBatch, Masked, q, input, pos, scale, cache, invocation, logical_capacity, \
-                    implementation_window, splits, wave_splits, partial_acc, partial_m, partial_l, \
+                    implementation_window, splits, wave_splits, envelope.invariant_segment_keys, \
+                    partial_acc, partial_m, partial_l, \
                     stream);                                                                       \
             } else {                                                                               \
                 launch_tc_partial_bf16<Geometry, (TOKENS), (WARPS), MultiBatch, Masked>(           \

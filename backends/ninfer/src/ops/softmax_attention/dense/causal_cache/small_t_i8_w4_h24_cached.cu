@@ -6,6 +6,6 @@ namespace ninfer::ops::detail {
 
 template void launch_small_t_i8<CausalD256H24Kv4, 4, CausalCachedInput>(bool, bool, const Tensor&, CausalCachedInput, const Tensor&, float,
     PagedKVBatchLayerView, const CausalSmallTInvocation&, std::int32_t, std::int32_t, std::int32_t,
-    std::int32_t, Tensor&, Tensor&, Tensor&, cudaStream_t);
+    std::int32_t, std::int32_t, Tensor&, Tensor&, Tensor&, cudaStream_t);
 
 } // namespace ninfer::ops::detail

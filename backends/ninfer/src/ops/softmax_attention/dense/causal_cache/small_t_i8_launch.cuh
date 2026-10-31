@@ -32,7 +32,8 @@ template <typename Geometry, int TokenTile, bool MultiBatch, bool Masked, typena
 void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                           PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
                           std::int32_t logical_capacity, std::int32_t implementation_window,
-                          std::int32_t splits, std::int32_t wave_splits, Tensor& partial_acc,
+                          std::int32_t splits, std::int32_t wave_splits,
+                          std::int32_t invariant_segment_keys, Tensor& partial_acc,
                           Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
     Tensor& cache_k       = cache.k_pages;
     Tensor& cache_v       = cache.v_pages;
@@ -74,8 +75,9 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                     ? nullptr
                     : static_cast<const std::int32_t*>(invocation.table_rows->data),
                 cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
-                logical_capacity, wave_splits, scale, static_cast<float*>(partial_acc.data),
-                static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+                logical_capacity, wave_splits, invariant_segment_keys, scale,
+                static_cast<float*>(partial_acc.data), static_cast<float*>(partial_m.data),
+                static_cast<float*>(partial_l.data));
         };
         auto issue = [&]<bool PackedValues, KvKeyCoding Keys>() {
             if (small_t_pv_f16()) {
@@ -237,12 +239,13 @@ template <typename Geometry, int TokenTile, typename CacheInput>
 void launch_small_t_i8(bool multi_batch, bool masked, const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                        PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
                        std::int32_t logical_capacity, std::int32_t implementation_window,
-                       std::int32_t splits, std::int32_t wave_splits, Tensor& partial_acc,
+                       std::int32_t splits, std::int32_t wave_splits,
+                       std::int32_t invariant_segment_keys, Tensor& partial_acc,
                        Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
     const auto run = [&]<bool MultiBatch, bool Masked>() {
         small_t_i8::launch_tc_partial_i8<Geometry, TokenTile, MultiBatch, Masked>(
             q, input, pos, scale, cache, invocation, logical_capacity, implementation_window,
-            splits, wave_splits, partial_acc, partial_m, partial_l, stream);
+            splits, wave_splits, invariant_segment_keys, partial_acc, partial_m, partial_l, stream);
     };
     if (multi_batch) {
         if (masked) {

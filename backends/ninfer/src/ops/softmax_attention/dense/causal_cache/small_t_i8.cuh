@@ -66,6 +66,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, std::int32_t wave_splits,
+        std::int32_t invariant_segment_keys,
         float scale, float* partial_acc, float* partial_m, float* partial_l) {
     constexpr bool PackedKeys          = Keys != KvKeyCoding::Int8;
     constexpr int Wc                   = WarpsPerCta;
@@ -209,16 +210,29 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 
     const int window = last_pos + 1;
     const int active_split_count =
-        causal_small_t_active_splits<Geometry, true>(window, split_count, TokenTile, wave_splits);
+        invariant_segment_keys > 0
+            ? (logical_capacity + invariant_segment_keys - 1) / invariant_segment_keys
+            : causal_small_t_active_splits<Geometry, true>(window, split_count, TokenTile,
+                                                           wave_splits);
     if (split >= active_split_count) { return; }
 
-    const int logical_tiles = div_up(window, Bc);
-    const bool tile_split   = logical_tiles >= active_split_count;
-    const int units_per_split =
-        tile_split ? div_up(logical_tiles, active_split_count) : div_up(window, active_split_count);
-    const int split_start = split * units_per_split * (tile_split ? Bc : 1);
-    const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
-    const int split_end   = (split_limit < window) ? split_limit : window;
+    int split_start = 0;
+    int split_end   = 0;
+    if (invariant_segment_keys > 0) {
+        // Fixed segments: every launch covers [s * N, (s + 1) * N), whatever its width.
+        split_start = split * invariant_segment_keys;
+        const int segment_limit = split_start + invariant_segment_keys;
+        split_end   = (segment_limit < window) ? segment_limit : window;
+    } else {
+        const int logical_tiles = div_up(window, Bc);
+        const bool tile_split   = logical_tiles >= active_split_count;
+        const int units_per_split =
+            tile_split ? div_up(logical_tiles, active_split_count)
+                       : div_up(window, active_split_count);
+        split_start = split * units_per_split * (tile_split ? Bc : 1);
+        const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
+        split_end   = (split_limit < window) ? split_limit : window;
+    }
     if (split_start >= split_end) {
         write_neutral();
         return;
