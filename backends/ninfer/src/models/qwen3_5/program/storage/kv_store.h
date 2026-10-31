@@ -1731,6 +1731,11 @@ public:
         const LogicalKVPageHandle page = address.slots[slot];
         address.slots[slot] = {};
         address.free_slots.push_back(slot);
+        // The compact membership may still alias the evicted descriptor. Clear it
+        // before dematerializing so the descriptor can back a recalled page.
+        for (std::uint32_t i = 0; i < address.page_count; ++i) {
+            if (membership(address, i) == page) { membership(address, i) = {}; }
+        }
         if (pages_->can_dematerialize(page)) {
             pages_->dematerialize(page, address.reservation);
         } else {

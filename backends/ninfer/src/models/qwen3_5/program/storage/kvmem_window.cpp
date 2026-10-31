@@ -128,13 +128,7 @@ public:
                 sequence.window.host_versions.at(id)});
         }
         for (auto id : sequence.window.pages) {
-            if (!sequence.window.slot_pages.empty()) { break; }
             if (id < count) { s.resident.push_back(id); }
-        }
-        if (!sequence.window.slot_pages.empty()) {
-            for (const auto id : sequence.window.slot_pages) {
-                if (id != UINT32_MAX && id < count) { s.resident.push_back(id); }
-            }
         }
         return s;
     }
@@ -555,9 +549,6 @@ public:
             seq.mtp_draft_count = 0;
         }
         seq.window.removed_tokens = seq.text_kv_valid - static_cast<std::uint32_t>(view.visible_tokens);
-        // Exercise the slot-pool publication path with the identity order first:
-        // behavior is identical to the append-order mapping, but the table now
-        // goes through publish_slots so arbitrary slot orders can follow.
         auto* addresses = p.text_kv_addresses.get();
         const auto mapped = addresses->mapped_page_count(seq.kv->text);
         addresses->ensure_slots(seq.kv->text);
@@ -1227,10 +1218,15 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
                 selected.size());
             return prepare_window(sequence, begin, end, false, allow_pending, reason);
         }
-        kvmem::MemorySession session(backend);
-        session.prepare(backend->stamp(), selected, mandatory, budget);
-        while (session.advance() != kvmem::MemoryPhase::Ready) {}
-        session.publish();
+        try {
+            kvmem::MemorySession session(backend);
+            session.prepare(backend->stamp(), selected, mandatory, budget);
+            while (session.advance() != kvmem::MemoryPhase::Ready) {}
+            session.publish();
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "KVMEM_WINDOW_ERROR %s\n", error.what());
+            throw;
+        }
         std::fprintf(stderr,
             "KVMEM_RESELECT logical=%u blocks=%llu score_us=%lld select_us=%lld transfer_us=%lld "
             "selected=%zu\n",
