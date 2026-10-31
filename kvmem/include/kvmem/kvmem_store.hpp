@@ -407,6 +407,18 @@ public:
     std::vector<uint32_t> pick_topk_blocks(
         const std::vector<uint32_t> &mandatory_blocks) const;
 
+    // 0.19 Query admission: fixed pages (sink, latest media, mandatory, recent)
+    // plus every remaining slot ranked by the current Query score. The graph
+    // variant consumes the post-propagation scores, which may be signed.
+    std::vector<uint32_t> query_fixed_blocks(
+        const std::vector<uint32_t> &mandatory) const;
+    std::vector<uint32_t> pick_graph_blocks(
+        const std::vector<uint32_t> &mandatory) const;
+    std::vector<uint32_t> pick_scored_blocks(
+        const std::vector<uint32_t> &candidates, const std::vector<double> &scores,
+        const std::vector<uint32_t> &mandatory, uint32_t budget,
+        bool signed_scores = false) const;
+
     // Select complete variable-length logical groups under the ordinary
     // fixed-physical-block budget. `groups` are half-open token spans in the
     // original prompt and `group_scores` contains one GPU-reduced semantic score

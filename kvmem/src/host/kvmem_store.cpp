@@ -2,10 +2,12 @@
 #include "kvmem/memory_contract.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -13,6 +15,25 @@
 namespace kvmem {
 
 namespace {
+
+// 0.19 scored selection keeps media items whole: a candidate page expands to the
+// connected media group that overlaps it, and the group is charged once.
+std::pair<uint32_t, uint32_t> scored_media_group(
+        uint32_t id, uint32_t n, uint32_t block,
+        const std::vector<std::pair<uint32_t, uint32_t>> &ranges) {
+    uint32_t begin = id, end = id + 1;
+    bool changed;
+    do {
+        const auto old_begin = begin, old_end = end;
+        for (const auto &range : ranges) {
+            const auto lo = range.first / block;
+            const auto hi = std::min(n, uint32_t((uint64_t(range.second) + block - 1) / block));
+            if (lo < end && begin < hi) { begin = std::min(begin, lo); end = std::max(end, hi); }
+        }
+        changed = old_begin != begin || old_end != end;
+    } while (changed);
+    return {begin, end};
+}
 
 uint32_t ceil_div_u32(uint32_t value, uint32_t divisor) {
     if (value == 0) return 0;
@@ -359,6 +380,90 @@ std::vector<uint32_t> KvMemStore::pick_prefill_pressure_blocks(const std::vector
 
 std::vector<uint32_t> KvMemStore::pick_topk_blocks(const std::vector<uint32_t> & mandatory) const {
     return constrain_media(pick_topk_ungrouped(mandatory), mandatory, budget_blocks(), false);
+}
+
+std::vector<uint32_t> KvMemStore::query_fixed_blocks(
+        const std::vector<uint32_t> & mandatory) const {
+    const auto n = block_count(), budget = budget_blocks();
+    if (!budget || n <= budget) {
+        std::vector<uint32_t> all(n);
+        std::iota(all.begin(), all.end(), 0u);
+        return all;
+    }
+    std::vector<uint8_t> kept(n, 0);
+    uint32_t count = 0;
+    auto keep = [&](uint32_t id, bool required) {
+        if (id >= n) throw std::invalid_argument("fixed Query page is outside its index");
+        const auto group = scored_media_group(id, n, cfg_.block_tokens, media_ranges_);
+        const auto begin = group.first, end = group.second;
+        uint32_t need = 0;
+        for (uint32_t b = begin; b < end; ++b) need += !kept[b];
+        if (count + need > budget) {
+            if (required) throw std::runtime_error("mandatory Query content exceeds its selection budget");
+            return;
+        }
+        for (uint32_t b = begin; b < end; ++b) if (!kept[b]) { kept[b] = 1; ++count; }
+    };
+    for (uint32_t i = 0; i < std::min(n, cfg_.sink_blocks); ++i) keep(i, true);
+    if (!media_ranges_.empty() && media_ranges_.back().first < total_tokens_)
+        keep(media_ranges_.back().first / cfg_.block_tokens, true);
+    for (auto id : mandatory) keep(id, true);
+    for (uint32_t i = 0; i < std::min(n, cfg_.recent_blocks); ++i) keep(n - 1 - i, false);
+    std::vector<uint32_t> result;
+    for (uint32_t i = 0; i < n; ++i) if (kept[i]) result.push_back(i);
+    return result;
+}
+
+std::vector<uint32_t> KvMemStore::pick_graph_blocks(
+        const std::vector<uint32_t> & mandatory) const {
+    std::vector<uint32_t> candidates(block_count());
+    std::iota(candidates.begin(), candidates.end(), 0u);
+    std::vector<double> scores;
+    scores.reserve(candidates.size());
+    for (auto id : candidates) scores.push_back(selection_score(id));
+    return pick_scored_blocks(candidates, scores, query_fixed_blocks(mandatory),
+                              budget_blocks(), true);
+}
+
+std::vector<uint32_t> KvMemStore::pick_scored_blocks(
+        const std::vector<uint32_t> & candidates, const std::vector<double> & scores,
+        const std::vector<uint32_t> & mandatory, uint32_t budget,
+        bool signed_scores) const {
+    if (candidates.size() != scores.size() || !budget)
+        throw std::invalid_argument("invalid scored selection frame");
+    const auto n = block_count();
+    std::vector<uint8_t> allowed(n), kept(n);
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const auto id = candidates[i];
+        if (id >= n || allowed[id] || !std::isfinite(scores[i]) ||
+            (!signed_scores && scores[i] < 0))
+            throw std::invalid_argument("invalid scored candidate");
+        allowed[id] = 1;
+    }
+    uint32_t count = 0;
+    auto keep = [&](uint32_t id, bool required) {
+        if (id >= n) throw std::invalid_argument("mandatory scored page is outside its index");
+        const auto group = scored_media_group(id, n, cfg_.block_tokens, media_ranges_);
+        const auto begin = group.first, end = group.second;
+        uint32_t need = 0;
+        bool complete = true;
+        for (auto b = begin; b < end; ++b) { need += !kept[b]; complete &= allowed[b] != 0; }
+        if (!complete || count + need > budget) {
+            if (required) throw std::runtime_error("mandatory scored content is cold, incomplete or exceeds budget");
+            return;
+        }
+        for (auto b = begin; b < end; ++b) if (!kept[b]) { kept[b] = 1; ++count; }
+    };
+    for (auto id : mandatory) keep(id, true);
+    std::vector<size_t> rank(candidates.size());
+    std::iota(rank.begin(), rank.end(), 0u);
+    std::sort(rank.begin(), rank.end(), [&](size_t a, size_t b) {
+        return scores[a] != scores[b] ? scores[a] > scores[b] : candidates[a] > candidates[b];
+    });
+    for (auto i : rank) keep(candidates[i], false);
+    std::vector<uint32_t> result;
+    for (uint32_t id = 0; id < n; ++id) if (kept[id]) result.push_back(id);
+    return result;
 }
 
 std::vector<uint32_t> KvMemStore::constrain_media(std::vector<uint32_t> selected,

@@ -21,6 +21,7 @@ add_library(kvmem
     src/host/session_memory.cpp
     src/host/rope.cpp
   src/host/prefix_checkpoint.cpp
+  src/host/checkpoint_policy.cpp
   src/host/graph_recall.cpp
 )
 set_target_properties(kvmem PROPERTIES POSITION_INDEPENDENT_CODE ON)
