@@ -51,7 +51,7 @@ keep 实际占用约 25% B，剩余 75% 留给检索。
 ### 5. GPU 时钟下限
 
 新增 `--gpu-clock-floor-mhz`：NVML 锁 `[floor, max]`，不抬高硬件上限。
-**日常默认 0（不锁频）**；压测或长上下文可设 1500，实测负载 2790 MHz < 3090。
+**日常默认 0（不锁频）**；压测或长上下文可设 1500，实测负载 2790 MHz < 3090，非特殊情况可无需启用参数。
 
 ### 6. KVMem 最新召回机制
 
@@ -77,11 +77,15 @@ keep 实际占用约 25% B，剩余 75% 留给检索。
 | 驱逐 | 满窗口 100% |
 
 ```bat
---max-context 262144 --prefill-chunk 256 ^
---kvmem-budget 36480 --kvmem-gen-reserve 16384 --kvmem-host-mib 12288 --kvmem-lrfu ^
---kv-dtype nvfp4 --spec dflash2 --draft-tokens 4 --ngram-draft-tokens 0 ^
---vision --vision-residency cpu --vision-max-merged 256 ^
---default-reasoning-effort medium --default-thinking-budget 16384
+  --port 18200 --model-id ninfer-27b --host 0.0.0.0 ^
+  --max-context 262144  ^
+  --prefill-chunk 256 ^
+  --kvmem-budget 41600 --kvmem-gen-reserve 4096 --kvmem-host-mib 12288 ^
+  --kvmem-lrfu --kvmem-keep ^
+  --kv-dtype rk8v4 --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
+  --spec dflash2 --draft-tokens 5 --ngram-draft-tokens 31 ^
+  --vision --vision-residency cpu --vision-max-merged 256 ^
+  --default-reasoning-effort xhigh  
 ```
 
 16 GB 卡启动 free 约 780–955 MiB；B/R 按显卡调整，不要再加 `--no-cuda-graph`。
