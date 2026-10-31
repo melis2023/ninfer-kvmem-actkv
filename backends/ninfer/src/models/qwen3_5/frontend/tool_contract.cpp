@@ -237,6 +237,12 @@ void prepare_strict_parameters(Contract::Tool& tool) {
 std::shared_ptr<const ToolCallOutputContract>
 select_tool_call_contract(const std::shared_ptr<const ToolCallOutputContract>& declarations,
                           const ToolChoice& choice) {
+    // Keep the tool definitions in the reusable prompt, but do not decode calls or build a
+    // prohibition grammar for the default none path. A separate sampler mask bans the single
+    // vocabulary token whose text is exactly <tool_call> when that token is unique.
+    if (choice.mode == ToolChoiceMode::None &&
+        choice.constraints == ToolConstraintMode::Automatic)
+        return {};
     if (choice.allowed_names) {
         for (const auto& name : *choice.allowed_names) {
             if (!declarations ||
@@ -245,7 +251,8 @@ select_tool_call_contract(const std::shared_ptr<const ToolCallOutputContract>& d
                 fail("tool choice refers to undeclared tool: " + name);
         }
     }
-    if (declarations && choice.mode == ToolChoiceMode::Auto && choice.parallel &&
+    if (declarations && declarations->forced_tool_name.empty() &&
+        choice.mode == ToolChoiceMode::Auto && choice.parallel &&
         !choice.allowed_names && choice.constraints == ToolConstraintMode::Automatic &&
         std::none_of(declarations->tools.begin(), declarations->tools.end(),
                      [](const auto& tool) { return tool.strict; }))
@@ -267,7 +274,8 @@ select_tool_call_contract(const std::shared_ptr<const ToolCallOutputContract>& d
         selected->constrained = true;
         return selected;
     }
-    selected->constrained = selected->required || !selected->parallel ||
+    selected->constrained = selected->required || !declarations->forced_tool_name.empty() ||
+                            !selected->parallel ||
                             choice.allowed_names.has_value() ||
                             choice.constraints == ToolConstraintMode::Basic ||
                             std::any_of(selected->tools.begin(), selected->tools.end(),
