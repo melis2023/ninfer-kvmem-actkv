@@ -27,14 +27,15 @@ cd /d "%BIN%"
 "%EXE%" ^
   "%MODEL%" ^
   --port 18200 --model-id ninfer-27b --host 0.0.0.0 ^
-    --max-context 262144 ^
-    --prefill-chunk 256  --kvmem-keep ^
-    --kvmem-budget 39040 --kvmem-gen-reserve 4096 --kvmem-host-mib 12288 ^
-  --kvmem-lrfu ^
-  --kv-dtype int8  --temperature 1 --top-p 0.95 --top-k 20 --min-p 0.0 ^
-  --spec dflash2 --draft-tokens 4 --ngram-draft-tokens 31 ^
+    --max-context 262144  ^
+    --prefill-chunk 256 ^
+    --kvmem-budget 41600 --kvmem-gen-reserve 4096 --kvmem-host-mib 12288 ^
+   --kvmem-lrfu --kvmem-keep ^
+    --cuda-graph-allowance-mib 128 ^
+  --kv-dtype rk8v4  --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
+  --spec dflash2 --draft-tokens 5 --ngram-draft-tokens 31 ^
   --vision --vision-residency cpu --vision-max-merged 256 ^
-  --default-reasoning-effort xhigh --default-thinking-budget 32768
+  --default-reasoning-effort xhigh  
 
 
 set "RC=%ERRORLEVEL%"
@@ -42,9 +43,3 @@ echo.
 echo Server exited with code %RC%.
 pause
 endlocal & exit /b %RC%
-
-
-
-
-
-
