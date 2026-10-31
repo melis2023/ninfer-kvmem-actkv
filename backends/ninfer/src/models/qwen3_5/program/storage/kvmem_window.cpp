@@ -128,7 +128,13 @@ public:
                 sequence.window.host_versions.at(id)});
         }
         for (auto id : sequence.window.pages) {
+            if (!sequence.window.slot_pages.empty()) { break; }
             if (id < count) { s.resident.push_back(id); }
+        }
+        if (!sequence.window.slot_pages.empty()) {
+            for (const auto id : sequence.window.slot_pages) {
+                if (id != UINT32_MAX && id < count) { s.resident.push_back(id); }
+            }
         }
         return s;
     }
@@ -192,6 +198,41 @@ public:
         // page keeps the same physical slot across reselections, so the next restore can
         // skip it instead of copying it back from the host.
         std::sort(selected.begin(), selected.end());
+        // Slot order: retained pages keep their previous physical slot, recalled
+        // pages take a slot freed by eviction (or a new slot at the tail).
+        const auto slot_capacity = static_cast<std::size_t>(p.kvmem_window_tokens / page_tokens);
+        slot_pages_next = seq.window.slot_pages;
+        if (slot_pages_next.empty()) slot_pages_next.assign(slot_capacity, UINT32_MAX);
+        for (auto& id : slot_pages_next) {
+            if (id != UINT32_MAX &&
+                std::find(selected.begin(), selected.end(), id) == selected.end()) {
+                id = UINT32_MAX;
+            }
+        }
+        std::vector<std::uint32_t> page_slot(count, UINT32_MAX);
+        for (std::uint32_t slot = 0; slot < slot_pages_next.size(); ++slot) {
+            const auto id = slot_pages_next[slot];
+            if (id != UINT32_MAX && id < count) page_slot[id] = slot;
+        }
+        slot_order.assign(selected.size(), UINT32_MAX);
+        for (std::size_t i = 0; i < selected.size(); ++i) {
+            const auto id = selected[i];
+            if (id < count && page_slot[id] != UINT32_MAX) {
+                slot_order[i] = page_slot[id];
+                continue;
+            }
+            auto free = std::find(slot_pages_next.begin(), slot_pages_next.end(), UINT32_MAX);
+            if (free == slot_pages_next.end()) {
+                if (slot_pages_next.size() >= slot_capacity) {
+                    throw std::logic_error("KVMem slot pool exhausted");
+                }
+                slot_pages_next.push_back(UINT32_MAX);
+                free = slot_pages_next.end() - 1;
+            }
+            const auto slot = static_cast<std::uint32_t>(free - slot_pages_next.begin());
+            slot_order[i] = slot;
+            slot_pages_next[slot] = id;
+        }
         if (seq.text_kv_valid % page_tokens &&
             (selected.empty() || selected.back() != seq.text_kv_valid / page_tokens)) {
             throw std::logic_error("KVMem partial append page must remain the last selected page");
@@ -512,6 +553,15 @@ public:
             seq.mtp_draft_count = 0;
         }
         seq.window.removed_tokens = seq.text_kv_valid - static_cast<std::uint32_t>(view.visible_tokens);
+        // Exercise the slot-pool publication path with the identity order first:
+        // behavior is identical to the append-order mapping, but the table now
+        // goes through publish_slots so arbitrary slot orders can follow.
+        auto* addresses = p.text_kv_addresses.get();
+        const auto mapped = addresses->mapped_page_count(seq.kv->text);
+        addresses->ensure_slots(seq.kv->text);
+        std::vector<std::uint32_t> order(mapped);
+        for (std::uint32_t i = 0; i < mapped; ++i) order[i] = i;
+        addresses->publish_slots(seq.kv->text, order, p.compute_streams);
         seq.window.pages = std::move(selected);
         seq.window.stamp = view.stamp;
         ++seq.window.swaps;
@@ -566,6 +616,8 @@ private:
     kvmem::WorkingSetPlan plan;
     std::vector<KvmemHostRecord> pending;
     std::vector<std::uint32_t> spill_ids, spill_slots, selected;
+    std::vector<std::uint32_t> slot_order;      // selected[i] -> physical slot
+    std::vector<std::uint32_t> slot_pages_next; // slot -> logical page
     std::vector<DeviceKVPageHandle> sources, mtp_sources;
     std::vector<std::uint64_t> mtp_source_epochs;
     std::vector<std::uint64_t> source_epochs;
@@ -975,6 +1027,8 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
             // With keep on, sink and recent follow the prompt's real spans. The fixed token
             // reservation remains the fallback when no dynamic span was published (raw prompt,
             // fewer than eight messages, or keep off).
+            const bool decode_pressure =
+                reason == kvmem::SelectionReason::DecodePressure;
             if (kvmem_options.keep && !state.dynamic_sink_pages.empty()) {
                 for (const auto id : state.dynamic_sink_pages) {
                     if (id < count) core.push_back(id);
@@ -984,7 +1038,11 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
                 for (std::uint32_t id = 0; id < sink_keep; ++id) core.push_back(id);
             }
             for (const auto id : state.media_pages) if (id < count) core.push_back(id);
-            if (kvmem_options.keep && !state.dynamic_recent_pages.empty()) {
+            // Decode already appends the newest tokens at the window tail, so the
+            // request-level recent snapshot adds nothing there. Keep it for Query
+            // admission; decode falls back to the fixed tail page.
+            if (kvmem_options.keep && !decode_pressure &&
+                !state.dynamic_recent_pages.empty()) {
                 for (const auto id : state.dynamic_recent_pages) {
                     if (id < count) core.push_back(id);
                 }

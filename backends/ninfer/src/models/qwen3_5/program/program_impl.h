@@ -575,6 +575,9 @@ struct KvmemWindowState {
     // Compact execution slots -> original logical pages. Host records retain native
     // packed data AND scales. They never contain a second allocation of device KV.
     std::vector<std::uint32_t> pages;
+    // Residency slot pool: slot -> original logical page. UINT32_MAX is free.
+    // Attention reads the compact order, so physical slots may be non-contiguous.
+    std::vector<std::uint32_t> slot_pages;
     std::vector<std::uint32_t> media_pages;
     // Logical page ids of the last response's non-thinking tail (final answer and tool-call
     // payload) and of fully-thinking pages. Pinned pages join the mandatory set; demoted pages

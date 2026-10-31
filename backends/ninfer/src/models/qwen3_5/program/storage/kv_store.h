@@ -1666,6 +1666,119 @@ public:
         address.page_count = target;
     }
 
+    [[nodiscard]] std::uint32_t mapped_page_count(KVAddressSpaceHandle handle) const {
+        return require_active(handle).page_count;
+    }
+
+    // Initialize the slot pool for pages materialized through the append path.
+    // Slot handles are re-synchronized with membership because destructive
+    // truncate can shrink the compact order and invalidate old handles.
+    void ensure_slots(KVAddressSpaceHandle handle) {
+        Address& address = require_active(handle);
+        address.slots.resize(address.page_count);
+        for (std::uint32_t i = 0; i < address.page_count; ++i) {
+            address.slots[i] = membership(address, i);
+        }
+        address.free_slots.clear();
+    }
+
+    [[nodiscard]] bool slot_occupied(KVAddressSpaceHandle handle, std::uint32_t slot) const {
+        const Address& address = require_active(handle);
+        return slot < address.slots.size() && address.slots[slot].valid();
+    }
+
+    // Slot-pool mapping for retention policies that keep logical pages in place:
+    // membership[] keeps the compact catalog order attention reads, while each page's
+    // device replica lives in an arbitrary slot. The caller owns slot lifetime.
+    [[nodiscard]] std::uint32_t alloc_slot(KVAddressSpaceHandle handle,
+                                           LogicalKVPageHandle page) {
+        Address& address = require_active(handle);
+        std::uint32_t slot = 0;
+        if (!address.free_slots.empty()) {
+            slot = address.free_slots.back();
+            address.free_slots.pop_back();
+        } else {
+            if (address.slots.size() >= page_capacity_) {
+                throw std::runtime_error("KV slot pool is exhausted");
+            }
+            slot = static_cast<std::uint32_t>(address.slots.size());
+            address.slots.emplace_back();
+        }
+        if (address.slots[slot].valid()) {
+            throw std::logic_error("KV slot pool entry is occupied");
+        }
+        address.slots[slot] = page;
+        return slot;
+    }
+
+    [[nodiscard]] LogicalKVPageHandle slot_page(KVAddressSpaceHandle handle,
+                                                std::uint32_t slot) const {
+        const Address& address = require_active(handle);
+        if (slot >= address.slots.size() || !address.slots[slot].valid()) {
+            throw std::out_of_range("KV slot pool entry is empty");
+        }
+        return address.slots[slot];
+    }
+
+    [[nodiscard]] DeviceKVPageHandle slot_physical(KVAddressSpaceHandle handle,
+                                                   std::uint32_t slot) const {
+        return pages_->physical(slot_page(handle, slot));
+    }
+
+    void release_slot(KVAddressSpaceHandle handle, std::uint32_t slot) {
+        Address& address = require_active(handle);
+        if (slot >= address.slots.size() || !address.slots[slot].valid()) { return; }
+        address.slots[slot] = {};
+        address.free_slots.push_back(slot);
+    }
+
+    // order[i] is the slot that compact logical position i reads. The tail beyond
+    // order.size() (the reserve pages) keeps its current membership mapping.
+    void publish_slots(KVAddressSpaceHandle handle, std::span<const std::uint32_t> order,
+                       RankStreams stream = {}) {
+        Address& address = require_active(handle);
+        if (order.size() > address.page_count) {
+            throw std::invalid_argument("KV slot publication exceeds mapped pages");
+        }
+        for (std::size_t i = 0; i < order.size(); ++i) {
+            const std::uint32_t slot = order[i];
+            if (slot >= address.slots.size() || !address.slots[slot].valid()) {
+                throw std::out_of_range("KV slot publication references an empty slot");
+            }
+            membership(address, static_cast<std::uint32_t>(i)) = address.slots[slot];
+        }
+        publish_membership(address, stream);
+    }
+
+    // Materialize one logical page directly into a slot. Used by the retention
+    // window when a recalled page takes a slot freed by an evicted page.
+    [[nodiscard]] LogicalKVPageHandle materialize_slot(KVAddressSpaceHandle handle,
+                                                       std::uint32_t slot) {
+        Address& address = require_active(handle);
+        if (slot >= page_capacity_) {
+            throw std::out_of_range("KV slot exceeds the address page capacity");
+        }
+        if (slot >= address.slots.size()) { address.slots.resize(slot + 1U); }
+        if (address.slots[slot].valid()) {
+            throw std::logic_error("KV slot is already occupied");
+        }
+        LogicalKVPageHandle page;
+        std::span<LogicalKVPageHandle> one(&page, 1);
+        std::optional<LogicalKVPageHandle> predecessor;
+        if (slot > 0 && address.slots[slot - 1U].valid()) {
+            predecessor = address.slots[slot - 1U];
+        }
+        pages_->materialize(address.reservation, one, predecessor);
+        address.slots[slot] = page;
+        return page;
+    }
+
+    void reset_slots(KVAddressSpaceHandle handle) {
+        Address& address = require_active(handle);
+        address.slots.clear();
+        address.free_slots.clear();
+    }
+
     void commit_frontier(KVAddressSpaceHandle handle, std::uint32_t frontier) {
         Address& address = require_active(handle);
         if (frontier < address.committed_frontier ||
@@ -1942,6 +2055,10 @@ private:
         std::uint32_t checkpoint_frontier = 0;
         DeviceKVPageReservation reservation;
         std::optional<KVExecutionRowLease> row;
+        // Slot pool: a logical page's physical device page lives in an arbitrary
+        // slot, while membership[] keeps the compact logical order attention reads.
+        std::vector<LogicalKVPageHandle> slots;
+        std::vector<std::uint32_t> free_slots;
         bool occupied = false;
         bool active   = false;
     };
