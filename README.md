@@ -101,6 +101,34 @@ DFlash2 行为 2026-10-26 复测（q3km、`ngram 0`、当前二进制）；MTP �
 | LongMemEval 54 题 | **54/60**（ActKV） |
 | Agent 220K | **30/30** 逐轮工具召回 |
 
+## 更新日志（2026-10-31）
+
+### 本轮改动
+
+| 领域 | 改动 | 验证 |
+|---|---|---|
+| DFlash2 同步 | 记录 `pending_features` 的捕获基准；append 起点不符即拒绝，所有 frontier 改写点重置标记 | 192K 262 轮零违约 |
+| 思考等级 | `tool` 消息可携带 `reasoning_effort`，顶层未指定时生效；pi-ai UA 省略 effort 解析为 off | none=0 / low=805 / xhigh=554 reasoning tokens |
+| keep 动态 | 开 keep 后 sink 取 `[0, first_user)` 实际页（cap 10% B），recent 取最后 8 条消息实际页（cap 15% B）；recent 仅在带 tools 时启用 | 带 tools `sink=38 recent=5`；纯文本回退固定 recent |
+| 图传播 | `graph_alpha` 默认 0.2；graph 未覆盖当前 frontier 时跳过传播 | 192K 20/20 |
+| 日志 | `req# done` 行增加每位置接受率 `pos` | — |
+| 投机内核 | coupled drafts accept；invariant attention 可选（默认关） | 数学等价，速度一致 |
+| GPU | NVML 时钟下限 `[floor, max]` | 负载 2790 MHz < 3090 上限 |
+| KVMem | 移植 0.19 checkpoint / speculative store | — |
+| 构建 | FFMPEG 路径转义；tool schema 顺序稳定 | — |
+
+### 192K LongMemEval 召回（20 题）
+
+| 配置 | 召回 | write | prefill | recall decode |
+|---|---|---:|---:|---:|
+| rk8v4 B=41600，无 keep | 20/20 | 365 s | 530–750 | 91.3 |
+| rk8v4 B=41600，keep 旧（固定 cap） | 20/20 | 344 s | — | 96.3 |
+| k8v4 B=38400，keep 全动态 | 19/20 | 454 s | 434 | 84.7 |
+| rk8v4 B=41600，keep 全动态 | 19/20 | 373 s | 538 | 89.6 |
+| **rk8v4 B=41600，keep 动态（gated）** | **20/20** | **356 s** | **579** | **95.3** |
+
+结论：动态 recent 只服务于带工具的多任务对话；纯文本长对话保持固定 recent，避免最近 8 条大消息挤占长召回所需的检索页。动态 sink 不受影响，始终按实际开头结构取页。
+
 ## 关键修补
 
 完整原因、提交和验证数据见 [docs/CHANGELOG.md](docs/CHANGELOG.md)。

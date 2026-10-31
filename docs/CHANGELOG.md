@@ -1,6 +1,6 @@
 # 修改与基准总览
 
-> 最后更新：2026-10-26。本文件汇总历次修补的**原因、改动和验证数据**；专题细节仍在
+> 最后更新：2026-10-31。本文件汇总历次修补的**原因、改动和验证数据**；专题细节仍在
 > `docs/` 下的原始记录里，关键结论以本文件为准。
 
 ## 0. 当前状态
@@ -434,3 +434,78 @@ DFlash2 行为 2026-10-26 复测（q3km、`ngram 0`、当前二进制）：报�
 | `docs/dflash2-passthrough-20261026.md` | q3km 直通、draft 扫描、floor/bypass 细节 |
 | `docs/integration-20261025.md` | 上游整合评估与 128K/256K 数据 |
 | `docs/CHANGELOG-20261025.md` | 10-25 当天的完整日志 |
+
+---
+
+## 11. 2026-10-31 更新
+
+### 11.1 DFlash2 feature append 同步校验
+
+**问题**：`pending_features` 是上一轮 decode 的 target hidden，下一轮 append 到 draft ring。
+如果两轮之间 frontier 被重写（复用、恢复、forced tokens、快照），列 0 的位置不再等于
+append 的起点，ring 会把 feature 写到错误的位置，且没有诊断。
+
+**改动**：
+
+- `SequenceState` 增加 `dflash_pending_base` / `dflash_pending_valid`；
+- decode 捕获后记录本轮起点；append 前校验 `start == pending_base`；
+- 所有非 decode 的 frontier 改写点（reuse、restore、forced tokens、snapshot）同步清零；
+- `--kvmem-verify-transfers` 下输出 `KVMEM_DFLASH_ROUND` / `KVMEM_DFLASH_APPEND`。
+
+**验证**：192K 262 轮 decode，`start + append_count == base` 全部成立，零违约。
+
+### 11.2 tool 结果携带思考等级
+
+**问题**：dsh 的 pi-ai 适配器把 `off` 实现为“省略 reasoning_effort”，服务端默认
+`--default-reasoning-effort xhigh` 又会把省略解释为 xhigh，导致选 off 后模型仍思考。
+
+**改动**：
+
+- `tool` 消息可带 `reasoning_effort`，仅当请求顶层未指定时生效（最后一条 tool 优先）；
+- User-Agent 为 pi-ai（`pi (...)`）且省略 effort 时，解析为 `none`；
+- 顶层显式 effort 始终优先。
+
+**验证**：
+
+| 用例 | reasoning_tokens |
+|---|---:|
+| 顶层 none | 0 |
+| 顶层 low | 805 |
+| 顶层 xhigh | 872 |
+| tool none | 0 |
+| tool low | 805 |
+| tool xhigh | 554 |
+
+### 11.3 keep 动态 sink / recent
+
+**问题**：固定 `recent_tokens = 64` 只保留 1 页，最近的 tool result（todo 状态）容易
+被驱逐；固定 `sink_tokens` 又与实际开头结构无关。
+
+**改动**：
+
+- `--kvmem-keep` 开启时，sink 取 `[0, first_user)` 的实际页（cap 10% B）；
+- recent 取 `PreparedPromptData.memory_recent_begin`（最后 8 条消息）的实际页（cap 15% B）；
+- **recent 仅在请求带 tools 时启用**；纯文本长对话回退固定 recent。
+
+**192K LongMemEval（20 题）**：
+
+| 配置 | 召回 | write | prefill | recall decode |
+|---|---|---:|---:|---:|
+| rk8v4 B=41600，无 keep | 20/20 | 365 s | 530–750 | 91.3 |
+| rk8v4 B=41600，keep 旧（固定 cap） | 20/20 | 344 s | — | 96.3 |
+| k8v4 B=38400，keep 全动态 | 19/20 | 454 s | 434 | 84.7 |
+| rk8v4 B=41600，keep 全动态 | 19/20 | 373 s | 538 | 89.6 |
+| **rk8v4 B=41600，keep 动态（gated）** | **20/20** | **356 s** | **579** | **95.3** |
+
+**结论**：动态 recent 对纯文本长对话会挤占检索页（`deep-original` 连续两轮丢失），
+gating 后恢复 20/20；带 tools 的请求仍保留最近 8 条消息（`sink=38 recent=5` 实测）。
+
+### 11.4 其他
+
+- `graph_alpha` 默认 0.2（0.19 调参值）；graph 未覆盖 frontier 时跳过传播而不是报错。
+- `req# done` 增加每位置接受率 `pos`。
+- coupled drafts accept 内核替换 greedy 两段式；数学等价，性能一致。
+- invariant attention 作为可选项保留（`--invariant-attention`，默认关，192K 下约慢 9%）。
+- GPU 时钟下限 `[floor, max]`，不抬高硬件上限。
+- 移植 0.19 checkpoint / speculative store。
+- 修复 FFMPEG 路径转义与 tool schema 顺序。
