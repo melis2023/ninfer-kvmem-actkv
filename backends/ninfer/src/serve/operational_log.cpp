@@ -314,6 +314,25 @@ OperationalRecord render_request_done(const RequestLogContext& context,
             << product::format_pretty_count(metrics.ngram_drafted_tokens) << " accepted, "
             << product::format_pretty_count(metrics.ngram_rounds) << " rounds";
     }
+    // Per-position acceptance, as a share of speculative rounds. Only the neural window is
+    // printed: wider ngram copy rounds also accumulate here, and their positions say nothing
+    // about the draft width this counter is used to size.
+    if (metrics.speculative_rounds != 0 && !metrics.speculative_accepted_per_position.empty()) {
+        const std::size_t positions = std::min(
+            metrics.speculative_accepted_per_position.size(),
+            static_cast<std::size_t>(metrics.speculative_draft_window));
+        if (positions != 0) {
+            out << " | pos ";
+            const double rounds = static_cast<double>(metrics.speculative_rounds);
+            for (std::size_t position = 0; position < positions; ++position) {
+                if (position != 0) { out << '/'; }
+                const double rate =
+                    static_cast<double>(metrics.speculative_accepted_per_position[position]) / rounds;
+                out << static_cast<int>(rate * 100.0 + 0.5);
+            }
+            out << '%';
+        }
+    }
     if (metrics.ngram_archive.enabled) {
         out << " | archive " << (metrics.ngram_archive.bound ? "bound" : "unbound");
         if (metrics.ngram_archive.bound) {
