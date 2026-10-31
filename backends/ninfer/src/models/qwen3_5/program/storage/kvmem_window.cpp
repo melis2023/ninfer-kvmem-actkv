@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <iterator>
+#include <numeric>
 #include <utility>
 
 namespace ninfer::models::qwen3_5::detail {
@@ -672,24 +673,26 @@ bool ProgramImpl::prepare_memory_append(SequenceState& sequence, std::uint32_t b
 void ProgramImpl::retain_prompt_spans(SequenceState& sequence,
                                       const PreparedPromptData& prompt) noexcept {
     try {
-        if (!kvmem_window_tokens || !kvmem_options.keep) { return; }
+        if (!kvmem_window_tokens || !kvmem_options.keep) {
+            sequence.window.dynamic_sink_pages.clear();
+            sequence.window.dynamic_recent_pages.clear();
+            return;
+        }
         const std::uint32_t total_pages = kv_pages_for_tokens(prompt.token_ids.size());
         if (total_pages == 0) { return; }
         const std::uint32_t keep = kvmem_options.selected_tokens / page_tokens;
-        // Structural budgets are internal and derived from the actual prompt spans:
-        // the system preamble, the declared tool schema and the first user turn.
-        // The percentages are caps, not reservations, so a small prompt spends only
-        // the pages it really uses while a large schema cannot crowd out retrieval.
-        const std::uint32_t system_end = prompt.tools_region
-            ? prompt.tools_region->begin
-            : (prompt.first_user_region ? prompt.first_user_region->begin : 0U);
-        const std::uint32_t system_pages_needed =
-            system_end ? (system_end + page_tokens - 1U) / page_tokens : 0U;
-        const std::uint32_t tool_pages_needed = prompt.tools_region
-            ? (prompt.tools_region->count + page_tokens - 1U) / page_tokens : 0U;
-        const std::uint32_t system_cap = std::min(system_pages_needed,
-            keep * (prompt.tools_region ? 10U : 40U) / 100U);
-        const std::uint32_t tool_cap   = std::min(tool_pages_needed, keep * 40U / 100U);
+        if (!keep) { return; }
+        // Structural pins must leave room for Query recall. The old layout could
+        // spend 100% on system/tools/newest-8 and then silently drop the current
+        // task when the 65% ceiling filled up, which is exactly the multi-task
+        // ordering failure. Caps sum to 80%; the remaining 20% is retrieval.
+        const std::uint32_t system_cap = std::max(1U, keep * 10U / 100U);
+        const std::uint32_t tool_cap   = std::max(1U, keep * 40U / 100U);
+        // The current turn and the initial brief are anchors, not history: a few
+        // dozen pages are enough for the instruction. Oversizing them was what
+        // pushed the oldest session out of the recall window.
+        const std::uint32_t task_cap   = std::max(1U, keep * 5U / 100U);
+        const std::uint32_t brief_cap  = std::max(1U, keep * 3U / 100U);
 
         const auto span_pages = [&](const TokenSpan& span, std::uint32_t cap, bool pin_tail,
                                     std::vector<std::uint32_t>& pages) {
@@ -697,7 +700,7 @@ void ProgramImpl::retain_prompt_spans(SequenceState& sequence,
             const std::uint64_t token_end = std::min<std::uint64_t>(
                 static_cast<std::uint64_t>(span.begin) + span.count, prompt.token_ids.size());
             if (token_end <= span.begin) { return; }
-            const std::uint32_t first = span.begin / page_tokens;
+            const std::uint32_t first = static_cast<std::uint32_t>(span.begin) / page_tokens;
             const std::uint32_t last =
                 static_cast<std::uint32_t>((token_end + page_tokens - 1U) / page_tokens);
             if (last <= first) { return; }
@@ -709,16 +712,78 @@ void ProgramImpl::retain_prompt_spans(SequenceState& sequence,
                 for (auto page = first; page < first + cap; ++page) pages.push_back(page);
                 return;
             }
-            // A long first user turn usually carries the actual instruction at its end (the
-            // beginning is often pasted context). Keep the first page and the trailing pages.
+            // Long spans carry meaning at both ends: the header and the trailing
+            // instruction. Keep the first page and the tail.
             pages.push_back(first);
             const std::uint32_t tail_begin = last - (cap - 1U);
             for (auto page = tail_begin; page < last; ++page) pages.push_back(page);
         };
+
+        // Qwen renders `# Tools` before the system preamble. The old code assumed
+        // tools came second, so it pinned one template page and left the real
+        // system rules (task order, tool-use contract) evictable. Derive the
+        // system region from whichever side of tools is actually free.
+        const std::uint32_t first_user =
+            prompt.first_user_region ? prompt.first_user_region->begin
+                                     : static_cast<std::uint32_t>(prompt.token_ids.size());
+        TokenSpan system_span{0, 0};
+        if (prompt.tools_region) {
+            const std::uint32_t tools_begin = prompt.tools_region->begin;
+            const std::uint32_t tools_end =
+                static_cast<std::uint32_t>(prompt.tools_region->begin + prompt.tools_region->count);
+            if (tools_begin <= page_tokens && tools_end < first_user) {
+                // [tools][system][first user]
+                system_span = TokenSpan{tools_end, first_user - tools_end};
+            } else if (tools_begin > 0) {
+                // [system][tools][first user]
+                system_span = TokenSpan{0, std::min(tools_begin, first_user)};
+            }
+        } else if (first_user > 0) {
+            system_span = TokenSpan{0, first_user};
+        }
+
         std::vector<std::uint32_t> system;
         std::vector<std::uint32_t> tools;
-        if (system_end) span_pages(TokenSpan{0, system_end}, system_cap, false, system);
-        if (prompt.tools_region) span_pages(*prompt.tools_region, tool_cap, false, tools);
+        std::vector<std::uint32_t> task;
+        std::vector<std::uint32_t> brief;
+        span_pages(system_span, system_cap, false, system);
+        if (prompt.tools_region) span_pages(*prompt.tools_region, tool_cap, true, tools);
+        // The newest user content is the task being executed now; pin it before
+        // the first brief so a long initial brief cannot evict the active task.
+        if (prompt.memory_query) span_pages(*prompt.memory_query, task_cap, true, task);
+        if (prompt.first_user_region) span_pages(*prompt.first_user_region, brief_cap, true, brief);
+
+        // Dynamic sink/recent: follow the prompt's real spans instead of the fixed token
+        // reservation. Sink covers the leading structure up to the first user content; recent
+        // covers the newest message window (the frontend's last eight messages), which is where
+        // tool results such as the live todo list live. Caps keep retrieval room even when one
+        // window is large (an HTML/file tool result can span many pages).
+        const std::uint32_t sink_cap   = std::max(1U, keep * 10U / 100U);
+        const std::uint32_t recent_cap = std::max(1U, keep * 15U / 100U);
+        std::vector<std::uint32_t> dynamic_sink;
+        std::vector<std::uint32_t> dynamic_recent;
+        const std::uint32_t first_user_page =
+            first_user > 0 ? static_cast<std::uint32_t>(first_user / page_tokens)
+                           : total_pages;
+        const std::uint32_t sink_end =
+            std::min({first_user_page, total_pages, sink_cap});
+        for (std::uint32_t page = 0; page < sink_end; ++page) dynamic_sink.push_back(page);
+        // The dynamic recent window exists to keep tool results (the live todo list, a file
+        // edit acknowledgement) visible across turns. A pure text conversation gets no such
+        // benefit: its newest eight messages are ordinary prose, and pinning up to 15% of the
+        // budget for them evicts the retrieval pages a long-recall question needs. Gate the
+        // window on declared tools and keep the fixed recent reservation otherwise.
+        if (prompt.tools_region && prompt.memory_recent_begin > 0 &&
+            prompt.memory_recent_begin < prompt.token_ids.size()) {
+            const std::uint32_t first = static_cast<std::uint32_t>(
+                prompt.memory_recent_begin / page_tokens);
+            const std::uint32_t last = static_cast<std::uint32_t>(
+                (prompt.token_ids.size() + page_tokens - 1U) / page_tokens);
+            const std::uint32_t begin = last > recent_cap ? last - recent_cap : 0U;
+            for (std::uint32_t page = std::max(first, begin); page < last; ++page) {
+                if (page < total_pages) dynamic_recent.push_back(page);
+            }
+        }
 
         const auto replace = [total_pages](std::vector<std::uint32_t>& destination,
                                            std::vector<std::uint32_t> source) {
@@ -734,41 +799,32 @@ void ProgramImpl::retain_prompt_spans(SequenceState& sequence,
         auto& window = sequence.window;
         replace(window.system_pages, std::move(system));
         replace(window.tool_pages, std::move(tools));
-        // Brief pin is disabled: keep only the system preamble and tool schema.
-        window.brief_pages.clear();
-        // Dynamic recent window: pin the pages of the newest messages instead
-        // of reserving a fixed recent-token band. The actual message span is
-        // what the model needs to continue the current tool sequence.
-        std::vector<std::uint32_t> recent;
-        if (prompt.memory_recent_begin && prompt.memory_recent_begin < prompt.token_ids.size()) {
-            span_pages(TokenSpan{prompt.memory_recent_begin,
-                                 prompt.token_ids.size() - prompt.memory_recent_begin},
-                       keep * 50U / 100U, true, recent);
-        }
-        replace(window.pinned_pages, std::move(recent));
+        replace(window.pinned_pages, std::move(task));
+        replace(window.brief_pages, std::move(brief));
+        replace(window.dynamic_sink_pages, std::move(dynamic_sink));
+        replace(window.dynamic_recent_pages, std::move(dynamic_recent));
 
         // Structural pins outrank the soft thinking demotion: a page that carries the system
-        // preamble, a tool definition or the first brief is never demoted, even if it also
-        // contains thinking.
-        if (!window.system_pages.empty() || !window.tool_pages.empty() ||
-            !window.brief_pages.empty()) {
-            std::vector<std::uint32_t> structural = window.system_pages;
-            structural.insert(structural.end(), window.tool_pages.begin(), window.tool_pages.end());
-            structural.insert(structural.end(), window.brief_pages.begin(), window.brief_pages.end());
-            std::sort(structural.begin(), structural.end());
-            structural.erase(std::unique(structural.begin(), structural.end()), structural.end());
-            std::vector<std::uint32_t> demoted_only;
-            std::set_difference(window.demoted_pages.begin(), window.demoted_pages.end(),
-                                structural.begin(), structural.end(),
-                                std::back_inserter(demoted_only));
-            window.demoted_pages.swap(demoted_only);
-        }
+        // preamble, a tool definition, the current task or the first brief is never demoted.
+        std::vector<std::uint32_t> structural = window.system_pages;
+        structural.insert(structural.end(), window.tool_pages.begin(), window.tool_pages.end());
+        structural.insert(structural.end(), window.pinned_pages.begin(), window.pinned_pages.end());
+        structural.insert(structural.end(), window.brief_pages.begin(), window.brief_pages.end());
+        std::sort(structural.begin(), structural.end());
+        structural.erase(std::unique(structural.begin(), structural.end()), structural.end());
+        std::vector<std::uint32_t> demoted_only;
+        std::set_difference(window.demoted_pages.begin(), window.demoted_pages.end(),
+                            structural.begin(), structural.end(),
+                            std::back_inserter(demoted_only));
+        window.demoted_pages.swap(demoted_only);
         if (kvmem_options.verify_transfers) {
             std::fprintf(stderr,
-                         "KVMEM_PROMPT_PIN system=%zu/%u tools=%zu/%u brief=%zu/%u pages=%u\n",
-                         window.system_pages.size(), system_cap,
-                         window.tool_pages.size(), tool_cap,
-                         window.brief_pages.size(), 0U, total_pages);
+                         "KVMEM_PROMPT_PIN system=%zu tools=%zu task=%zu brief=%zu "
+                         "sink=%zu recent=%zu pages=%u\n",
+                         window.system_pages.size(), window.tool_pages.size(),
+                         window.pinned_pages.size(), window.brief_pages.size(),
+                         window.dynamic_sink_pages.size(), window.dynamic_recent_pages.size(),
+                         total_pages);
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "KVMEM_PROMPT_PIN skipped: %s\n", error.what());
@@ -895,11 +951,26 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
         if (count == 0) {
             core.push_back(0);
         } else {
-            const auto sink_keep = std::min(kvmem_options.sink_blocks(), count);
-            for (std::uint32_t id = 0; id < sink_keep; ++id) core.push_back(id);
+            // With keep on, sink and recent follow the prompt's real spans. The fixed token
+            // reservation remains the fallback when no dynamic span was published (raw prompt,
+            // fewer than eight messages, or keep off).
+            if (kvmem_options.keep && !state.dynamic_sink_pages.empty()) {
+                for (const auto id : state.dynamic_sink_pages) {
+                    if (id < count) core.push_back(id);
+                }
+            } else {
+                const auto sink_keep = std::min(kvmem_options.sink_blocks(), count);
+                for (std::uint32_t id = 0; id < sink_keep; ++id) core.push_back(id);
+            }
             for (const auto id : state.media_pages) if (id < count) core.push_back(id);
-            const auto recent_keep = std::min(kvmem_options.recent_blocks(), count);
-            for (std::uint32_t i = 0; i < recent_keep; ++i) core.push_back(count - 1 - i);
+            if (kvmem_options.keep && !state.dynamic_recent_pages.empty()) {
+                for (const auto id : state.dynamic_recent_pages) {
+                    if (id < count) core.push_back(id);
+                }
+            } else {
+                const auto recent_keep = std::min(kvmem_options.recent_blocks(), count);
+                for (std::uint32_t i = 0; i < recent_keep; ++i) core.push_back(count - 1 - i);
+            }
         }
         std::sort(core.begin(), core.end());
         core.erase(std::unique(core.begin(), core.end()), core.end());
@@ -907,10 +978,11 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
         // the L1 answer. The answer keeps its previous newest-page rule; structural spans keep
         // their leading pages so a truncated schema still starts at the tool header.
         std::vector<std::uint64_t> mandatory = core;
-        // Structural pins and the answer tail share a hard ceiling so retrieval
-        // keeps at least the remaining 35% of B. Order is system -> tools ->
-        // brief -> answer; the last claimant is trimmed first.
-        const std::uint32_t structural_cap = keep * 65U / 100U;
+        // Structural pins share a hard ceiling so retrieval keeps at least the
+        // remaining 30% of B. Order is system -> tools -> current task -> brief;
+        // the last claimant is trimmed first, and the active task outranks the
+        // initial brief so multi-task turns cannot evict what is running now.
+        const std::uint32_t structural_cap = keep * 70U / 100U;
         const auto add_pages = [&](const std::vector<std::uint32_t>& source, bool newest) {
             std::vector<std::uint64_t> pages;
             pages.reserve(source.size());
@@ -936,8 +1008,8 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
         };
         add_pages(state.system_pages, false);
         add_pages(state.tool_pages, false);
-        add_pages(state.brief_pages, false);
         add_pages(state.pinned_pages, true);
+        add_pages(state.brief_pages, false);
         std::vector<std::uint64_t> selected;
         const bool query_complete = state.query_tokens != 0 &&
             (state.query_replayed || begin >= state.query_end) &&
@@ -955,7 +1027,6 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
             }
         }
         if (reason == kvmem::SelectionReason::Query && query_ready) {
-            const auto& config = parameters.model.config().text;
             const std::vector<std::uint32_t> required(mandatory.begin(), mandatory.end());
             const auto score_started = std::chrono::steady_clock::now();
             auto scores = score_memory_query(sequence, required);
@@ -972,7 +1043,9 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
                 }
                 state.selector->set_retrieval_scores(scores);
             }
-            const auto ids = state.selector->pick_topk_blocks(required);
+            // 0.19 Query selector: fixed pages first, then every remaining slot
+            // ranked by the page-softmax + graph score.
+            const auto ids = state.selector->pick_graph_blocks(required);
             const auto select_ended = std::chrono::steady_clock::now();
             reselect_score_us = std::chrono::duration_cast<std::chrono::microseconds>(
                 score_ended - score_started).count();
@@ -1205,6 +1278,11 @@ std::unique_ptr<KvmemPrefixCheckpoint> ProgramImpl::capture_memory_checkpoint(Se
     checkpoint->prefix_identity.truncate(frontier);
     checkpoint->mean_tail = window.statistics->mean_checkpoint(frontier);
     checkpoint->history = window.selector->retrieval_checkpoint();
+    // 0.19 Query replay: the score must see the graph and feedback sampled up to
+    // this exact boundary, not the live end-of-prompt statistics.
+    checkpoint->graph = window.graph;
+    checkpoint->feedback = window.feedback.snapshot();
+    checkpoint->attention_scope = window.attention_scope;
     const auto bytes = state_images->host_layout().image_bytes;
     checkpoint->state = std::make_unique<PinnedHostBuffer>(bytes);
     std::memset(checkpoint->state->data(), 0, bytes);
@@ -1238,6 +1316,14 @@ std::unique_ptr<KvmemPrefixCheckpoint> ProgramImpl::capture_memory_checkpoint(Se
     if (kvmem_options.verify_transfers) {
         std::fprintf(stderr, "KVMEM_PREFIX_CHECKPOINT frontier=%u state_bytes=%zu\n", frontier, bytes);
     }
+    // 0.19 periodic coverage: keep spaced restore points within the archive budget.
+    if (!window.periodic_checkpoints.policy().enabled) {
+        auto policy = kvmem::CheckpointPolicy::environment();
+        policy.enabled = true;
+        window.periodic_checkpoints =
+            kvmem::CheckpointArchive<KvmemPrefixCheckpoint>(policy);
+    }
+    window.periodic_checkpoints.remember(*checkpoint, kvmem::CoveragePurpose::Periodic);
     return checkpoint;
 }
 
@@ -1527,6 +1613,36 @@ std::optional<KvmemHistoryMatch> ProgramImpl::memory_restorable_history(const Pr
     if (kvmem_options.verify_transfers)
         std::fprintf(stderr, "KVMEM_HISTORY_LOOKUP frontier=%zu prefix_rejected=%u identity_rejected=%u query_rejected=%u incomplete=%u\n",
                      best_frontier, prefix_rejected, identity_rejected, query_rejected, incomplete);
+    // 0.19 periodic archive: a spaced restore point may cover a frontier the
+    // fixed slots do not.
+    for (std::size_t index = 0; index < memory_histories.size(); ++index) {
+        const auto& history = memory_histories[index];
+        if (!history || !history->stamp.valid) continue;
+        if (const auto* periodic = history->periodic_checkpoints.select(
+                static_cast<std::uint64_t>(prompt.token_ids.size()) - 1,
+                [&](const KvmemPrefixCheckpoint& candidate) {
+                    return candidate.state_bytes() == state_images->host_layout().image_bytes;
+                })) {
+            const auto frontier = static_cast<std::uint32_t>(periodic->prefix.size());
+            // A spaced restore point outlives the resident archive: its pages may already
+            // have been evicted. Restoring it would throw mid-request, so require the same
+            // native prefix coverage the fixed checkpoints prove above.
+            const auto pages = kv_pages_for_tokens(frontier);
+            bool complete = history->statistics && history->selector &&
+                history->statistics_frontier >= frontier &&
+                history->archive.size() >= pages && history->host_versions.size() >= pages;
+            for (std::uint32_t page = 0; complete && page < pages; ++page)
+                complete = history->archive[page] && history->host_versions[page] >= valid_columns(page, frontier);
+            if (complete && frontier < prompt.token_ids.size() &&
+                std::equal(periodic->prefix.begin(), periodic->prefix.end(),
+                           prompt.token_ids.begin()) &&
+                periodic->prefix_identity.matches(prompt, frontier) &&
+                frontier > best_frontier) {
+                best = KvmemHistoryMatch{index, KvmemCheckpointKind::Base, frontier, periodic};
+                best_frontier = frontier;
+            }
+        }
+    }
     return best;
 }
 
@@ -1646,11 +1762,18 @@ bool ProgramImpl::restore_memory_history(SequenceState& sequence, RequestControl
         slot->state = std::move(state);
         slot->cold_state = {};
     }
+    // A periodic archive record lives inside the history being moved below, so
+    // copy it before the move invalidates the pointer.
+    std::unique_ptr<KvmemPrefixCheckpoint> periodic_copy;
+    if (match->periodic) {
+        periodic_copy = std::make_unique<KvmemPrefixCheckpoint>(*match->periodic);
+    }
     sequence.window = std::move(*history);
     history.reset();
     auto& window = sequence.window;
     const bool same_query = memory_same_query(window, staged.prompt, *frontier);
-    auto checkpoint = std::move(memory_checkpoint_slot(window, match->kind));
+    auto checkpoint = periodic_copy ? std::move(periodic_copy)
+                                    : std::move(memory_checkpoint_slot(window, match->kind));
     // The previous Program address-space lease has been released. These IDs
     // must never be treated as resident in the new native address space.
     window.pages.clear();
