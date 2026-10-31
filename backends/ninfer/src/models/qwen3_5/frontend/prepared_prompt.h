@@ -168,6 +168,9 @@ struct PreparedPromptData {
     // Proven message spans in token coordinates. Graph propagation discounts
     // mass that crosses a message boundary; an empty list uses coefficient 1.
     std::vector<TokenSpan> memory_messages;
+    // Proven tool-result message spans. KVMem keeps each one's first page so a
+    // large result still exposes its header when the recent window is capped.
+    std::vector<TokenSpan> tool_messages;
     // First real user content and the declared tool-definition union. KVMem structural pins
     // use these spans; an absent span falls back to the positional sink.
     std::optional<TokenSpan> first_user_region;

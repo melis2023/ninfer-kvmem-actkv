@@ -1237,7 +1237,20 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             const auto end = *message_boundaries[i + 1];
             if (begin < end && end <= result.token_ids.size()) {
                 result.memory_messages.push_back({begin, end - begin});
+                if (i < message_roles.size() && message_roles[i] == ChatRole::Tool) {
+                    result.tool_messages.push_back({begin, end - begin});
+                }
             }
+        }
+    }
+    // The newest message has no following boundary: its end is the prompt end.
+    // Tool results are usually the newest message, so record them here too.
+    if (!message_boundaries.empty() && message_boundaries.back() &&
+        *message_boundaries.back() < result.token_ids.size()) {
+        const auto begin = *message_boundaries.back();
+        const auto end = static_cast<std::uint32_t>(result.token_ids.size());
+        if (!message_roles.empty() && message_roles.back() == ChatRole::Tool) {
+            result.tool_messages.push_back({begin, end - begin});
         }
     }
     if (impl_->ngram_archive_enabled) {

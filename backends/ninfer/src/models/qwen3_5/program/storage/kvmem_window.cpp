@@ -369,7 +369,6 @@ public:
         const std::size_t selection_pages =
             static_cast<std::size_t>(backend.program.kvmem_options.selected_tokens / page_tokens);
         const bool incremental = !checked && enough &&
-            changed.size() * 2 <= selected.size() &&
             selected.size() >= std::max<std::size_t>(1, selection_pages / 2);
         std::fprintf(stderr, "KVMEM_RESTORE_DIFF prev=%zu sel=%zu changed=%zu same=%d inc=%d\n",
             previous.size(), selected.size(), changed.size(), int(enough), int(incremental));
@@ -768,20 +767,42 @@ void ProgramImpl::retain_prompt_spans(SequenceState& sequence,
         const std::uint32_t sink_end =
             std::min({first_user_page, total_pages, sink_cap});
         for (std::uint32_t page = 0; page < sink_end; ++page) dynamic_sink.push_back(page);
-        // The dynamic recent window exists to keep tool results (the live todo list, a file
-        // edit acknowledgement) visible across turns. A pure text conversation gets no such
-        // benefit: its newest eight messages are ordinary prose, and pinning up to 15% of the
-        // budget for them evicts the retrieval pages a long-recall question needs. Gate the
-        // window on declared tools and keep the fixed recent reservation otherwise.
-        if (prompt.tools_region && prompt.memory_recent_begin > 0 &&
-            prompt.memory_recent_begin < prompt.token_ids.size()) {
-            const std::uint32_t first = static_cast<std::uint32_t>(
-                prompt.memory_recent_begin / page_tokens);
+        // A tool turn needs the newest user task and every tool call/result it
+        // triggered to stay together: a fixed "last eight messages" window can
+        // split them, and a pure token tail can drop the task header. Anchor the
+        // window at memory_query (the newest real user content), keep its first
+        // page plus each tool result's first page, then fill the rest from the
+        // newest tail. Pure text conversations keep the fixed reservation so the
+        // retrieval budget stays available for long-recall questions.
+        const bool has_task = prompt.memory_query && prompt.memory_query->count > 0 &&
+            prompt.memory_query->begin < prompt.token_ids.size();
+        if (prompt.tools_region && (has_task || prompt.memory_recent_begin > 0)) {
             const std::uint32_t last = static_cast<std::uint32_t>(
                 (prompt.token_ids.size() + page_tokens - 1U) / page_tokens);
-            const std::uint32_t begin = last > recent_cap ? last - recent_cap : 0U;
-            for (std::uint32_t page = std::max(first, begin); page < last; ++page) {
-                if (page < total_pages) dynamic_recent.push_back(page);
+            std::uint32_t task_begin = has_task
+                ? static_cast<std::uint32_t>(prompt.memory_query->begin / page_tokens)
+                : static_cast<std::uint32_t>(prompt.memory_recent_begin / page_tokens);
+            task_begin = std::min(task_begin, last);
+            const auto push_page = [&](std::uint32_t page) {
+                if (page < last && page < total_pages &&
+                    std::find(dynamic_recent.begin(), dynamic_recent.end(), page) ==
+                        dynamic_recent.end()) {
+                    dynamic_recent.push_back(page);
+                }
+            };
+            // Task header first, then tool result headers, then the newest tail.
+            push_page(task_begin);
+            for (const auto& span : prompt.tool_messages) {
+                if (dynamic_recent.size() >= recent_cap) { break; }
+                push_page(static_cast<std::uint32_t>(span.begin / page_tokens));
+            }
+            const std::uint32_t room = dynamic_recent.size() < recent_cap
+                ? recent_cap - static_cast<std::uint32_t>(dynamic_recent.size()) : 0U;
+            const std::uint32_t tail_begin = last > room ? last - room : 0U;
+            for (std::uint32_t page = std::max(tail_begin, task_begin + 1U);
+                 page < last; ++page) {
+                if (dynamic_recent.size() >= recent_cap) { break; }
+                push_page(page);
             }
         }
 
