@@ -459,4 +459,17 @@ __device__ __forceinline__ int sampling_pick_from_support(const int* cand_idx, c
     return picked;
 }
 
+// thread-0 helper: the inverse-CDF draw of every keyed sample -- the rank of the first candidate
+// whose cumulative normalized weight exceeds `u`, the last one when rounding leaves the sum at or
+// below `u`. sample() and coupled speculative verification share it, so the same key and the
+// same distribution give the same token on both routes.
+__device__ __forceinline__ int sampling_pick_rank(const float* prob, int n, float u) {
+    float acc = 0.0f;
+    for (int j = 0; j < n; ++j) {
+        acc += prob[j];
+        if (u < acc) { return j; }
+    }
+    return n - 1;
+}
+
 } // namespace ninfer::ops
