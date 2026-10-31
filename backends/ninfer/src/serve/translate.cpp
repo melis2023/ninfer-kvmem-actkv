@@ -125,51 +125,6 @@ std::vector<const ToolDefinition*> effective_tools(const GenerationRequest& requ
     for (const ToolDefinition& tool : request.tools) { tools.push_back(&tool); }
     return tools;
 }
-
-// Long-payload tools (write/edit) are more reliable when the short path argument is
-// rendered before the payload. The same applies to shell/grep tools: the short
-// description/pattern is easier to emit before a long command. Property order does
-// not affect JSON Schema validation; this only changes the prompt.
-RequestJson order_tool_schema_properties(RequestJson schema, std::string_view tool_name) {
-    if (!schema.is_object() || !schema.contains("properties") ||
-        !schema["properties"].is_object()) {
-        return schema;
-    }
-    const auto promoted = [tool_name](std::string_view key) {
-        if (key == "file_path" || key == "path" || key == "file") { return true; }
-        // No pwsh/description promotion: DSH already places `description` first,
-        // and forcing it here made the model emit only that field before stopping.
-        if (tool_name == "grep" && key == "pattern") { return true; }
-        return false;
-    };
-    RequestJson properties = RequestJson::object();
-    for (auto& [key, value] : schema["properties"].items()) {
-        if (promoted(key)) { properties[key] = std::move(value); }
-    }
-    for (auto& [key, value] : schema["properties"].items()) {
-        if (!properties.contains(key)) { properties[key] = std::move(value); }
-    }
-    schema["properties"] = std::move(properties);
-
-    if (schema.contains("required") && schema["required"].is_array()) {
-        RequestJson required = RequestJson::array();
-        for (const auto& item : schema["required"]) {
-            if (item.is_string() && promoted(item.get<std::string>())) {
-                required.push_back(item);
-            }
-        }
-        for (const auto& item : schema["required"]) {
-            bool seen = false;
-            for (const auto& existing : required) {
-                if (existing == item) { seen = true; break; }
-            }
-            if (!seen) { required.push_back(item); }
-        }
-        schema["required"] = std::move(required);
-    }
-    return schema;
-}
-
 // The members follow the order the Qwen templates were trained on, name, description and
 // parameters; `strict` is the server's enforcement flag for the output contract, and the frontend
 // leaves it out of the rendered prompt.
@@ -244,6 +199,17 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
     auto thinking = merge_boolean("enable_thinking", request.enable_thinking);
     auto preserve = merge_boolean("preserve_thinking", request.preserve_thinking);
     auto effort   = request.reasoning_effort;
+    if (!effort) {
+        // A tool result may carry the thinking level for the turn it feeds. The last one wins:
+        // it is the result that immediately precedes this generation. The request-level field
+        // still takes precedence over every tool suggestion.
+        for (auto turn = request.messages.rbegin(); turn != request.messages.rend(); ++turn) {
+            if (turn->role == ChatRole::Tool && turn->reasoning_effort) {
+                effort = turn->reasoning_effort;
+                break;
+            }
+        }
+    }
     if (kwargs.contains("reasoning_effort") && !kwargs["reasoning_effort"].is_null()) {
         if (!kwargs["reasoning_effort"].is_string())
             invalid_prompt_option("reasoning_effort must be a string", "reasoning_effort",
@@ -259,6 +225,11 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         effort = nested;
     }
     kwargs.erase("reasoning_effort");
+    // pi-ai clients express "off" by omitting the field. Resolve that omission to off unless the
+    // request already decided thinking explicitly (enable_thinking or a template kwarg).
+    if (!effort && !request.enable_thinking && request.omitted_effort_means_off) {
+        effort = RequestedReasoningEffort::None;
+    }
     if (request.structured_output.kind != StructuredOutputKind::None) {
         if (!request.stop_strings.empty() ||
             request.continuation != PromptContinuationMode::NewAssistantTurn) {

@@ -30,6 +30,11 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
         const auto body                  = parse_json_body(req);
         request                          = parse_chat_completion_request(body, limits);
         request.generation.ngram_session = resolve_ngram_session(req, body, options_);
+        // pi-ai (the DeepSeek Harness adapter) sends User-Agent "pi (<platform> <release>; <arch>)"
+        // and expresses the "off" reasoning level by omitting the field. Treat that omission as
+        // off so the server default effort does not silently turn reasoning back on.
+        request.generation.omitted_effort_means_off =
+            req.get_header_value("User-Agent").rfind("pi (", 0) == 0;
         lease                            = lease_model(request.model, req);
         request.model                    = lease.model();
     } catch (const ApiException& exception) {

@@ -490,6 +490,22 @@ ChatTurn parse_tool_message(const Json& item, std::size_t index, bool legacy_fun
     if (item.contains("tool_call_id") && item.at("tool_call_id").is_string()) {
         turn.tool_call_id = item.at("tool_call_id").get<std::string>();
     }
+    // A tool result may name the thinking level for the turn it feeds. The request-level
+    // reasoning_effort still wins; this is the per-tool-result fallback.
+    if (item.contains("reasoning_effort") && !item.at("reasoning_effort").is_null()) {
+        if (!item.at("reasoning_effort").is_string()) {
+            bad_request("tool reasoning_effort must be a string",
+                        "messages[" + std::to_string(index) + "].reasoning_effort");
+        }
+        const auto parsed = parse_requested_reasoning_effort(
+            item.at("reasoning_effort").get<std::string>());
+        if (!parsed) {
+            bad_request("tool reasoning_effort must be one of none, minimal, low, medium, high, "
+                        "xhigh, or max",
+                        "messages[" + std::to_string(index) + "].reasoning_effort");
+        }
+        turn.reasoning_effort = *parsed;
+    }
     parse_content_parts(item.at("content"), turn, index);
     return turn;
 }

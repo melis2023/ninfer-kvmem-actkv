@@ -107,6 +107,8 @@ struct ToolChoice : ninfer::ToolChoice {
     std::string forced_name;
 };
 
+enum class RequestedReasoningEffort : std::uint8_t;
+
 struct ChatTurn {
     ChatRole role = ChatRole::User;
     std::vector<ContentPart> content; // ordered parts; may be empty when wire content is empty
@@ -116,6 +118,10 @@ struct ChatTurn {
     // the function identified by tool_call_id before the Engine sees the history.
     std::optional<std::string> tool_result_name;
     bool tool_result_is_error = false;
+    // A tool result may carry the thinking level the next assistant turn should use.
+    // It only applies when the request itself omits reasoning_effort, so an explicit
+    // request field always wins over a tool suggestion.
+    std::optional<RequestedReasoningEffort> reasoning_effort;
     std::string reasoning_content; // assistant thinking carried across turns (round-tripped to the
                                    // template)
     std::optional<CacheBoundary> cache_boundary_after;
@@ -229,6 +235,10 @@ struct GenerationRequest {
     std::optional<bool> enable_thinking;      // unset => use the server default
     std::optional<std::uint32_t> thinking_budget;
     std::optional<RequestedReasoningEffort> reasoning_effort;
+    // pi-ai clients (DeepSeek Harness) express "off" by omitting reasoning_effort entirely;
+    // their adapter has no wire value for it. Mark such a request so the translator treats
+    // the omission as an explicit off instead of falling back to the server default.
+    bool omitted_effort_means_off = false;
     std::optional<bool> preserve_thinking;
     std::string chat_template_kwargs_json;
     // NInfer extension: name of a phantom-kv graft loaded with --graft. Unset => use the server's
