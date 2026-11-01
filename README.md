@@ -61,6 +61,43 @@ KVMem query replay has no complete exclusive checkpoint
 
 修复：`rewind_memory_query` 在 checkpoint 缺失、StateImage 非独占或 fork 未 settle 时返回 false，回退普通 prefill，不再 500。
 
+### 3. ngram copy 收益仲裁恢复
+
+0.19 rebase 时丢失了旧 fork 的 `NgramCopySignal`，ngram 又回到“有匹配就 copy”的行为。
+
+问题：
+
+```text
+短匹配或不准确的 copy 也整轮走 ngram 宽验证
+DFlash2 被跳过，验证宽度从 4 变成 15/31
+copy 一直不中还继续 copy，比神经草稿慢
+```
+
+修复：
+
+```text
+expected_copy = (accepted / drafted) × match_length
+copy 条件     = expected_copy > neural_expected × 1.3
+前 2 轮无条件放行，用于建立样本
+连续 8 轮拒绝后强制探测一轮
+```
+
+实测（8K 复制，DFlash2 draft 4，int8）：
+
+| ngram | decode | ngram 接受 | 结果 |
+|---|---:|---:|---|
+| 0 | 100.6 tok/s | - | 基线 |
+| 15 | 264.5 tok/s | 289/289，20 轮 | 2.6× |
+
+128K 自由生成（prompt 163,065，输出 320 token）：
+
+| ngram | decode | copy 轮 |
+|---|---:|---:|
+| 0 | 42.8 tok/s | - |
+| 15 | 42.0 tok/s | 0 |
+
+128K 下 ngram 没有收益时不触发 copy，decode 与 ngram 0 基本一致；之前 20 token “OK” 测试的 20% 差异来自小样本轮数噪声，不是 ngram 兼容问题。
+
 ## 更新日志（2026-10-31）
 
 ### 1. DFlash2 同步

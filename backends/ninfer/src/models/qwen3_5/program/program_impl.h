@@ -69,6 +69,7 @@ namespace ninfer::models::qwen3_5::detail {
 
 using runtime::MtpAdaptiveBatchController;
 using runtime::MtpAdaptiveSignal;
+using runtime::NgramCopySignal;
 using PreparedPromptData    = qwen3_5::PreparedPromptData;
 using RewriteCheckpointKind = qwen3_5::RewriteCheckpointKind;
 using RewriteCheckpointSpec = qwen3_5::RewriteCheckpointSpec;
@@ -797,6 +798,10 @@ struct RequestControl {
     SpeculativeStats speculative_stats;
     // Adaptive MTP: how far this request's drafts survive.
     MtpAdaptiveSignal mtp_signal;
+    // Copy rounds compete with the neural drafter for the next round. The signal keeps the
+    // measured committed tokens per drafted token so a short or stale match cannot outrank a
+    // drafter that still repays its cost.
+    NgramCopySignal ngram_signal;
     detail::PhysicalResources active_resources;
     detail::PhysicalResources optional_resources;
     bool publish_continuation = true;
