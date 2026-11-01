@@ -90,32 +90,44 @@ RerankRequest parse_rerank_request(const Json& body) {
     return out;
 }
 
-GenerationRequest make_rerank_judgement(const RerankRequest& request, const std::string& document) {
+GenerationRequest make_rerank_judgement(const RerankRequest& request, const std::string& document,
+                                        const RerankAnswers& answers) {
     GenerationRequest out;
     out.messages.push_back(text_turn(ChatRole::System, kJudge));
-    out.messages.push_back(text_turn(ChatRole::User, "<Instruct>: " + request.instruction +
-                                                         "\n<Query>: " + request.query +
-                                                         "\n<Document>: " + document));
+    ChatTurn user = text_turn(ChatRole::User, "<Instruct>: " + request.instruction +
+                                                  "\n<Query>: " + request.query + "\n<Document>: ");
+    user.content.front().cache_boundary_after = CacheBoundary{};
+    user.content.push_back(ContentPart{.kind = ContentKind::Text, .text = document});
+    out.messages.push_back(std::move(user));
     out.enable_thinking      = false;
     out.max_tokens           = 1;
     out.sampling.temperature = 0.0;
     out.logprobs             = true;
+    out.readout_tokens       = answers.tokens;
+    // One token drafts nothing; --spec's drafter would only run over the prompt.
+    out.speculative_drafting = false;
     // The server's default graft would be a hidden prefix the judging prompt does not expect.
     out.graft = std::string();
     return out;
 }
 
-double rerank_score(const GenerationOutcome& outcome) {
-    if (outcome.content_logprobs.empty() || outcome.content_logprobs.front().top_ids[0] < 0) {
+double rerank_score(const ninfer::TokenLogprob& answer, const RerankAnswers& answers) {
+    if (answer.top_ids[0] < 0) {
         throw std::runtime_error("the rerank judgement produced no answer token");
     }
+    double yes = 0.0;
+    double no  = 0.0;
+    if (!answers.tokens.empty() && answer.readout.size() == answers.tokens.size()) {
+        for (std::size_t k = 0; k < answers.tokens.size(); ++k) {
+            const double probability = std::exp(static_cast<double>(answer.readout[k]));
+            (answers.yes[k] ? yes : no) += probability;
+        }
+        return yes + no > 0.0 ? yes / (yes + no) : 0.5;
+    }
     // The answer token's most likely alternatives, under the greedy judge's raw distribution.
-    const ninfer::TokenLogprob& answer = outcome.content_logprobs.front();
-    double yes                         = 0.0;
-    double no                          = 0.0;
-    double least                       = 0.0;
-    bool has_yes                       = false;
-    bool has_no                        = false;
+    double least = 0.0;
+    bool has_yes = false;
+    bool has_no  = false;
     for (std::size_t k = 0; k < ninfer::kMaximumTokenLogprobs && answer.top_ids[k] >= 0; ++k) {
         const std::string& bytes = answer.top_bytes[k];
         const double probability = std::exp(static_cast<double>(answer.top_values[k]));

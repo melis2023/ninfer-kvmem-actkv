@@ -82,12 +82,13 @@ void permute_row_split_to_panel(const WeightGeometry& geometry, std::byte* data,
     }
     const auto rows   = static_cast<long long>(geometry.shape[0]);
     const int groups  = static_cast<int>(geometry.padded_columns / geometry.group_size);
-    permute_plane(data, groups, 32, rows, stream);
+    permute_plane(data, groups, static_cast<int>(geometry.code_bytes_per_row / groups), rows,
+                  stream);
     if (geometry.high_bytes) {
         permute_plane(data + geometry.high_offset, groups,
                       static_cast<int>(geometry.high_bytes_per_row / groups), rows, stream);
     }
-    // Scales stay row-major. They are 2 bytes per row per group against 32 for the codes, and the
+    // Scales stay row-major. They are 2 bytes per row per group against 16-32 for the codes, and the
     // prefill kernels prefetch them once per ring refill rather than once per group, so the same
     // argument that makes the codes worth permuting does not carry to them. Measure before adding.
 }

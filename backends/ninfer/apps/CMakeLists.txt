@@ -1,9 +1,15 @@
+if(NINFER_SHARED_RUNTIME)
+  include(${PROJECT_SOURCE_DIR}/cmake/NinferRuntime.cmake)
+endif()
 # Every program links the whole kernel image (~0.5 GB per architecture). NINFER_MULTICALL links the
-# four into one executable, ninfer-multicall (cmake/NinferBundles.cmake), with each program name a
-# symlink to it beside it: the container image carries the kernels once instead of four times.
+# five into one executable, ninfer-multicall (cmake/NinferBundles.cmake), with each program name a
+# symlink to it beside it: the container image carries the kernels once instead of five times.
 option(NINFER_MULTICALL
-       "Link ninfer, ninfer-serve, ninfer-calibrate and ninfer-perplexity into one multi-call executable"
+       "Link ninfer, ninfer-serve, ninfer-calibrate, ninfer-perplexity and ninfer-ngram-profile into one multi-call executable"
        OFF)
+if(NINFER_MULTICALL AND NINFER_SHARED_RUNTIME)
+  message(FATAL_ERROR "NINFER_MULTICALL and NINFER_SHARED_RUNTIME are mutually exclusive")
+endif()
 if(NINFER_MULTICALL)
   if(WIN32)
     message(FATAL_ERROR "NINFER_MULTICALL names its programs with symlinks; it is for Linux")
@@ -15,7 +21,10 @@ endif()
 # or with NINFER_MULTICALL as <bundle program> of ninfer-multicall, run under <name>.
 function(ninfer_app name program)
   cmake_parse_arguments(PARSE_ARGV 2 arg "BUILD_ID" "" "SOURCES;LIBRARIES")
-  if(NINFER_MULTICALL)
+  if(NINFER_SHARED_RUNTIME)
+    ninfer_runtime_program(${name} ${program} SOURCES ${arg_SOURCES} LIBRARIES ${arg_LIBRARIES})
+    set(target ${program})
+  elseif(NINFER_MULTICALL)
     ninfer_bundle_program(ninfer-multicall ${program} COMMAND ${name}
       SOURCES ${arg_SOURCES} LIBRARIES ${arg_LIBRARIES})
     set(target ${program})
@@ -43,17 +52,20 @@ ninfer_app(ninfer-calibrate ninfer_app_calibrate
 ninfer_app(ninfer-perplexity ninfer_app_perplexity BUILD_ID
   SOURCES perplexity/main.cpp perplexity/corpus.cpp perplexity/evaluation.cpp
   LIBRARIES ninfer_engine ninfer_product_logging ninfer::json)
+ninfer_app(ninfer-ngram-profile ninfer_app_ngram_profile
+  SOURCES ngram_profile/main.cpp
+  LIBRARIES ninfer_model_runtime ninfer_product_prompt_input ninfer::json)
 
 if(NINFER_MULTICALL)
   ninfer_finalize_bundle(ninfer-multicall)
-  foreach(name IN ITEMS ninfer ninfer-serve ninfer-calibrate ninfer-perplexity)
+  foreach(name IN ITEMS ninfer ninfer-serve ninfer-calibrate ninfer-perplexity ninfer-ngram-profile)
     add_custom_command(TARGET ninfer-multicall POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E create_symlink ninfer-multicall
               $<TARGET_FILE_DIR:ninfer-multicall>/${name})
   endforeach()
 endif()
 
-if(WIN32 AND NINFER_DIRECTSTORAGE)
+if(WIN32 AND NINFER_DIRECTSTORAGE AND NOT NINFER_SHARED_RUNTIME)
   foreach(app IN ITEMS ninfer ninfer-serve)
     add_custom_command(TARGET ${app} POST_BUILD
       COMMAND ${CMAKE_COMMAND} -E copy_if_different ${NINFER_DIRECTSTORAGE_DLLS}

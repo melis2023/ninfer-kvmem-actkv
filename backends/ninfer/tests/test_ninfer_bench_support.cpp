@@ -61,6 +61,15 @@ qb::BenchOptions parse_for_test(std::vector<std::string> arguments) {
 
 int test_cli_contract() {
     int failures                  = 0;
+    const auto memory = parse_for_test({"ninfer_bench", "--weights", "model.ninfer",
+        "--kvmem-budget", "2048", "--kvmem-gen-reserve", "512",
+        "--kvmem-host-mib", "256", "--kvmem-lrfu"});
+    failures += expect(memory.kvmem.device_tokens() == 2560 &&
+                           memory.kvmem.host_bytes == (256ULL << 20) && memory.kvmem.lrfu,
+                       "benchmark uses shared KVMem capacity and policy settings");
+    failures += expect(parse_for_test({"ninfer_bench", "--weights", "model.ninfer"})
+                           .kvmem.selected_tokens == 0,
+                       "benchmark defaults to the native route");
     const qb::BenchOptions parsed = parse_for_test({
         "ninfer_bench",
         "--weights",
@@ -374,6 +383,7 @@ std::vector<qb::TestResult> sample_results() {
     tg.reps[0].speculative.ngram_rounds          = 1;
     tg.reps[0].speculative.ngram_drafted_tokens  = 5;
     tg.reps[0].speculative.ngram_accepted_tokens = 5;
+    tg.reps[0].timings.generation_wall_seconds = 0.51;
     return {std::move(pp), std::move(tg)};
 }
 
@@ -449,7 +459,7 @@ int test_report_contract() {
 
     failures += expect(report.at("config").at("rope_yarn_factor") == 2.5,
                        "report preserves runtime YaRN factor");
-    failures += expect(report.at("schema_version") == 17, "report schema v17");
+    failures += expect(report.at("schema_version") == 18, "report schema v18");
     failures += expect(report.at("config").at("speculative_backend") == "mtp" &&
                            report.at("config").at("draft_tokens") == 5,
                        "report identifies its backend and window");
@@ -519,6 +529,9 @@ int test_report_contract() {
     failures += expect(tg.at("reps").at(0).at("decode_engine_tokens") == 6, "rep engine tokens");
     failures += expect_near(tg.at("reps").at(0).at("timings").at("decode_seconds").get<double>(),
                             0.5, "rep GenerationTimings");
+    failures += expect_near(tg.at("reps").at(0).at("timings")
+                               .at("generation_wall_seconds").get<double>(),
+                            0.51, "generation wall time stays distinct from Program decode time");
     failures += expect(tg.at("reps").at(0).at("speculative").at("drafted_tokens") == 5,
                        "rep SpeculativeStats");
     return failures;

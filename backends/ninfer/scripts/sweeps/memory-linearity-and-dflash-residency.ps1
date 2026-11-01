@@ -31,7 +31,7 @@ $models = @(
 # serving path, which dflash-residency-and-auto-capacity.ps1 does.
 #
 # ---------------------------------------------------------------------------------------------
-# 2. Does carrying DFlash cost anything when DFlash is not selected? docs/rtx-3090-windows.md
+# 2. Does carrying DFlash cost anything when DFlash is not selected? docs/build-windows.md
 #    recommends the older, 0.38 GiB smaller pin on the grounds that it is what qualified the 24 GB
 #    profiles. If those bytes are only resident when --spec dflash is chosen, that objection is
 #    moot and the DFlash-bearing revision is strictly the better default.

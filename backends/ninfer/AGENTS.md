@@ -30,7 +30,11 @@ approval requirements beyond the user's instructions and the actual execution en
 NInfer is a from-scratch C++/CUDA inference engine for maximum single-GPU performance, with an
 optional layer pipeline across several GPUs on Linux. It implements
 `Qwen3_5ForCausalLM` and `Qwen3_5MoeForCausalLM`; official Qwen3.6/3.8 artifacts and user recipes
-use the same architecture, binding and execution path. Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`,
+use the same architecture, binding and execution path. Native MoE routed experts may reside
+on the GPU, in pinned host memory, or in the artifact's files, brought into whole-layer device
+banks beside an optional persistent device cache (`--expert-residency host|disk`). Router and
+shared experts remain resident; all model arithmetic runs on the GPU, including the MTP MoE.
+Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`,
 `src/models/qwen4_exp`) is a second, explicit family with its own load, executor and Engine core
 (`runtime/engine/qwen4_exp_core`); it shares the Qwen3.5 frontend and Vision tower, runs up to
 eight requests at once (one batched decode step between prompt chunks), and may keep its routed
@@ -38,27 +42,65 @@ experts off the GPU, in pinned host memory with a device cache of the most used
 ones (`--expert-residency host`) or in the artifact's files, read into a device cache as each layer
 routes to them (`--expert-residency disk`). Its n-gram table is stored in the model's artifact or
 in a separate table artifact the model names by digest (`--ngram-table`); it stays in that file,
-read a row at a time, unless `--ngram-ram` loads it, and a model without a table is refused unless
-`--no-ngram-table` overrides that. These are the only product modes in which model weights live off
-the GPU.
+read a row at a time, unless `--ngram-residency ram` loads it. A model with PLE requires its table
+unless `--no-ngram-table` overrides that; a qualification layer slice without PLE needs no table.
+Native Qwen MoE, Gemma MoE and Flint also support host/disk expert placements, with all expert
+arithmetic on the GPU and whole-layer device banks beside the optional persistent cache.
+Gemma 4 26B-A4B (`Gemma4ForCausalLM`, the text component of `Gemma4ForConditionalGeneration`;
+`src/models/gemma4`, `runtime/engine/gemma4_core`) is a third explicit family converted from
+Google's QAT GGUF (or a mixed-format GGUF of the same model) with its ggml blocks kept as stored.
+It shares the Qwen3.5 frontend (tokenizer, chat template, output channels and Gemma's tool-call
+markup), runs one to eight sequences in prompt chunks of 2048 tokens (narrower where memory is
+short) with an F16 KV cache or any
+`--kv-dtype` format, drafts with the release's multi-token-prediction assistant (the artifact's
+`mtp` component, `--spec mtp`),
+encodes images and video with the release's vision tower (the artifact's `vision` component, from
+its llama.cpp mmproj; resident, streamed from pinned memory, or FP32 on CPU threads), and has no
+pipeline stages.
+Flint (`FlintForCausalLM`; `src/models/flint`, `runtime/engine/flint_core`) is a fourth explicit
+family converted from a llama.cpp GGUF of Recursive's release (Unsloth's UD-Q4_K_XL) with its ggml
+blocks kept as stored. It shares the Qwen3.5 frontend in a Flint dialect (its pre-tokenizer, the
+role-marker chat template, reasoning the model opens itself, GLM-4.7 tool calls), runs one to eight
+sequences in prompt chunks of 2048 tokens with an F16 KV cache, drafts by context lookup only
+(`--lookup-ngram`; Recursive publishes no draft model), and has no vision, rotation scaling or
+pipeline stages.
+Flash-Next's dense and attention arithmetic runs on the GPU. Of a decode or verification call's
+routed experts that the device cache lacks, CPU threads may compute a share from the host copy
+while the GPU copies and runs the rest (hybrid execution, `--expert-dma-share`), including a share
+the engine chooses from measured CPU and bus speeds; develop it where measurements show a gain.
+The CPU's GGUF expert products reproduce the GPU's decode products bit for bit
+(`gguf_expert_cpu`); a change to either side keeps them equal.
+Develop the existing GGUF host-RAM and disk-streaming paths;
+reuse published weights and the published IQ4 table when adding MTP. Disk residency uses the OS
+page cache. An additional application-managed RAM cache of experts is excluded from this delivery
+by the user's decision. Keep the bounded transfer buffers and the device expert cache.
 This line builds for **`sm_86`** (the RTX 30 series; that build also runs the RTX 40 series),
-`sm_89`, and `120a` (the RTX 50 series and RTX PRO 6000 Blackwell, CUDA 13.1 or newer), with
-`sm_80` as an unmeasured compatibility target; the published Docker image carries the `86` and
-`120a` builds. It was tuned on the **NVIDIA GeForce RTX 3090** (24 GB) first, and each card's kernel
-routes now come from its measured device profile, built in for the RTX 3090, 4090, 5090 and the
-three RTX PRO 6000 editions. Upstream (`Neroued/ninfer`) targets `sm_120a` on RTX 5090 with native
-routes that this line's `120a` build does not compile by default; its schedules, route tables and
-published measurements are not authoritative here -- every route table this fork inherited and
-re-measured on sm_86 turned out to be wrong by 12-41%. Treat an upstream tuning constant as a
-hypothesis until measured on the card in question. The Windows build environment and its
-compatibility constraints are in "Windows build environment (RTX 3090 fork host)" below.
+`sm_89`, `120a` (the RTX 50 series and RTX PRO 6000 Blackwell, CUDA 13.1 or newer) and `sm_75`
+(Turing: the TITAN RTX and RTX 20 series, Turing forms of the sm_80 instructions and Turing shapes
+of the kernels past its 64 KiB of shared memory, `docs/maintainer/build-system.md`), with `sm_80`
+(A100 class: device profiles calibrated, not benchmarked) and `sm_70` (Tesla V100, CUDA 12.x only, its own small-T,
+attention and prompt routes over emulated Ampere warp primitives). The Docker pipeline packages
+the native Debian 13 archives as `cuda12.9` (`70;75;80;86;89`) and `cuda13.4`
+(`75;80;86;89;120a`), with all targets in each shared backend. Portable native packages also combine both CUDA backends
+behind Toolkit-independent launchers, selecting one backend per process. It was tuned on the **NVIDIA
+GeForce RTX 3090** (24 GB) first, and each card's kernel routes now come from its measured device
+profile, built in for every card the Profile column of `docs/gpus.md` marks, from the Tesla V100
+to Blackwell. Upstream (`Neroued/ninfer`) targets `sm_120a` on RTX
+5090 with native routes that this line's `120a` build does not compile by default; its schedules,
+route tables and published measurements are not authoritative here -- every route table this fork
+inherited and re-measured on sm_86 turned out to be wrong by 12-41%. Treat an upstream tuning
+constant as a hypothesis until measured on the card in question. Windows builds and their
+toolchain constraints are in `docs/build-windows.md`; this repository has no Windows test host and
+the Native release workflow builds native multi-architecture executables but does not run GPU inference.
 
 Generation uses one resident model on one GPU, or split into pipeline stages over up to eight
-(`--devices`, Linux only; each stage owns whole layers with their KV and state, and the head,
+(`--devices`; each stage owns whole layers with their KV and state, and the head,
 round state and sampling stay on the first device; design in
-`docs/maintainer/pipeline-parallel-plan.md`). It runs startup-fixed concurrency of one to eight
-requests, bounded FIFO ingress, no active-request preemption, and one compact decode batch per
-round. Tensor parallelism is not built.
+`docs/maintainer/pipeline-stages.md`). It runs startup-fixed concurrency of one to eight
+requests, bounded FIFO ingress (whose one-token reads trade places by remaining work), no
+active-request preemption, and one compact decode batch per
+round. Tensor parallelism (`--tensor-parallel`) divides the GDN heads and dense FFN rows of a dense
+Qwen3.5-core model over the devices, with attention, KV, head and MTP on the first.
 Generation and offline CausalScoring use the same public `.ninfer` Engine route. Delivered
 capabilities and commands are documented in `README.md`, the product guides, and executable
 `--help`. New mathematical architectures, execution platforms, large-scale/preemptive continuous
@@ -190,96 +232,11 @@ Read the authority relevant to the current decision; this is not a mandatory rea
 | Artifact, layout, codec, conversion, or model mathematics | model/artifact references and conversion guide linked from `docs/README.md` |
 | Op contracts, implementation ownership, numerical/performance qualification | `docs/maintainer/op-development.md` |
 | Test/benchmark commands and published performance | `tests/README.md`, `bench/README.md`, `docs/performance.md` |
-| In-tree C++ interface | `include/ninfer/engine.h`, `include/ninfer/types.h` |
+| In-tree C++ interface | `include/ninfer/engine.h`; types in the headers `include/ninfer/types.h` lists |
 
 [Documentation map](docs/README.md) routes to narrower authorities when needed.
 
 ## Local operations
-
-### Windows build environment (RTX 3090 fork host)
-
-Verified 2026-09 by building all 444 targets and running the full 100-test suite. An earlier
-revision of this section was wrong on four points and sent at least one agent down a dead end;
-the corrections are called out at the bottom so anyone reading git history is not re-confused.
-
-**Use the existing `build-ninja/` tree. Do not reconfigure and do not delete it.** It is already
-configured correctly: Release, `CMAKE_CUDA_ARCHITECTURES=86`, `BUILD_TESTING=ON`,
-`NINFER_BUILD_APPS=ON`, FFMPEG resolved through the vcpkg manifest into
-`build-ninja/vcpkg_installed/x64-windows`. Configure on this host is slow; there is nothing to
-gain by redoing it.
-
-The one real trap is that **two MSVC toolchains are installed and the wrong one is first on
-PATH**:
-
-| | version | path |
-|---|---|---|
-| VS 2026 Community | MSVC v145 `14.50.35717` | `C:\Program Files\Microsoft Visual Studio\18\Community` |
-| VS 2022 BuildTools | MSVC v143 `14.44.35207` | `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools` |
-
-CUDA 12.8 hard-errors on v145 (`C1189: unsupported Microsoft Visual Studio version!`), and
-`nvcc` picks up whatever `cl.exe` PATH offers, which by default is VS 2026. `build-ninja`'s cache
-pins the VS 2022 compiler, so the fix is simply to put that environment in front before building.
-Note the `(x86)` in the path — that is the detail the earlier revision missed when it concluded
-VS 2022 was absent.
-
-From PowerShell, import the VS 2022 BuildTools environment and build:
-
-```powershell
-$vcvars = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-cmd /c "`"$vcvars`" >nul 2>&1 && set" | ForEach-Object {
-  if ($_ -match '^([^=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
-}
-Set-Location C:\ninfer-fork\ninfer-3090\build-ninja
-cmake --build .                                  # everything
-cmake --build . --target <name>                  # one target
-ctest -j2                                        # full suite, ~70 s
-ctest -R <regex> --output-on-failure             # one test
-```
-
-That import is reliable; the environment it produces builds cleanly. Adding only the compiler's
-`bin` directory to PATH is *not* enough — the standard library headers go missing
-(`fatal error C1083: Cannot open include file: 'cstdint'`), because `INCLUDE` and `LIB` come from
-vcvars too.
-
-For a standalone `.cu` probe outside the build tree, `nvcc` can be driven directly. Git Bash
-mangles MSVC-style flags (`/wd4819` becomes a path), so use PowerShell:
-
-```powershell
-nvcc -O3 -arch=sm_86 -allow-unsupported-compiler probe.cu -o probe.exe
-```
-
-`-allow-unsupported-compiler` is needed there and only there, because a bare `nvcc` invocation
-finds VS 2026 on PATH. It is not needed for the CMake build and is not in the cache.
-
-Other host facts:
-
-- CMake 3.31.3 at `C:\Program Files\CMake`; Ninja 1.11.1 from the Python 3.13 pip install.
-- Profilers are installed: Nsight Systems 2024.6.2 (`nsys.exe` under
-  `target-windows-x64/`) and Nsight Compute 2025.1.0 (`ncu.bat`). `ncu` needs GPU performance
-  counters, which are admin-only by default — run it from an elevated shell rather than changing
-  `RmProfilingAdminOnly`, which needs two reboots and loosens a system-wide setting.
-- Compilation needs no GPU, so building is always possible. **Executing** CUDA tests, benchmarks
-  or perplexity runs needs free VRAM, and the user often has the server loaded — ask before
-  assuming the device is free.
-- `nvcc` writes `.exp`/`.lib` next to any `-o` target; keep probe builds out of the repo root.
-- An untracked `config.bat` in the repo root is a leftover from the earlier, incorrect recipe. It
-  sets up the VS 2026 v145 environment with `-allow-unsupported-compiler` and reconfigures into
-  `build/`. It is not the supported path; prefer `build-ninja` as above.
-
-Corrections to the previous revision of this section, all verified false:
-
-1. "VS 2022 BuildTools is **not** installed, so caches pinning `14.44.35207` are stale —
-   reconfigure fresh." It is installed, under `Program Files (x86)`, and those caches are live and
-   correct. Reconfiguring is the one thing that actually breaks the build here.
-2. "Do not invoke `vcvars64.bat` from a non-interactive shell." The VS 2022 BuildTools vcvars
-   imports cleanly and non-interactively, as above. The variable flood described belongs to the
-   VS 2026 vcvars, not this one.
-3. "FFMPEG is required and was missing." It is provided by the vcpkg manifest and already present
-   in `build-ninja/vcpkg_installed/x64-windows`. No `-DFFMPEG_DIR` is needed.
-4. "Configure must pass `-DCMAKE_CUDA_FLAGS=-allow-unsupported-compiler`." Not for this build;
-   the cache carries `-Xcompiler=/Zc:__cplusplus` and nothing else, because it uses v143.
-
-## Commits
 
 Use `cmake --build <build-dir> -j` by default. Adjust parallelism when actual resource pressure
 causes failures or interferes with the task, and briefly explain why.
@@ -291,6 +248,11 @@ keeps them (by convention `build/`, `models/`, `profiles/ncu/`, `profiles/nsys/`
 Select model artifacts by explicit path, never glob order, modification time, or unqualified
 “latest”. Source checkpoints and large artifacts are prerequisites; download or regenerate them
 only when that work is in scope. Install or upgrade dependencies only when the task needs it.
+
+Compilation needs no GPU. Executing CUDA tests, benchmarks or perplexity runs needs a free GPU; GPU
+work runs on rented hosts through `scripts/pods` ([pods](scripts/pods/README.md)).
+
+## Commits
 
 Create commits only when requested. Use Conventional Commit subjects with concise lowercase types
 such as `feat`, `fix`, `perf`, `bench`, `test`, `build`, `refactor`, `docs`, or `chore`.

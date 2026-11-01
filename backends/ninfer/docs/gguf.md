@@ -2,12 +2,19 @@
 
 NInfer serves GGUF releases that give every tensor its own ggml quantization type, such as
 ISTA-DASLab's [GSQ-RCO models](https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF),
-without converting their weights to another format. The converter recipe `qwen3_8_27b_gguf` copies
-each quantized tensor's blocks of a Qwen3.8-27B release into the artifact unchanged (see
+without converting their weights to another format. The converter recipe `qwen3_5_dense_gguf` copies
+each quantized tensor's blocks of a dense Qwen3.5-family release into the artifact unchanged (see
 [weight conversion](weight-conversion.md#a-mixed-precision-qwen38-27b-gguf)), and the runtime
 multiplies them in place. The Qwen3.8-Flash-Next releases convert the same way with
 `qwen3_8_flash_next_gguf`, their routed experts kept as expert-major banks
 ([Qwen3.8-Flash-Next](qwen3-8-flash-next.md)).
+
+The dense recipe derives dimensions from the text configuration and checks them against the
+GGUF header and every tensor. It covers the 0.8B, 2B, 4B, 9B and 27B geometries, including
+shared embedding/output weights and a matching embedded MTP head. Shape coverage is separate
+from full-model qualification; see the parent KVMem repository's validation record for the
+models actually run. The smaller dense towers use GQA=4 prompt kernels for all token widths;
+their narrow decode routes have not been performance tuned.
 
 ## Formats
 

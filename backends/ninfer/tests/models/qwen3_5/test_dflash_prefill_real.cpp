@@ -136,7 +136,7 @@ void run(const char* artifact, SpeculativeBackend backend) {
     options.speculative.proposal_head                       = ProposalHead::Full;
     auto planner = qwen::make_sequence_planner(parameters, device, options);
     auto plan    = std::move(planner).finalize(2 * pages);
-    qwen::detail::ProgramImpl program(parameters, *plan.impl_, device, {});
+    qwen::detail::ProgramImpl program(parameters, *plan.impl_, device, {}, {});
 
     auto& states      = *program.state_store;
     const auto source = states.reserve_reset(device.stream);

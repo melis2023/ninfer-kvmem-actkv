@@ -8,8 +8,10 @@
 
 #include <xgrammar/grammar.h>
 
+#include <bitset>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -22,6 +24,13 @@
 #include "xgrammar/exception.h"
 
 namespace xgrammar {
+
+// NInfer (from Neroued/ninfer 0a8530d44): the first bytes of a nonempty, productive,
+// deterministic byte language whose units are prefix-free (no end state has an outgoing edge);
+// nullopt otherwise. Shared by FSM building, which normalizes repeated rules to such DFAs, and
+// token-mask compilation.
+std::optional<std::bitset<256>> RepetitionUnitFirstBytes(const CompactFSMWithStartEnd& fsm);
+std::optional<FSMWithStartEnd> NormalizeRepetitionUnit(const FSMWithStartEnd& fsm);
 
 /******************* CompiledGrammar Datastructures *******************/
 
@@ -59,6 +68,18 @@ struct AdaptiveTokenMask {
 
   std::vector<int32_t> uncertain_indices;
 
+  // NInfer: in the body state of a counted repetition, tokens whose legality depends only on the
+  // parent's remaining repetition count. Dense buckets are cumulative bitsets over strictly
+  // increasing counts; sparse (required count, token id) pairs are sorted by count. An unfinished
+  // unit at the end of a token reserves one repetition. Exit tokens finish the repetition on their
+  // last byte and must also reach the parent's lower bound. Classified tokens are removed from the
+  // ordinary classes. Derived data: rebuilt by PopulateRepeatMasks on compilation and
+  // deserialization, never serialized.
+  std::vector<int32_t> repeat_interior_counts;
+  std::vector<DynamicBitset> repeat_interior_bitsets;
+  std::vector<std::pair<int32_t, int32_t>> repeat_interior_tokens;
+  std::vector<std::pair<int32_t, int32_t>> repeat_exit_tokens;
+
   /*! \brief Default constructor. Only for deserialization. */
   AdaptiveTokenMask() = default;
 
@@ -81,7 +102,9 @@ struct AdaptiveTokenMask {
 
   friend std::size_t MemorySize(const AdaptiveTokenMask& mask) {
     return MemorySize(mask.uncertain_indices) + MemorySize(mask.accepted_indices) +
-           MemorySize(mask.rejected_indices) + MemorySize(mask.accepted_bitset);
+           MemorySize(mask.rejected_indices) + MemorySize(mask.accepted_bitset) +
+           MemorySize(mask.repeat_interior_counts) + MemorySize(mask.repeat_interior_bitsets) +
+           MemorySize(mask.repeat_interior_tokens) + MemorySize(mask.repeat_exit_tokens);
   }
 };
 
@@ -132,6 +155,15 @@ class CompiledGrammar::Impl {
   );
   friend std::size_t MemorySize(const Impl& impl);
 };
+
+// NInfer: classify the tokens of every body state of a counted repetition whose unit is a
+// deterministic, prefix-free byte language and whose every reference is a repeat edge followed by
+// bytes that cannot start another unit (see AdaptiveTokenMask::repeat_interior_counts).
+void PopulateRepeatMasks(
+    const Grammar& grammar,
+    const TokenizerInfo& tokenizer_info,
+    std::unordered_map<ParserState, AdaptiveTokenMask, StateHashForCache, StateEqualForCache>* cache
+);
 
 XGRAMMAR_MEMBER_TABLE(
     CompiledGrammar::Impl,

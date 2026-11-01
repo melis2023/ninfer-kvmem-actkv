@@ -1,4 +1,5 @@
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan_unified.h"
+#include "ops/common/blackwell_routes.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_output_unified.cuh"
 #include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "ops/linear/fp8/fp8_instances.cuh"
@@ -19,6 +20,7 @@ std::size_t fp8_attn_input_partial_capacity_bytes(std::int32_t max_tokens) {
 void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                               Tensor& key, Tensor& value, Fp8A8Workspace workspace,
                               cudaStream_t stream) {
+    require_fp8_a8_card();
     launch_fp8_a8_quantize(x, weight, workspace, stream);
     const Fp8AttentionInputOutput output{
         static_cast<__nv_bfloat16*>(q.data), static_cast<__nv_bfloat16*>(key.data),

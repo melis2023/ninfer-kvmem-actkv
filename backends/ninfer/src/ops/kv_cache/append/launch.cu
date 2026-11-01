@@ -155,6 +155,43 @@ void launch_cyclic_profile(const Tensor& k, const Tensor& v, const Tensor& posit
                            const Tensor& counts, const Tensor& lanes, CyclicKVCacheLayerView cache,
                            const KVCacheAppendPrefixPlan& plan, cudaStream_t stream) {
     if (plan.max_count == 0) return;
+    if (cache.storage == KvCacheStorage::Int8Group64) {
+        if (cache.k_scales.data == nullptr || cache.v_scales.data == nullptr) {
+            throw std::invalid_argument("int8 cyclic append requires scale planes");
+        }
+        auto* cache_k       = static_cast<std::int8_t*>(cache.k.data);
+        auto* cache_v       = static_cast<std::int8_t*>(cache.v.data);
+        auto* scale_k       = static_cast<__half*>(cache.k_scales.data);
+        auto* scale_v       = static_cast<__half*>(cache.v_scales.data);
+        auto* shadow_k      = static_cast<__nv_bfloat16*>(cache.k_bf16.data);
+        auto* shadow_v      = static_cast<__nv_bfloat16*>(cache.v_bf16.data);
+        if (shadow_k == nullptr || shadow_v == nullptr) {
+            throw std::invalid_argument("int8 cyclic append requires BF16 shadow planes");
+        }
+        const auto* input_k = static_cast<const __nv_bfloat16*>(k.data);
+        const auto* input_v = static_cast<const __nv_bfloat16*>(v.data);
+        const auto* pos     = static_cast<const std::int32_t*>(positions.data);
+        const auto* count   = static_cast<const std::int32_t*>(counts.data);
+        const auto* lane    = static_cast<const std::int32_t*>(lanes.data);
+        const int padded    = static_cast<int>(cache.padded_capacity);
+        const auto launch   = [&]<int Threads>() {
+            constexpr int Warps         = Threads / 32;
+            constexpr int UnitsPerToken = kKVCacheAppendPrefixHeads *
+                                          (kKVCacheAppendPrefixHeadDim / kKVCacheInt8Group);
+            const int units = plan.max_count * UnitsPerToken;
+            const dim3 grid((units + Warps - 1) / Warps, k.ne[3], 1);
+            kv_cache_append_prefix_cyclic_i8_kernel<Capacity, Threads>
+                <<<grid, Threads, 0, stream>>>(input_k, input_v, pos, count, lane, cache_k, cache_v,
+                                               scale_k, scale_v, shadow_k, shadow_v, plan.min_count,
+                                               plan.max_count, plan.tokens, padded);
+            CUDA_CHECK(cudaGetLastError());
+        };
+        if (plan.max_count * k.ne[3] <= 128)
+            launch.template operator()<64>();
+        else
+            launch.template operator()<128>();
+        return;
+    }
     auto* cache_k       = static_cast<__nv_bfloat16*>(cache.k.data);
     auto* cache_v       = static_cast<__nv_bfloat16*>(cache.v.data);
     const auto* input_k = static_cast<const __nv_bfloat16*>(k.data);

@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "ops/common/blackwell_routes.h"
 #include "ops/linear/fp8/fp8_a8_plan.h"
 
 #include "core/device.h"
@@ -83,6 +84,7 @@ void launch_quantize_exact(const Tensor& x, Fp8A8Workspace workspace, cudaStream
 
 void launch_fp8_a8_quantize(const Tensor& x, const Weight& weight, Fp8A8Workspace workspace,
                             cudaStream_t stream) {
+    require_fp8_a8_card();
     if (workspace.codes == nullptr || workspace.scales == nullptr) {
         throw std::invalid_argument("fp8 A8 requires caller workspace");
     }

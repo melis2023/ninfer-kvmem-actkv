@@ -2,8 +2,9 @@
 
 The architecture: 48 blocks of Gated DeltaNet and Qwen Sparse Attention (QSA) mixers, each half
 read from and written into a four-stream hyper-connection residual, a 512-expert top-10 MoE in
-every block, and a hashed n-gram embedding (PLE) injected into the residual before one block.
-The converter normalises the checkpoint's config into the text component's config, which
+every block, and a hashed n-gram embedding (PLE) injected into the residual before one block; an
+MTP block of one more QSA layer drafts for speculative decoding. The converter normalises the
+checkpoint's config into the text and MTP components' configs, which
 src/models/qwen4_exp/config.cpp parses strictly.
 """
 
@@ -131,6 +132,12 @@ def text_config(source: dict) -> dict:
 
 
 def mtp_config(source: dict) -> dict:
+    """The `mtp` component's config: the MTP block is one sparse-attention layer with the text
+    model's geometry, its own MoE and final mixer, sharing the token embedding and the head. Its
+    expert count is the text model's unless the block keeps more (an expert-pruned model with the
+    full model's MTP block): `text_config.mtp.num_experts`, which with_mtp_expert_count sets from an
+    MTP GGUF."""
+
     raw = source.get("text_config", source)
     _fixed(raw, "mtp_num_hidden_layers", 1, "text")
     _fixed(raw, "mtp_use_dedicated_embeddings", False, "text")
@@ -140,9 +147,13 @@ def mtp_config(source: dict) -> dict:
     _fixed(mtp, "num_hidden_layers", 1, "text.mtp")
     _fixed(mtp, "hybrid", True, "text.mtp")
     _fixed(mtp, "layer_types", ["full_attention"], "text.mtp")
+    experts = _positive(mtp.get("num_experts", raw.get("num_experts")), "text.mtp.num_experts")
+    if experts < _positive(raw.get("num_experts_per_tok"), "text.num_experts_per_tok"):
+        raise ValueError("text.mtp.num_experts is below the experts each token selects")
     return {
         "architectures": ["Qwen4ExpMTP"],
         "rope_theta": _f32(mtp.get("rope_theta"), "text.mtp.rope_theta"),
+        "num_experts": experts,
     }
 
 
@@ -267,54 +278,105 @@ def ngram_hash_constants(text: dict, ple_layer_index: int = 0) -> tuple[list[int
     return multipliers, head_vocab
 
 
-def build_model(base, *, components=("text", "ngram"), companions=None, resource_overrides=None):
-    """A Qwen3.8-Flash-Next checkpoint's text component (no MTP), optionally its Vision tower, and
-    its n-gram table.
+def build_model(base, *, components=("text", "ngram"), companions=None, resource_overrides=None,
+                layers=None):
+    """A Qwen3.8-Flash-Next checkpoint's text component, optionally its Vision tower and its MTP
+    block, and its n-gram table.
 
     The model always describes the table it reads in its `ngram` component; selecting `ngram` also
     stores the table's rows. `text,ngram` is the self-contained model, `text` the model alone (its
     rows come from a table artifact at run time), and `ngram` alone that table artifact; `vision`
-    adds the tower to a model.
+    adds the tower to a model and `mtp` the MTP block that drafts for speculative decoding.
+    `layers=(begin, end)` selects a zero-based, half-open source layer range for qualification.
+    The slice retains the embedding, final mixer and head. A slice without PLE has no table.
     """
     from .model import Model
     from .qwen3_5 import _Builder, vision_config
     from .resources import load_resources
+    from .qwen4_exp_ngram import attach_hot_profile
+    from pathlib import Path
+
+    resource_overrides = dict(resource_overrides or {})
+    explicit_profile = resource_overrides.pop("ngram.hot", None)
+
+    def add_profile(model):
+        path = Path(explicit_profile) if explicit_profile is not None else None
+        if path is None and "ngram/table" in model.parameters and (base.root / "ngram.hot").is_file():
+            path = base.root / "ngram.hot"
+        attach_hot_profile(model, path)
 
     selected = set(components)
     if len(selected) != len(tuple(components)) or not (
-        selected == {"ngram"} or ("text" in selected and selected <= {"text", "ngram", "vision"})
+        selected == {"ngram"}
+        or ("text" in selected and selected <= {"text", "ngram", "vision", "mtp"})
     ):
         raise ValueError(
             "Qwen3.8-Flash-Next converts --components text,ngram (the model with its n-gram "
-            "table), text (the model alone) or ngram (the table alone), with vision optional "
-            "beside text"
+            "table), text (the model alone) or ngram (the table alone), with vision and mtp "
+            "optional beside text"
         )
-    descriptor = {"config": ngram_config(base.config)}
     if "text" not in selected:
-        model = Model({"ngram": descriptor})
+        if layers is not None:
+            raise ValueError("--layers requires the text component")
+        model = Model({"ngram": {"config": ngram_config(base.config)}})
         _ngram_table(model)
+        if resource_overrides:
+            raise ValueError("resource overrides have no selected frontend consumer")
+        add_profile(model)
         return model
     config = text_config(base.config)
-    records = {"text": {"config": config}, "ngram": descriptor}
+    begin, end = 0, config["num_hidden_layers"]
+    if layers is not None:
+        if (not isinstance(layers, (tuple, list)) or len(layers) != 2
+                or any(type(v) is not int for v in layers)
+                or not 0 <= layers[0] < layers[1] <= end):
+            raise ValueError(f"--layers requires 0 <= begin < end <= {end} (end excluded)")
+        begin, end = layers
+    source_layers = tuple(range(begin, end))
+    config["num_hidden_layers"] = len(source_layers)
+    config["layer_types"] = config["layer_types"][begin:end]
+    config["ple_layers"] = [i - begin for i in config["ple_layers"] if begin <= i < end]
+    records = {"text": {"config": config}}
+    if config["ple_layers"]:
+        records["ngram"] = {"config": ngram_config(base.config)}
     if "vision" in selected:
         records["vision"] = {"config": vision_config(base.config, config), "target": "text"}
+    if "mtp" in selected:
+        from .sources.safetensors import SafetensorsSource
+
+        mtp_source = (companions or {}).get("mtp", base)
+        # GGUF recipes replace these lazy logical sources after building the model.
+        # A safetensors subset already has the HF names and supplies them directly.
+        mtp_store = mtp_source if isinstance(mtp_source, SafetensorsSource) else base
+        mtp_description = mtp_store.config or base.config
+        if mtp_store is not base:
+            actual = text_config(mtp_description)
+            for key in ("hidden_size", "hc_count", "hc_lowrank", "num_attention_heads",
+                        "num_key_value_heads", "head_dim", "indexer_n_heads", "indexer_head_dim",
+                        "moe_intermediate_size", "shared_expert_intermediate_size"):
+                if actual[key] != config[key]:
+                    raise ValueError(f"MTP companion {key} differs from the target model")
+        records["mtp"] = {"config": mtp_config(mtp_description), "target": "text"}
     refs, resources, count, special = load_resources(
         base.root, vocab_size=config["vocab_size"],
         vision_config=records["vision"]["config"] if "vision" in selected else None,
         overrides=resource_overrides)
     for component, resource_refs in refs.items():
         records[component]["resources"] = resource_refs
-    model = Model(records, resources=resources, token_count=count, special_token_ids=special)
+    model = Model(records, resources=resources, token_count=count, special_token_ids=special,
+                  source_layers=source_layers)
     builder = _Builder(model)
     h, vocab = config["hidden_size"], config["vocab_size"]
     prefix = "model.language_model."
     builder.add("text/token_embedding", base, prefix + "embed_tokens.weight", (vocab, h))
     head = prefix + "embed_tokens.weight" if config["tie_word_embeddings"] else "lm_head.weight"
-    builder.add("text/output_head", base, head, (vocab, h), inputs=("text/final_hidden",))
+    # The MTP block reads the head with its own final mixer's output.
+    head_inputs = ("text/final_hidden",) + (("mtp/final_hidden",) if "mtp" in selected else ())
+    builder.add("text/output_head", base, head, (vocab, h), inputs=head_inputs)
     _hyper_connection(builder, "text/final_mixer/", prefix + "hyper_connection_mixer.", base,
                       config, inject=False)
     for i, kind in enumerate(config["layer_types"]):
-        p, sp = f"text/layers/{i}/", prefix + f"layers.{i}."
+        p, sp = f"text/layers/{i}/", prefix + f"layers.{source_layers[i]}."
         _hyper_connection(builder, p + "attn_hc/", sp + "attn_hyper_connection.", base, config,
                           inject=True)
         _hyper_connection(builder, p + "mlp_hc/", sp + "mlp_hyper_connection.", base, config,
@@ -329,9 +391,38 @@ def build_model(base, *, components=("text", "ngram"), companions=None, resource
             _ple(builder, p, sp, base, config)
     if "vision" in selected:
         builder.vision(base, records["vision"]["config"], h)
-    if "ngram" in selected:
+    if "mtp" in selected:
+        _mtp(builder, mtp_store, config, records["mtp"]["config"]["num_experts"])
+    if "ngram" in selected and "ngram" in records:
         _ngram_table(model)
+    add_profile(model)
     return model
+
+
+def _mtp(builder, store, config, experts):
+    """The MTP block (vLLM Qwen4ExpMultiTokenPredictor): the token's embedding and the target's
+    pre-mixer stack, each normalised and projected (the stack one stream at a time, by one shared
+    matrix), start a stack that one sparse-attention layer advances; its own final mixer feeds the
+    shared head. `pre_fc_norm_hidden` normalises all 10240 values of a position at once."""
+
+    h, width = config["hidden_size"], config["hc_count"] * config["hidden_size"]
+    p, sp = "mtp/", "mtp."
+    builder.add(p + "embedding_norm", store, sp + "pre_fc_norm_embedding.weight", (h,))
+    builder.add(p + "hidden_norm", store, sp + "pre_fc_norm_hidden.weight", (width,))
+    builder.add(p + "fc_embedding", store, sp + "fc_embedding.weight", (h, h),
+                inputs=(p + "embedding_normalized",))
+    builder.add(p + "fc_hidden", store, sp + "fc_hidden.weight", (h, h),
+                inputs=(p + "hidden_normalized",))
+    layer, source = p + "layer/", sp + "layers.0."
+    _hyper_connection(builder, layer + "attn_hc/", source + "attn_hyper_connection.", store,
+                      config, inject=True)
+    _hyper_connection(builder, layer + "mlp_hc/", source + "mlp_hyper_connection.", store,
+                      config, inject=True)
+    builder.attention(layer, source, store, config)
+    _indexer(builder, layer, source, store, config)
+    builder.moe(layer, source, store, {**config, "num_experts": experts})
+    _hyper_connection(builder, p + "final_mixer/", sp + "hyper_connection_mixer.", store, config,
+                      inject=False)
 
 
 def _ngram_table(model):

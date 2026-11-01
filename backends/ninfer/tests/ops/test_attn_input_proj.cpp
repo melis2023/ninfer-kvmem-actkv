@@ -6,6 +6,7 @@
 #include "core/decode_graph.h"
 #include "ops/direct_bf16_weight.h"
 #include "ops/input_projection_test_common.h"
+#include "ops/linear/sm70/sm70_project.h"
 
 #include <cuda_runtime.h>
 
@@ -202,7 +203,7 @@ int run_t2_case(DevicePackedWeight& query_key, DevicePackedWeight& gate_value, i
     Tensor x(input.p, DType::BF16, {hidden, tokens}), q = query.tensor(), g = gate.tensor(),
                                                       k = key.tensor(), v = value.tensor();
     const auto capacity = ops::attn_input_proj_split_workspace_capacity_bytes(
-        QType::T2_G128_FP16, 7168, QType::T2_G128_FP16, 7168, hidden, policy, tokens, tokens);
+        query_key.host.weight.qtype, 7168, gate_value.host.weight.qtype, 7168, hidden, policy, tokens, tokens);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
     DeviceArena workspace(DeviceSpan{scratch.data(), std::max<std::size_t>(capacity, 1)});
     DeviceContext device;
@@ -213,7 +214,7 @@ int run_t2_case(DevicePackedWeight& query_key, DevicePackedWeight& gate_value, i
     ops::attn_input_proj(x, query_key.view(), gate_value.view(), q, g, k, v, policy, workspace,
                          device.stream);
     cuda_synchronize(device.stream);
-    const std::string suffix = " T2 allow-a8-int T=" + std::to_string(tokens);
+    const std::string suffix = (query_key.host.weight.qtype == QType::PTQ1_G128_FP16 ? " PTQ1 allow-a8-int T=" : " T2 allow-a8-int T=") + std::to_string(tokens);
     int failures = verify_output("attn q" + suffix, query, query_key.host, 0, qrows, activation,
                                  hidden, tokens, kAttnInputProjA8Tolerance, 31);
     failures += verify_output("attn k" + suffix, key, query_key.host, qrows, kvrows, activation,
@@ -233,15 +234,15 @@ int run_t2_case(DevicePackedWeight& query_key, DevicePackedWeight& gate_value, i
     return failures;
 }
 
-int run_t2() {
+int run_t2(QType qtype = QType::T2_G128_FP16) {
     constexpr std::int32_t kHidden = 5120;
     constexpr std::int32_t kParent = 7168;
     DevicePackedWeight query_key(
-        quantized_weight::make_patterned_weight(QType::T2_G128_FP16, kParent, kHidden, 151U));
+        quantized_weight::make_patterned_weight(qtype, kParent, kHidden, 151U));
     DevicePackedWeight gate_value(
-        quantized_weight::make_patterned_weight(QType::T2_G128_FP16, kParent, kHidden, 157U));
+        quantized_weight::make_patterned_weight(qtype, kParent, kHidden, 157U));
     int failures = 0;
-    for (int t : {1, 2, 4, 8, 9, 16, 17, 33, 65, 128, 129, 192, 193, 300, 600, 1007, 1024}) {
+    for (int t : {1, 2, 4, 8, 9, 16, 17, 32, 33, 64, 65, 128, 129, 192, 193, 300, 600, 1007, 1024}) {
         failures += run_t2_case(query_key, gate_value, t);
     }
     return failures;
@@ -403,8 +404,14 @@ int run_bf16_target() {
     constexpr std::int32_t kParentRows = 14336;
     DeviceWeight parent(make_patterned(kParentRows, kHidden, 313U));
     int failures = 0;
+    // sm_70's wide route is the one BF16 route that holds workspace (ops/linear/sm70).
+    const std::size_t expected_bf16 =
+        ops::detail::sm70::takes(1024)
+            ? ops::detail::sm70::workspace_bytes(kParentRows, kHidden, 1024)
+            : 0;
     if (ops::attn_input_proj_workspace_capacity_bytes(QType::BF16, kParentRows, kHidden,
-                                                      ops::LinearPolicy::A16Only, 1, 1024) != 0) {
+                                                      ops::LinearPolicy::A16Only, 1,
+                                                      1024) != expected_bf16) {
         std::cerr << "BF16 attention input workspace interval is not zero-capacity\n";
         ++failures;
     }
@@ -535,7 +542,11 @@ int run_fp8_target() {
         }
         const auto interval = ops::attn_input_proj_workspace_capacity_bytes(
             QType::FP8_E4M3FN_ROW_BF16, kRows, kHidden, policy, 1, 128);
-        if (interval != peak || (policy == ops::LinearPolicy::A16Only && interval != 0)) {
+        const std::size_t a16_interval =
+            ops::detail::sm70::takes(128) ? ops::detail::sm70::workspace_bytes(kRows, kHidden, 128)
+                                          : 0;
+        if (interval != peak ||
+            (policy == ops::LinearPolicy::A16Only && interval != a16_interval)) {
             std::cerr << "FP8 attention projection workspace interval mismatch\n";
             ++failures;
         }
@@ -715,10 +726,11 @@ int run_weight_inputs() {
 } // namespace
 
 int main(int argc, char** argv) {
+    const bool ptq1_only = argc == 2 && std::string(argv[1]) == "--ptq1-only";
     const bool dflash2_only = argc == 2 && std::string(argv[1]) == "--dflash2-only";
     const bool inputs_only  = argc == 2 && std::string(argv[1]) == "--weight-inputs-only";
-    if (argc != 1 && !dflash2_only && !inputs_only) {
-        std::cerr << "usage: ninfer_attn_input_proj_test [--dflash2-only|--weight-inputs-only]\n";
+    if (argc != 1 && !dflash2_only && !inputs_only && !ptq1_only) {
+        std::cerr << "usage: ninfer_attn_input_proj_test [--dflash2-only|--weight-inputs-only|--ptq1-only]\n";
         return 2;
     }
     if (cuda_unavailable()) {
@@ -727,6 +739,7 @@ int main(int argc, char** argv) {
     }
 
     int failures = 0;
+    if (ptq1_only) { return run_t2(QType::PTQ1_G128_FP16) == 0 ? 0 : 1; }
     if (inputs_only) { return run_weight_inputs() == 0 ? 0 : 1; }
     if (!dflash2_only) {
         failures += run_q4_q5();

@@ -58,7 +58,10 @@ ChatRole parse_message_role(const std::string& role) {
     bad_request("unsupported role: " + role, "messages", "unsupported_role");
 }
 
-std::string require_function_name(const Json& object, std::string param) {
+// The name charset is restricted only on tool definitions and references. A name replayed in
+// message history (tool_calls, function_call, function messages) keeps whatever the originating
+// client or model used, so it need only be a non-empty string.
+std::string require_function_name(const Json& object, std::string param, bool definition = true) {
     if (!object.contains("name") || !object.at("name").is_string()) {
         bad_request("function name must be a string, got " +
                         std::string(object.contains("name")
@@ -67,7 +70,8 @@ std::string require_function_name(const Json& object, std::string param) {
                     std::move(param));
     }
     std::string name = object.at("name").get<std::string>();
-    if (!valid_tool_name(name, kMaximumToolNameLength)) {
+    if (name.empty()) { bad_request("function name must not be empty", std::move(param)); }
+    if (definition && !valid_tool_name(name, kMaximumToolNameLength)) {
         bad_request("function name '" + ascii_preview(name) + "' (" +
                         std::to_string(name.size()) + " bytes) must match [A-Za-z0-9_-]{1," +
                         std::to_string(kMaximumToolNameLength) + "}",
@@ -196,26 +200,6 @@ void validate_standard_output_controls(const Json& body) {
     }
 }
 
-void validate_constrained_decoding_extensions(const Json& body) {
-    // llama.cpp exposes grammar; vLLM uses structured_outputs and previously exposed the
-    // guided_* spellings. Each promises constrained generation rather than an advisory hint.
-    static constexpr const char* fields[] = {
-        "grammar",      "structured_outputs", "guided_json",
-        "guided_regex", "guided_choice",      "guided_grammar",
-    };
-    for (const char* field : fields) {
-        if (!body.contains(field) || body.at(field).is_null()) { continue; }
-        const Json& value = body.at(field);
-        if (std::string_view(field) == "grammar" && value.is_string() &&
-            value.get_ref<const std::string&>().empty()) {
-            continue;
-        }
-        bad_request(std::string(field) +
-                        " requests constrained decoding, which NInfer does not provide",
-                    field, "constrained_decoding_not_supported");
-    }
-}
-
 void validate_compatibility_hints(const Json& body) {
     // vLLM exposes repetition_penalty, but NInfer's Engine intentionally has no such sampler.
     // The neutral value is accepted so common client defaults remain harmless.
@@ -250,8 +234,9 @@ void validate_compatibility_hints(const Json& body) {
     }
 }
 
+// `image` receives an image's detail; a video has none.
 ninfer::product::media_acquire::Source parse_media_url(const Json& part, const char* field,
-                                                       bool image) {
+                                                       ContentPart* image) {
     if (!part.contains(field)) {
         bad_request(std::string(field) + " content part must contain " + field, "messages");
     }
@@ -265,7 +250,15 @@ ninfer::product::media_acquire::Source parse_media_url(const Json& part, const c
             bad_request(std::string(field) + " must contain a string url", "messages");
         }
         url = value.at("url").get<std::string>();
-        if (image) { validate_openai_image_detail(value, "image_url.detail", "messages"); }
+        if (image != nullptr && value.contains("detail") && !value.at("detail").is_null()) {
+            if (!value.at("detail").is_string()) {
+                bad_request("image_url.detail must be a string", "messages");
+            }
+            const std::string detail = value.at("detail").get<std::string>();
+            const auto parsed        = parse_image_detail(detail);
+            image->image_detail      = parsed.value_or(ninfer::ImageDetail::Auto);
+            if (!parsed) { image->unknown_image_detail = detail; }
+        }
     } else {
         bad_request(std::string(field) + " must be a URL string or object", "messages");
     }
@@ -322,7 +315,7 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
                             "modality_not_supported");
             }
             parsed.kind   = ContentKind::Image;
-            parsed.source = parse_media_url(part, "image_url", true);
+            parsed.source = parse_media_url(part, "image_url", &parsed);
         } else if (type == "video_url") {
             // Qwen, vLLM, and SGLang use video_url as a Chat Completions extension for
             // multimodal models. NInfer maps it to the Engine's native Video input.
@@ -331,7 +324,7 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
                             "modality_not_supported");
             }
             parsed.kind   = ContentKind::Video;
-            parsed.source = parse_media_url(part, "video_url", false);
+            parsed.source = parse_media_url(part, "video_url", nullptr);
         } else {
             bad_request("content type '" + type + "' is not supported", "messages",
                         "modality_not_supported");
@@ -372,10 +365,10 @@ std::vector<ToolCall> parse_assistant_tool_calls(const Json& message, std::size_
             bad_request("function tool_calls must contain string arguments",
                         prefix + ".function.arguments");
         }
-        calls.push_back(ToolCall{
-            .id             = value.at("id").get<std::string>(),
-            .name           = require_function_name(function, prefix + ".function.name"),
-            .arguments_json = function.at("arguments").get<std::string>()});
+        calls.push_back(
+            ToolCall{.id   = value.at("id").get<std::string>(),
+                     .name = require_function_name(function, prefix + ".function.name", false),
+                     .arguments_json = function.at("arguments").get<std::string>()});
     }
     return calls;
 }
@@ -396,7 +389,7 @@ std::optional<ToolCall> parse_legacy_assistant_function_call(const Json& message
     }
     return ToolCall{.id   = {},
                     .name = require_function_name(
-                        call, "messages[" + std::to_string(index) + "].function_call.name"),
+                        call, "messages[" + std::to_string(index) + "].function_call.name", false),
                     .arguments_json = call.at("arguments").get<std::string>()};
 }
 
@@ -423,18 +416,12 @@ std::optional<std::string> parse_assistant_reasoning(const Json& message, std::s
     return reasoning ? reasoning : content;
 }
 
-void validate_message_name(const Json& item, ChatRole role) {
+// The optional message `name` is a participant label that agent frameworks attach to any role and
+// some clients mirror onto tool results. The chat template has no participant slot, so a string
+// name is accepted and ignored: it never reaches the Engine or the prompt renderer.
+void validate_message_name(const Json& item) {
     if (!item.contains("name") || item.at("name").is_null()) { return; }
     if (!item.at("name").is_string()) { bad_request("message name must be a string", "messages"); }
-    const std::string& name = item.at("name").get_ref<const std::string&>();
-    // Some OpenAI-compatible clients mirror the function name onto role=tool messages. Accept
-    // that non-standard field as an ignored compatibility hint; it never reaches the Engine or
-    // prompt renderer.
-    if (!name.empty() && role != ChatRole::Tool) {
-        bad_request("a non-empty message name changes participant identity, which NInfer's chat "
-                    "template cannot represent",
-                    "messages", "message_name_not_supported");
-    }
 }
 
 void validate_non_assistant_fields(const Json& item, ChatRole role) {
@@ -481,7 +468,10 @@ ChatTurn parse_tool_message(const Json& item, std::size_t index, bool legacy_fun
         !item.at("tool_call_id").is_string()) {
         bad_request("tool_call_id must be a string", "messages");
     }
-    if (!item.contains("content") || item.at("content").is_null()) {
+    // A legacy function message may carry content:null (a call with no output); a tool message
+    // requires content.
+    const bool null_content = !item.contains("content") || item.at("content").is_null();
+    if (null_content && !(legacy_function && item.contains("content"))) {
         bad_request("tool messages must contain content", "messages");
     }
 
@@ -490,23 +480,7 @@ ChatTurn parse_tool_message(const Json& item, std::size_t index, bool legacy_fun
     if (item.contains("tool_call_id") && item.at("tool_call_id").is_string()) {
         turn.tool_call_id = item.at("tool_call_id").get<std::string>();
     }
-    // A tool result may name the thinking level for the turn it feeds. The request-level
-    // reasoning_effort still wins; this is the per-tool-result fallback.
-    if (item.contains("reasoning_effort") && !item.at("reasoning_effort").is_null()) {
-        if (!item.at("reasoning_effort").is_string()) {
-            bad_request("tool reasoning_effort must be a string",
-                        "messages[" + std::to_string(index) + "].reasoning_effort");
-        }
-        const auto parsed = parse_requested_reasoning_effort(
-            item.at("reasoning_effort").get<std::string>());
-        if (!parsed) {
-            bad_request("tool reasoning_effort must be one of none, minimal, low, medium, high, "
-                        "xhigh, or max",
-                        "messages[" + std::to_string(index) + "].reasoning_effort");
-        }
-        turn.reasoning_effort = *parsed;
-    }
-    parse_content_parts(item.at("content"), turn, index);
+    parse_content_parts(null_content ? Json("") : item.at("content"), turn, index);
     return turn;
 }
 
@@ -569,9 +543,9 @@ ChatTurn parse_message(const Json& item, std::size_t index) {
     const bool legacy_function  = role_name == "function";
     const ChatRole role         = legacy_function ? ChatRole::Tool : parse_message_role(role_name);
 
-    validate_message_name(item, role);
+    validate_message_name(item);
     if (legacy_function) {
-        (void)require_function_name(item, "messages[" + std::to_string(index) + "].name");
+        (void)require_function_name(item, "messages[" + std::to_string(index) + "].name", false);
     }
     validate_non_assistant_fields(item, role);
 
@@ -697,6 +671,7 @@ void parse_tools(const Json& body, GenerationRequest& output) {
             if (!function.at("strict").is_boolean()) {
                 bad_request("function strict must be a boolean", prefix + ".function.strict");
             }
+            // Enforced with --structured-output, a hint without it (docs/serving.md).
             tool.strict = function.at("strict").get<bool>();
         }
         output.tools.push_back(std::move(tool));
@@ -741,13 +716,22 @@ void apply_allowed_tools(const Json& config, GenerationRequest& output) {
                 "provides no other output contract",
                 prefix + ".type", "tool_type_not_supported");
         }
-        const std::string name = require_function_name(item, prefix + ".name");
+        // An entry names its tool in the Chat form `{type, <type>:{name}}`, or in the flat
+        // `{type, name}` form that Responses-style clients send.
+        const std::string type = item.at("type").get<std::string>();
+        const bool chat_form   = item.contains(type) && !item.at(type).is_null();
+        if (chat_form && !item.at(type).is_object()) {
+            bad_request("allowed tool " + type + " reference must be an object",
+                        prefix + "." + type);
+        }
+        const std::string name_param = chat_form ? prefix + "." + type + ".name" : prefix + ".name";
+        const std::string name =
+            require_function_name(chat_form ? item.at(type) : item, name_param);
         const bool declared =
             std::any_of(output.tools.begin(), output.tools.end(),
                         [&](const ToolDefinition& tool) { return tool.name == name; });
         if (!declared) {
-            bad_request("allowed tool '" + name + "' is not present in tools",
-                        prefix + ".name");
+            bad_request("allowed tool '" + name + "' is not present in tools", name_param);
         }
         if (std::find(allowed_names.begin(), allowed_names.end(), name) == allowed_names.end()) {
             allowed_names.push_back(name);
@@ -973,7 +957,6 @@ void parse_output_limit(const Json& body, const RequestLimits& limits, OpenAICha
 OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestLimits& limits) {
     require_object(body, "request body must be a JSON object");
     validate_standard_output_controls(body);
-    validate_constrained_decoding_extensions(body);
     validate_compatibility_hints(body);
 
     OpenAIChatRequest output;
@@ -981,6 +964,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
         output.generation.structured_output =
             parse_structured_output(body.at("response_format"), true, "response_format");
     }
+    parse_constrained_decoding_extensions(body, output.generation);
     // One model is resident, so an omitted, null or empty model means that one: llama.cpp's
     // WebUI omits it or sends "". The HTTP layer substitutes the served model. A model that is
     // present but not a string is still a malformed request.
@@ -996,6 +980,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     parse_tool_constraints(body, output.generation);
     parse_parallel_tool_calls(body, output.generation);
     parse_messages(body, limits.assistant_prefill, output.generation);
+    settle_image_details(output.generation.messages, limits, "messages", "image_url.detail");
     parse_stop(body, output.generation);
     parse_sampling(body, output.generation);
     if (body.contains("logprobs") && body.at("logprobs").is_boolean()) {
@@ -1013,6 +998,13 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     output.generation.graft                     = parse_graft_field(body);
     output.generation.thinking_budget           = parse_thinking_budget_field(body);
     apply_openai_prompt_cache_policy(output.generation, cache_policy);
+    // As on Responses: a client that names its conversation will extend the prompt, so the Engine
+    // keeps a resumable point at its end. The automatic boundary sits before the last user
+    // message, so a tool-calling exchange (many requests, no new user turn between them) would
+    // otherwise resume from the start of the exchange instead of from the previous request.
+    output.generation.private_cache_boundary_at_prompt_end =
+        body.contains("prompt_cache_key") && body.at("prompt_cache_key").is_string() &&
+        !body.at("prompt_cache_key").get_ref<const std::string&>().empty();
     return output;
 }
 

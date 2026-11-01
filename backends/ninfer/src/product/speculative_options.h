@@ -1,7 +1,9 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "ninfer/engine_options.h"
+#include "ninfer/model_enums.h"
 
+#include <cmath>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -9,6 +11,7 @@
 namespace ninfer::product {
 
 [[nodiscard]] inline SpeculativeBackend parse_speculative_backend(std::string_view value) {
+    if (value == "none") { return SpeculativeBackend::None; }
     if (value == "mtp") { return SpeculativeBackend::Mtp; }
     if (value == "dflash") { return SpeculativeBackend::DFlash; }
     if (value == "dflash2") { return SpeculativeBackend::DFlash2; }
@@ -40,7 +43,19 @@ inline void apply_default_ngram_draft_tokens(SpeculativeOptions& options,
     }
 }
 
+// Without --spec the Engine chooses (SpeculativeOptions::automatic), unless a drafting option
+// names the backend's own settings.
+inline void apply_automatic_speculation(SpeculativeOptions& options, bool backend_explicit) noexcept {
+    options.automatic = !backend_explicit && options.backend == SpeculativeBackend::None &&
+                        options.draft_tokens == 0;
+}
+
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
+    if (!std::isfinite(options.draft_min_p) || options.draft_min_p < 0 ||
+        options.draft_min_p > 1 ||
+        (options.draft_min_p != 0 && options.backend != SpeculativeBackend::Mtp)) {
+        throw std::invalid_argument("--draft-min-p requires --spec mtp and a finite value in [0,1]");
+    }
     if (options.ngram_archive_bytes != 0 &&
         (options.ngram_draft_tokens == 0 || options.ngram_session_bytes < (1ULL << 20) ||
          options.ngram_session_bytes > options.ngram_archive_bytes)) {

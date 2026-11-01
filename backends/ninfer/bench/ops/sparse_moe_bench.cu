@@ -1,11 +1,11 @@
 // Cold-cache benchmark for the public SparseMoe contract.
 //
-// The benchmark deliberately knows nothing about decode, small-T, prefill,
-// private plans, or kernel candidates. Production dispatch remains entirely
-// behind ninfer::ops::sparse_moe().
+// Default measurements use the public Op. --candidate opts into internal laboratory
+// dispatch for crossover comparisons; it does not change production policy.
 
 #include "core/weight.h"
 #include "ninfer/ops/sparse_moe.h"
+#include "ops/sparse_moe/laboratory.h"
 
 #include "core/device.h"
 #include "ninfer_bench_common.h"
@@ -80,6 +80,7 @@ struct TokenSweep {
 
 struct Options {
     std::string codec = "q4-q5";
+    ops::detail::SparseMoeCandidate candidate = ops::detail::SparseMoeCandidate::Automatic;
     TokenSweep tokens;
     ExpertDistribution distribution = ExpertDistribution::TraceLike;
     Execution execution             = Execution::Graph;
@@ -105,6 +106,7 @@ struct Stats {
 
 struct Result {
     CodecProfile codec;
+    ops::detail::SparseMoeCandidate candidate;
     std::int32_t tokens;
     ExpertDistribution distribution;
     std::uint32_t seed;
@@ -318,6 +320,8 @@ void usage(const char* argv0) {
                  "  --sweep START:END[:STEP]         Public token-extent sweep.\n"
                  "  --distribution trace-like|independent|same\n"
                  "  --seed N                         Fixture seed.\n\n"
+                 "Laboratory selection (default auto):\n"
+                 "  --candidate auto|decode|small-t|prefill|prefill-narrow|prefill-wide\n"
                  "Measurement:\n"
                  "  --execution graph|eager|both     Default graph.\n"
                  "  --cache cold|warm|both           Default both; cold is authoritative.\n"
@@ -341,6 +345,8 @@ Options parse_options(int argc, char** argv) {
         };
         if (argument == "--codec") {
             options.codec = next("codec");
+        } else if (argument == "--candidate") {
+            options.candidate = ops::detail::parse_sparse_moe_candidate(next("candidate"));
         } else if (argument == "--tokens") {
             const std::int32_t tokens = parse_positive_i32(next("tokens"), "tokens");
             options.tokens            = {tokens, tokens, 1};
@@ -589,13 +595,14 @@ private:
 class BenchmarkState {
 public:
     BenchmarkState(BenchmarkWeights& fixture, CodecProfile profile, std::int32_t tokens,
-                   ExpertDistribution distribution, std::uint32_t seed)
-        : fixture_(fixture), route_pattern_(make_route_pattern(tokens, distribution, seed)),
+                   ExpertDistribution distribution, std::uint32_t seed,
+                   ops::detail::SparseMoeCandidate candidate)
+        : fixture_(fixture), candidate_(candidate), route_pattern_(make_route_pattern(tokens, distribution, seed)),
           input_(static_cast<std::size_t>(tokens) * kHidden * 2),
           residual_(static_cast<std::size_t>(tokens) * kHidden * 2),
           destination_(static_cast<std::size_t>(tokens) * kHidden * 2),
-          workspace_bytes_(ops::sparse_moe_workspace_capacity_bytes(
-              gate_codec(profile), down_codec(profile), tokens, tokens)),
+          workspace_bytes_(ops::detail::sparse_moe_candidate_workspace_bytes(
+              gate_codec(profile), down_codec(profile), tokens, candidate)),
           workspace_(workspace_bytes_) {
         std::vector<std::uint16_t> input(static_cast<std::size_t>(tokens) * kHidden);
         std::vector<std::uint16_t> residual(static_cast<std::size_t>(tokens) * kHidden);
@@ -640,12 +647,18 @@ public:
     }
 
     void launch(cudaStream_t stream) {
-        ops::sparse_moe(x_, fixture_.weights(), ops::SparseMoeEpilogue::AddResidual,
-                        destination_tensor_, workspace_, stream);
+        if (candidate_ == ops::detail::SparseMoeCandidate::Automatic) {
+            ops::sparse_moe(x_, fixture_.weights(), ops::SparseMoeEpilogue::AddResidual,
+                            destination_tensor_, workspace_, stream);
+        } else {
+            ops::detail::sparse_moe_candidate(x_, fixture_.weights(), ops::SparseMoeEpilogue::AddResidual,
+                                              destination_tensor_, candidate_, workspace_, stream);
+        }
     }
 
 private:
     BenchmarkWeights& fixture_;
+    ops::detail::SparseMoeCandidate candidate_;
     RoutePattern route_pattern_;
     DeviceBuffer input_;
     DeviceBuffer residual_;
@@ -767,7 +780,7 @@ Stats measure_graph(BenchmarkState& state, const BodyTimedGraph& graph, CacheSta
 
 std::vector<Result> run_point(BenchmarkWeights& fixture, CodecProfile profile, std::int32_t tokens,
                               const Options& options, cudaStream_t stream) {
-    BenchmarkState state(fixture, profile, tokens, options.distribution, options.seed);
+    BenchmarkState state(fixture, profile, tokens, options.distribution, options.seed, options.candidate);
 
     // Match the production graph lifecycle: materialize eagerly, capture from a
     // reset state, instantiate, then prime one replay before configured warmup.
@@ -793,7 +806,7 @@ std::vector<Result> run_point(BenchmarkWeights& fixture, CodecProfile profile, s
                 execution == Execution::Graph
                     ? measure_graph(state, graph, cache, stream, options.warmup, options.repeat)
                     : measure_eager(state, cache, stream, options.warmup, options.repeat);
-            results.push_back({profile, tokens, options.distribution, options.seed,
+            results.push_back({profile, options.candidate, tokens, options.distribution, options.seed,
                                pattern.unique_experts, pattern.adjacent_overlap, execution, cache,
                                stats, state.workspace_bytes()});
         }
@@ -806,10 +819,11 @@ void print_result(const Result& result, double peak_memory_gbps) {
     const double useful_weight_gbps    = unique_weight_bytes(result) / seconds / 1.0e9;
     const double useful_weight_percent = 100.0 * useful_weight_gbps / peak_memory_gbps;
     const double tflops                = logical_flops(result.tokens) / seconds / 1.0e12;
-    std::printf("%-6s T=%-5d %-11s U=%-3d ov=%4.1f %-12s %-4s "
+    std::printf("%-6s candidate=%-14s T=%-5d %-11s U=%-3d ov=%4.1f %-12s %-4s "
                 "median=%8.3f us min=%8.3f us p95=%8.3f us "
                 "unique_weight=%7.1f GB/s (%4.1f%% peak) logical=%6.2f TFLOP/s workspace=%zu\n",
-                codec_name(result.codec), result.tokens, distribution_name(result.distribution),
+                codec_name(result.codec), ops::detail::sparse_moe_candidate_name(result.candidate).data(),
+                result.tokens, distribution_name(result.distribution),
                 result.unique_experts, result.adjacent_overlap, execution_name(result.execution),
                 cache_name(result.cache), result.stats.median_us, result.stats.min_us,
                 result.stats.p95_us, useful_weight_gbps, useful_weight_percent, tflops,
@@ -828,14 +842,15 @@ void write_csv(const std::string& path, const std::vector<Result>& results, cons
     int runtime = 0;
     CUDA_CHECK(cudaRuntimeGetVersion(&runtime));
     const double peak_memory_gbps = theoretical_memory_gbps(context.device);
-    stream << "codec,tokens,distribution,seed,unique_experts,adjacent_overlap,execution,"
+    stream << "codec,candidate,tokens,distribution,seed,unique_experts,adjacent_overlap,execution,"
               "timed_scope,cache,median_us,min_us,p95_us,unique_weight_gbps,"
               "unique_weight_peak_percent,logical_tflops,workspace_bytes,warmup,repeat,"
               "flush_bytes,build_type,gpu,cuda_runtime\n";
     for (const Result& result : results) {
         const double seconds            = result.stats.median_us * 1.0e-6;
         const double useful_weight_gbps = unique_weight_bytes(result) / seconds / 1.0e9;
-        stream << codec_name(result.codec) << ',' << result.tokens << ','
+        stream << codec_name(result.codec) << ',' << ops::detail::sparse_moe_candidate_name(result.candidate)
+               << ',' << result.tokens << ','
                << distribution_name(result.distribution) << ',' << result.seed << ','
                << result.unique_experts << ',' << result.adjacent_overlap << ','
                << execution_name(result.execution) << ",full_sparse_moe_device_body,"

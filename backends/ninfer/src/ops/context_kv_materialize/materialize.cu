@@ -1,6 +1,7 @@
 #include "ops/context_kv_materialize/launch.h"
 #include "core/device.h"
 #include "core/pdl.cuh"
+#include "ops/common/device_limits.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/common/route_table.h"
@@ -308,11 +309,12 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
     }
 }
 
-template <int Rows, int Columns, int BlockK, int ColumnWarps>
+template <bool TuringShapes, int Rows, int Columns, int BlockK, int ColumnWarps>
 void launch_mma(const Tensor& x, const Tensor& positions, const Tensor& counts, const Tensor& slots,
                 DeviceLayers layers, ContextKVMaterializeExecutionEnvelope envelope,
                 const Tensor& scratch, cudaStream_t stream) {
     constexpr int bytes = sizeof(MaterializeStorage<Rows, Columns, BlockK>);
+    static_assert(bytes <= shape_max_shared_bytes_per_block(TuringShapes));
     if constexpr (bytes > 48 * 1024)
         CUDA_CHECK(cudaFuncSetAttribute(context_kv_mma_kernel<Rows, Columns, BlockK, ColumnWarps>,
                                         cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
@@ -500,36 +502,49 @@ void context_kv_materialize_launch(
     const Tensor& key_scratch, cudaStream_t stream) {
     const DeviceLayers device_layers = make_device_layers(layers);
     using Route                      = ContextKVMaterializeRoute;
-    switch (route) {
-    case Route::KSplit16:
-        launch_grouped<16>(context, positions, counts, state_slots, device_layers, envelope,
-                           key_scratch, stream);
-        break;
-    case Route::KSplit24:
-        launch_grouped<24>(context, positions, counts, state_slots, device_layers, envelope,
-                           key_scratch, stream);
-        break;
-    case Route::Mma32:
-        launch_mma<64, 32, 128, 2>(context, positions, counts, state_slots, device_layers, envelope,
-                                   key_scratch, stream);
-        break;
-    case Route::Mma80:
-        launch_mma<64, 80, 128, 5>(context, positions, counts, state_slots, device_layers, envelope,
-                                   key_scratch, stream);
-        break;
-    case Route::Mma96:
-        launch_mma<64, 96, 128, 6>(context, positions, counts, state_slots, device_layers, envelope,
-                                   key_scratch, stream);
-        break;
-    case Route::Fused64:
-        launch_mma<128, 64, 128, 2>(context, positions, counts, state_slots, device_layers,
-                                    envelope, key_scratch, stream);
-        return;
-    case Route::Mma64:
-        launch_mma<64, 64, 64, 2>(context, positions, counts, state_slots, device_layers, envelope,
-                                  key_scratch, stream);
-        break;
-    }
+    const bool post                  = with_shape_set([&]<bool TuringShapes>() {
+        switch (route) {
+        case Route::KSplit16:
+            launch_grouped<16>(context, positions, counts, state_slots, device_layers, envelope,
+                               key_scratch, stream);
+            break;
+        case Route::KSplit24:
+            launch_grouped<24>(context, positions, counts, state_slots, device_layers, envelope,
+                               key_scratch, stream);
+            break;
+        case Route::Mma32:
+            launch_mma<TuringShapes, 64, 32, 128, 2>(context, positions, counts, state_slots,
+                                                     device_layers, envelope, key_scratch, stream);
+            break;
+        case Route::Mma80:
+            launch_mma<TuringShapes, 64, 80, 128, 5>(context, positions, counts, state_slots,
+                                                     device_layers, envelope, key_scratch, stream);
+            break;
+        case Route::Mma96:
+            launch_mma<TuringShapes, 64, 96, 128, 6>(context, positions, counts, state_slots,
+                                                     device_layers, envelope, key_scratch, stream);
+            break;
+        case Route::Fused64: {
+            // The 128-row tile stages 65 KiB with a 128-deep K block, past Turing's 64 KiB per
+            // block; a 64-deep block (32.5 KiB) keeps the tile, its quantization groups and fused
+            // epilogue.
+            constexpr int kBlockK = sizeof(MaterializeStorage<128, 64, 128>) <=
+                                            shape_max_shared_bytes_per_block(TuringShapes)
+                                        ? 128
+                                        : 64;
+            launch_mma<TuringShapes, 128, 64, kBlockK, 2>(context, positions, counts, state_slots,
+                                                          device_layers, envelope, key_scratch,
+                                                          stream);
+            return false;
+        }
+        case Route::Mma64:
+            launch_mma<TuringShapes, 64, 64, 64, 2>(context, positions, counts, state_slots,
+                                                    device_layers, envelope, key_scratch, stream);
+            break;
+        }
+        return true;
+    });
+    if (!post) { return; }
     CUDA_CHECK(pdl::launch_consumer(
         {dim3(envelope.max_count * context.ne[2], kLayers), dim3(256), 0, stream},
         context_kv_key_post_kernel, static_cast<const float*>(key_scratch.data),

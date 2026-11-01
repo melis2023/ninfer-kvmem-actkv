@@ -1,4 +1,5 @@
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_plan_unified.h"
+#include "ops/common/blackwell_routes.h"
 #include "ops/gdn_input_proj/fp8/fp8_gdn_input_output_unified.cuh"
 #include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "ops/linear/fp8/fp8_instances.cuh"
@@ -18,6 +19,7 @@ std::size_t fp8_gdn_input_partial_capacity_bytes(std::int32_t max_tokens) {
 
 void fp8_gdn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z,
                              Fp8A8Workspace workspace, cudaStream_t stream) {
+    require_fp8_a8_card();
     launch_fp8_a8_quantize(x, weight, workspace, stream);
     const Fp8GdnInputOutput output{static_cast<__nv_bfloat16*>(qkv.data),
                                    static_cast<__nv_bfloat16*>(z.data)};

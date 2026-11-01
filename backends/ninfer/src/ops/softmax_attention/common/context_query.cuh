@@ -3,6 +3,7 @@
 #include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
+#include "ops/softmax_attention/common/bf16_attention.cuh"
 
 #include <cuda_bf16.h>
 #include <math_constants.h>
@@ -364,11 +365,11 @@ __device__ __forceinline__ void context_query_split_partial_body(
             block_l1 += p10 + p11;
             const int pk = nt >> 1;
             if ((nt & 1) == 0) {
-                p_frag[pk][0] = pack_bf16x2(p00, p01);
-                p_frag[pk][1] = pack_bf16x2(p10, p11);
+                p_frag[pk][0] = pack_attention_p(p00, p01);
+                p_frag[pk][1] = pack_attention_p(p10, p11);
             } else {
-                p_frag[pk][2] = pack_bf16x2(p00, p01);
-                p_frag[pk][3] = pack_bf16x2(p10, p11);
+                p_frag[pk][2] = pack_attention_p(p00, p01);
+                p_frag[pk][3] = pack_attention_p(p10, p11);
             }
         }
         block_l0 = warp_sum<4>(block_l0, FullMask);
@@ -405,12 +406,12 @@ __device__ __forceinline__ void context_query_split_partial_body(
                                   v_lane_base + static_cast<unsigned>(next_pk * 16 * RowBytes),
                                   static_cast<unsigned>(next_n2 << 4), v_as, v_r));
             }
-            mma_bf16(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[pk][0], p_frag[pk][1],
-                     p_frag[pk][2], p_frag[pk][3], vf[cur][0], vf[cur][1]);
+            attention_pv_mma(acc[n2][0], acc[n2][1], acc[n2][2], acc[n2][3], p_frag[pk][0],
+                             p_frag[pk][1], p_frag[pk][2], p_frag[pk][3], vf[cur][0], vf[cur][1]);
             if (n2 + 1 < PVNt) {
-                mma_bf16(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3],
-                         p_frag[pk][0], p_frag[pk][1], p_frag[pk][2], p_frag[pk][3], vf[cur][2],
-                         vf[cur][3]);
+                attention_pv_mma(acc[n2 + 1][0], acc[n2 + 1][1], acc[n2 + 1][2], acc[n2 + 1][3],
+                                 p_frag[pk][0], p_frag[pk][1], p_frag[pk][2], p_frag[pk][3],
+                                 vf[cur][2], vf[cur][3]);
             }
         }
 

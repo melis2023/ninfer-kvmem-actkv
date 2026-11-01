@@ -6,6 +6,7 @@
 #include <cmath>
 #include <limits>
 #include <set>
+#include <stdexcept>
 #include <string>
 
 namespace ninfer::models::qwen3_5 {
@@ -291,6 +292,24 @@ VisionConfig parse_vision_config(const artifact::Directory& directory) {
 std::uint64_t GdnConfig::conv_channels() const {
     return artifact::checked_add(artifact::checked_mul(2, key_width(), "GDN key width"),
                                  value_width(), "GDN convolution channels");
+}
+
+TextConfig tensor_parallel_share(const TextConfig& text, std::size_t ranks) {
+    if (ranks < 2) { throw std::invalid_argument("tensor parallelism needs two or more devices"); }
+    const auto* dense = std::get_if<DenseConfig>(&text.ffn);
+    if (dense == nullptr) {
+        throw std::invalid_argument("tensor parallelism supports models with a dense FFN");
+    }
+    if (!text.gdn || text.gdn->linear_num_key_heads % ranks != 0 ||
+        text.gdn->linear_num_value_heads % ranks != 0 || dense->intermediate_size % ranks != 0) {
+        throw std::invalid_argument("--tensor-parallel " + std::to_string(ranks) +
+                                    " does not divide the GDN heads and FFN rows");
+    }
+    TextConfig out = text;
+    out.gdn->linear_num_key_heads /= static_cast<std::uint32_t>(ranks);
+    out.gdn->linear_num_value_heads /= static_cast<std::uint32_t>(ranks);
+    std::get<DenseConfig>(out.ffn).intermediate_size /= static_cast<std::uint32_t>(ranks);
+    return out;
 }
 
 std::uint64_t VisionConfig::patch_width() const {

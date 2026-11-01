@@ -6,9 +6,9 @@ namespace ninfer::ops::detail::unified {
 namespace {
 using Geometry = Nvfp4Geometry<16384, 5120>;
 using Gemv =
-    Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
+    Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Streaming, 4>;
 using C2      = Nvfp4A16SimtSchedule<4, 1, 2, 16, 2, 1, Nvfp4SimtActivationAccess::SharedPhase,
-                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
+                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Streaming, 1,
                                      Nvfp4SimtBlockOrder::RowsContiguous, 1>;
 using T32R64  = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
 using T32R128 = Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
@@ -27,7 +27,7 @@ Nvfp4Launch select_a16(int tokens) {
         return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 64, 64, 32, 16, 2, 2>>;
     if (tokens <= 96)
         return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 96, 128, 64, 16, 1, 2>>;
-    return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>>;
+    return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 1, 3>>;
 }
 
 void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
@@ -48,5 +48,7 @@ bool uses_a4(std::int32_t, std::int32_t) { return true; }
 } // namespace
 
 const Nvfp4LinearShape kNvfp4N16384K5120{16384, 5120, launch_a16, launch_nvfp4_a4<select_a4>,
-                                         uses_a4};
+                                         uses_a4,
+                                         nvfp4_linear_int8_grouped_launch,
+                                         nvfp4_linear_int8_tokens_supported};
 } // namespace ninfer::ops::detail::unified

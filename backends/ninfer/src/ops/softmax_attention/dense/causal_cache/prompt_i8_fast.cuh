@@ -29,13 +29,18 @@
 //   * Keys selects a packed key plane (rk4v4, rk4v4-e8, rk2v4-e8). Its codes for the next tile are
 //     loaded into registers where the INT8 path issues its copy and expanded into that stage's
 //     INT8 K tile after this tile's PV, so QK is unchanged.
+//   * A split launch (gridDim.z > 1, prompt_i8_fast_plan.h) gives each CTA a contiguous run of a
+//     row block's key pages and publishes, per row, the normalized FP32 row and its (max, sum)
+//     statistics; causal_attention_prompt_i8_fast_merge_kernel combines the splits.
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <math_constants.h>
 
+#include "ops/common/device_limits.h"
 #include "ops/kv_cache/int8_g64_codec.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"
+#include "ops/softmax_attention/dense/causal_cache/value_fragments.cuh"
 
 #include <cstdint>
 
@@ -62,15 +67,30 @@ struct CausalPromptI8FastStage {
 };
 inline constexpr int kCausalPromptI8FastStageBytes = CausalPromptI8FastStage<false>::Bytes;
 
+// K/V tiles are double-buffered so the next tile's cp.async overlaps this tile's math, where two
+// stages beside the four-warp shape's Q tile fit a block. Turing's 64 KiB holds one stage, and its
+// copies are synchronous, so a second stage would overlap nothing there.
+template <bool TuringShapes>
+inline constexpr int kCausalPromptI8FastStages =
+    4 * 16 * kCausalPromptHeadDim + 2 * kCausalPromptI8FastStageBytes <=
+            shape_max_shared_bytes_per_block(TuringShapes)
+        ? 2
+        : 1;
+
 // Each warp owns 16 query rows. Eight warps fill an SM's register file; four warps serve
-// launches too narrow to occupy every SM with 128-row CTAs.
-template <int Warps, bool PackedValues = false>
+// launches too narrow to occupy every SM with 128-row CTAs. TuringShapes selects the shape set
+// (ops/common/device_tier.h).
+template <int Warps, bool PackedValues = false, bool TuringShapes = false>
 struct CausalPromptI8FastShape {
     static_assert(Warps == 4 || Warps == 8);
     static constexpr int Threads   = Warps * 32;
     static constexpr int Br        = Warps * 16;
     static constexpr int QBytes    = Br * kCausalPromptHeadDim;
-    static constexpr int SmemBytes = QBytes + 2 * CausalPromptI8FastStage<PackedValues>::Bytes;
+    static constexpr int Stages    = kCausalPromptI8FastStages<TuringShapes>;
+    static constexpr int SmemBytes = QBytes + Stages * CausalPromptI8FastStage<PackedValues>::Bytes;
+    // Whether this shape can launch in its shape set (8 warps with INT8 values cannot on Turing:
+    // 66,560 bytes).
+    static constexpr bool Launchable = SmemBytes <= shape_max_shared_bytes_per_block(TuringShapes);
 };
 
 // A 64-key FP16 partial is bounded by 64 * 127 * max_scale (every probability is at most one).
@@ -81,58 +101,35 @@ inline constexpr float kCausalPromptI8FastPackedF16PartialScaleLimit = 64.0f;
 
 static_assert(kCausalPromptI8FastBc == kPagedKVPageSize);
 static_assert(kCausalPromptI8FastGroups == 4);
-static_assert(CausalPromptI8FastShape<8>::SmemBytes == 100352);
+static_assert(CausalPromptI8FastShape<8>::Stages == 2 &&
+              CausalPromptI8FastShape<8>::SmemBytes == 100352);
+static_assert(CausalPromptI8FastShape<8, false, true>::Stages == 1);
+static_assert(CausalPromptI8FastShape<4>::Launchable &&
+              CausalPromptI8FastShape<4, true>::Launchable &&
+              CausalPromptI8FastShape<8, true>::Launchable &&
+              CausalPromptI8FastShape<4, false, true>::Launchable &&
+              CausalPromptI8FastShape<4, true, true>::Launchable &&
+              CausalPromptI8FastShape<8, true, true>::Launchable);
+
+// Split partial layout for key split s, column c and query head h: the D256 row at
+// ((s * width + c) * QHeads + h) * 256 and its (max, sum) pair at that row index.
+template <typename Geometry>
+__host__ __device__ __forceinline__ std::int64_t
+causal_prompt_i8_fast_partial_row(int split, int column, int q_head, int width) {
+    return (static_cast<std::int64_t>(split) * width + column) * Geometry::QHeads + q_head;
+}
 
 __device__ __forceinline__ void causal_prompt_i8_fast_mma_f16_acc(unsigned& c0, unsigned& c1,
                                                                   unsigned a0, unsigned a1,
                                                                   unsigned a2, unsigned a3,
                                                                   unsigned b0, unsigned b1) {
-    asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
-                 "{%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};\n"
-                 : "+r"(c0), "+r"(c1)
-                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
-}
-
-// One ldmatrix.trans b16 lane of an INT8 [key][d] tile holds the codes
-// {V[k][d], V[k][d+1], V[k+1][d], V[k+1][d+1]}. Returns the FP16 B-fragment halves
-// {V[k][d], V[k+1][d]} and {V[k][d+1], V[k+1][d+1]}, each code widened exactly and multiplied
-// once by its key's represented group scale.
-__device__ __forceinline__ void causal_prompt_i8_fast_decode_v_pair(unsigned codes, unsigned scales,
-                                                                    unsigned& even, unsigned& odd) {
-    // code ^ 0x80 is code + 128; 0x6400 | byte is the FP16 value 1024 + byte.
-    const unsigned biased = codes ^ 0x80808080u;
-    unsigned e            = __byte_perm(biased, 0x64646464u, 0x4240);
-    unsigned o            = __byte_perm(biased, 0x64646464u, 0x4341);
-    const __half2 offset  = __float2half2_rn(1152.0f);
-    const __half2 s2      = load_vec<__half2>(&scales);
-    const __half2 ve      = __hmul2(__hsub2(load_vec<__half2>(&e), offset), s2);
-    const __half2 vo      = __hmul2(__hsub2(load_vec<__half2>(&o), offset), s2);
-    even                  = load_vec<unsigned>(&ve);
-    odd                   = load_vec<unsigned>(&vo);
-}
-
-// One ldmatrix.trans b16 lane of a packed int4 [key][d/2] tile holds dimensions 4c..4c+3 of keys k
-// and k+1, one nibble each (low nibble first, byte order: k lo pair, k hi pair, k+1 lo, k+1 hi).
-// Returns, for r = 0..3, the FP16 B-fragment half {V[k][4c+r], V[k+1][4c+r]}, each code widened
-// exactly and multiplied once by its key's represented group scale.
-__device__ __forceinline__ void causal_prompt_i8_fast_decode_v_quad(unsigned codes, unsigned scales,
-                                                                    unsigned (&out)[4]) {
-    // Signed nibble ^ 8 is code + 8; 0x6400 | nibble is the FP16 value 1024 + nibble.
-    const unsigned biased = codes ^ 0x88888888u;
-    const __half2 offset  = __float2half2_rn(1032.0f);
-    const __half2 s2      = load_vec<__half2>(&scales);
-#pragma unroll
-    for (int r = 0; r < 4; ++r) {
-        const unsigned widened = ((biased >> (4 * r)) & 0x000F000Fu) | 0x64006400u;
-        const __half2 value    = __hmul2(__hsub2(load_vec<__half2>(&widened), offset), s2);
-        out[r]                 = load_vec<unsigned>(&value);
-    }
+    mma_f16_f16acc(c0, c1, a0, a1, a2, a3, b0, b1);
 }
 
 template <typename Geometry, typename Metadata, int Warps, bool PackedValues = false,
-          KvKeyCoding Keys = KvKeyCoding::Int8>
+          KvKeyCoding Keys = KvKeyCoding::Int8, bool TuringShapes = false, bool Split = false>
 __global__ __launch_bounds__(
-    CausalPromptI8FastShape<Warps, PackedValues>::Threads,
+    CausalPromptI8FastShape<Warps, PackedValues, TuringShapes>::Threads,
     1) void causal_attention_prompt_i8_fast_kernel(const __nv_bfloat16* __restrict__ q,
                                                    const std::int8_t* __restrict__ cache_k,
                                                    const std::int8_t* __restrict__ cache_v,
@@ -141,10 +138,16 @@ __global__ __launch_bounds__(
                                                    Metadata metadata,
                                                    const std::int32_t* __restrict__ positions,
                                                    float scale, __nv_bfloat16* __restrict__ out,
-                                                   std::int32_t width) {
+                                                   std::int32_t width,
+                                                   float* __restrict__ partial_rows,
+                                                   float2* __restrict__ partial_stats) {
+    if constexpr (!shape_set_in_image(TuringShapes)) { return; } // not this image's set
+    // A Volta card runs its own prompt route (prompt_sm70.cu) or the standard kernel: a build of
+    // several architectures compiles this kernel empty in the Volta image.
+#if !defined(NINFER_SM70_DEVICE)
     constexpr int D             = kCausalPromptHeadDim;
     constexpr int DB16          = D / 2;
-    using Shape                 = CausalPromptI8FastShape<Warps, PackedValues>;
+    using Shape                 = CausalPromptI8FastShape<Warps, PackedValues, TuringShapes>;
     using Stage                 = CausalPromptI8FastStage<PackedValues>;
     constexpr int VGroups       = Stage::VGroups;
     constexpr int VRowBytes     = Stage::VRowBytes;
@@ -195,9 +198,12 @@ __global__ __launch_bounds__(
     };
 
     if (q0 >= tokens) {
-        for (int element = tid; element < Br * (D / 4); element += Threads) {
-            const int row = element / (D / 4);
-            store_row(row, (element - row * (D / 4)) * 4, 0.0f, 0.0f, 0.0f, 0.0f);
+        // The merge publishes a split launch's inactive columns.
+        if constexpr (!Split) {
+            for (int element = tid; element < Br * (D / 4); element += Threads) {
+                const int row = element / (D / 4);
+                store_row(row, (element - row * (D / 4)) * 4, 0.0f, 0.0f, 0.0f, 0.0f);
+            }
         }
         return;
     }
@@ -207,6 +213,12 @@ __global__ __launch_bounds__(
     const int rows                  = min(Br, tokens - q0);
     const int max_query_abs         = base_pos + q0 + rows - 1;
     const int key_blocks            = max_query_abs / Bc + 1;
+    // Key pages [kb_begin, kb_end) of this split; an empty run publishes neutral statistics.
+    const int split = Split ? static_cast<int>(blockIdx.z) : 0;
+    const int pages_per_split =
+        Split ? (key_blocks + static_cast<int>(gridDim.z) - 1) / static_cast<int>(gridDim.z) : 0;
+    const int kb_begin = Split ? min(key_blocks, split * pages_per_split) : 0;
+    const int kb_end   = Split ? min(key_blocks, kb_begin + pages_per_split) : key_blocks;
 
     // Each warp rotates and encodes its own 16 rows, keeping the two rows each lane owns in the
     // MMA C layout as register scales.
@@ -253,7 +265,7 @@ __global__ __launch_bounds__(
     // zero-filled and their scores masked.
     const auto commit_keys = [&](int kb) {
         if constexpr (PackedKeys) {
-            std::int8_t* k_s = reinterpret_cast<std::int8_t*>(stage_base(kb & 1));
+            std::int8_t* k_s = reinterpret_cast<std::int8_t*>(stage_base(kb % Shape::Stages));
 #pragma unroll
             for (int i = 0; i < KChunksPerThread; ++i) {
                 const int chunk = tid + i * Threads;
@@ -269,7 +281,7 @@ __global__ __launch_bounds__(
     // packed) and their scales, all contiguous in the cache. Keys past the CTA's last visible key
     // are zero-filled so masked columns stay finite.
     const auto issue_tile = [&](int kb) {
-        unsigned char* base = stage_base(kb & 1);
+        unsigned char* base = stage_base(kb % Shape::Stages);
         std::int8_t* k_s    = reinterpret_cast<std::int8_t*>(base);
         std::int8_t* v_s    = k_s + kCausalPromptI8FastTileBytes;
         __half* ks_s        = reinterpret_cast<__half*>(base + Stage::KScaleOffset);
@@ -388,7 +400,7 @@ __global__ __launch_bounds__(
         tile_live    = false;
         const int k0 = kb * Bc;
         if (!warp_active || k0 > warp_max_qabs) { return; }
-        const unsigned char* base  = stage_base(kb & 1);
+        const unsigned char* base  = stage_base(kb % Shape::Stages);
         const __nv_bfloat16* k_b16 = reinterpret_cast<const __nv_bfloat16*>(base);
         const __half* ks_s = reinterpret_cast<const __half*>(base + Stage::KScaleOffset);
         const __half* vs_s = ks_s + Bc * Groups;
@@ -509,7 +521,7 @@ __global__ __launch_bounds__(
     };
 
     const auto pv_packed = [&](int kb) {
-        const unsigned char* base = stage_base(kb & 1);
+        const unsigned char* base = stage_base(kb % Shape::Stages);
         const std::int8_t* v_s =
             reinterpret_cast<const std::int8_t*>(base) + kCausalPromptI8FastTileBytes;
         const __half* vs_s =
@@ -538,8 +550,8 @@ __global__ __launch_bounds__(
                 unsigned r0, r1;
                 ldmatrix_x2_t(r0, r1, smem_addr(&v_s[row * VRowBytes + ((grp ^ (row & 7)) << 4)]));
                 unsigned b_lo[4], b_hi[4];
-                causal_prompt_i8_fast_decode_v_quad(r0, load_vec<unsigned>(&lo), b_lo);
-                causal_prompt_i8_fast_decode_v_quad(r1, load_vec<unsigned>(&hi), b_hi);
+                causal_i4_value_quad_fragments(r0, load_vec<unsigned>(&lo), b_lo);
+                causal_i4_value_quad_fragments(r1, load_vec<unsigned>(&hi), b_hi);
 #pragma unroll
                 for (int r = 0; r < 4; ++r) {
                     causal_prompt_i8_fast_mma_f16_acc(h[r][0], h[r][1], pa[j][0], pa[j][1],
@@ -572,7 +584,8 @@ __global__ __launch_bounds__(
             return;
         }
         const std::int8_t* v_s =
-            reinterpret_cast<const std::int8_t*>(stage_base(kb & 1)) + kCausalPromptI8FastTileBytes;
+            reinterpret_cast<const std::int8_t*>(stage_base(kb % Shape::Stages)) +
+            kCausalPromptI8FastTileBytes;
         const __half* vs_s =
             reinterpret_cast<const __half*>(v_s + kCausalPromptI8FastTileBytes) + Bc * Groups;
         const __half2 mul   = __float2half2_rn(ldexpf(1.0f, -tile_shift));
@@ -618,10 +631,9 @@ __global__ __launch_bounds__(
 #pragma unroll
                         for (int b = 0; b < 2; ++b) {
                             unsigned even_lo, odd_lo, even_hi, odd_hi;
-                            causal_prompt_i8_fast_decode_v_pair(r[2 * b], vsc[j][0], even_lo,
-                                                                odd_lo);
-                            causal_prompt_i8_fast_decode_v_pair(r[2 * b + 1], vsc[j][1], even_hi,
-                                                                odd_hi);
+                            causal_i8_value_pair_fragments(r[2 * b], vsc[j][0], even_lo, odd_lo);
+                            causal_i8_value_pair_fragments(r[2 * b + 1], vsc[j][1], even_hi,
+                                                           odd_hi);
                             unsigned (&he)[2] = h[2 * q2 + b][0];
                             unsigned (&ho)[2] = h[2 * q2 + b][1];
                             causal_prompt_i8_fast_mma_f16_acc(he[0], he[1], pa[j][0], pa[j][1],
@@ -654,24 +666,74 @@ __global__ __launch_bounds__(
         }
     };
 
-    // Every warp publishes one tile per barrier; the next tile's copy overlaps this tile's math.
-    issue_tile(0);
-    commit_keys(0);
+    if constexpr (Shape::Stages == 1) {
+        // One stage: a tile is staged once every warp is done with the previous one, then
+        // published.
 #pragma unroll 1
-    for (int kb = 0; kb < key_blocks; ++kb) {
-        cp_wait<0>();
-        __syncthreads();
-        if (kb + 1 < key_blocks) { issue_tile(kb + 1); }
-        qk_softmax(kb);
-        pv(kb);
-        if (kb + 1 < key_blocks) { commit_keys(kb + 1); }
+        for (int kb = kb_begin; kb < kb_end; ++kb) {
+            if (kb > kb_begin) { __syncthreads(); }
+            issue_tile(kb);
+            commit_keys(kb);
+            cp_wait<0>();
+            __syncthreads();
+            qk_softmax(kb);
+            pv(kb);
+        }
+    } else {
+        // Every warp publishes one tile per barrier; the next tile's copy overlaps this tile's
+        // math.
+        if (kb_begin < kb_end) {
+            issue_tile(kb_begin);
+            commit_keys(kb_begin);
+        }
+#pragma unroll 1
+        for (int kb = kb_begin; kb < kb_end; ++kb) {
+            cp_wait<0>();
+            __syncthreads();
+            if (kb + 1 < kb_end) { issue_tile(kb + 1); }
+            qk_softmax(kb);
+            pv(kb);
+            if (kb + 1 < kb_end) { commit_keys(kb + 1); }
+        }
     }
 
     running_l0         = warp_sum<4>(running_l0, FullMask);
     running_l1         = warp_sum<4>(running_l1, FullMask);
     const float inv_l0 = running_l0 > 0.0f ? __frcp_rn(running_l0) : 0.0f;
     const float inv_l1 = running_l1 > 0.0f ? __frcp_rn(running_l1) : 0.0f;
-    if constexpr (PackedValues) {
+    if constexpr (Split) {
+        // Each split publishes its rows normalized by its own sum, beside (max, sum).
+        const auto publish = [&](int row, float maximum, float sum, float inverse, int e0) {
+            if (row >= rows) { return; }
+            const std::int64_t index =
+                causal_prompt_i8_fast_partial_row<Geometry>(split, q0 + row, q_head, width);
+            if (lid == 0) { partial_stats[index] = make_float2(maximum, sum); }
+            float* target = partial_rows + index * D;
+            if constexpr (PackedValues) {
+#    pragma unroll
+                for (int grp = 0; grp < AccOuter; ++grp) {
+                    const int d0 = grp * 32 + 8 * lid;
+                    store_vec(target + d0,
+                              make_float4(acc[grp][0][e0] * inverse, acc[grp][1][e0] * inverse,
+                                          acc[grp][2][e0] * inverse, acc[grp][3][e0] * inverse));
+                    store_vec(target + d0 + 4, make_float4(acc[grp][0][e0 + 1] * inverse,
+                                                           acc[grp][1][e0 + 1] * inverse,
+                                                           acc[grp][2][e0 + 1] * inverse,
+                                                           acc[grp][3][e0 + 1] * inverse));
+                }
+            } else {
+#    pragma unroll
+                for (int b = 0; b < DBlocks; ++b) {
+                    store_vec(target + b * 16 + 4 * lid,
+                              make_float4(acc[b][0][e0] * inverse, acc[b][1][e0] * inverse,
+                                          acc[b][0][e0 + 1] * inverse,
+                                          acc[b][1][e0 + 1] * inverse));
+                }
+            }
+        };
+        publish(row0, running_m0, running_l0, inv_l0, 0);
+        publish(row1, running_m1, running_l1, inv_l1, 2);
+    } else if constexpr (PackedValues) {
         // Tile r of group g holds dimensions 32g + 4n + r, so lane (g, t) owns the eight
         // contiguous dimensions 32g + 8t .. 32g + 8t + 7 of its two rows: columns 2t (first four)
         // and 2t + 1 (last four) of the four tiles.
@@ -699,6 +761,46 @@ __global__ __launch_bounds__(
                       acc[b][0][3] * inv_l1, acc[b][1][3] * inv_l1);
         }
     }
+#endif
+}
+
+// Combines the key splits of one column and query head: every split row is normalized by its own
+// sum, so the merged row is sum_s w_s * row_s / sum_s w_s with w_s = sum_s * 2^((m_s - M) * c).
+// Columns past the valid count publish zeros.
+template <typename Geometry>
+__global__
+__launch_bounds__(kCausalPromptHeadDim) void causal_attention_prompt_i8_fast_merge_kernel(
+    const float* __restrict__ partial_rows, const float2* __restrict__ partial_stats,
+    const std::int32_t* __restrict__ valid_columns, std::int32_t width, std::int32_t splits,
+    float scale_l2, __nv_bfloat16* __restrict__ out) {
+    const int column = static_cast<int>(blockIdx.x);
+    const int q_head = static_cast<int>(blockIdx.y);
+    const int d      = static_cast<int>(threadIdx.x);
+    const int tokens = valid_columns == nullptr ? width : max(0, min(width, valid_columns[0]));
+    const auto index = causal_prompt_q_index<Geometry>(q_head, d, column);
+    if (column >= tokens) {
+        out[index] = __float2bfloat16(0.0f);
+        return;
+    }
+    float maximum = -CUDART_INF_F;
+    for (int split = 0; split < splits; ++split) {
+        const float2 stats = partial_stats[causal_prompt_i8_fast_partial_row<Geometry>(
+            split, column, q_head, width)];
+        if (stats.y > 0.0f) { maximum = fmaxf(maximum, stats.x); }
+    }
+    float numerator   = 0.0f;
+    float denominator = 0.0f;
+    for (int split = 0; split < splits; ++split) {
+        const std::int64_t row =
+            causal_prompt_i8_fast_partial_row<Geometry>(split, column, q_head, width);
+        const float2 stats = partial_stats[row];
+        if (stats.y > 0.0f) {
+            const float weight = stats.y * exp2f((stats.x - maximum) * scale_l2);
+            numerator = __fmaf_rn(weight, partial_rows[row * kCausalPromptHeadDim + d], numerator);
+            denominator += weight;
+        }
+    }
+    out[index] = __float2bfloat16(denominator > 0.0f ? numerator / denominator : 0.0f);
 }
 
 } // namespace ninfer::ops

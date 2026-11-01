@@ -25,6 +25,8 @@ from .sources.gguf import GGUFFile
 from .sources.logical import EncodedRows, LogicalSource, array_source
 
 T2 = "t2_g128_fp16"
+PTQ1 = "ptq1_g128_fp16"
+T5 = "t5_g128_fp16"
 
 # The DFlash2 adapter projections a ternary artifact encodes as Q4. The fused query/key/value
 # projection, which the context key/value Uses share, stays Q8 for its Q8-only three-output op.
@@ -251,7 +253,7 @@ def _flat(read_rows, k: int):
 
 
 def ternary_source(
-    gguf: GGUFFile, tensor: str, shape: tuple[int, int], select: RowMap
+    gguf: GGUFFile, tensor: str, shape: tuple[int, int], select: RowMap, format: str = T2
 ) -> LogicalSource:
     """Rotated ternary rows as encoded T2 words, and their exact values for any other method."""
 
@@ -260,16 +262,29 @@ def ternary_source(
     def encoded(begin: int, end: int) -> EncodedRows:
         index = select(begin, end)
         low, high = int(index.min()), int(index.max()) + 1
+        if format == PTQ1 and gguf.info(tensor).type_name == "PTQ1_0":
+            row_bytes = k // 128 * 28
+            raw = gguf.tensor_bytes(tensor, low * row_bytes, high * row_bytes)
+            selected = np.asarray(raw).reshape(high - low, k // 128, 28)[index - low]
+            codes = np.ascontiguousarray(selected[:, :, :26]).reshape(end - begin, -1)
+            scales = np.ascontiguousarray(selected[:, :, 26:]).view("<f2").reshape(end - begin, k // 128)
+            return EncodedRows(PTQ1, torch.from_numpy(codes), torch.from_numpy(scales), packed=True)
         blocks = gguf.read_ternary(tensor, low, high)
         return EncodedRows(
-            T2,
+            format,
             torch.from_numpy(np.ascontiguousarray(blocks.values[index - low])),
             torch.from_numpy(np.ascontiguousarray(blocks.scales[index - low])),
         )
 
     def values(first: int, last: int) -> torch.Tensor:
         words = encoded(first, last)
-        return words.codes.float() * words.scales.float().unsqueeze(-1)
+        if words.packed:
+            from ..artifact.codecs.ptq1 import unpack
+            records = words.codes.reshape(-1, 26)
+            codes = unpack(records[:, :24], records[:, 24:]).reshape(last-first, k // 128, 128)
+        else:
+            codes = words.codes
+        return codes.float() * words.scales.float().unsqueeze(-1)
 
     return LogicalSource(shape, f"{tensor}{list(shape)}", _flat(values, k), encoded)
 
@@ -284,16 +299,18 @@ def _norm(gguf: GGUFFile, tensor: str, offset: bool) -> LogicalSource:
 
 
 def text_sources(
-    gguf: GGUFFile,
+    gguf: GGUFFile, format: str = T2,
 ) -> tuple[dict[str, LogicalSource], dict[str, LogicalSource]]:
     """Encoded T2 sources and direct sources of every GGUF-backed text parameter."""
 
+    from functools import partial
+    source = partial(ternary_source, format=format)
     encoded = {
-        "text/output_head": ternary_source(
+        "text/output_head": source(
             gguf, "output.weight", (VOCABULARY, HIDDEN), rows()
         ),
         # Stored inverse-rotated: the runtime restores each gathered row as s * FWHT(z).
-        "text/token_embedding": ternary_source(
+        "text/token_embedding": source(
             gguf, "token_embd.weight", (VOCABULARY, HIDDEN), rows()
         ),
     }
@@ -304,13 +321,13 @@ def text_sources(
         direct[p + "post_attention_norm"] = _norm(
             gguf, g + "post_attention_norm.weight", True
         )
-        encoded[p + "mlp/gate"] = ternary_source(
+        encoded[p + "mlp/gate"] = source(
             gguf, g + "ffn_gate.weight", (INTERMEDIATE, HIDDEN), rows()
         )
-        encoded[p + "mlp/up"] = ternary_source(
+        encoded[p + "mlp/up"] = source(
             gguf, g + "ffn_up.weight", (INTERMEDIATE, HIDDEN), rows()
         )
-        encoded[p + "mlp/down"] = ternary_source(
+        encoded[p + "mlp/down"] = source(
             gguf, g + "ffn_down.weight", (HIDDEN, INTERMEDIATE), rows()
         )
         if full_attention(layer):
@@ -319,19 +336,19 @@ def text_sources(
                 (ATTENTION_QUERY_ROWS, HIDDEN),
                 (ATTENTION_KV_ROWS, HIDDEN),
             )
-            encoded[a + "query"] = ternary_source(
+            encoded[a + "query"] = source(
                 gguf, g + "attn_q.weight", q_shape, attention_rows(False)
             )
-            encoded[a + "gate"] = ternary_source(
+            encoded[a + "gate"] = source(
                 gguf, g + "attn_q.weight", q_shape, attention_rows(True)
             )
-            encoded[a + "key"] = ternary_source(
+            encoded[a + "key"] = source(
                 gguf, g + "attn_k.weight", kv_shape, rows()
             )
-            encoded[a + "value"] = ternary_source(
+            encoded[a + "value"] = source(
                 gguf, g + "attn_v.weight", kv_shape, rows()
             )
-            encoded[a + "output"] = ternary_source(
+            encoded[a + "output"] = source(
                 gguf, g + "attn_output.weight", (HIDDEN, ATTENTION_QUERY_ROWS), rows()
             )
             direct[a + "query_norm"] = _norm(gguf, g + "attn_q_norm.weight", True)
@@ -339,18 +356,18 @@ def text_sources(
             continue
         d = p + "gdn/"
         qkv = g + "attn_qkv.weight"
-        encoded[d + "query"] = ternary_source(gguf, qkv, (GDN_KEY_DIM, HIDDEN), rows())
-        encoded[d + "key"] = ternary_source(
+        encoded[d + "query"] = source(gguf, qkv, (GDN_KEY_DIM, HIDDEN), rows())
+        encoded[d + "key"] = source(
             gguf, qkv, (GDN_KEY_DIM, HIDDEN), rows(GDN_KEY_DIM)
         )
-        encoded[d + "value"] = ternary_source(
+        encoded[d + "value"] = source(
             gguf, qkv, (GDN_VALUE_DIM, HIDDEN), untiled_rows(2 * GDN_KEY_DIM)
         )
-        encoded[d + "z"] = ternary_source(
+        encoded[d + "z"] = source(
             gguf, g + "attn_gate.weight", (GDN_VALUE_DIM, HIDDEN), untiled_rows(0)
         )
         # ssm_out keeps its grouped column order in the GGUF (prism.hadamard.gdn_v_grouped).
-        encoded[d + "output"] = ternary_source(
+        encoded[d + "output"] = source(
             gguf, g + "ssm_out.weight", (HIDDEN, GDN_VALUE_DIM), rows()
         )
         for role, tensor in (
@@ -386,7 +403,7 @@ def text_sources(
     return encoded, direct
 
 
-def bonsai2_27b_ternary(model, recipe, sources):
+def bonsai2_27b_ternary(model, recipe, sources, *, format=T2):
     """Ternary Bonsai 2 27B from `--source ternary=Ternary-Bonsai-2-27B-PQ2_0.gguf`."""
 
     config = model.config
@@ -408,9 +425,10 @@ def bonsai2_27b_ternary(model, recipe, sources):
     for name in model.parameters:
         if name.startswith("dflash2/") and name.endswith(DFLASH2_Q4_PROJECTIONS):
             recipe.assign(name, format=Q4, method=grouped_absmax)
-    encoded, direct = text_sources(gguf)
+    encoded, direct = text_sources(gguf, format=format)
     for name, source in encoded.items():
-        recipe.assign(name, format=T2, method=import_encoded, source=source)
+        recipe.assign(name, format=format, method=import_encoded, source=source,
+                      activation_policy="AllowA8" if format == T5 else "A16Only")
     for name, source in direct.items():
         recipe.assign(
             name,
@@ -451,7 +469,8 @@ def bonsai2_27b_ternary_gguf_mtp(model, recipe, sources):
     if "mtp" not in model.components:
         raise ValueError("the GGUF MTP recipe requires --components text,mtp")
     bonsai2_27b_ternary(model, recipe, sources)
-    encoded, direct = mtp_sources(sources["gguf"])
+    from .dense_geometry import DenseGeometry
+    encoded, direct = mtp_sources(sources["gguf"], DenseGeometry.from_config(model.config))
     formats = {}
     for name, source in encoded.items():
         formats[name] = source.read_encoded(0, 1).format
@@ -466,7 +485,19 @@ def bonsai2_27b_ternary_gguf_mtp(model, recipe, sources):
     _group_same_format(recipe, [p + "mlp/gate", p + "mlp/up"], formats)
 
 
-RECIPES = {"bonsai2_27b_ternary": bonsai2_27b_ternary,
+def bonsai2_27b_ptq1(model, recipe, sources):
+    """Native PTQ1 text weights; retain the companion's optional Vision/MTP components."""
+    bonsai2_27b_ternary(model, recipe, sources, format=PTQ1)
+
+
+def bonsai2_27b_t5(model, recipe, sources):
+    """Exact Bonsai ternary weights in the JGamboa T5 layout with A8 execution."""
+    bonsai2_27b_ternary(model, recipe, sources, format=T5)
+
+
+RECIPES = {"bonsai2_27b_t5": bonsai2_27b_t5,
+           "bonsai2_27b_ptq1": bonsai2_27b_ptq1,
+           "bonsai2_27b_ternary": bonsai2_27b_ternary,
            "bonsai2_27b_ternary_gguf_mtp": bonsai2_27b_ternary_gguf_mtp}
 
 __all__ = [

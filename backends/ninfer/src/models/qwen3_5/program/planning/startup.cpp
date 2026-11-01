@@ -3,29 +3,35 @@
 #include "models/qwen3_5/execution/rotation.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/gdn.h"
+#include "models/qwen3_5/execution/linear.h"
 #include "models/qwen3_5/execution/mtp.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/prefix/hybrid_host_layout.h"
 #include "models/qwen3_5/execution/vision.h"
+#include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
 #include "core/host_kv_arena.h"
+#include "ops/common/device_tier.h"
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/context_kv_materialize.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "ninfer/ops/logprob_topk.h"
+#include "ninfer/ops/readout_logprobs.h"
 #include "ninfer/ops/linear_topk.h"
 #include "ninfer/ops/gdn_gating_proj.h"
 #include "ninfer/ops/gdn_input_proj.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/sliding_window_attention.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/speculative_round.h"
+#include "runtime/contract/rope_scaling.h"
 #include <algorithm>
 #include <cstdlib>
 #include <initializer_list>
@@ -158,6 +164,21 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     std::vector<qwen3_5::StateImageShard> state_shards;
     if (ranks == 1) {
         state_shards.push_back({.rank = 0, .first_layer = 0, .layers = config.linear_attention_layers});
+    } else if (parameters.text.tensor_parallel()) {
+        // Attention and its KV stay on rank 0; every rank holds its heads' share of every GDN
+        // layer's state.
+        for (std::size_t layer = 0; layer < parameters.text.layers.size(); ++layer) {
+            if (config.layer_types[layer] == MixerKind::FullAttention) {
+                attention_layer_rank.push_back(0);
+            }
+        }
+        for (std::size_t rank = 0; rank < ranks; ++rank) {
+            state_shards.push_back({.rank        = rank,
+                                    .first_layer = 0,
+                                    .layers      = config.linear_attention_layers,
+                                    .part        = static_cast<std::uint32_t>(rank),
+                                    .parts       = static_cast<std::uint32_t>(ranks)});
+        }
     } else {
         std::uint32_t gdn_index = 0;
         for (std::size_t layer = 0; layer < parameters.text.layers.size(); ++layer) {
@@ -219,23 +240,31 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                 .capacity = draft->sliding_window.value_or(0),
                 .kv_heads = dimension(draft->attention.num_key_value_heads),
                 .head_dim = dimension(draft->attention.head_dim),
+                // Quantized draft rings need the matching per-head layout; the default stays
+                // BF16 and --draft-kv-dtype int8 selects the synchronized path.
+                .storage  = plan.kvmem.draft_kv_storage,
             };
         }
     }
     out.state_images =
         qwen3_5::plan_state_image_device_pool(builder_pointers, state_shards, state_image_spec);
     if (plan.speculative_backend != SpeculativeBackend::None) {
-        // A stage records only the GDN layers it holds, in its own device's memory.
+        // A stage records only the GDN layers it holds, in its own device's memory; a
+        // tensor-parallel rank only its heads.
         for (std::size_t shard = 0; shard < state_shards.size(); ++shard) {
+            const auto parts              = static_cast<std::int32_t>(state_shards[shard].parts);
             GdnReplayRecordLayout records = plan_gdn_replay_records(
                 *builder_pointers[state_shards[shard].rank],
                 GdnReplayRecordSpec{
                     .layers          = static_cast<std::int32_t>(state_shards[shard].layers),
                     .record_capacity = static_cast<std::int32_t>(plan.max_concurrency),
                     .width           = static_cast<std::int32_t>(widest_verify_window(plan) + 1U),
-                    .conv_channels   = (config.gdn ? dimension(config.gdn->conv_channels()) : 0),
-                    .qk_heads    = (config.gdn ? dimension(config.gdn->linear_num_key_heads) : 0),
-                    .value_heads = (config.gdn ? dimension(config.gdn->linear_num_value_heads) : 0),
+                    .conv_channels =
+                        (config.gdn ? dimension(config.gdn->conv_channels()) / parts : 0),
+                    .qk_heads =
+                        (config.gdn ? dimension(config.gdn->linear_num_key_heads) / parts : 0),
+                    .value_heads =
+                        (config.gdn ? dimension(config.gdn->linear_num_value_heads) / parts : 0),
                     .key_dim     = (config.gdn ? dimension(config.gdn->linear_key_head_dim) : 0),
                     .value_dim   = (config.gdn ? dimension(config.gdn->linear_value_head_dim) : 0),
                 });
@@ -337,39 +366,36 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                  dimension((widest_verify_window(plan) + 1) * plan.max_concurrency), layers},
                  "memory candidate keys");
             stats.candidate_origin = add_tensor(local, DType::I32, {1}, "memory candidate origin");
-            stats.query_sums = add_tensor(local, DType::FP32,
-                {dimension(config.attention->query_width()), dimension(effective_prefill_chunk), layers},
-                "memory query rows");
-            const auto capture_columns = std::max<std::size_t>(effective_prefill_chunk,
-                (widest_verify_window(plan) + 1U) * plan.max_concurrency);
-            stats.attention_queries = add_tensor(local, DType::BF16,
-                {dimension(config.attention->query_width()), dimension(capture_columns), 3},
-                "memory attention Q capture");
-            const auto sample_pages = dimension((plan.kvmem_window_tokens + 63) / 64);
-            stats.attention_rows = add_tensor(local, DType::I32, {64}, "memory attention sample rows");
-            stats.attention_positions = add_tensor(local, DType::I32, {64}, "memory attention causal ends");
-            stats.attention_scratch = add_tensor(local, DType::FP32,
-                {sample_pages, dimension(config.attention->num_attention_heads), 64},
-                "memory attention page LSE");
-            stats.attention_norms = add_tensor(local, DType::FP32,
-                {2, dimension(config.attention->num_attention_heads), 64},
-                "memory attention row norms");
-            stats.attention_output = add_tensor(local, DType::FP32,
-                {sample_pages, 64}, "memory attention page mass");
+            const auto query_columns = plan.kvmem.query_meanq_cosine ? 1U :
+                std::min<std::uint32_t>(effective_prefill_chunk, plan.kvmem.query_max_tokens);
+            stats.query_values = add_tensor(local, plan.kvmem.query_meanq_cosine ? DType::FP32 : DType::BF16,
+                {dimension(config.attention->query_width()), dimension(query_columns), layers},
+                plan.kvmem.query_meanq_cosine ? "memory query sums" : "memory query rows");
+            const auto capture_columns=std::max<std::size_t>(effective_prefill_chunk,
+                (widest_verify_window(plan)+1U)*plan.max_concurrency);
+            stats.attention_queries=add_tensor(local,DType::BF16,
+                {dimension(config.attention->query_width()),dimension(capture_columns),3},"memory attention Q capture");
+            const auto sample_pages=dimension((plan.kvmem_window_tokens+63)/64);
+            stats.attention_rows=add_tensor(local,DType::I32,{64},"memory attention sample rows");
+            stats.attention_positions=add_tensor(local,DType::I32,{64},"memory attention causal ends");
+            stats.attention_scratch=add_tensor(local,DType::FP32,
+                {sample_pages,dimension(config.attention->num_attention_heads),64},"memory attention page LSE");
+            stats.attention_norms=add_tensor(local,DType::FP32,
+                {2,dimension(config.attention->num_attention_heads),64},"memory attention row norms");
+            stats.attention_output=add_tensor(local,DType::FP32,{sample_pages,64},"memory attention page mass");
             stats.ranges = add_tensor(local, DType::I32, {4}, "memory statistics ranges");
         }
         // Prefill sets the origin on rank 0; the stage control block carries it onward.
         out.memory_statistics.front().prefill_origin =
             add_tensor(builder, DType::I32, {1}, "memory logical prefill origin");
-        out.memory_statistics.front().attention_tokens = add_tensor(builder, DType::I32,
-            {dimension(std::max<std::size_t>(effective_prefill_chunk,
-                (widest_verify_window(plan) + 1U) * plan.max_concurrency))},
+        out.memory_statistics.front().attention_tokens=add_tensor(builder,DType::I32,
+            {dimension(std::max<std::size_t>(effective_prefill_chunk,(widest_verify_window(plan)+1U)*plan.max_concurrency))},
             "memory consumed token capture");
-        const auto query_bytes = kvmem::PageSoftmaxCuda::workspace_bytes(
-            (plan.capacity + 63U) / 64U, config.attention->num_attention_heads,
-            config.attention->num_key_value_heads, config.attention->head_dim);
-        out.memory_query_workspace =
-            add_tensor(builder, DType::U8, {dimension(query_bytes)}, "memory page-softmax workspace");
+        if (!plan.kvmem.query_meanq_cosine) {
+            const auto query_bytes=kvmem::PageSoftmaxCuda::workspace_bytes((plan.capacity+63U)/64U,
+                config.attention->num_attention_heads,config.attention->num_key_value_heads,config.attention->head_dim);
+            out.memory_query_workspace=add_tensor(builder,DType::U8,{dimension(query_bytes)},"memory page-softmax workspace");
+        }
     }
     if (plan.causal_scoring) {
         out.score_hidden =
@@ -383,7 +409,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                                              {dimension(parameters.model.resources().public_token_count),
                                               static_cast<std::int32_t>(plan.max_concurrency)},
                                              "sampling token counts");
-        { // Every generation lane can receive a default constrained tool request.
+        { // Every generation lane can receive an explicitly constrained tool request.
             out.grammar_masks =
                 add_tensor(builder, DType::I32,
                            {static_cast<std::int32_t>(
@@ -448,24 +474,19 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
     }
     const std::int32_t narrowest_drafts =
         *std::min_element(round_widths.begin(), round_widths.end()) - 1;
-    const std::uint32_t invariant_segment_keys =
-        plan.invariant_attention ? ops::causal_attention_invariant_segment_keys(plan.capacity) : 0U;
-    const ops::CausalAttentionExecutionEnvelope text_envelope{
-        1, plan.capacity, false, false, false, invariant_segment_keys};
+    const ops::CausalAttentionExecutionEnvelope text_envelope{1, plan.capacity};
     // Prefill chunks of 17 to 64 rows may take the chunked small-T route over a long context, and
     // wider ones run the selected prompt kernel, whose fast NVFP4 form may split keys into
     // workspace (see execution/text.cpp).
     const ops::CausalAttentionExecutionEnvelope prefill_envelope{
-        .min_visible_keys        = 1,
-        .max_visible_keys        = plan.capacity,
-        .fast_prompt_kernel      = plan.fast_prefill_kernel,
-        .small_prefill           = true,
-        .invariant_segment_keys  = invariant_segment_keys};
-    const ops::CausalAttentionExecutionEnvelope verify_envelope{
-        .min_visible_keys        = 1,
-        .max_visible_keys        = plan.capacity,
-        .wide_verification       = plan.ngram_draft_window > 15,
-        .invariant_segment_keys  = invariant_segment_keys};
+        .min_visible_keys   = 1,
+        .max_visible_keys   = plan.capacity,
+        .fast_prompt_kernel = plan.fast_prefill_kernel,
+        .small_prefill      = true};
+    const ops::CausalAttentionExecutionEnvelope verify_envelope{.min_visible_keys = 1,
+                                                                .max_visible_keys = plan.capacity,
+                                                                .wide_verification =
+                                                                    plan.ngram_draft_window > 15};
 
     const auto matrix  = [](WorkspaceLayoutBuilder& layout, DType dtype, std::int32_t rows,
                            std::int32_t tokens) { (void)layout.alloc(dtype, {rows, tokens}); };
@@ -491,20 +512,22 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
     const auto add_scratch = [&](WorkspaceLayoutBuilder& layout,
                                  const execution::LinearParameters& p, int first, int last,
                                  bool wide_verification = false) {
-        scratch(layout,
-                execution::rotated_workspace_bytes(
-                    p.hadamard_signs, p.weight.k, last,
-                    ops::linear_add_workspace_capacity_bytes(
-                        p.weight.qtype, p.weight.n, p.weight.k,
-                        execution::residual_projection_policy(p, wide_verification), first, last)));
+        // A round's narrower families may resolve the ordinary policy at the same columns.
+        const auto bytes = [&](bool wide) {
+            return execution::rotated_workspace_bytes(
+                p.hadamard_signs, p.weight.k, last,
+                ops::linear_add_workspace_capacity_bytes(
+                    p.weight.qtype, p.weight.n, p.weight.k,
+                    execution::residual_projection_policy(p, wide), first, last));
+        };
+        scratch(layout, wide_verification ? std::max(bytes(true), bytes(false)) : bytes(false));
     };
     const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                  std::int32_t last, TextPhase phase, GdnWorkspacePath path,
                                  std::int32_t batch_size, std::int32_t min_width,
                                  std::int32_t max_width,
                                  ops::CausalAttentionExecutionEnvelope envelope) {
-        const bool wide_verification =
-            wide_residual_verification(phase, batch_size, min_width, max_width);
+        const bool wide_verification = wide_residual_verification(phase, min_width, max_width);
         for (const auto& block : parameters.text.layers) {
             {
                 auto stage = layout.scope();
@@ -554,12 +577,18 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
             }
             auto stage = layout.scope();
             (void)workspace::post_mixer_hidden(layout, config, last);
-            scratch(layout,
-                    execution::ffn_workspace_bytes(block.ffn, first, last, false,
-                                                   phase == TextPhase::Verify, wide_verification));
+            const bool verify = phase == TextPhase::Verify;
+            scratch(layout, std::max(execution::ffn_workspace_bytes(block.ffn, first, last, false,
+                                                                    verify, wide_verification),
+                                     execution::ffn_workspace_bytes(block.ffn, first, last, false,
+                                                                    verify, false)));
         }
+        // A prompt chunk projects only its last column through the head; a verify round projects
+        // every column.
         if (!plan.causal_scoring) {
-            linear_scratch(layout, parameters.text.output_head, first, last);
+            const std::int32_t head_last = phase == TextPhase::Prefill ? 1 : last;
+            linear_scratch(layout, parameters.text.output_head, std::min(first, head_last),
+                           head_last);
         }
     };
     const auto mtp_post_mixer = [&](WorkspaceLayoutBuilder& layout, int first, int last) {
@@ -568,9 +597,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
     };
     const auto proposal_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t columns) {
         if (plan.proposal_head == ProposalHead::Optimized) {
-            matrix(layout, DType::BF16, dimension(parameters.proposal->rows), columns);
-            linear_scratch(layout, parameters.proposal->head, columns, columns);
+            const auto& head = parameters.proposal->head;
+            matrix(layout, execution::fp32_proposal_logits(head) ? DType::FP32 : DType::BF16,
+                   dimension(parameters.proposal->rows), columns);
+            linear_scratch(layout, head, columns, columns);
         } else {
+            if (execution::fp32_proposal_logits(parameters.mtp->output_head)) {
+                matrix(layout, DType::FP32, dimension(config.vocab_size), columns);
+            }
             linear_scratch(layout, parameters.mtp->output_head, columns, columns);
         }
     };
@@ -645,14 +679,41 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
     WorkspacePlan out;
     WorkspaceLayoutBuilder text_prefill;
     text_common_root(text_prefill, chunk);
+    if (!plan.causal_scoring && config.gdn) {
+        // A branch block's convolution window and recurrent state, held while its layer runs
+        // (TextContext::prefill_final_batch).
+        matrix(text_prefill, DType::BF16, dimension(config.gdn->conv_channels()),
+               dimension(config.gdn->linear_conv_kernel_dim - 1));
+        (void)text_prefill.alloc(DType::FP32, {dimension(config.gdn->linear_key_head_dim),
+                                               dimension(config.gdn->linear_value_head_dim),
+                                               dimension(config.gdn->linear_num_value_heads)});
+    }
     target_body(text_prefill, 1, chunk, qwen3_5::TextPhase::Prefill, GdnWorkspacePath::Prefill, 1,
                 1, chunk, prefill_envelope);
     if (!plan.causal_scoring) {
-        scratch(text_prefill,
-                ops::sampling_workspace_capacity_bytes(
-                    dimension(parameters.model.resources().public_token_count), 1, 1));
-        scratch(text_prefill, ops::logprob_topk_workspace_capacity_bytes(
-                                  dimension(parameters.model.resources().public_token_count), 1));
+        // A shared pass reads up to kMaximumPrefillSegments rows: their hidden, logits, sampling
+        // records, logprob gather and readout, and samples up to one row per lane.
+        const auto vocabulary = dimension(parameters.model.resources().public_token_count);
+        const auto rows       = static_cast<std::int32_t>(execution::kMaximumPrefillSegments);
+        const auto lanes      = static_cast<std::int32_t>(plan.max_concurrency);
+        auto tail             = text_prefill.scope();
+        (void)text_prefill.alloc(DType::BF16, {dimension(config.hidden_size), rows});
+        (void)text_prefill.alloc(DType::BF16, {dimension(config.vocab_size), rows});
+        (void)text_prefill.alloc_bytes(sizeof(ops::SamplingConfig) *
+                                       execution::kMaximumPrefillSegments);
+        (void)text_prefill.alloc(DType::I32, {ops::kLogprobTopK, 1, rows});
+        (void)text_prefill.alloc(DType::FP32, {ops::kLogprobTopK, 1, rows});
+        (void)text_prefill.alloc(DType::FP32, {1, rows});
+        (void)text_prefill.alloc(DType::I32, {ops::kReadoutLogprobsMaximum, rows});
+        (void)text_prefill.alloc(DType::FP32, {ops::kReadoutLogprobsMaximum, rows});
+        (void)text_prefill.alloc(DType::I32, {rows});
+        (void)text_prefill.alloc(DType::BF16, {dimension(config.vocab_size), lanes});
+        (void)text_prefill.alloc_bytes(sizeof(ops::SamplingConfig) *
+                                       static_cast<std::size_t>(lanes));
+        (void)text_prefill.alloc(DType::I32, {lanes});
+        (void)text_prefill.alloc(DType::I32, {lanes});
+        scratch(text_prefill, ops::sampling_workspace_capacity_bytes(vocabulary, 1, lanes));
+        scratch(text_prefill, ops::logprob_topk_workspace_capacity_bytes(vocabulary, rows));
     }
     out.text_prefill = finish(text_prefill);
 
@@ -824,10 +885,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
                                              dimension(draft->attention.num_key_value_heads)},
                                             dimension(draft->sliding_window.value_or(0)),
                                             {0, plan.capacity}, width, width, batch));
-                        scratch(layout,
-                                ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-                                    dimension(draft->attention.query_width()), width, width, batch,
-                                    batch));
+                        for (const auto& block : parameters.draft->layers) {
+                            const auto& w = block.output.weight;
+                            scratch(layout,
+                                    ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+                                        w.qtype, w.k, width, width, batch, batch));
+                        }
                     }
                     {
                         auto mlp = layout.scope();
@@ -841,10 +904,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
                                                     p.weight.qtype, p.weight.n, p.weight.k,
                                                     p.policy, tokens, tokens)));
                         }
-                        scratch(
-                            layout,
-                            ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-                                dimension(draft->intermediate_size), width, width, batch, batch));
+                        for (const auto& block : parameters.draft->layers) {
+                            const auto& w = block.mlp.down.weight;
+                            scratch(layout,
+                                    ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+                                        w.qtype, w.k, width, width, batch, batch));
+                        }
                     }
                     const auto mask_columns = proposal_drafts * batch;
                     matrix(layout, DType::BF16, dimension(config.hidden_size), mask_columns);
@@ -960,7 +1025,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
         const std::uint64_t columns = stage_boundary_columns(plan);
         const std::size_t residual =
             static_cast<std::size_t>(columns) * static_cast<std::size_t>(config.hidden_size) * 2U;
-        const std::size_t control = (6U * static_cast<std::size_t>(columns) + 16U) * 4U;
+        const auto control = static_cast<std::size_t>(stage_control_bytes(columns));
         out.general_capacity =
             checked_add(out.general_capacity, checked_add(residual, control, "stage boundary") + 1024U,
                         "stage boundary workspace");
@@ -1038,23 +1103,20 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
+    // Decode and verify rounds run the target's projections with the prefill's Linear policies, one
+    // call over every lane's verify columns. The cuBLAS prefill route has to stay out of them -- it
+    // would put a weight-sized scratch into every round workspace and change decode numerics -- so
+    // the widest round sits at or below the floor no device profile moves its width gate past.
+    static_assert(kMaximumConcurrency * kMtpDecodeMaximumWidth <=
+                      static_cast<std::uint32_t>(ops::kCublasPrefillFloorTokens),
+                  "the widest decode/verify round must stay below the cuBLAS prefill width gate");
     if (parameters.text.rank_count != device.size()) {
-        throw std::invalid_argument("the model is split into " +
+        throw std::invalid_argument("the model is split over " +
                                     std::to_string(parameters.text.rank_count) +
-                                    " pipeline stages but " + std::to_string(device.size()) +
+                                    (parameters.text.tensor_parallel() ? " tensor-parallel ranks"
+                                                                       : " pipeline stages") +
+                                    " but " + std::to_string(device.size()) +
                                     " devices are attached");
-    }
-    if (parameters.text.split_execution()) {
-        // DFlash feature capture still assumes primary-device target layers.
-        const auto unsupported = [](const char* feature) {
-            throw std::invalid_argument(
-                std::string(feature) +
-                " is not yet supported with a multi-device --devices split");
-        };
-        if (options.speculative.backend == SpeculativeBackend::DFlash ||
-            options.speculative.backend == SpeculativeBackend::DFlash2) {
-            unsupported("DFlash speculative decoding");
-        }
     }
     const std::uint32_t logical_pages = page_count(options.kvmem.device_tokens()
         ? options.kvmem.device_tokens() : options.max_context);
@@ -1112,16 +1174,35 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         if (options.speculative.draft_tokens == 0 || options.speculative.draft_tokens > 15) {
             throw std::invalid_argument("masked draft window must be in [1,15]");
         }
+        if (parameters.text.tensor_parallel()) {
+            throw std::invalid_argument("--tensor-parallel does not run a masked drafter");
+        }
         break;
     }
     // 12.0 is admitted alongside the qualified capabilities: consumer Blackwell runs the same
     // warp-level mma.sync schedules this family is written against, with the same 100 KiB of shared
     // memory per SM. The occupancy and split-k choices are still the sm_86 ones, so the card is
-    // supported here in the sense of running correctly, not of being tuned for.
-    if (device.compute_capability() != 80 && device.compute_capability() != 86 &&
-        device.compute_capability() != 89 && device.compute_capability() != 120) {
-        throw std::invalid_argument(
-            "Qwen3.5 family runtime requires compute capability 8.0, 8.6, 8.9 or 12.0");
+    // supported here in the sense of running correctly, not of being tuned for. 7.0 (Tesla V100)
+    // runs Volta's code, whose kernels emulate the Ampere warp primitives. 7.5 needs Turing's code
+    // (a build with 75 among its architectures), whose kernels avoid the sm_80 instructions and fit
+    // its 64 KiB of shared memory.
+    // Every rank is checked: pipeline stages may mix capabilities (core/device.cu).
+    for (std::size_t rank = 0; rank < device.size(); ++rank) {
+        const RankContext& context = device.rank(rank);
+        const int capability       = context.compute_capability();
+        if (capability == 70 || capability == 80 || capability == 86 || capability == 89 ||
+            capability == 120 ||
+            (capability == 75 && ops::device_tier(context.device) == ops::DeviceTier::Turing)) {
+            continue;
+        }
+        std::string message =
+            "Qwen3.5 family runtime requires compute capability 7.0, 7.5, 8.0, 8.6, 8.9 or 12.0 "
+            "(7.5 needs a build with 75 among CMAKE_CUDA_ARCHITECTURES)";
+        if (device.model_parallel()) {
+            message += "; CUDA device " + std::to_string(context.device) + " has " +
+                       std::to_string(capability / 10) + "." + std::to_string(capability % 10);
+        }
+        throw std::invalid_argument(message);
     }
     if (options.speculative.ngram_draft_tokens != 0 &&
         ((options.speculative.backend != SpeculativeBackend::DFlash2 &&
@@ -1154,7 +1235,6 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->max_concurrency     = inputs.max_concurrency;
     impl->prefill_chunk       = inputs.prefill_chunk;
     impl->fast_prefill_kernel = inputs.fast_prefill_kernel;
-    impl->invariant_attention = inputs.invariant_attention;
     impl->draft_window        = inputs.draft_window;
     impl->lookup_ngram        = inputs.lookup_ngram;
     impl->mtp_policy          = inputs.mtp_policy;
@@ -1165,6 +1245,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->rope_yarn           = inputs.rope_yarn;
     impl->mtp_attention_window = inputs.mtp_attention_window;
     impl->features            = inputs.features;
+    impl->expert_cache_bytes  = inputs.expert_cache_bytes;
     impl->use_cuda_graph      = inputs.use_cuda_graph;
     impl->causal_scoring      = inputs.causal_scoring;
     impl->structured_output   = inputs.structured_output;
@@ -1275,14 +1356,8 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
             // batch size, on the one frame viewed at that width.
             const auto class_allowance = [&](std::uint32_t batch_size, std::uint32_t window) {
                 const std::uint32_t width = window;
-                // KVMem sizes the device window to B+R, so the profile must be planned for
-                // that window rather than for --max-context; ordinary and MTP do the same.
-                // Without this the masked-draft verify envelope is planned against
-                // max-context and exceeds the KVMem cache whenever B+R < max-context.
-                const auto profiles = dflash_graph_profiles(
-                    impl->speculative_backend,
-                    impl->kvmem_window_tokens ? impl->kvmem_window_tokens : impl->capacity, width,
-                    batch_size);
+                const auto profiles = dflash_graph_profiles(impl->speculative_backend,
+                                                            impl->capacity, width, batch_size);
                 return graph_topology_allowance(
                     profiles,
                     [&](GraphExecutionProfile profile) {
@@ -1316,14 +1391,26 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     // persistent state. Its graph allowance is the primary device's scaled by the share of layers
     // it runs; the primary keeps the whole figure, which only over-reserves it a little.
     const auto& text = impl->parameters->text;
+    // A tensor-parallel exchange holds two FP32 partials of the widest pass on every rank.
+    const std::size_t exchange_bytes =
+        text.tensor_parallel()
+            ? checked_mul(stage_boundary_columns(*impl) * 2U * sizeof(float),
+                          static_cast<std::size_t>(impl->parameters->model.config().text.hidden_size),
+                          "tensor-parallel exchange")
+            : 0U;
+    impl->device_reservation_bytes =
+        checked_add(impl->device_reservation_bytes, exchange_bytes, "tensor-parallel exchange");
     for (std::size_t rank = 1; rank < text.rank_count; ++rank) {
-        const std::uint64_t layers_here = text.stage_end(rank) - text.stage_begin[rank];
+        const std::uint64_t layers_here =
+            text.tensor_parallel() ? text.layers.size()
+                                   : text.stage_end(rank) - text.stage_begin[rank];
         const std::size_t graph_share   = static_cast<std::size_t>(
             (static_cast<std::uint64_t>(impl->graph_allowance_bytes) * layers_here) /
             std::max<std::size_t>(text.layers.size(), 1));
         impl->extra_rank_reservation_bytes.push_back(checked_add(
-            checked_add(impl->persistent.extra_rank_bytes[rank - 1],
-                        impl->workspace.general_capacity, "further device memory plan"),
+            checked_add(checked_add(impl->persistent.extra_rank_bytes[rank - 1],
+                                    impl->workspace.general_capacity, "further device memory plan"),
+                        exchange_bytes, "tensor-parallel exchange"),
             graph_share, "further device graph allowance"));
     }
     return impl;
@@ -1404,18 +1491,14 @@ std::uint32_t vision_item_token_bound(std::uint32_t capacity, const models::Load
         std::min<std::uint64_t>({capacity, kMaximumVisionItemTokens, requested}));
 }
 
+// The rotation past the native window, as every family resolves it (rope_scaling.h); this family
+// takes YaRN and linear position interpolation alike, for its text and MTP layers.
 ops::RopeYarn planned_rope_yarn(const execution::Parameters& parameters,
                                 const EngineOptions& options) {
-    const std::uint32_t native = parameters.model.config().text.max_position_embeddings;
-    if (options.rope_scaling_factor > 1.0F) {
-        return {.interpolation_factor    = options.rope_scaling_factor,
-                .interpolation_threshold = options.rope_scaling_original_context != 0
-                                               ? options.rope_scaling_original_context
-                                               : native};
-    }
-    if (options.rope_yarn_factor > 1.0F) { return {options.rope_yarn_factor, native}; }
-    if (!options.rope_yarn || options.max_context <= native) { return {}; }
-    return {static_cast<float>(options.max_context) / static_cast<float>(native), native};
+    return runtime::resolve_rope_scaling(options,
+                                         parameters.model.config().text.max_position_embeddings,
+                                         runtime::kQwen35RopeScaling)
+        .yarn;
 }
 
 // Every chunk but a prompt's last one has the effective width, so it is chosen near the request
@@ -1449,7 +1532,6 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .max_concurrency            = options.max_concurrency,
         .prefill_chunk              = effective_prefill_chunk(parameters, options),
         .fast_prefill_kernel        = options.fast_prefill_kernel,
-        .invariant_attention        = options.invariant_attention,
         .draft_window               = options.speculative.draft_tokens,
         .lookup_ngram               = options.speculative.lookup_ngram,
         .mtp_policy                 = options.speculative.mtp_policy,
@@ -1461,6 +1543,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .rope_yarn                  = planned_rope_yarn(parameters, options),
         .mtp_attention_window       = options.speculative.mtp_attention_window,
         .features                   = models::load_options(options),
+        .expert_cache_bytes         = options.expert_cache_bytes,
         .use_cuda_graph             = options.use_cuda_graph,
         .cuda_graph_allowance_bytes = options.cuda_graph_allowance_bytes,
         .causal_scoring             = options.purpose == EnginePurpose::CausalScoring,
@@ -1519,21 +1602,15 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
 
 std::unique_ptr<SequencePlanImpl>
 make_graph_probe_plan(const execution::Parameters& parameters, DeviceContext& device,
-                      const EngineOptions& options, std::uint32_t main_page_groups) {
+                      const EngineOptions& options) {
     auto planner = make_sequence_planner_impl(parameters, device, options, 0);
-    auto inputs  = planner->inputs;
-    // A KVMem window is the capacity the masked-draft graph profiles are built from; using it as
-    // the probe's logical capacity keeps every profile while avoiding a full max-context KV pool.
-    const bool windowed = (inputs.speculative_backend == SpeculativeBackend::DFlash ||
-                           inputs.speculative_backend == SpeculativeBackend::DFlash2) &&
-                          inputs.kvmem_window_tokens != 0 &&
-                          inputs.kvmem_window_tokens < inputs.capacity;
-    if (windowed) inputs.capacity = inputs.kvmem_window_tokens;
-    const auto pages = std::max(page_count(inputs.capacity), main_page_groups);
-    if (pages == 0) { throw std::invalid_argument("CUDA graph probe needs a physical KV page"); }
-    // Keep the planner's logical capacity so every graph profile is captured, but allocate only
-    // the pages that capacity needs. The capacity-curve minimum deliberately does not apply: this
-    // plan is never served.
+    auto inputs = planner->inputs;
+    // Match the window used by prepare_graphs(), including the n-gram graph family.
+    // This is a full physical window, not one dummy page: graph preparation runs kernels.
+    if (inputs.kvmem_window_tokens && inputs.kvmem_window_tokens < inputs.capacity) {
+        inputs.capacity = inputs.kvmem_window_tokens;
+    }
+    const auto pages = std::max(page_count(inputs.capacity), inputs.max_concurrency);
     return build_sequence_candidate(inputs, pages);
 }
 

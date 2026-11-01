@@ -19,6 +19,23 @@ namespace ninfer::serve {
     throw ApiException(std::move(error));
 }
 
+void settle_image_details(std::vector<ChatTurn>& turns, const RequestLimits& limits,
+                          const std::string& param, const std::string& field) {
+    for (ChatTurn& turn : turns) {
+        for (ContentPart& part : turn.content) {
+            if (!part.unknown_image_detail) { continue; }
+            // KVMem's documented compatibility value retains its old auto preprocessing.
+            if (*part.unknown_image_detail != "original" && !limits.lenient_image_detail) {
+                bad_request(field + "='" + *part.unknown_image_detail +
+                                "' is not one of 'auto', 'low' or 'high'",
+                            param, "image_detail_not_supported");
+            }
+            part.image_detail = ninfer::ImageDetail::Auto;
+            part.unknown_image_detail.reset();
+        }
+    }
+}
+
 void parse_tool_constraints(const RequestJson& body, GenerationRequest& request) {
     if (!body.contains("tool_constraints") || body.at("tool_constraints").is_null()) return;
     const auto& mode = body.at("tool_constraints");

@@ -1,6 +1,7 @@
 #include "serve/anthropic_messages.h"
 
 #include "serve/generation_service.h"
+#include "serve/structured_output.h"
 #include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
@@ -499,20 +500,27 @@ int test_tools() {
                          "Anthropic tool schema/examples did not reach the Qwen prompt");
 
     body["tools"] = Json::array({ordinary_tool(true)});
-    failures += check(api_code([&] { (void)parse(body); }) == "strict_tools_not_supported",
-                      "active strict tool was accepted without constrained decoding");
+    body["tools"][0]["input_schema"]["additionalProperties"] = false;
+    body["tools"][0]["input_schema"]["required"] = Json::array({"city"});
+    const GenerationRequest strict_request = parse(body).generation;
+    failures += check(strict_request.tools.size() == 1 && strict_request.tools[0].strict &&
+                          Json::parse(prompt(strict_request).options.tool_jsons[0])["function"]["strict"] == true,
+                      "active strict tool schemas retain enforcement intent");
     body["tool_choice"]               = Json{{"type", "none"}, {"disable_parallel_tool_use", true}};
     body["tools"][0]["defer_loading"] = true;
     body["tools"][0]["allowed_callers"] = Json::array({"code_execution"});
     const GenerationRequest disabled    = parse(body).generation;
-    failures += check(!disabled.uses_tools() && prompt(disabled).options.tool_jsons.empty(),
-                      "tool_choice:none did not neutralize inactive tool guarantees");
+    failures += check(!disabled.uses_tools() && disabled.tool_choice.mode == ToolChoiceMode::None &&
+                          prompt(disabled).options.tool_jsons.size() == 1,
+                      "tool_choice:none blocks calls without dropping prompt declarations");
 
     body                = base_request();
     body["tools"]       = Json::array({ordinary_tool()});
     body["tool_choice"] = Json{{"type", "any"}};
-    failures += check(parse(body).generation.tool_choice.forced_name == "weather",
-                      "any over a single callable tool forces that tool");
+    const auto any_single = parse(body).generation;
+    failures += check(any_single.tool_choice.mode == ToolChoiceMode::Required &&
+                          prompt(any_single).options.forced_tool_name.empty(),
+                      "any over a single tool requires a call without a forced prompt opener");
     body["tool_choice"] = Json{{"type", "tool"}, {"name", "weather"}};
     failures += check(parse(body).generation.tool_choice.forced_name == "weather",
                       "named tool choice forces that tool");
@@ -522,20 +530,18 @@ int test_tools() {
     Json two_tools      = ordinary_tool();
     two_tools["name"]   = "search";
     body["tools"]       = Json::array({ordinary_tool(), two_tools});
-    // any over several tools is advisory: Qwen Code sends it for its JSON side queries, and the
-    // tools stay offered under automatic selection.
+    // any requires a call while retaining every declared tool in the reusable prompt.
     body["tool_choice"]              = Json{{"type", "any"}};
-    const GenerationRequest advisory = parse(body).generation;
-    failures += check(advisory.uses_tools() && advisory.tool_choice.mode == ToolChoiceMode::Auto &&
-                          advisory.tool_choice.forced_name.empty() &&
-                          prompt(advisory).options.tool_jsons.size() == 2,
-                      "any over several tools was rejected or did not keep the tools offered");
+    const GenerationRequest any_multiple = parse(body).generation;
+    failures += check(any_multiple.uses_tools() && any_multiple.tool_choice.mode == ToolChoiceMode::Required &&
+                          any_multiple.tool_choice.forced_name.empty() &&
+                          prompt(any_multiple).options.tool_jsons.size() == 2,
+                      "any over several tools requires a call and retains all declarations");
     body          = base_request();
     body["tool_choice"] = Json{{"type", "any"}};
     failures += check(api_param([&] { (void)parse(body); }) == "tool_choice",
                       "tool_choice any without tools was accepted");
-    // disable_parallel_tool_use is honoured as parallel_tool_calls=false: the response keeps the
-    // first call. It is still type-checked.
+    // disable_parallel_tool_use constrains sampling to at most one call and is type-checked.
     body["tools"] = Json::array({ordinary_tool()});
     for (const Json& choice : {Json{{"type", "auto"}, {"disable_parallel_tool_use", true}},
                                Json{{"type", "any"}, {"disable_parallel_tool_use", true}}}) {
@@ -630,6 +636,12 @@ int test_thinking_and_count_tokens() {
     body["thinking"] = Json{{"type", "future"}};
     failures += check(api_param([&] { (void)parse(body); }) == "thinking",
                       "unknown Thinking mode defaulted to enabled");
+    body["thinking"] = Json{{"type", "between_tools"}};
+    failures += check(parse(body).generation.enable_thinking == false,
+                      "between_tools did not turn off up-front Thinking");
+    body["thinking"] = Json{{"type", "between_tools"}, {"display", "summarized"}};
+    failures += check(api_param([&] { (void)parse(body); }) == "thinking",
+                      "display was accepted with between_tools Thinking");
     body["thinking"] = Json{{"type", "adaptive"}, {"display", "omitted"}};
     const AnthropicMessagesRequest hidden = parse(body);
     failures += check(hidden.hide_thinking && hidden.generation.enable_thinking == true &&

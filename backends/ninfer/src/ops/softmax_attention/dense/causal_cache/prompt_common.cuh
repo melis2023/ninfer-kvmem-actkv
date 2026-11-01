@@ -62,6 +62,7 @@ __device__ __forceinline__ void causal_prompt_store_byte_swizzled(Byte* tile, in
 
 template <int Columns>
 __device__ __forceinline__ int causal_prompt_p_swz(int row, int col) {
+    if constexpr (Columns == 16) { return (((col >> 3) ^ (row & 1)) << 3) | (col & 7); }
     if constexpr (Columns == 32) { return (((col >> 3) ^ (row & 3)) << 3) | (col & 7); }
     return causal_prompt_swz(row, col);
 }

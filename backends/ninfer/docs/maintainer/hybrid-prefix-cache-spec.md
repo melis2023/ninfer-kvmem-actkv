@@ -1,18 +1,17 @@
-# Hybrid prefix cache: design and decisions
+# Hybrid prefix cache
 
-The hybrid prefix cache (HPC) is `ninfer-serve`'s default prefix-cache mode
-(`ContextCacheOptions::mode = ContextCacheMode::Hybrid`). It reuses prompt prefixes through
-content-addressed 64-token KV blocks and sparse recurrent-state snapshots, kept on the Device and in
-one pinned Host tier. The original system
-([Resource scheduling and context cache](resource-scheduling-and-context-cache.md)) stays available
-with `--use-original-prefix-caching` (`ContextCacheMode::Legacy`, still the Engine option default)
-and is not modified or removed; the two modes coexist by explicit owner request.
+The hybrid prefix cache (HPC) is the default prefix-cache mode of `ninfer-serve`
+(`ContextCacheOptions::mode = ContextCacheMode::Hybrid`; `--use-alt-prefix-caching` names it). It
+reuses prompt prefixes through content-addressed 64-token KV blocks and sparse recurrent-state
+snapshots, kept on the Device and in one pinned Host tier. The checkpoint catalog
+([Resource scheduling and context cache](resource-scheduling-and-context-cache.md),
+`ContextCacheMode::Legacy`) is the Engine's default and serves what the hybrid cache does not;
+`--use-original-prefix-caching` selects it in the server. The two modes coexist. Ian Ranson designed and built the
+mode in [Wallawalla47/ninfer-custom](https://github.com/Wallawalla47/ninfer-custom).
 
 This document is the authority for the Hybrid mode. §0–§11 describe the design as implemented,
 marking the parts of the original design that were not built; §12–§15 cover optional features,
-tests, configuration and risks; the [decision record](#16-decision-record) (§16) lists the decisions
-taken while building and operating it, with the measurements behind them and the alternatives that
-were tried and reverted.
+tests, configuration and risks.
 
 Scope: an alternative to NInfer's prefix-reuse, checkpoint-retention and cache-pressure
 system for `Qwen3_5ForCausalLM` / `Qwen3_5MoeForCausalLM` on one RTX 5090 (`sm_120a`), with
@@ -29,13 +28,15 @@ author's on an RTX 5090.
 
 Coexistence rules:
 
-- The mode is fixed at Engine construction. Legacy-only options (`--device-state-slots`,
-  `--host-state-slots`, `--host-kv-mib`, `--max-private-continuations`, `--max-shared-prefixes`,
-  `--max-long-anchors-per-continuation`, `--long-anchor-spacing`) require
-  `--use-original-prefix-caching`; Hybrid-only options are rejected with it. `--host-cache-mib`
-  applies to both modes (in Hybrid mode it sizes the Host slab pool); `--no-prefix-reuse`
-  disables the cache and is rejected with `--use-original-prefix-caching` and with every
-  mode-specific option.
+- The mode is fixed at Engine construction. `ninfer-serve` selects Hybrid unless
+  `--use-original-prefix-caching` is given or an option only the catalog serves selects the
+  catalog: its capacities (`--device-state-slots`, `--host-state-slots`, `--host-kv-mib`,
+  `--max-private-continuations`, `--max-shared-prefixes`, `--max-long-anchors-per-continuation`),
+  anchors and policies, the disk tier, slot files, pipeline `--devices`, `--no-prefix-reuse` or a
+  `--graft`. With `--use-alt-prefix-caching` named, those options are rejected instead; Hybrid-only
+  options are rejected with the catalog. `--host-cache-mib` applies to both modes (in Hybrid mode
+  it sizes the Host slab pool). Gemma 4 and Qwen3.8-Flash-Next run context caches of their own,
+  and their Engine reports the Legacy mode.
 - Hybrid mode reuses the active-execution machinery unchanged: `LogicalKVPageStore`,
   `KVAddressSpaceStore`, execution rows, the active `StateStore` images, prefill/decode/speculative
   paths. It replaces only admission-source selection, retention, capture and pressure. Tree nodes
@@ -64,11 +65,11 @@ Hybrid mode configures itself: the only capacity a deployment chooses is `--host
 | §7.7 endpoint snapshots at finish and consistent abort | implemented |
 | §6.2 cost model | implemented: the Engine's context-cost coefficients (prefill and Host-to-Device transfer) rank sources and value snapshots |
 | §5.5 persistence across restarts | implemented (opt-in `--prefix-cache-file`) |
-| §12.2 in-flight prefix coalescing | implemented: requests sharing a new prefix with a lane still prefilling wait for its snapshot at the divergence instead of prefilling the prefix again; in this line a request is admitted while another prefills only with `--concurrent-prefill`, so coalescing needs it |
+| §12.2 in-flight prefix coalescing | implemented: requests sharing a new prefix with a lane still prefilling wait for its snapshot at the divergence instead of prefilling the prefix again; in this line a request is admitted while another prefills with `--concurrent-prefill`, or without it only while every staged prefill is a last chunk that can share a pass, so coalescing needs the option |
 | reuse-loss attribution | implemented: the request log's `materialization` record carries `cached_prefix_tokens` (longest cached block prefix, reusable or not), and `restored_host_bytes` |
 | §7.2–§7.3 zero-split GDN state tap and phase alignment | not implemented: an exact tap costs one prefill split (about 15 ms per turn on 27B); flexible taps avoid it, and requests resuming from an endpoint skip the opener tap (§7.1) |
 | §11.2 KV transfer Op | copy-engine path only (`cudaMemcpy2DAsync` runs over consecutive pages and slabs) |
-| §6.3 persistent backfill proof | not issued: a blocked FIFO head is never overtaken (a proof with a growth reserve was tried and reverted, §16.3) |
+| §6.3 persistent backfill proof | not issued: a blocked FIFO head is never overtaken (a proof with a growth reserve moved latency from short to long requests without a net gain, §6.3) |
 | §12 optional features other than 12.1 and 12.2, §13.2 Op qualification | not implemented |
 | §13.3 real-artifact scenarios | `ninfer_qwen3_5_hybrid_prefix_real_test`: Host vs Device restore exactness (with and without MTP), generation-opener and system-block reuse, Device-only mode, protocol cache hints, Vision, persistence across a restart; `NINFER_HYBRID_KV_DTYPE` runs them for every KV storage (bf16, int8, fp8, nvfp4, k8v4 pass). `ninfer_ngram_concurrent_real` runs on Hybrid with `NINFER_NGRAM_TEST_CONTEXT_CACHE=hybrid` |
 
@@ -97,7 +98,8 @@ What the design changes for users:
   Only exact taps split a prefill chunk, and the template's rewrite frontiers no longer do.
 - **Throughput unchanged.** Kernels, page layout, block tables and CUDA Graph keys are unchanged.
   A flexible tap costs one Device copy of the state image (about 0.25 ms) at a chunk boundary.
-  Cold prefill and decode match Legacy at the same pool size (§16.1).
+  Cold prefill and decode match Legacy at the same pool size (on an RTX 5090: 10.2k against 10.1k
+  tok/s prefill, 84.6 against 84.9 tok/s decode).
 - **Better memory efficiency.** Shared prefixes are stored once. KV that no snapshot can reach
   ("dead KV") is reclaimed first. The host pool has no fragmentation and no split between KV and
   state.
@@ -493,30 +495,14 @@ This is the same classification as today, computed by arithmetic.
 `need(borrower) + need(head root) ≤ free + all_evictable + Σ donor entitlements released`.
 Hybrid mode does not issue it: a blocked FIFO head is never overtaken.
 
-*Tried and not adopted (2026-09-27).* A proof with this arithmetic plus a growth reserve was
-implemented and measured (the change record near the top of this document). Without the reserve,
-a borrower can take the pages a long answer would grow into, and that answer then ends early
-(bounded completion, paged-kv §6.2). The reserve kept every active sequence, the borrower and the
-head able to grow by 16K more tokens:
-
-```text
-Σ_active (entitlement + G) + entitlement(c) + G(c)                      ≤ capacity   // now
-Σ_borrowers (entitlement + G) + entitlement(c) + G(c) + root(h) + G(h)  ≤ capacity   // donors ended
-G(x) = min(pages to x's lease ceiling beyond its entitlement, pages of 16K tokens)
-```
-
-It was safe (no answer cut short), but it moved latency rather than removing it. Queued short
-requests finished in 1.6 s instead of 35 s. The long request already decoding was slower by about
-their prefill time, and the blocked long head started that much later. For workloads dominated by
-long main-agent requests that is a loss where it matters, so it was reverted. A version worth
-revisiting needs a clear win, for example:
-
-- bound the borrower's cost to the donor: only borrowers whose whole service (prefill and expected
-  answer) is small against the donor's remaining time, so the head's delay stays negligible;
-- keep donor decode rounds running while a borrower prefills (prefill in short slices between
-  rounds), since most of the donor's slowdown was the borrower's prefill blocking its rounds;
-- make the reserve unnecessary by suspending a borrower to the Host tier when a donor needs its
-  pages (a product change: active-request preemption).
+A proof with this arithmetic needs a growth reserve: without one, a borrower can take the pages a
+long answer would grow into, and that answer then ends early (bounded completion, paged-kv §6.2).
+With a 16K-token reserve per active sequence it was safe, but it moved latency instead of removing
+it: queued short requests finished in 1.6 s instead of 35 s, while the long request already
+decoding slowed by about their prefill time and the blocked long head started that much later. A
+version worth adding has to bound the borrower's cost to the donor, keep the donor's decode rounds
+running while a borrower prefills, or suspend a borrower to the Host tier when a donor needs its
+pages (active-request preemption, a product change).
 
 Every unpinned Device-resident cache entry (node or snapshot tail) owns its page bundle
 exclusively, so evicting one returns exactly one page to each pool and the arithmetic is exact.
@@ -670,6 +656,15 @@ Candidates, in priority order:
   generation opener is not tapped. Measured on a tool-calling agent trace (27B NVFP4, INT8 KV,
   `--preserve-thinking`), the opener split cost about 15 ms of a ~70–130 ms turn TTFT. Requests
   that resumed from a tap keep the exact opener: their client re-renders history.
+- A `Disposable` request (a decision read) keeps no tap past its last explicit marker: no request
+  continues it, so a snapshot of its own text (the question) serves nobody and an exact tap there
+  only costs a pass.
+- On an Engine with a drafter (`--spec`), a request without drafting
+  (`ExecutionOptions::speculative_drafting = false`, one output token; the decision reads) keeps
+  only exact taps, and the drafter's prompt work (the MTP bridge and KV, the DFlash context) runs
+  only below the deepest one or its resume point: the snapshots it publishes there carry the
+  drafter's state for drafting requests, and the rest of its prompt runs without the drafter. It
+  publishes no endpoint, since its drafter state stops short of it.
 - Hints are the Frontend's existing `message_boundaries` plus the structural boundaries it already
   computes.
 - At most `max_new_taps` (default 8 with a Host tier, 2 without) taps are kept per request.
@@ -914,10 +909,15 @@ comes from its own lineage when it can. A tap or endpoint takes a slot in this o
    at least as high. The snapshot is lost, and `L` rises to its priority;
 4. the least recently hit Host-backed snapshot's slot, which loses only its Device copy.
 
-Otherwise the tap or endpoint is skipped. A Device-only owner's slot is its last copy, so value
-decides there rather than recency: least-recently-hit eviction let a short request's snapshots
-push out the snapshot a long conversation resumes from, and taking Host-backed slots first left
-owners that Host eviction had made Device-only in their slots for good (§16.5).
+Otherwise the tap or endpoint is skipped, and `L` rises to its estimated priority, as if it had
+been inserted and evicted at once. A Device-only owner's slot is its last copy, so value decides
+there rather than recency: least-recently-hit eviction let a short request's snapshots push out the
+snapshot a long conversation resumes from, and taking Host-backed slots first left owners that
+Host eviction had made Device-only in their slots for good. Without the rise, nothing would age
+owners that are never hit again: decision reads about a stream of new states hit each state's
+snapshot two or three times, and once those snapshots filled the Host tier and the slots, every
+later state's snapshot was refused (about 50 states into a run on an RTX 3090 with an 8 GiB Host
+tier) and every read prefilled its state again.
 
 ### 9.3 Host (superseded snapshots first, then GDSF; dead-KV first)
 
@@ -931,7 +931,12 @@ whose template re-renders the reply (stripped thinking) resumes from that tap. A
 snapshot retains it again, until that lineage moves on. A `Boundary` snapshot (a tap at a client
 breakpoint or structural boundary, or at the divergence of coalesced requests, §12.2) may be shared
 by conversations, so it is superseded only while no other conversation has continued from it: while
-the tree below it is a single chain. Until then it is just its lineage's snapshot.
+the tree below it is a single chain. Until then it is just its lineage's snapshot. A request with
+`CacheRetentionHint::Disposable` (the decision endpoints' reads) has no lineage, since no request
+continues it, and supersedes nothing it resumed from. The first of several reads that share a
+boundary would otherwise supersede it with its endpoint, so far the only branch below the boundary,
+and the boundary would then give up its Device slot and Host slabs first while the other reads
+still wait to resume from it.
 
 Allocation of `k` slabs:
 
@@ -945,7 +950,9 @@ Allocation of `k` slabs:
 
 A snapshot image write stops at step 3 when the victim is worth more than the new snapshot
 (`H(victim) > H(new)`): GDSF never inserts what it would evict next, and the new snapshot stays
-Device-only (§9.2). KV block writes (write-through at release) are not bounded this way.
+Device-only (§9.2). `L` still rises to `H(new)`, as if the new snapshot had been inserted and
+evicted, so retained snapshots that are not hit again age out. KV block writes (write-through at
+release) are not bounded this way.
 
 ```text
 H(s)  = L_s + F(s) · C(s) / Z(s)                // L_s: L when s was published or last hit
@@ -1087,7 +1094,10 @@ Uncalibrated terms keep the index's generic defaults. No separate calibration ru
      chunk.
    - It waits only when the prefill it saves exceeds the split it may add, and when twice the
      sibling's predicted prefill up to the target (other lanes' decode rounds interleave) is within
-     half the Engine's queue timeout (`pending_timeout_ms`). A waiting head stays in the FIFO.
+     half the Engine's queue timeout (`pending_timeout_ms`). The saving is its prefill from its
+     own resume point less its prefill from the target: the pass it runs either way is not saved.
+     Counting it as saved once made questions that share their first token after a cached state
+     wait one token deeper and split the sibling's pass for it. A waiting head stays in the FIFO.
    - Vision prompts do not coalesce: placeholder tokens are equal for different media.
    - Every sibling prefill boundary re-arms admission, and the head stops waiting once the sibling
      passes the target, finishes or is cancelled. So a missing snapshot never blocks it for long.
@@ -1110,8 +1120,7 @@ Uncalibrated terms keep the index's generic defaults. No separate calibration ru
 ## 13. Test specification
 
 The test design follows. §13.1 and §13.3 are implemented (`ninfer_prefix_cache_index_test`,
-`ninfer_qwen3_5_hybrid_prefix_real_test`, see Status); §13.2 applies to the unimplemented Ops;
-§13.4 was the acceptance plan, and §16 records what was measured.
+`ninfer_qwen3_5_hybrid_prefix_real_test`, see Status); §13.2 applies to the unimplemented Ops.
 
 ### 13.1 Host-only unit tests (`tests/test_prefix_cache_index.cpp`)
 
@@ -1200,22 +1209,6 @@ Fault injection covers:
   pins (checked by `prefix_cache_stats` after restart);
 - `compute-sanitizer --tool memcheck` on one concurrency-8 scenario, for the lifetime claims.
 
-### 13.4 Performance acceptance plan
-
-The baseline is Legacy mode, run on identical traces and flags, with `--host-cache-mib` equal in
-both runs.
-
-| metric | requirement |
-|---|---|
-| prompt tokens served from cache, agent trace (README workload) | ≥ baseline, target ≥ +5 points |
-| admission planning time (quote + admit, host) | p99 < 1 ms (baseline: up to 250 ms allowance) |
-| TTFT p50 / p95 on the agent trace | lower than baseline; report the breakdown (planning, restore, prefill) |
-| cold-request prefill tok/s | within ±1 % |
-| decode tok/s at c = 1, 2, 8 (with and without write-through active) | within ±1 % |
-| tap overhead per 4 k-token chunk | < 0.5 % of chunk time |
-| restore bandwidth | ≥ 85 % of measured PCIe peak |
-| device memory | shared-preamble trace: ≥ 7× fewer preamble pages at c = 8 |
-
 
 ---
 
@@ -1261,7 +1254,7 @@ struct HybridPrefixCacheOptions {                           // used only when mo
 };
 
 struct ContextCacheOptions {                  // existing struct, extended
-    ContextCacheMode mode = ContextCacheMode::Legacy; // ninfer-serve selects Hybrid by default
+    ContextCacheMode mode = ContextCacheMode::Legacy; // the Engine's default; ninfer-serve selects Hybrid
     HybridPrefixCacheOptions hybrid;
     // Hybrid mode: host_cache_budget_bytes (--host-cache-mib) sizes the one slab pool.
     // ... existing Legacy fields unchanged ...
@@ -1292,213 +1285,7 @@ Host pools (`host_state_slots`, `host_kv_capacity_bytes`) are zero in Hybrid mod
 |---|---|
 | Exact taps cost one prefill split each | Only semantic boundaries are exact (explicit, generation opener, structural); the prompt tail and ladder are flexible and cost no split. The proximity rule leaves one split per chat request, and none after an endpoint resume. The zero-split GDN tap (§7.2–§7.3) removes the rest if measurement shows it matters. |
 | Snapshots crowd KV out of host memory | GDSF weighs bytes against recompute seconds on the same scale for both. Dead-KV sweep runs first. |
-| Write-through competes with decode | Copy engines only, batched when a lane releases its blocks; decode rounds/s were unchanged with prefetch and write-through active (§16.3). Write-through can be throttled when decode is active without changing correctness. |
+| Write-through competes with decode | Copy engines only, batched when a lane releases its blocks; decode rounds/s were unchanged with prefetch and write-through active. Write-through can be throttled when decode is active without changing correctness. |
 | Unbacked device eviction deletes subtrees | Only happens with no or full host cache. Backed entries are always preferred. |
 | Large pinned allocations on Windows | Chunked allocation; the startup ledger reports the resolved size. |
 | Hybrid mode ignores session keys | Content addressing reproduces chain reuse; the protocol surface is unchanged in both modes. |
-
----
-
-## 16. Decision record
-
-Every measurement here ran on one RTX 5090 (Windows, CUDA 13.4) with Qwen3.8-27B NVFP4. The
-Host-to-Device link of the measuring machine runs at PCIe 5.0 x8 (the GPU supports x16), so
-restores and prefetches move about 25 GB/s. A change that did not improve its target metric, or
-that regressed another, was reverted and is recorded here with the reason.
-
-### 16.1 Hybrid against Legacy
-
-`ninfer-serve --max-context 32768 --max-concurrency 2 --kv-dtype int8 --kv-capacity auto
---prefill-chunk 2048 --host-cache-mib 12000`, plus `--use-original-prefix-caching` for Legacy, a
-fresh server per workload:
-
-| workload | Legacy | Hybrid |
-|---|---|---|
-| 4 conversations × 6 turns, thinking, shared ~5.9K-token system prompt: prompt tokens from cache | 83.0% | 90.9% |
-| same: TTFT p50 / p90 / mean | 0.177 / 0.962 / 0.331 s | 0.149 / 0.283 / 0.200 s |
-| same: TTFT median of later turns | 0.173 s | 0.129 s |
-| 8 distinct ~11.4K-token prompts overflowing the Device pool, revisited: tokens reused on revisit | 0 of 8 | ~11,400 of each |
-| cold ~8.6K-token prompts: server prefill / decode tok/s (median of 6) | 10.1k / 84.9 | 10.2k / 84.6 |
-| 64-token prompt, 2048 output tokens: decode tok/s | 86.3 | 86.0–86.1 (86.1–86.3 with `--kv-capacity 65536`) |
-
-With `--spec dflash2 --draft-tokens 7` and `--spec mtp --draft-tokens 3` the conversation workload
-served 90.8% and 90.9% of prompt tokens from cache with no errors.
-
-### 16.2 Decisions while building
-
-1. **A second mode, not a replacement.** The owner asked for both systems to stay available, so
-   Hybrid reuses the active-execution machinery and replaces only admission-source selection,
-   retention, capture and pressure (coexistence rules above). `ninfer-serve` defaults to Hybrid;
-   the Engine option default stays Legacy.
-2. **Snapshots copy the committed state at chunk boundaries; the zero-split GDN tap was not
-   built.** A tap copies the lane's StateImage into a snapshot slot (about 0.25 ms D2D), so only
-   exact taps split a prefill chunk, at about 15 ms per split on 27B. §7.2–§7.3 remain the design
-   for removing that split if measurement shows it matters.
-3. **Hybrid ignores the chat template's rewrite frontiers.** Legacy splits prefill after each
-   assistant header, after `<think>` and after the reasoning close for its rewrite checkpoints.
-   Hybrid captures nothing there, so a short chat turn prefills in two passes (to the opener, then
-   the rest) instead of four (§7.1).
-4. **No opener tap after an endpoint resume.** On a tool-calling agent trace (27B NVFP4, INT8 KV,
-   `--preserve-thinking`) the opener split cost about 15 ms of a ~70–130 ms turn TTFT. A request
-   that resumed from an endpoint proves its client echoes generated turns token for token, so its
-   own endpoint serves the next turn (§7.1).
-5. **Free VRAM becomes Device block cache.** Removing the `C·L` clamp and defaulting
-   `--kv-capacity` to `auto` makes the pool several times larger. At the Legacy pool size decode is
-   within noise; the automatic pool costs about 0.2–0.35% decode throughput, attributed by the
-   capped runs to KV placement across the larger pool, not to per-round cache work (§16.1).
-6. **One pinned Host slab pool, pinned in chunks.** KV blocks and snapshots share one pool with no
-   fixed split (§5.4). A single very large pinned allocation can fail or stall under WDDM, so the
-   pool is pinned in chunks of at most 4 GiB; strided copy runs never cross chunks, after a 52 GB
-   Host tier produced an invalid `cudaMemcpy2DAsync` that aborted the server.
-7. **In-flight prefix coalescing** (§12.2). With `--max-concurrency 4`, four requests arriving
-   together with a new ~13.9K-token system prompt served 74.9% of prompt tokens from cache (the
-   three followers reuse 13,888 tokens each) instead of 11.0%. Mean TTFT fell from 3.52 s to
-   1.48 s and the burst's wall time from 5.56 s to 1.80 s.
-8. **Restores never hold the admission, and the first prefill pass waits layer by layer** (§6.5).
-   Copies run at 24–27 GB/s. Revisits of 8 ~11.4K-token prompts under two clients, each restoring
-   its 147 MiB state image, have a median TTFT of 45.7 ms, against 60.0 ms when the admission
-   waited for the copy. Revisits of two alternating ~90K-token conversations, each restoring
-   2.6–2.8 GiB, have a TTFT of 268 ms with a short question (was 301 ms) and 1186 ms with a
-   3.4K-token tool output (was 1208 ms). An Nsight Systems trace of a 44K-token revisit (1.49 GiB
-   restored in 60 ms) shows the pipelining at work: the first prefill pass runs its
-   linear-attention layers at once and waits ~2.2 ms at each attention layer for its KV, finishing
-   as the copy does. The rest of that TTFT was not the restore: the 45 new tokens ran as four
-   passes over the model, split at exact snapshot and template boundaries (~12–15 ms each), which
-   decision 3 removed, and the prompt-attention kernel took ~2.3 ms per attention layer over the
-   44K context in the one pass that used it.
-9. **Short prefill passes over long contexts use split-KV attention.** Single-row passes of 17–64
-   new tokens were then routed to the chunked split-KV attention once the context held 64 visible
-   keys per new token (80 for 16 query heads), 4–12× faster than the prompt kernels at 16K–180K
-   keys (32 new tokens at 180K keys: 1.06 ms per layer instead of 9.5 ms). With ~90K cached tokens,
-   one client:
-
-   | revisit | before | after |
-   |---|---|---|
-   | Device-resident, short question | 204 ms | 91 ms |
-   | Device-resident, 3.4K-token tool output | 1101 ms | 1050 ms |
-   | Host restore (2.6–2.8 GiB), short question | 268 ms | 170 ms |
-   | Host restore, 3.4K-token tool output | 1186 ms | 1067 ms |
-
-   Under two clients, ~11.4K-token Host revisits went from a 45.7 ms to a 30.1 ms median TTFT. Cold
-   prefill was unchanged (10.1k vs 10.2k tok/s). Causal attention has since been reorganized per
-   KV format: its grouped split-KV routes take single-row passes of up to 256 new tokens (BF16,
-   INT8), 192 (NVFP4) or 80 (FP8, K8V4) directly, so no cache-specific routing remains. The
-   numbers above were measured on the earlier kernels.
-
-### 16.3 Changes from a production agent log (2026-09-26)
-
-A production request log (889 requests over 70 min, 27B NVIDIA NVFP4 + DFlash2, INT8 KV, C=2,
-`--host-cache-mib 52000`, 247K-token Device pool) of an agent harness with about ten concurrent
-conversations (17-tool subagents of 30K–208K tokens and a 20-tool orchestrator) served 94.9 % of
-prompt tokens from cache but prefilled 5.02M tokens (994 s). It showed three problems:
-
-1. **Host eviction kept the wrong snapshots.** The Host tier was full from minute 4. The GDSF value
-   of a snapshot counted only aligned ancestors, so tailed endpoints were priced as full
-   re-prefills from the root: about 100 stale chain endpoints (~19 GB) stayed, while shared
-   system/tools taps and fresh endpoints went first. 68 turns re-prefilled 758K tokens because
-   their resume point was stuck at an old aligned tap while the suffix grew to 42K tokens, and 24
-   subagent turns prefilled from the root next to a cached 19.8K-token shared prefix.
-2. **Only one lane ran for half the wall time.** Two 150K–200K contexts do not fit in the Device
-   pool together, and Hybrid mode never issued a backfill proof: the average decode batch was
-   1.27 of 2.
-3. **Every turn restored its whole context from the Host tier**: 2.59 TB in total, 2.7 GB per turn
-   (median), while the FIFO head had usually been waiting seconds to minutes.
-
-| change | section | A/B result | status |
-|---|---|---|---|
-| Superseded snapshots evicted first; valuation against the nearest retained ancestor | §9.3 | prompt tokens prefilled −10.8 % (seed 42) and −3.4 % (seed 43); main-session turns that re-prefilled the whole prompt 3 → 1 (seed 42); TTFT without queue wait −6 % and −3 % | kept |
-| Persistent backfill proof with a 16K-token growth reserve | §6.3 | targeted scenario: four 12K-token requests queued behind a blocked 90K-token head finish in 1.6 s instead of 35–36 s; the long request already decoding takes 4.7 s (12 %) longer, about the borrowers' prefill time, and the head starts that much later (its answer ends at the same time); no answer is cut short. Agentic workload: 0–9 backfills per run, effect within sampling noise | reverted: a trade-off, not a win (below) |
-| Prefetch of the blocked head's Host-only blocks | §6.6 | admission Host restores −22 % (seed 42, 62.4 → 48.6 GB) and −25 % (seed 43, 68.4 → 51.3 GB), 10–11 GB prefetched per run; TTFT without queue wait −3 % and −6 %; decode rounds/s unchanged (57.8 vs 57.8, one request decoding) | kept |
-
-The prefetch was measured on top of the backfill proof. The build that combined all three against
-the base: at the 16 GB Host tier, prompt tokens prefilled −13.9 % (seed 42) and −2.7 % (seed 43),
-TTFT without queue wait 0.82 → 0.74 s and 0.75 → 0.73 s; at 52 GB (seed 42), prompt tokens
-prefilled −9.2 % (623,853 → 566,189), served from cache 89.1 → 90.1 %, no turn prefilled from the
-root beside cached blocks (3 before), TTFT without queue wait 0.68 → 0.60 s (−12 %), workload wall
-time −7.8 % for the same output volume (130K tokens). That 52 GB arm's mean TTFT including queue
-wait rose from 2.1 to 2.8 s: in a closed loop, turns that finish sooner re-queue sooner, and the
-queue-wait increase was spread over requests that no change touches. Backfill triggered at most
-twice in it. The two kept changes together (without the backfill proof) ran the pressure workload at
-scale 0.3 (54 requests, no failures, 1.2 GB prefetched); that combination was not A/B tested on its
-own.
-
-**Why the backfill proof was reverted.** Backfill lets a shorter request start beside a long one
-while a longer FIFO head waits for pages. The GPU time the borrower uses comes out of the long
-requests: the one decoding slows by about the borrower's prefill time, and the blocked head starts
-that much later. Short requests gain a lot, long ones lose a little, and aggregate throughput hardly
-moves. When long main-agent requests dominate, the proof rarely passes (two long contexts never
-fit, and the growth reserve leaves room only for small borrowers; in the production log about
-225 of the 2,122 s spent with one lane decoding and requests waiting), and when it passes the
-latency cost falls on those long requests. Hybrid mode therefore still issues no backfill proof.
-A version worth revisiting has to remove the trade-off rather than move it; see §6.3.
-
-Measurement: `bench/agentic_ab` (3 interleaved sessions and 11 subagents, 130 requests; seeds 42
-and 43) on the production flags with the Device pool and Host tier scaled down to that workload
-(`--kv-capacity 160000`, `--max-context 160000`, `--host-cache-mib 16000`; `--vram-headroom-mib`
-dropped, since it requires `--kv-capacity auto`). Each change is compared with the build before it
-at a 16 GB Host tier, where eviction matters, and all three with the base at 52 GB, where it rarely
-does. The policy does not depend on the tier size (`--host-cache-mib` 0 to 230 GiB): snapshot count
-is bounded by `host_cache_bytes / image_bytes` (about 1,300 at 230 GiB), and victim selection is a
-scan over snapshots.
-
-Run notes:
-
-- Seed 42, first run: the superseded-first arm and the second half of the prefetch arm ran under
-  outside CPU load; tokenization, which none of these changes touch, was up to 2.3× slower, and
-  their decode host time per round (204 and 338 µs against 80 µs) was not the builds'. Both arms
-  were rerun with per-process CPU logging and the rerun values are the ones above; their
-  tokenization matched the base.
-- Backfill needs a blocked FIFO head with a shorter request behind it while a long answer decodes.
-  The workload's lock-step sessions rarely queue that way (one lane decoding with requests waiting
-  for 3–13 % of a run, against 50 % in the production log), so a targeted scenario measures it: a
-  100K-token request answering with a count to 2,400, then a 90K-token request, then four 12K-token
-  requests, greedy, `max_tokens` 64000, two repetitions per build, identical to within a second.
-  In seed 43 the two long requests that borrowers overtook waited 6 and 8 s longer (23 s for one in
-  the prefetch arm) while the borrowers saved about 1 s each; output lengths differ between arms,
-  so this is not attributable, but it is worth watching in production.
-
-### 16.4 Fixes from operation (2026-09-27)
-
-None of these were A/B tested; each is a correctness, behavior or log fix.
-
-| change | section | reason and evidence |
-|---|---|---|
-| A Host tier smaller than the saved file restores its most valuable snapshots and only their paths (file format 3, tables before slab bytes), with a startup warning | §5.5 | Format 2 restored every block before any snapshot, in file order, and still reported the file restored. For the production file (15,807 blocks and 98 snapshots of 91–92 slabs of 2.06 MiB, 49.97 GiB, saved at `--host-cache-mib 52000`), any tier below about 32,800 MiB filled with blocks and kept no snapshot, so nothing was resumable; between that and about 51,200 MiB the snapshots kept depended on file order |
-| A Host tier that keeps none of the file's snapshots warns `prefix cache not restored` instead of `partly restored … the most valuable snapshots were kept` | §5.5 | A restore keeps only the blocks its snapshots resume through, so keeping no snapshot restores nothing, yet the line claimed the most valuable snapshots were kept; it now names the tier the file needs and that the save at shutdown replaces the file |
-| A Host restore's per-layer events are looked up immediately before the first prefill chunk, not before the MTP bridge | §6.5 | Reported by funguf (Wallawalla47/ninfer-custom pull request 2) with an AddressSanitizer trace and 9 production crashes in `cuStreamWaitEvent` in one day (`--spec mtp`, Host tier): the view was taken before the MTP bridge, whose KV commit polls the cache, and a batch that had landed meanwhile was freed under it, so the first chunk waited on whatever the freed memory held. The report's fix copied the handles into the prefill context; looking them up at the chunk instead never hands CUDA an event the cache has recycled, needs no allocation, and skips the waits once the copies are complete. DFlash2 and no-speculation lanes run no bridge and were not exposed |
-| The chunk function takes the restore's layer events itself (`PrefillContext::take_layer_ready`), so program code never holds the view | §6.5 | Hardening. A deterministic test of the fix above was asked for, but the retired-batch path is timing-dependent and a dangling view reading a recycled handle can pass a token-equality check, so a test would need a product seam or AddressSanitizer. Moving the lookup inside the chunk call instead leaves no place for program code to take the view early |
-| A stop fails running and queued requests and answers them before the save (`Engine::stop()`; `ninfer-serve` stops on Ctrl+C pressed twice within 5 s) | §5.5 | The production log's stops at 07:48 and 07:54 left 10 and 3 requests unfinished and wrote no file: Ctrl+C waited silently for them and a second Ctrl+C killed the process. Console test, one streaming and one queued request: before, generation ran on 68.6 s after Ctrl+C; after, one press only prompts, and a confirmed pair fails both with 503 within 0.2 s, saves 99 blocks (503 MiB) in 0.1–0.2 s and exits about 0.7 s later. Answering them only after the cleanup that saves made each 503 wait for the whole save (408 blocks and 4 snapshots, 1,438 MiB: both 503s 392 ms after the stop, as the 0.3 s save ended); they are now answered first (8 ms after the stop, 447 ms before the save ended), and the `persist` real test checks that the file is not yet saved when the running generation is answered |
-| One Ctrl+C during the stop exits without saving and deletes the unfinished file (`PrefixCacheSaveControl`); the line reads `Press Ctrl+C again to exit without saving` | §5.5 | Leaving during the save needed another confirmed pair of presses, and `_Exit` left a partial `.tmp` of up to the Host tier's size beside the previous file until the next save |
-
-### 16.5 Changes from upstream's TTFT campaign (2026-09-30)
-
-Upstream's public-HTTP TTFT campaign (`tools/bench/ttft`, its cache profiles translated to this
-cache's options at equal Device state slots and pinned Host bytes) ran against the upstream port of
-this cache in WSL2 on the same RTX 5090. Five of its cases resumed a conversation from the root, or
-far behind its newest snapshot, where upstream's checkpoint-catalog cache resumed from the conversation's own
-checkpoint. Measured with one sample per case on the upstream port; the eviction code is the same
-in both trees.
-
-| change | section | result | status |
-|---|---|---|---|
-| A sequence supersedes the snapshot it resumed from before its new snapshot takes a slot | §9.2, §9.3 | `session-alternating` (2 Device snapshot slots, no Host tier; two sessions sharing a 4K prefix): A2 and B2 TTFT 305 → 22 ms (upstream 49 ms). Before, each session's endpoint took the slot of the other session's endpoint, not of the shared tap it had resumed from | kept |
-| Device-only slots evicted by GDSF priority, only for a new snapshot worth as much, and before a Host-backed slot gives up its Device copy | §9.2 | `resume-after-interference-device` (same profile; two short requests between a 7.7K conversation's turns): resume 600 → 22 ms (upstream 78 ms); `resume-after-interference-catalog` 600 → 22 ms (632 ms) | kept |
-| A snapshot image goes to the Host only by displacing snapshots worth no more; protocol-automatic markers published as ordinary taps rather than `Boundary` snapshots | §7.1, §8.3, §9.3 | `private-state-working-set-shift` (2 Device slots, 384 MiB Host, DFlash2; four 2K conversations in two phases): the second phase's continuations 204–215 → 40–49 ms (upstream 48 ms). New images had displaced the snapshots the waiting conversations resume from | kept |
-| A `Boundary` snapshot is superseded like any other while no other conversation has continued from it | §9.3 | same case: B1 207 → 39 ms. Each conversation kept its system-block boundary beside its newer snapshot, so the other conversation's snapshot lost its slot. All eight continuations now take 20–40 ms (upstream 48–56 ms) | kept |
-| A deeper tap supersedes the sequence's previous tap of the same prompt (the endpoint does not supersede the prompt's last tap) | §9.3 | `session-alternating-64k-host-swap` (4.5 GiB Host for two 64K sessions whose KV takes 4 GiB): A2 2381 → 176 ms, B2 164 → 113 ms (upstream 242 and 171 ms). Valued against the tap below it, each ladder tap was worth more per byte than the prompt's last tap, so GDSF kept the four ladder taps and evicted the last tap until A resumed from 48K | kept |
-| Flexible taps (prompt tail, ladder) as a separate snapshot kind, evicted before every other retained snapshot | §9.3 | broke a regenerate-after-edit resume: with DFlash2 and a 1 GiB Host tier, the prompt-tail tap a request diverging late in the previous prompt needed went first (`restore-exact-dflash2` real test) | reverted |
-| The same kind starting from half a hit in its GDSF value | §9.3 | no change on the two cases it targeted | reverted |
-| Host admission by value (`F·C/Z`) instead of priority `H` | §9.3 | meant for small tiers, where `L` rises by a whole snapshot's value per eviction and almost any new image outranks the rest: stale snapshots worth more per byte then kept the tier from new ones, and the index test's Host backup found no slabs | reverted |
-
-The full campaign after these changes (3 samples per case) gives a geometric-mean TTFT ratio of
-0.658 against upstream's cache over 259 (case, role) observations: 172 faster by more than 10%, 18
-slower. The slower roles are not eviction. The 55K rotation (six sessions resumed round-robin with
-Device KV for about four) restores every session from Host, about 101 ms each, because Device KV is
-LRU over a cyclic working set larger than the Device; upstream's cache keeps three sessions resident
-(72 ms) and restores the other three in 125–245 ms, so its per-round mean is higher (128 against 99
-ms) while three roles are faster. A repeat of an identical prompt prefills its last few tokens
-(about 20 ms), where upstream's cache samples from the hidden state stored with its checkpoint (6
-ms): the prompt's last tap sits before the generation opener, and a snapshot at the prompt's exact
-end would cost a whole state image per request for byte-identical repeats only. The other slower
-roles are arrival races between concurrent requests and timing effects in profiles that run with the
-cache off.

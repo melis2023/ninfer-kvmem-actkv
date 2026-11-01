@@ -15,7 +15,7 @@ void nvfp4_gdn_snapshot_decode_launch(const Tensor& x, const Weight& weight,
                                       Tensor& value, Tensor& z, cudaStream_t stream) {
     using Geometry = Nvfp4N16384K5120;
     using Schedule =
-        Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
+        Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 4>;
 
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const float inverse   = 1.0F / weight.weight_scale_divisor;

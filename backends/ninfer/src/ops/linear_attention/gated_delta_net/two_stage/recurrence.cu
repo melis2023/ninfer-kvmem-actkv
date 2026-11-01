@@ -361,10 +361,7 @@ template <int DV>
 void launch(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
             cudaStream_t stream) {
     constexpr int shared_bytes = sizeof(RecurrenceShared<DV>);
-    configure_cuda_device_once([] {
-        return cudaFuncSetAttribute(chunk_recurrence_kernel<DV>,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes);
-    });
+    raise_dynamic_shared_memory(chunk_recurrence_kernel<DV>, shared_bytes);
     chunk_recurrence_kernel<DV>
         <<<args.value_heads*(kStateDim / DV), kThreads<DV>, shared_bytes, stream>>>(args, qk,
                                                                                     control);

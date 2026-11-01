@@ -5,6 +5,7 @@
 #include "core/pdl.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
+#include "ops/common/silu.h"
 #include "ops/common/warp.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
 #include "ops/linear/q4/q4_rowsplit_storage.cuh"
@@ -13,6 +14,7 @@
 #include "ops/linear/q8/q8_rowsplit_storage.cuh"
 #include "ops/sparse_moe/sparse_moe_route.cuh"
 #include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
+#include "ops/sparse_moe/streamed.h"
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -470,7 +472,7 @@ __global__ void sparse_moe_d3_nine_warp_kernel(
                                            kIntermediate + j, x_shared, 0, kHidden, gate, up,
                                            shared_divisors);
     }
-    if (lane == 0) { act[static_cast<std::int64_t>(warp) * kIntermediate + j] = silu(gate) * up; }
+    if (lane == 0) { act[static_cast<std::int64_t>(warp) * kIntermediate + j] = ops::portable_silu(gate) * up; }
 }
 
 template <class RoutedCodec, int PathsPerBlock, bool Adaptive, class SharedCodec = Q8Codec>
@@ -534,7 +536,7 @@ __global__ void sparse_moe_d3_path_tiled_kernel(
         if (lane == 0) {
             token_activations[(static_cast<std::int64_t>(token) * (kTopK + 1) + path) *
                                   kIntermediate +
-                              j] = silu(gate) * up;
+                              j] = ops::portable_silu(gate) * up;
         }
         if constexpr (Adaptive) { __syncthreads(); }
     }
@@ -747,6 +749,144 @@ __global__ void sparse_moe_d4_token_kernel(
         }
         if constexpr (Adaptive) { __syncthreads(); }
     }
+}
+
+
+struct StreamPlane {
+    const std::uint8_t* codes;
+    const std::uint8_t* high;
+    const std::uint8_t* scales;
+    Nvfp4RowDivisors divisors;
+};
+
+__device__ __forceinline__ StreamPlane stream_plane(const void* const* tables, int expert,
+                                                     int projection) {
+    const int base = projection * 4 * kExperts + expert;
+    return {static_cast<const std::uint8_t*>(tables[base]),
+            static_cast<const std::uint8_t*>(tables[base + kExperts]),
+            static_cast<const std::uint8_t*>(tables[base + 2 * kExperts]),
+            {static_cast<const float*>(tables[base + 3 * kExperts]),
+             projection == 0 ? kIntermediate : kHidden}};
+}
+
+template<class RoutedCodec, class SharedCodec>
+__global__ void sparse_moe_stream_d3_kernel(
+    const __nv_bfloat16* x, const int* ids, const void* const* tables,
+    const std::uint8_t* shared_codes, const std::uint8_t* shared_scales,
+    Nvfp4RowDivisors shared_divisors, float* activations, bool shared) {
+    __shared__ __align__(16) __nv_bfloat16 input[kHidden];
+    const int token = static_cast<int>(blockIdx.y) / 3;
+    const int path = (static_cast<int>(blockIdx.y) % 3) * 3 + (threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    const int j = blockIdx.x;
+    for (int v = threadIdx.x; v < kHidden / 8; v += blockDim.x) {
+        store_vec(input + v * 8, load_vec<uint4>(x + token * kHidden + v * 8));
+    }
+    __syncthreads();
+    float gate = 0, up = 0;
+    if (path < kTopK) {
+        const int expert = ids[token * kTopK + path];
+        if (expert < 0) { return; }
+        const auto plane = stream_plane(tables, expert, 0);
+        dot_two_rows<RoutedCodec, kHidden>(plane.codes, plane.high, plane.scales,
+                                           j, kIntermediate + j, input, 0, kHidden,
+                                           gate, up, plane.divisors);
+    } else {
+        if (!shared) { return; }
+        dot_two_rows<SharedCodec, kHidden>(shared_codes, nullptr, shared_scales,
+                                           j, kIntermediate + j, input, 0, kHidden,
+                                           gate, up, shared_divisors);
+    }
+    if (lane == 0) {
+        activations[(token * (kTopK + 1) + path) * kIntermediate + j] = ops::portable_silu(gate) * up;
+    }
+}
+
+template<class RoutedCodec, class SharedCodec>
+__global__ void sparse_moe_stream_d4_kernel(
+    const int* ids, const void* const* tables, const float* alpha, const float* shared_scale,
+    const float* activations, const std::uint8_t* shared_codes,
+    const std::uint8_t* shared_scales, Nvfp4RowDivisors shared_divisors,
+    float* products, bool shared) {
+    const int token = blockIdx.y;
+    const int path = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int row = blockIdx.x * 2;
+    const auto* act = activations + (token * (kTopK + 1) + path) * kIntermediate;
+    float dot[2];
+    float coefficient;
+    if (path < kTopK) {
+        const int expert = ids[token * kTopK + path];
+        if (expert < 0) { return; }
+        const auto plane = stream_plane(tables, expert, 1);
+        dot_fp32_rows<RoutedCodec, 2>(plane.codes, plane.high, plane.scales, row, act,
+                                      0, kIntermediate / RoutedCodec::kGroupK, dot,
+                                      plane.divisors);
+        coefficient = alpha[token * kTopK + path];
+    } else {
+        if (!shared) { return; }
+        dot_fp32_rows<SharedCodec, 2>(shared_codes, nullptr, shared_scales, row, act, 0,
+                                      kIntermediate / SharedCodec::kGroupK, dot, shared_divisors);
+        coefficient = shared_scale[token];
+    }
+    if (lane == 0) {
+        const auto offset = (token * (kTopK + 1) + path) * kHidden + row;
+        products[offset] = coefficient * dot[0];
+        products[offset + 1] = coefficient * dot[1];
+    }
+}
+
+__global__ void sparse_moe_stream_merge_kernel(const float* products,
+                                               __nv_bfloat16* destination) {
+    const int row = blockIdx.x * blockDim.x + threadIdx.x;
+    const int token = blockIdx.y;
+    if (row >= kHidden) { return; }
+    float value = __bfloat162float(destination[token * kHidden + row]);
+#pragma unroll
+    for (int path = 0; path < kTopK + 1; ++path) {
+        value += products[(token * (kTopK + 1) + path) * kHidden + row];
+    }
+    destination[token * kHidden + row] = __float2bfloat16_rn(value);
+}
+
+// The CPU's product rows (sparse_moe_stream_cpu) into their pairs' slots: a pair neither cached
+// nor missing is the CPU's, and its row is the count of CPU pairs before it.
+__global__ void sparse_moe_stream_place_kernel(const int* ids, const int* cached, const int* missing,
+                                               const int* cpu, const float* rows, int pairs,
+                                               float* products) {
+    if (*cpu == 0) { return; }
+    const int pair = static_cast<int>(blockIdx.y);
+    const auto computed = [&](int p) { return ids[p] >= 0 && cached[p] < 0 && missing[p] < 0; };
+    if (!computed(pair)) { return; }
+    int row = 0;
+    for (int p = 0; p < pair; ++p) { row += computed(p) ? 1 : 0; }
+    const int column = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
+    const int token = pair / kTopK, path = pair % kTopK;
+    products[(token * (kTopK + 1) + path) * kHidden + column] =
+        rows[static_cast<std::int64_t>(row) * kHidden + column];
+}
+
+template<class Gate, class Down, class Shared = Q8Codec>
+void launch_stream_experts(const Tensor& x, const SparseMoeWeights& weights,
+                            const void* const* tables, const int* ids, const float* alpha,
+                            const float* shared_scale, float* activations, float* products,
+                            bool shared, cudaStream_t stream) {
+    sparse_moe_stream_d3_kernel<Gate, Shared>
+        <<<dim3(kIntermediate, x.ne[1] * 3), 96, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(x.data), ids, tables,
+            static_cast<const std::uint8_t*>(weights.shared_gate_up.qdata),
+            static_cast<const std::uint8_t*>(weights.shared_gate_up.scales),
+            {static_cast<const float*>(weights.shared_gate_up.weight_divisors),
+             weights.shared_gate_up.weight_divisor_rows}, activations, shared);
+    CUDA_CHECK(cudaGetLastError());
+    sparse_moe_stream_d4_kernel<Down, Shared>
+        <<<dim3(kHidden / 2, x.ne[1]), 288, 0, stream>>>(
+            ids, tables, alpha, shared_scale, activations,
+            static_cast<const std::uint8_t*>(weights.shared_down.qdata),
+            static_cast<const std::uint8_t*>(weights.shared_down.scales),
+            {static_cast<const float*>(weights.shared_down.weight_divisors),
+             weights.shared_down.weight_divisor_rows}, products, shared);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 // How many bytes of the shared-expert down codes the D1 prefetch may touch. A four-bit plane is
@@ -968,6 +1108,58 @@ void launch_d4_small_t_codec(const SparseMoeWeights& weights, Tensor& destinatio
 }
 
 } // namespace
+
+
+void sparse_moe_stream_decode_route(const Tensor& x, const Weight& router,
+                                     const SparseMoeSmallTWorkspace& workspace,
+                                     cudaStream_t stream) {
+    sparse_moe_d1_kernel<<<kRouterRows, kD1Warps * 32, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data),
+        static_cast<const __nv_bfloat16*>(router.qdata),
+        static_cast<float*>(workspace.scratch.data), nullptr, 0);
+    CUDA_CHECK(cudaGetLastError());
+    sparse_moe_d2_warp_kernel<<<1, 32, 0, stream>>>(
+        static_cast<const float*>(workspace.scratch.data),
+        static_cast<int*>(workspace.token_ids.data),
+        static_cast<float*>(workspace.token_alpha.data),
+        static_cast<float*>(workspace.shared_scale.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void sparse_moe_stream_experts(const Tensor& x, const SparseMoeWeights& weights,
+                                const void* const* tables, const std::int32_t* ids,
+                                const float* alpha, const float* shared_scale,
+                                float* activations, float* products, bool shared,
+                                cudaStream_t stream) {
+    if (weights.routed_gate_up.qtype == QType::NVFP4) {
+        launch_stream_experts<Nvfp4Codec, Nvfp4Codec, Nvfp4Codec>(
+            x, weights, tables, ids, alpha, shared_scale, activations, products, shared, stream);
+    } else if (weights.routed_gate_up.qtype == QType::Q8_G32_FP16) {
+        launch_stream_experts<Q8Codec, Q8Codec>(
+            x, weights, tables, ids, alpha, shared_scale, activations, products, shared, stream);
+    } else if (weights.routed_down.qtype == QType::Q5_G64_FP16) {
+        launch_stream_experts<Q4Codec, Q5Codec>(
+            x, weights, tables, ids, alpha, shared_scale, activations, products, shared, stream);
+    } else {
+        launch_stream_experts<Q4Codec, Q6Codec>(
+            x, weights, tables, ids, alpha, shared_scale, activations, products, shared, stream);
+    }
+}
+
+void sparse_moe_stream_place(const std::int32_t* ids, const std::int32_t* cached,
+                             const std::int32_t* missing, const std::int32_t* cpu,
+                             const void* rows, std::int32_t pairs, float* products,
+                             cudaStream_t stream) {
+    sparse_moe_stream_place_kernel<<<dim3(kHidden / 256, pairs), 256, 0, stream>>>(
+        ids, cached, missing, cpu, static_cast<const float*>(rows), pairs, products);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void sparse_moe_stream_merge(const float* products, Tensor& destination, cudaStream_t stream) {
+    sparse_moe_stream_merge_kernel<<<dim3(kHidden / 256, destination.ne[1]), 256, 0, stream>>>(
+        products, static_cast<__nv_bfloat16*>(destination.data));
+    CUDA_CHECK(cudaGetLastError());
+}
 
 void sparse_moe_decode_launch_d3_small_t(const Tensor& x, const SparseMoeWeights& weights,
                                          const int* token_ids, float* token_activations,

@@ -11,6 +11,12 @@
 
 namespace ninfer::ops {
 
+/** Native ternary weights use T2_G128_FP16, PTQ1_G128_FP16 or T5_G128_FP16 RowSplit,
+ * group 128 and FP16 multipliers. Exact packing and the T5 compute contract are defined in
+ * docs/maintainer/tensor-formats.md. Split parents must use the same packing. PTQ1 has a high
+ * plane; T2/T5 do not. T5 requires A8 permission and workspace, with per-group s8 activations
+ * and positive K divisible by 1024; it has no A16 fallback. Public activations remain BF16.
+ */
 /**
  * @brief Permitted private activation-compute profiles for a linear projection.
  *
@@ -38,12 +44,21 @@ enum class LinearPolicy : std::uint8_t {
     /// scales and per-token activation scales, where the integer route carries per-group ones -- so
     /// it is opt-in per engine, and it falls back to AllowA8Int below the width where it pays.
     AllowPrefillCublas,
+    /// AllowA8Int's counterpart for block-scaled NVFP4 weights: the stored E2M1 codes widen
+    /// losslessly to s8 and feed the integer tensor cores with s8-quantised activations, one FP32
+    /// scale per (token, 32 columns) and the per-16 E4M3 weight scales rescaling in FP32. It is the
+    /// same A8-activation quality trade the Q4/Q5 integer routes carry, opt-in per engine with
+    /// --nvfp4-w4a8-int. Which mainloop answers follows the route table -- the own table runs MMQ,
+    /// the unified table runs the grouped ladder, and T <= 8 runs the MMVQ-shaped row-form kernel
+    /// under either -- so a calibrated band chooses it (the nvfp4_int8/* keys).
+    AllowNvfp4Int8,
 };
 
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
            policy == LinearPolicy::AllowA4 || policy == LinearPolicy::AllowA8Int ||
-           policy == LinearPolicy::AllowA8IntDecode || policy == LinearPolicy::AllowPrefillCublas;
+           policy == LinearPolicy::AllowA8IntDecode || policy == LinearPolicy::AllowPrefillCublas ||
+           policy == LinearPolicy::AllowNvfp4Int8;
 }
 
 [[nodiscard]] constexpr bool allows_a8(LinearPolicy policy) noexcept {
@@ -60,15 +75,29 @@ enum class LinearPolicy : std::uint8_t {
            policy == LinearPolicy::AllowPrefillCublas;
 }
 
-/// The cuBLAS prefill route. Only ever admitted above `kCublasPrefillMinTokens`, because its
-/// dequantise pass is weight-sized and has to be amortised over the tokens in the call.
+/// The NVFP4 int8-grouped route: the same activation trade as allows_a8_int, but for block-scaled
+/// NVFP4 weights against their stored E2M1/E4M3 planes, and never for any other weight format.
+[[nodiscard]] constexpr bool allows_nvfp4_int8(LinearPolicy policy) noexcept {
+    return policy == LinearPolicy::AllowNvfp4Int8;
+}
+
+/// The cuBLAS prefill route. Only ever admitted past a width gate, because its dequantise pass is
+/// weight-sized and has to be amortised over the tokens in the call.
 [[nodiscard]] constexpr bool allows_cublas_prefill(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::AllowPrefillCublas;
 }
 
-/// Below this width the route loses to the integer mainloop it replaces: the dequantise pass costs
-/// the same whatever the token count, so a narrow call pays for it without the GEMM to amortise it.
+/// The route's width gate where the device profile names none: from here it beats the integer
+/// mainloop it replaces on every card measured. The dequantise pass costs the same whatever the
+/// token count, so a narrow call pays for it without the GEMM to amortise it; where the narrower
+/// gate lies depends on the card and on whether the width is a multiple of the integer route's
+/// 128-column tile, so a calibrated profile places it per Op (`w4_cublas/...` keys).
 inline constexpr std::int32_t kCublasPrefillMinTokens = 512;
+
+/// No profile moves the gate to this width or below it: a decode or verify round runs up to
+/// kMaximumConcurrency lanes of a 16-token window, 8 x 16 = 128 columns, through the same Ops and
+/// policies, and those rounds stay off the route.
+inline constexpr std::int32_t kCublasPrefillFloorTokens = 128;
 
 /**
  * Returns the caller-owned transient capacity required by Linear for every T in the inclusive
@@ -93,11 +122,13 @@ inline constexpr std::int32_t kCublasPrefillMinTokens = 512;
  * @f]
  *
  * `out` stores a BF16 approximation of this ideal result under the named numerical criterion for
- * the selected private activation-compute path.
+ * the selected private activation-compute path; with a BF16 or GGUF weight it may instead be FP32,
+ * the unrounded FP32 accumulation.
  *
  * @par Logical tensors and layout
  * `x` is contiguous, non-null, 16-byte-aligned BF16 `[K,T]`, `w` has logical shape `[N,K]`, and
- * `out` is contiguous, non-null, 16-byte-aligned BF16 `[N,T]`. Every logical extent is positive;
+ * `out` is contiguous, non-null, 16-byte-aligned BF16 `[N,T]` (FP32 `[N,T]` is accepted for a BF16
+ * or GGUF `w` only). Every logical extent is positive;
  * in particular, `T=0` is invalid rather than a no-op. Dimension zero is stored fastest. The Op has
  * no bias, activation, residual addition, or transpose mode.
  *
@@ -110,16 +141,19 @@ inline constexpr std::int32_t kCublasPrefillMinTokens = 512;
  * [34816,5120], [248320,5120], [5120,6144], [5120,17408]}` at every positive T. The current NVFP4
  * problems register the five non-vocabulary FP8 geometries and accept every positive T. Q8 also
  * registers `[5120,25600]` at every positive T. BF16 registers `[14336,5120]`,
- * `[5120,6144]`, and `[256,5120]` at every positive T. Text and MTP packed-weight problems accept
- * every positive column extent T. Registered Vision problems accept raw-patch P in
+ * `[5120,6144]`, and `[256,5120]` at every positive T; any other BF16 `[N,K]` (the Gemma 4 vision
+ * tower's projections, for instance), and every BF16 problem with an FP32 `out`, runs a
+ * runtime-shape GEMM, cuBLAS's tensor-core BF16 GEMM with an FP32 accumulator from T=64 on. Text and MTP packed-weight problems accept every positive
+ * column extent T. Registered Vision problems accept raw-patch P in
  * `{4,8,...,131072}` or merged-token V in `[1,32768]`; a matrix column does not inherently
- * represent a text token. FP32 is unsupported.
+ * represent a text token. FP32 `x`, and FP32 `out` with a weight neither BF16 nor GGUF, are
+ * unsupported.
  *
  * @par Numerical contract
  * Test fixture code materializes the persistent weight as its logical FP32 dequantized matrix.
  * The one Linear oracle accepts that matrix and the FP32 values represented by the BF16 activation,
  * evaluates every complete dot product with naive FP64 accumulation, and retains the FP64 result.
- * The BF16 output is promoted and compared against that result. Output representation,
+ * The BF16 or FP32 output is promoted and compared against that result. Output representation,
  * accumulator precision, activation quantization, staging, reduction order, and kernel schedule
  * are private implementation effects covered by the named tolerance for the selected
  * activation-compute path; none is copied into the oracle. Kernel, schedule, template instance,

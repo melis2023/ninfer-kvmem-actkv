@@ -2,6 +2,8 @@
 #include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
 
 #include "core/device.h"
+#include "core/expert_delivery.h"
+#include "ops/sparse_moe/streamed.h"
 #include "ops/common/device_multiprocessors.h"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
@@ -498,13 +500,13 @@ constexpr int kGateUpDeepJobsNum = 7;
 constexpr int kGateUpDeepJobsDen = 4;
 
 template <int ExpertWarps, int ExpertBN, int Stages = kExpertStages,
-          GateUpRoute Route = GateUpRoute::Any>
+          GateUpRoute Route = GateUpRoute::Any, bool Indirect = false>
 __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gate_up_kernel(
     const __nv_bfloat16* __restrict__ x, const int* __restrict__ packed_token,
     const int* __restrict__ expert_offsets, const int* __restrict__ route_job_experts,
     const int* __restrict__ route_job_columns, const int* __restrict__ route_job_count,
-    const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
-    __nv_bfloat16* __restrict__ activation) {
+    const std::uint8_t* __restrict__ bank_codes, const std::uint8_t* __restrict__ bank_scales,
+    __nv_bfloat16* __restrict__ activation, const void* const* tables = nullptr) {
     if constexpr (Route != GateUpRoute::Any) {
         const bool spread =
             route_job_count[0] * kGateUpDeepJobsDen < kGateUpDeepJobsNum * route_job_count[1];
@@ -543,6 +545,9 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
         const int route_job   = work / row_blocks;
         const int row_block   = work - route_job * row_blocks;
         const int expert      = route_job_experts[route_job];
+        const auto* codes = Indirect ? static_cast<const std::uint8_t*>(tables[0 * kExperts + expert]) : bank_codes;
+        const auto* scales = Indirect ? static_cast<const std::uint8_t*>(tables[(0 + 2) * kExperts + expert]) : bank_scales;
+
         const int logical0    = row_block * (kExpertBM / 2);
         const int begin       = expert_offsets[expert];
         const int count       = expert_offsets[expert + 1] - begin;
@@ -564,7 +569,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
 
         auto global_row = [&](int local_row) {
             const int logical = logical0 + (local_row & (kExpertBM / 2 - 1));
-            return expert * 1024 + logical + (local_row >= kExpertBM / 2 ? kIntermediate : 0);
+            return (Indirect ? 0 : expert * 1024) + logical + (local_row >= kExpertBM / 2 ? kIntermediate : 0);
         };
 
         auto stage_scales = [&] {
@@ -725,11 +730,11 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_q4_gat
     }
 }
 
-template <bool Routed, bool Adaptive = false>
+template <bool Routed, bool Adaptive = false, bool Indirect = false>
 __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_gate_up_kernel(
     const __nv_bfloat16* __restrict__ input, const int* __restrict__ expert_offsets,
-    const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
-    __nv_bfloat16* __restrict__ activation, int tokens, const int* __restrict__ route_job_count) {
+    const std::uint8_t* __restrict__ bank_codes, const std::uint8_t* __restrict__ bank_scales,
+    __nv_bfloat16* __restrict__ activation, int tokens, const int* __restrict__ route_job_count, const void* const* tables = nullptr) {
     __shared__ __align__(16) __nv_bfloat16 As[kExpertBM * kExpertBK];
     __shared__ __align__(16) __nv_bfloat16 Bs[kExpertStages][kExpertBN * kExpertBK];
     __shared__ __align__(16) std::uint8_t Cr[kExpertBM * kExpertBK];
@@ -747,6 +752,9 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_gate_
     const int count    = Routed ? expert_offsets[expert + 1] - begin
                                 : (tokens - begin < kExpertBN ? tokens - begin : kExpertBN);
     if (count <= 0) { return; }
+        const auto* codes = Indirect ? static_cast<const std::uint8_t*>(tables[0 * kExperts + expert]) : bank_codes;
+        const auto* scales = Indirect ? static_cast<const std::uint8_t*>(tables[(0 + 2) * kExperts + expert]) : bank_scales;
+
 
     const int a_mat              = lane >> 3;
     const int a_rin              = lane & 7;
@@ -767,7 +775,7 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_gate_
         auto global_row = [&](int local_row) {
             const int logical = logical0 + (local_row & (kExpertBM / 2 - 1));
             const int row     = logical + (local_row >= kExpertBM / 2 ? kIntermediate : 0);
-            return (Routed ? expert * 1024 : 0) + row;
+            return (Routed && !Indirect ? expert * 1024 : 0) + row;
         };
 
         auto stage_x = [&](int stage, int kt) {
@@ -936,13 +944,13 @@ struct Q6DownMma {
     }
 };
 
-template <class Codec, int ExpertWarps, int ExpertBN>
+template <class Codec, int ExpertWarps, int ExpertBN, bool Indirect = false>
 __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_down_kernel(
     const __nv_bfloat16* __restrict__ activation, const int* __restrict__ expert_offsets,
     const int* __restrict__ route_job_experts, const int* __restrict__ route_job_columns,
-    const int* __restrict__ route_job_count, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
-    __nv_bfloat16* __restrict__ output) {
+    const int* __restrict__ route_job_count, const std::uint8_t* __restrict__ bank_codes,
+    const std::uint8_t* __restrict__ bank_high, const std::uint8_t* __restrict__ bank_scales,
+    __nv_bfloat16* __restrict__ output, const void* const* tables = nullptr) {
     constexpr int ExpertThreads = ExpertWarps * 32;
     constexpr int GroupsPerRow  = kIntermediate / 64;
     __shared__ __align__(16) __nv_bfloat16 As[kExpertBM * kExpertBK];
@@ -970,6 +978,10 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
         const int route_job   = work / row_blocks;
         const int row_block   = work - route_job * row_blocks;
         const int expert      = route_job_experts[route_job];
+        const auto* codes = Indirect ? static_cast<const std::uint8_t*>(tables[4 * kExperts + expert]) : bank_codes;
+        const auto* scales = Indirect ? static_cast<const std::uint8_t*>(tables[(4 + 2) * kExperts + expert]) : bank_scales;
+        const auto* high = Indirect ? static_cast<const std::uint8_t*>(tables[5 * kExperts + expert]) : bank_high;
+
         const int row0        = row_block * kExpertBM;
         const int begin       = expert_offsets[expert];
         const int count       = expert_offsets[expert + 1] - begin;
@@ -979,7 +991,7 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
 
         auto stage_scales = [&] {
             for (int row = tid; row < kExpertBM; row += ExpertThreads) {
-                const int global_row  = expert * kHidden + row0 + row;
+                const int global_row  = (Indirect ? 0 : expert * kHidden) + row0 + row;
                 const std::int64_t gi = static_cast<std::int64_t>(global_row) * GroupsPerRow;
                 cp_async<16, Cache::cg>(&Sr[row * GroupsPerRow * 2], &scales[gi * 2]);
             }
@@ -1002,13 +1014,13 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
             for (int item = tid; item < kExpertBM * 2; item += ExpertThreads) {
                 const int row         = item >> 1;
                 const int half        = item & 1;
-                const int global_row  = expert * kHidden + row0 + row;
+                const int global_row  = (Indirect ? 0 : expert * kHidden) + row0 + row;
                 const std::int64_t gi = static_cast<std::int64_t>(global_row) * GroupsPerRow + kt;
                 cp_async<16, Cache::cg>(&Cr[stage][row * 32 + half * 16],
                                         &codes[gi * 32 + half * 16]);
             }
             for (int row = tid; row < kExpertBM; row += ExpertThreads) {
-                const int global_row  = expert * kHidden + row0 + row;
+                const int global_row  = (Indirect ? 0 : expert * kHidden) + row0 + row;
                 const std::int64_t gi = static_cast<std::int64_t>(global_row) * GroupsPerRow + kt;
                 if constexpr (Codec::kHighBytes == 8) {
                     cp_async<8>(&Hr[stage][row * Codec::kHighBytes], &high[gi * Codec::kHighBytes]);
@@ -1114,13 +1126,13 @@ __global__ __launch_bounds__(ExpertWarps * 32, 3) void sparse_moe_prefill_qx_dow
     }
 }
 
-template <bool Routed, bool Adaptive = false>
+template <bool Routed, bool Adaptive = false, bool Indirect = false>
 __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_down_kernel(
     const __nv_bfloat16* __restrict__ input, const int* __restrict__ expert_offsets,
-    const std::uint8_t* __restrict__ codes, const std::uint8_t* __restrict__ scales,
+    const std::uint8_t* __restrict__ bank_codes, const std::uint8_t* __restrict__ bank_scales,
     __nv_bfloat16* __restrict__ grouped_output, const float* __restrict__ routed_sum,
     const float* __restrict__ shared_scale, __nv_bfloat16* __restrict__ destination, int tokens,
-    const int* __restrict__ route_job_count) {
+    const int* __restrict__ route_job_count, const void* const* tables = nullptr) {
     __shared__ __align__(16) __nv_bfloat16 As[kExpertBM * kExpertBK];
     __shared__ __align__(16) __nv_bfloat16 Bs[kExpertStages][kExpertBN * kExpertBK];
     __shared__ __align__(16) std::uint8_t Cr[kExpertBM * kExpertBK];
@@ -1138,6 +1150,9 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_down_
     const int count  = Routed ? expert_offsets[expert + 1] - begin
                               : (tokens - begin < kExpertBN ? tokens - begin : kExpertBN);
     if (count <= 0) { return; }
+        const auto* codes = Indirect ? static_cast<const std::uint8_t*>(tables[4 * kExperts + expert]) : bank_codes;
+        const auto* scales = Indirect ? static_cast<const std::uint8_t*>(tables[(4 + 2) * kExperts + expert]) : bank_scales;
+
 
     const int a_mat              = lane >> 3;
     const int a_rin              = lane & 7;
@@ -1177,7 +1192,7 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_down_
             for (int item = tid; item < kExpertBM * (kExpertBK / 16); item += kExpertThreads) {
                 const int row        = item / (kExpertBK / 16);
                 const int chunk      = item - row * (kExpertBK / 16);
-                const int global_row = (Routed ? expert * kHidden : 0) + row0 + row;
+                const int global_row = (Routed && !Indirect ? expert * kHidden : 0) + row0 + row;
                 const std::int64_t gi =
                     static_cast<std::int64_t>(global_row) * groups_per_row + group0;
                 cp_async<16, Cache::cg>(&Cr[row * kExpertBK + chunk * 16],
@@ -1185,7 +1200,7 @@ __global__ __launch_bounds__(kExpertThreads, 1) void sparse_moe_prefill_q8_down_
             }
             if ((kt % scale_cache_tiles) == 0) {
                 for (int row = tid; row < kExpertBM; row += kExpertThreads) {
-                    const int global_row = (Routed ? expert * kHidden : 0) + row0 + row;
+                    const int global_row = (Routed && !Indirect ? expert * kHidden : 0) + row0 + row;
                     const std::int64_t gi =
                         static_cast<std::int64_t>(global_row) * groups_per_row + group0;
                     cp_async<16, Cache::cg>(&Sr[row * 16], &scales[gi * 2]);
@@ -1446,12 +1461,12 @@ struct Nvfp4RoutedRaster {
 // `down` weight rows are contiguous inside an expert, so folding the expert's row base into the
 // block row lets the stock identity row policy and the stock contiguous scale staging address
 // the plane without knowing about routing.
-template <int BlockM, int BlockN>
+template <int BlockM, int BlockN, bool Indirect = false>
 struct Nvfp4RoutedDownRaster {
     Nvfp4Jobs jobs;
 
     __device__ __forceinline__ void blocks(int& block_row, int& block_token) const {
-        block_row   = jobs.expert() * (kHidden / BlockN) + static_cast<int>(blockIdx.x);
+        block_row   = (Indirect ? 0 : jobs.expert() * (kHidden / BlockN)) + static_cast<int>(blockIdx.x);
         block_token = jobs.column_base() / BlockM;
     }
 
@@ -1469,6 +1484,43 @@ struct Nvfp4ExpertGateUpRows {
         const int within = row_begin + (local_row & (kRowsPerBranch - 1)) +
                            (local_row >= kRowsPerBranch ? kIntermediate : 0);
         return jobs.expert() * (2 * kIntermediate) + within;
+    }
+};
+
+template <int RowsPerBranch>
+struct Nvfp4IndirectGateUpRows : Nvfp4ExpertGateUpRows<RowsPerBranch> {
+    const void* const* tables;
+    __device__ __forceinline__ int weight_row(int row_begin, int local_row) const {
+        return row_begin + (local_row & (RowsPerBranch - 1)) +
+               (local_row >= RowsPerBranch ? kIntermediate : 0);
+    }
+    __device__ __forceinline__ const std::uint8_t* codes() const {
+        return static_cast<const std::uint8_t*>(tables[0 * kExperts + this->jobs.expert()]);
+    }
+    __device__ __forceinline__ const std::uint8_t* scales() const {
+        return static_cast<const std::uint8_t*>(tables[(0 + 2) * kExperts + this->jobs.expert()]);
+    }
+};
+struct Nvfp4IndirectDownRows : Nvfp4W4a4IdentityRows {
+    Nvfp4Jobs jobs;
+    const void* const* tables;
+    __device__ __forceinline__ const std::uint8_t* codes() const {
+        return static_cast<const std::uint8_t*>(tables[4 * kExperts + jobs.expert()]);
+    }
+    __device__ __forceinline__ const std::uint8_t* scales() const {
+        return static_cast<const std::uint8_t*>(tables[(4 + 2) * kExperts + jobs.expert()]);
+    }
+};
+struct Nvfp4IndirectDivisorEpilogue {
+    Nvfp4Jobs jobs;
+    const void* const* tables;
+    int projection;
+    __device__ __forceinline__ float apply(int row, int, float value) const {
+        const auto* divisors = static_cast<const float*>(tables[(projection * 4 + 3) * kExperts + jobs.expert()]);
+        return value * __frcp_rn(divisors[row / (projection == 0 ? kIntermediate : kHidden)]);
+    }
+    __device__ __forceinline__ float apply_scaled(int row, int token, float value, float scale) const {
+        return apply(row, token, value * scale);
     }
 };
 
@@ -1713,6 +1765,7 @@ struct Nvfp4PrefillPlanes {
     std::uint8_t* shared_scales;
 };
 
+template <bool Indirect = false>
 void launch_sparse_moe_prefill_nvfp4(const __nv_bfloat16* input, const SparseMoeWeights& weights,
                                      __nv_bfloat16* destination, int tokens, int assignments,
                                      int max_route_jobs, const int* packed_token,
@@ -1721,7 +1774,7 @@ void launch_sparse_moe_prefill_nvfp4(const __nv_bfloat16* input, const SparseMoe
                                      const int* packed_index, const float* alpha,
                                      const float* shared_scale, __nv_bfloat16* grouped_io,
                                      float* /*routed_sum*/, Nvfp4PrefillPlanes planes,
-                                     cudaStream_t stream) {
+                                     cudaStream_t stream, const void* const* tables = nullptr) {
 #if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_NVFP4)
     // The route runs W4A4 on the Blackwell FP4 tensor-core instruction, which sm_8x does not have;
     // binding refuses the profile on this build before any call reaches here.
@@ -1752,25 +1805,29 @@ void launch_sparse_moe_prefill_nvfp4(const __nv_bfloat16* input, const SparseMoe
     {
         // Alpha keeps only what the whole plane shares; the row's own divisor is the epilogue's.
         const float scale = 1.0F / weights.routed_gate_up.input_scale_divisor;
-        const Nvfp4SourceDivisorEpilogue epilogue = nvfp4_divisor_epilogue(weights.routed_gate_up);
+        const auto epilogue = [&] {
+            if constexpr (Indirect) { return Nvfp4IndirectDivisorEpilogue{jobs, tables, 0}; }
+            else { return nvfp4_divisor_epilogue(weights.routed_gate_up); }
+        }();
         const Nvfp4RoutedGatherTokens token_policy{packed_token, offsets, jobs};
         const Nvfp4RoutedGateUpOutput output{planes.routed_codes, planes.routed_scales, offsets,
                                              jobs, weights.routed_down.input_scale_divisor};
         const auto launch = [&](auto tag) {
             using Schedule          = typename decltype(tag)::type;
             constexpr int kPairRows = Schedule::kBlockN / 2;
-            using Rows              = Nvfp4ExpertGateUpRows<kPairRows>;
+            using Rows = std::conditional_t<Indirect, Nvfp4IndirectGateUpRows<kPairRows>, Nvfp4ExpertGateUpRows<kPairRows>>;
+            const Rows rows = [&] { if constexpr (Indirect) { return Rows{{jobs}, tables}; } else { return Rows{jobs}; } }();
             using Raster            = Nvfp4RoutedRaster<Schedule::kBlockM>;
             const dim3 grid(kIntermediate / kPairRows, max_route_jobs);
             constexpr auto kernel =
                 nvfp4_w4a4_mma_kernel<Nvfp4RoutedGateUpGeometry, Schedule,
-                                      Nvfp4SourceDivisorEpilogue, Nvfp4RoutedGateUpOutput, Rows,
-                                      true, Nvfp4RoutedGatherTokens, Raster>;
+                                      decltype(epilogue), Nvfp4RoutedGateUpOutput, Rows,
+                                      true, Nvfp4RoutedGatherTokens, Raster, Indirect>;
             const std::size_t shared_bytes = nvfp4_w4a4_shared_bytes<Schedule, kernel>();
             kernel<<<grid, Schedule::kThreads, shared_bytes, stream>>>(
                 chunk, static_cast<const std::uint8_t*>(weights.routed_gate_up.qdata),
                 static_cast<const std::uint8_t*>(weights.routed_gate_up.scales), assignments, scale,
-                epilogue, output, Rows{jobs}, token_policy, Raster{jobs});
+                epilogue, output, rows, token_policy, Raster{jobs});
         };
         if (tokens <= kNvfp4RoutedSmallTokens) {
             launch(Nvfp4ScheduleTag<Nvfp4RoutedGateUpSmallTSchedule>{});
@@ -1782,22 +1839,27 @@ void launch_sparse_moe_prefill_nvfp4(const __nv_bfloat16* input, const SparseMoe
 
     {
         const float scale                         = 1.0F / weights.routed_down.input_scale_divisor;
-        const Nvfp4SourceDivisorEpilogue epilogue = nvfp4_divisor_epilogue(weights.routed_down);
+        const auto epilogue = [&] {
+            if constexpr (Indirect) { return Nvfp4IndirectDivisorEpilogue{jobs, tables, 1}; }
+            else { return nvfp4_divisor_epilogue(weights.routed_down); }
+        }();
         const Nvfp4RoutedPackedTokens token_policy{offsets, jobs};
         const Nvfp4RoutedDownOutput output{grouped_io, offsets, jobs};
         const auto launch = [&](auto tag) {
             using Schedule = typename decltype(tag)::type;
-            using Raster   = Nvfp4RoutedDownRaster<Schedule::kBlockM, Schedule::kBlockN>;
+            using Raster = Nvfp4RoutedDownRaster<Schedule::kBlockM, Schedule::kBlockN, Indirect>;
+            using Rows = std::conditional_t<Indirect, Nvfp4IndirectDownRows, Nvfp4W4a4IdentityRows>;
+            const Rows rows = [&] { if constexpr (Indirect) { return Rows{{}, jobs, tables}; } else { return Rows{}; } }();
             const dim3 grid(kHidden / Schedule::kBlockN, max_route_jobs);
             constexpr auto kernel =
                 nvfp4_w4a4_mma_kernel<Nvfp4RoutedDownGeometry, Schedule,
-                                      Nvfp4SourceDivisorEpilogue, Nvfp4RoutedDownOutput,
-                                      Nvfp4W4a4IdentityRows, false, Nvfp4RoutedPackedTokens, Raster>;
+                                      decltype(epilogue), Nvfp4RoutedDownOutput,
+                                      Rows, false, Nvfp4RoutedPackedTokens, Raster, Indirect>;
             const std::size_t shared_bytes = nvfp4_w4a4_shared_bytes<Schedule, kernel>();
             kernel<<<grid, Schedule::kThreads, shared_bytes, stream>>>(
                     routed_middle, static_cast<const std::uint8_t*>(weights.routed_down.qdata),
                     static_cast<const std::uint8_t*>(weights.routed_down.scales), assignments,
-                    scale, epilogue, output, Nvfp4W4a4IdentityRows{}, token_policy, Raster{jobs});
+                    scale, epilogue, output, rows, token_policy, Raster{jobs});
         };
         if (tokens <= kNvfp4RoutedSmallTokens) {
             launch(Nvfp4ScheduleTag<Nvfp4RoutedDownSmallTSchedule>{});
@@ -1869,9 +1931,11 @@ void launch_sparse_moe_prefill_nvfp4(const __nv_bfloat16* input, const SparseMoe
 
 } // namespace
 
-void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
+template <bool Indirect>
+void sparse_moe_prefill_launch_impl(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoePrefillPlan& plan,
-                               const SparseMoePrefillWorkspace& workspace, cudaStream_t stream) {
+                               const SparseMoePrefillWorkspace& workspace, cudaStream_t stream,
+                                    ExpertDelivery* delivery, std::size_t layer) {
     if (x.ne[1] != plan.tokens || destination.ne[1] != plan.tokens || plan.slice_tokens < 1) {
         throw std::invalid_argument("sparse_moe prefill: launch plan does not match tensors");
     }
@@ -1918,10 +1982,14 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
             (tokens + kSparseMoeRouteTileTokens - 1) / kSparseMoeRouteTileTokens;
         const int assignments   = tokens * kTopK;
         const bool nvfp4        = weights.routed_gate_up.qtype == QType::NVFP4;
+        const auto candidate = sparse_moe_prefill_tile_candidate(
+            tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype, plan.candidate);
         const int adaptive_last = weights.routed_down.qtype == QType::Q5_G64_FP16   ? 51
                                   : weights.routed_down.qtype == QType::Q6_G64_FP16 ? 52
                                                                                     : 0;
-        const bool adaptive     = !nvfp4 && tokens >= 47 && tokens <= adaptive_last;
+        const bool adaptive = !Indirect && !nvfp4 && tokens >= 47 && tokens <= adaptive_last &&
+                              candidate != SparseMoeCandidate::PrefillNarrow &&
+                              candidate != SparseMoeCandidate::PrefillWide;
 
         // Only this profile: the small-token router folds the NVFP4 quantisation of the chunk
         // into its epilogue, and its reduction order differs from the MMA router's, so a
@@ -1955,7 +2023,9 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         }
         CUDA_CHECK(cudaGetLastError());
 
-        const bool wide_plan = tokens >= kSparseMoePrefillWideMin;
+        const bool wide_plan = candidate == SparseMoeCandidate::PrefillWide ||
+                               (candidate != SparseMoeCandidate::PrefillNarrow &&
+                                tokens >= kSparseMoePrefillWideMin);
         // The NVFP4 tile is 64 columns wide at every token count, so its jobs have to be too.
         const int route_job_bn = nvfp4 ? kNvfp4JobColumns : (wide_plan ? 64 : 32);
         // The scan emits one route job per nonempty column tile of an expert, so it cannot
@@ -2011,6 +2081,13 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         }
         CUDA_CHECK(cudaGetLastError());
 
+        const void* const* tables = nullptr;
+        if constexpr (Indirect) {
+            (void)delivery->begin(layer, ids, assignments, stream);
+            delivery->await(stream);
+            tables = delivery->tables(layer);
+        }
+
         if (nvfp4) {
             const Nvfp4PrefillPlanes planes{
                 static_cast<std::uint8_t*>(workspace.nvfp4_input_codes.data),
@@ -2019,10 +2096,10 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                 static_cast<std::uint8_t*>(workspace.nvfp4_routed_scales.data),
                 static_cast<std::uint8_t*>(workspace.nvfp4_shared_codes.data),
                 static_cast<std::uint8_t*>(workspace.nvfp4_shared_scales.data)};
-            launch_sparse_moe_prefill_nvfp4(
+            launch_sparse_moe_prefill_nvfp4<Indirect>(
                 input, weights, output, tokens, assignments, max_route_jobs, packed_token, offsets,
                 route_job_experts, route_job_columns, route_job_count, packed_index, alpha,
-                shared_scale, grouped_io, routed_sum, planes, stream);
+                shared_scale, grouped_io, routed_sum, planes, stream, tables);
             continue;
         }
 
@@ -2030,26 +2107,26 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         // Same predicate that decided whether packed_token was written above.
         if (routed_gate_up_q4) {
             if (wide_plan) {
-                sparse_moe_prefill_q4_gate_up_kernel<8, 64>
+                sparse_moe_prefill_q4_gate_up_kernel<8, 64, kExpertStages, GateUpRoute::Any, Indirect>
                     <<<routed_gate_blocks, 8 * 32, 0, stream>>>(
                         input, packed_token, offsets, route_job_experts, route_job_columns,
-                        route_job_count, routed_gate_codes, routed_gate_scales, routed_activation);
+                        route_job_count, routed_gate_codes, routed_gate_scales, routed_activation, tables);
             } else {
-                sparse_moe_prefill_q4_gate_up_kernel<4, 32, kExpertStages, GateUpRoute::Packed>
+                sparse_moe_prefill_q4_gate_up_kernel<4, 32, kExpertStages, GateUpRoute::Packed, Indirect>
                     <<<routed_gate_blocks, 4 * 32, 0, stream>>>(
                         input, packed_token, offsets, route_job_experts, route_job_columns,
-                        route_job_count, routed_gate_codes, routed_gate_scales, routed_activation);
+                        route_job_count, routed_gate_codes, routed_gate_scales, routed_activation, tables);
                 sparse_moe_prefill_q4_gate_up_kernel<4, 32, kGateUpNarrowStages,
-                                                     GateUpRoute::Spread>
+                                                     GateUpRoute::Spread, Indirect>
                     <<<routed_gate_blocks, 4 * 32, 0, stream>>>(
                         input, packed_token, offsets, route_job_experts, route_job_columns,
-                        route_job_count, routed_gate_codes, routed_gate_scales, routed_activation);
+                        route_job_count, routed_gate_codes, routed_gate_scales, routed_activation, tables);
             }
         } else if (weights.routed_gate_up.qtype == QType::Q8_G32_FP16) {
-            sparse_moe_prefill_q8_gate_up_kernel<true>
+            sparse_moe_prefill_q8_gate_up_kernel<true, false, Indirect>
                 <<<routed_gate_grid, kExpertThreads, 0, stream>>>(
                     grouped_io, offsets, routed_gate_codes, routed_gate_scales, routed_activation,
-                    tokens, nullptr);
+                    tokens, nullptr, tables);
         } else {
             throw std::invalid_argument("sparse_moe prefill: unsupported gate/up codec");
         }
@@ -2074,39 +2151,39 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         switch (weights.routed_down.qtype) {
         case QType::Q5_G64_FP16:
             if (wide_plan) {
-                sparse_moe_prefill_qx_down_kernel<Q5DownMma, 8, 64>
+                sparse_moe_prefill_qx_down_kernel<Q5DownMma, 8, 64, Indirect>
                     <<<routed_down_blocks, 8 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
-                        grouped_io);
+                        grouped_io, tables);
             } else {
-                sparse_moe_prefill_qx_down_kernel<Q5DownMma, 4, 32>
+                sparse_moe_prefill_qx_down_kernel<Q5DownMma, 4, 32, Indirect>
                     <<<routed_down_blocks, 4 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
-                        grouped_io);
+                        grouped_io, tables);
             }
             break;
         case QType::Q6_G64_FP16:
             if (wide_plan) {
-                sparse_moe_prefill_qx_down_kernel<Q6DownMma, 8, 64>
+                sparse_moe_prefill_qx_down_kernel<Q6DownMma, 8, 64, Indirect>
                     <<<routed_down_blocks, 8 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
-                        grouped_io);
+                        grouped_io, tables);
             } else {
-                sparse_moe_prefill_qx_down_kernel<Q6DownMma, 4, 32>
+                sparse_moe_prefill_qx_down_kernel<Q6DownMma, 4, 32, Indirect>
                     <<<routed_down_blocks, 4 * 32, 0, stream>>>(
                         routed_activation, offsets, route_job_experts, route_job_columns,
                         route_job_count, routed_down_codes, routed_down_high, routed_down_scales,
-                        grouped_io);
+                        grouped_io, tables);
             }
             break;
         case QType::Q8_G32_FP16:
-            sparse_moe_prefill_q8_down_kernel<true>
+            sparse_moe_prefill_q8_down_kernel<true, false, Indirect>
                 <<<routed_down_grid, kExpertThreads, 0, stream>>>(
                     routed_activation, offsets, routed_down_codes, routed_down_scales, grouped_io,
-                    nullptr, nullptr, nullptr, tokens, nullptr);
+                    nullptr, nullptr, nullptr, tokens, nullptr, tables);
             break;
         default:
             throw std::invalid_argument("sparse_moe prefill: unsupported down codec");
@@ -2136,6 +2213,18 @@ void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
         }
         CUDA_CHECK(cudaGetLastError());
     }
+}
+
+void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
+                               Tensor& destination, const SparseMoePrefillPlan& plan,
+                               const SparseMoePrefillWorkspace& workspace, cudaStream_t stream) {
+    sparse_moe_prefill_launch_impl<false>(x, weights, destination, plan, workspace, stream, nullptr, 0);
+}
+void sparse_moe_stream_prefill(const Tensor& x, const SparseMoeWeights& weights,
+                               Tensor& destination, const SparseMoePrefillPlan& plan,
+                               const SparseMoePrefillWorkspace& workspace, ExpertDelivery& delivery,
+                               std::size_t layer, cudaStream_t stream) {
+    sparse_moe_prefill_launch_impl<true>(x, weights, destination, plan, workspace, stream, &delivery, layer);
 }
 
 } // namespace ninfer::ops::detail

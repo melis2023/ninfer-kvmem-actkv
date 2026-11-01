@@ -75,10 +75,15 @@ int main(int argc, char** argv) {
             o.speculative.draft_tokens = static_cast<std::uint32_t>(std::stoul(argv[5]));
         }
         const std::string mode = argc >= 7 ? argv[6] : "";
+        if (mode.starts_with("input-fallback-disk-"))
+            throw std::invalid_argument("persistent KVMem snapshots are retired; use tests/ninfer_memory_disk.py in the parent repository for process-local SSD lifecycle checks");
+        if (mode == "prefix-anchor-ssd") {
+            o.kvmem.host_bytes = 64ULL << 20;
+            o.kvmem.disk_path = std::filesystem::path(argv[4]).parent_path() / "prefix-spill";
+            o.kvmem.disk_bytes = 1ULL << 30;
+        }
         if (mode == "lrfu") { o.kvmem.lrfu = true; o.kvmem.score_agg_max = true; }
-        const bool input_fallback = mode == "input-fallback" ||
-            mode == "input-fallback-disk-write" || mode == "input-fallback-disk-read" ||
-            mode == "input-fallback-disk-corrupt";
+        const bool input_fallback = mode == "input-fallback";
         if ((mode == "endpoint" || input_fallback) && o.speculative.draft_tokens) {
             o.speculative.ngram_draft_tokens = 31;
             o.speculative.ngram_min_match = 4;
@@ -94,22 +99,19 @@ int main(int argc, char** argv) {
             else throw std::invalid_argument("expected wddm, adaptive, fast or adaptive-fast");
         }
         if (input_fallback) o.gdn_state_fp16 = true;
-        if (input_fallback && mode != "input-fallback") {
-            o.kvmem.disk_path = std::filesystem::path(argv[4]).parent_path() / "disk";
-            o.kvmem.disk_bytes = 2ULL << 30;
-        }
         ninfer::Engine engine(o);
         std::cout << "FEATURE drafts=" << o.speculative.draft_tokens << " adaptive="
                   << (o.speculative.mtp_policy == ninfer::MtpDraftPolicy::Adaptive)
                   << " fast=" << o.fast_prefill_kernel << std::endl;
         std::ofstream output(argv[4]);
+        std::uint32_t last_processed_prompt = 0;
         const auto run = [&](const char* name, const ninfer::PromptInput& p, bool reuse,
-                             bool expected_reuse, std::uint32_t cancel_prompt = 0,
+                             std::optional<bool> expected_reuse, std::uint32_t cancel_prompt = 0,
                              std::uint32_t cancel_output = 0, std::uint32_t output_tokens = 32,
                              bool model_stop = false) {
             ninfer::RequestOptions request;
             request.execution.requested_output_tokens = cancel_output ? 130 : output_tokens;
-            request.execution.sampling.temperature = 0;
+            request.execution.sampling.temperature = mode == "stochastic" ? 0.7F : 0.0F;
             request.execution.sampling.seed = 42;
             request.execution.allow_prefix_reuse = reuse;
             request.stop.include_model_defaults = model_stop;
@@ -120,7 +122,9 @@ int main(int argc, char** argv) {
                 .wait(&sink, ninfer::CancellationView([&] { return sink.cancel.load(); }));
             require(engine.is_available(), "request made Engine unavailable");
             require(sink.starts == 1, "request admission was not published exactly once");
-            require((result.reused_prompt_tokens > 0) == expected_reuse, "unexpected prefix reuse decision");
+            if (expected_reuse.has_value())
+                require((result.reused_prompt_tokens > 0) == *expected_reuse, "unexpected prefix reuse decision");
+            last_processed_prompt = sink.processed;
             require(result.reused_prompt_tokens == sink.reused, "terminal reuse accounting mismatch");
             if (cancel_prompt || cancel_output) {
                 require(result.finish_reason == ninfer::FinishReason::Cancelled, "cancellation did not terminate");
@@ -156,6 +160,36 @@ int main(int argc, char** argv) {
             }
             return result;
         };
+        if (mode == "prefix-anchor" || mode == "prefix-anchor-ssd") {
+            ninfer::PromptInput history;
+            history.options.enable_thinking = false;
+            history.context_cache.session_key = "prefix-anchor-core";
+            add(history, ninfer::ChatRole::System, "Answer briefly using the archive.");
+            std::string document;
+            for (int i = 0; i < 160; ++i)
+                document += "The violet observatory studies pulsars and cosmic rays. ";
+            add(history, ninfer::ChatRole::User, document);
+            ninfer::PromptInput current;
+            for (int turn = 1; turn <= 6; ++turn) {
+                current = history;
+                add(current, ninfer::ChatRole::User, "Tool-call turn " + std::to_string(turn) +
+                    " of 100. State one fact.");
+                run("rewritten-tail", current, true, turn >= 3, 0, 0, 8);
+                add(history, ninfer::ChatRole::Assistant, "The archive is recorded.");
+                add(history, ninfer::ChatRole::Tool, "Observation: the observatory studies pulsars.");
+            }
+            run("cancel-output", current, true, true, 0, 8);
+            run("after-cancel", current, true, true, 0, 0, 8);
+            if (mode == "prefix-anchor-ssd") {
+                const auto memory = engine.memory_summary().kvmem;
+                require(memory.disk_read_bytes && memory.disk_written_bytes,
+                        "prefix-anchor SSD fixture did not exercise native cold reads and writes");
+                std::cout << "PREFIX_SSD read=" << memory.disk_read_bytes
+                          << " written=" << memory.disk_written_bytes << std::endl;
+            }
+            std::cout << "PREFIX_ANCHOR PASS" << std::endl;
+            return 0;
+        }
         if (mode == "lrfu") {
             auto chat = archive();
             chat.options.enable_thinking = false;
@@ -226,27 +260,13 @@ int main(int argc, char** argv) {
             };
             auto previous = engine.prepare(chat).summary().prompt_tokens;
             require(previous > 512, "fallback fixture does not exercise sparse history");
-            if (mode != "input-fallback-disk-read" && mode != "input-fallback-disk-corrupt")
-                check("cold", chat, 0);
-            if (mode == "input-fallback-disk-write") {
-                require(engine.memory_summary().kvmem.disk_writes == 1,
-                        "fallback history was not published to disk");
-                std::cout << "INPUT_FALLBACK DISK_WRITE PASS" << std::endl;
-                return 0;
-            }
+            check("cold", chat, 0);
             for (int turn = 0; turn < 3; ++turn) {
                 // The benchmark keeps a synthetic tool history and discards the actual
                 // generated reasoning/answer. Its exact earlier input remains reusable.
                 add(chat, ninfer::ChatRole::Assistant, "The tool record is saved.");
                 add(chat, ninfer::ChatRole::Tool, "Additional archive fragment.\n" + records.substr(0, 600));
-                const bool corrupt = turn == 0 && mode == "input-fallback-disk-corrupt";
-                previous = check("discard-and-append", chat, corrupt ? 0 : previous);
-                if (turn == 0 && mode == "input-fallback-disk-read")
-                    require(engine.memory_summary().kvmem.disk_hits == 1,
-                            "canonical input checkpoint was not restored after restart");
-                if (corrupt)
-                    require(engine.memory_summary().kvmem.disk_errors == 1,
-                            "corrupt snapshot was not rejected before reuse");
+                previous = check("discard-and-append", chat, previous);
             }
             check("repeat", chat, previous);
             check("cancel-output", chat, previous, 8);
@@ -442,7 +462,12 @@ int main(int argc, char** argv) {
         auto different = a;
         different.messages[0].parts[0].text = "Read the following archive carefully.";
         run("cancel-prefill", different, true, false, 128);
-        run("resume-prefill", different, true, false);
+        const auto cancelled_frontier = last_processed_prompt;
+        const auto resumed_prefill = run("resume-prefill", different, true, std::nullopt);
+        // Cancellation may preserve an earlier complete LCP checkpoint. The transfer verifier
+        // checks its prefix and native KV/state; it must never reuse unprocessed input.
+        require(resumed_prefill.reused_prompt_tokens <= cancelled_frontier,
+                "cancelled prefill reused beyond its completed input frontier");
         if (argc >= 6) {
             // The identical prefix ends immediately before a changed suffix. MTP's
             // boundary row must use the new suffix embedding, not the old query.

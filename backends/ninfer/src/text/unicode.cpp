@@ -91,6 +91,47 @@ bool is_letter(std::int32_t codepoint) noexcept {
     }
 }
 
+bool is_upper_or_title_letter(std::int32_t codepoint) noexcept {
+    const auto category = utf8proc_category(codepoint);
+    return category == UTF8PROC_CATEGORY_LU || category == UTF8PROC_CATEGORY_LT;
+}
+
+bool is_lower_letter(std::int32_t codepoint) noexcept {
+    return utf8proc_category(codepoint) == UTF8PROC_CATEGORY_LL;
+}
+
+bool is_modifier_or_other_letter(std::int32_t codepoint) noexcept {
+    const auto category = utf8proc_category(codepoint);
+    return category == UTF8PROC_CATEGORY_LM || category == UTF8PROC_CATEGORY_LO;
+}
+
+bool is_punctuation(std::int32_t codepoint) noexcept {
+    switch (utf8proc_category(codepoint)) {
+    case UTF8PROC_CATEGORY_PC:
+    case UTF8PROC_CATEGORY_PD:
+    case UTF8PROC_CATEGORY_PS:
+    case UTF8PROC_CATEGORY_PE:
+    case UTF8PROC_CATEGORY_PI:
+    case UTF8PROC_CATEGORY_PF:
+    case UTF8PROC_CATEGORY_PO:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool is_symbol(std::int32_t codepoint) noexcept {
+    switch (utf8proc_category(codepoint)) {
+    case UTF8PROC_CATEGORY_SM:
+    case UTF8PROC_CATEGORY_SC:
+    case UTF8PROC_CATEGORY_SK:
+    case UTF8PROC_CATEGORY_SO:
+        return true;
+    default:
+        return false;
+    }
+}
+
 bool is_mark(std::int32_t codepoint) noexcept {
     switch (utf8proc_category(codepoint)) {
     case UTF8PROC_CATEGORY_MN:

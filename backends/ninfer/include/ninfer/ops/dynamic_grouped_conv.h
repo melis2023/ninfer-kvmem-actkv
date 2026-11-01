@@ -69,10 +69,11 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
 /**
  * Returns the transient capacity required by linear_dynamic_grouped_conv_add for every width/batch
  * pair in the inclusive intervals. input_rows is 4096 or 17408, widths lie in [2,16], and batch
- * sizes in [1,8]. Capacity follows every shape-selected production route.
+ * sizes in [1,8]. Capacity covers the actual projection format's routes, including Linear's
+ * staging for materialized projections; other formats do not contribute to the reservation.
  */
 [[nodiscard]] std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-    std::int32_t input_rows, std::int32_t min_width, std::int32_t max_width,
+    QType projection_type, std::int32_t input_rows, std::int32_t min_width, std::int32_t max_width,
     std::int32_t min_batch_size, std::int32_t max_batch_size);
 
 /**
@@ -88,8 +89,9 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
  *       + I(i>0) * (base_kernel[h,1,1] + finish_delta[g,1,i,b]) * z[h,i-1,b].
  *
  * Logical shapes / supported domain:
- *   x is contiguous BF16 [C,W,B]; projection_weight is RowSplit [5120,C] with unpadded C, either
- *   Q8_G32_FP16 (the fused routes) or a format Linear registers at that shape (projected through
+ *   x is contiguous BF16 [C,W,B]; projection_weight is [5120,C] with unpadded C, either
+ *   RowSplit Q8_G32_FP16 (the fused routes), another RowSplit format, GGUF blocks or NVFP4
+ *   that Linear registers at that shape (projected through
  *   Linear into the same BF16 plane); base_kernel is contiguous BF16 [5120,2,2] with axes
  *   [channel,tap,side];
  *   finish_delta is contiguous BF16 [320,2,W,B]; and residual is contiguous BF16 [5120,W,B].

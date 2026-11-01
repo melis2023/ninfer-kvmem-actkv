@@ -1,0 +1,283 @@
+name: Native release
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish native release assets and both Docker images (master only)
+        type: boolean
+        default: false
+      platforms:
+        description: Platforms to build (publication requires all)
+        type: choice
+        options: [all, linux, windows]
+        default: all
+      windows_phase:
+        description: Windows phase (package restores all required object shards from HF)
+        type: choice
+        options: [full, package]
+        default: full
+      linux_runner:
+        description: Linux runner (the temporary runner must already provide Debian 13)
+        type: choice
+        options: [github-hosted, ninfer-native-debian13]
+        default: github-hosted
+
+permissions:
+  contents: read
+
+env:
+  HF_BUILD_CACHE_SEED_REF: ${{ vars.HF_BUILD_CACHE_SEED_REF }}
+
+# A newer commit cancels old builds. Cleanup saves completed object-cache entries.
+# Publication uses a draft and checks master again before moving latest.
+concurrency:
+  group: native-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: Native inputs changed
+    runs-on: ubuntu-24.04
+    outputs:
+      native: ${{ steps.compare.outputs.native }}
+      release_tools: ${{ steps.compare.outputs.release_tools }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - id: compare
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/build-inputs.sh --native >> "$GITHUB_OUTPUT"
+
+  checks:
+    needs: changes
+    if: needs.changes.outputs.native == 'true' || needs.changes.outputs.release_tools == 'true'
+    uses: ./.github/workflows/build-workflow-checks.yml
+
+  validate:
+    needs: [changes, checks]
+    if: needs.changes.outputs.native == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Check publication scope
+        env:
+          PUBLISH: ${{ inputs.publish }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          if [[ "$PUBLISH" == true && "$PLATFORMS" != all ]]; then
+            echo 'Publication requires both Linux and Windows artifacts.' >&2
+            exit 1
+          fi
+      - name: Wait for the previous run to finish cache cleanup
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3.11 .github/scripts/wait-previous-builds.py
+
+  windows-objects:
+    needs: validate
+    if: inputs.platforms != 'linux' && inputs.windows_phase != 'package'
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+        toolkit:
+          - cuda: '12.9.2'
+            archs: '70;75;80;86;89'
+            packages: '["nvcc", "cudart", "cublas", "cublas_dev", "nvtx", "thrust", "cuda_profiler_api", "cuobjdump", "nvprune"]'
+          - cuda: '13.4.3'
+            archs: '75;80;86;89;120a'
+            packages: '["nvcc", "crt", "nvvm", "cudart", "cublas", "cublas_dev", "nvtx", "thrust", "cuda_profiler_api", "cuobjdump", "nvprune"]'
+    uses: ./.github/workflows/native-windows.yml
+    with:
+      cuda: ${{ matrix.toolkit.cuda }}
+      archs: ${{ matrix.toolkit.archs }}
+      packages: ${{ matrix.toolkit.packages }}
+      phase: objects
+      shard: ${{ matrix.shard }}
+    secrets:
+      HF_BUILD_CACHE_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
+
+  windows:
+    needs: [validate, windows-objects]
+    if: >-
+      ${{ always() && !cancelled() && needs.validate.result == 'success' &&
+          inputs.platforms != 'linux' &&
+          (needs.windows-objects.result == 'success' ||
+           (inputs.windows_phase == 'package' && needs.windows-objects.result == 'skipped')) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        toolkit:
+          - cuda: '12.9.2'
+            archs: '70;75;80;86;89'
+            packages: '["nvcc", "cudart", "cublas", "cublas_dev", "nvtx", "thrust", "cuda_profiler_api", "cuobjdump", "nvprune"]'
+          - cuda: '13.4.3'
+            archs: '75;80;86;89;120a'
+            packages: '["nvcc", "crt", "nvvm", "cudart", "cublas", "cublas_dev", "nvtx", "thrust", "cuda_profiler_api", "cuobjdump", "nvprune"]'
+    uses: ./.github/workflows/native-windows.yml
+    with:
+      cuda: ${{ matrix.toolkit.cuda }}
+      archs: ${{ matrix.toolkit.archs }}
+      packages: ${{ matrix.toolkit.packages }}
+      phase: package
+    secrets:
+      HF_BUILD_CACHE_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
+
+  linux:
+    needs: validate
+    if: inputs.platforms != 'windows'
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - cuda: '12.9.2'
+            archs: '70;75;80;86;89'
+          - cuda: '13.4.3'
+            archs: '75;80;86;89;120a'
+    uses: ./.github/workflows/native-linux.yml
+    with:
+      cuda: ${{ matrix.cuda }}
+      archs: ${{ matrix.archs }}
+      runner: ${{ inputs.linux_runner == 'ninfer-native-debian13' && 'ninfer-native-debian13' || 'ubuntu-24.04' }}
+      jobs: ${{ inputs.linux_runner == 'ninfer-native-debian13' && 32 || 4 }}
+    secrets: inherit
+
+  universal-linux:
+    name: Assemble universal linux package
+    needs: linux
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Reserve archive space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          sudo apt-get update && sudo apt-get install -y p7zip-full
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: native-linux-cuda-*
+          merge-multiple: true
+          path: native-input
+      - name: Combine verified backends without compilation
+        run: >-
+          python3.11 .github/scripts/run-cached-build.py --checkpoint-family=
+          --log universal-package.log -- python3.11 scripts/assemble-universal-release.py
+          --input native-input --output dist --platform linux-x64 --revision "${{ github.sha }}"
+      - name: Preserve universal Linux archive in HF
+        env:
+          HF_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
+          HF_HUB_DISABLE_TELEMETRY: '1'
+        run: |
+          python3.11 -m pip install --disable-pip-version-check huggingface_hub==1.17.0
+          python3.11 .github/scripts/archive-linux-artifact.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: native-linux-universal
+          path: |
+            dist/*.7z.*
+            dist/*.tar.gz.*
+            dist/SHA256SUMS-*.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: universal-linux-logs
+          path: universal-package.log
+          if-no-files-found: ignore
+
+  universal-windows:
+    name: Assemble universal windows package
+    needs: windows
+    # Package-only runs skip the object-shard ancestor.
+    if: ${{ !cancelled() && needs.windows.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Reserve archive space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          sudo apt-get update && sudo apt-get install -y p7zip-full
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: native-windows-cuda-*
+          merge-multiple: true
+          path: native-input
+      - name: Combine verified backends without compilation
+        run: >-
+          python3.11 .github/scripts/run-cached-build.py --checkpoint-family=
+          --log universal-package.log -- python3.11 scripts/assemble-universal-release.py
+          --input native-input --output dist --platform windows-x64 --revision "${{ github.sha }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: native-windows-universal
+          path: |
+            dist/*.7z.*
+            dist/*.tar.gz.*
+            dist/SHA256SUMS-*.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: universal-windows-logs
+          path: universal-package.log
+          if-no-files-found: ignore
+
+  containers:
+    name: Docker images from Linux artifacts
+    needs: linux
+    uses: ./.github/workflows/docker.yml
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+    with:
+      publish: ${{ github.ref == 'refs/heads/master' && (github.event_name == 'push' || inputs.publish) }}
+
+  publish:
+    needs: [windows, linux, universal-windows, universal-linux]
+    if: github.ref == 'refs/heads/master' && (github.event_name == 'push' || inputs.publish)
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: native-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Publish verified assets from this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: .github/scripts/publish-native-release.sh

@@ -35,6 +35,64 @@ int main() {
     }
     CHECK(storage.charged_bytes() == 0);
     {
+        HostKvStorage branches(24);
+        auto parent=branches.allocate(8,bytes.data());
+        rejects(MemoryErrorCode::Pending,[&] { parent.fork(); });
+        parent.seal();
+        parent.write(0,bytes.data(),1);
+        rejects(MemoryErrorCode::Pending,[&] { parent.fork(); });
+        parent.seal();
+        auto child=parent.fork();
+        CHECK(parent.storage_identity()==child.storage_identity());
+        CHECK(branches.charged_bytes()==8);
+        uint8_t value=99;
+        child.write(0,&value,1);
+        CHECK(branches.charged_bytes()==16);
+        CHECK(parent.data()[0]==1 && child.data()[0]==99);
+        value=77; parent.write(1,&value,1);
+        CHECK(parent.data()[1]==77 && child.data()[1]==2);
+        parent.reset();
+        CHECK(child.data()[0]==99 && branches.charged_bytes()==8);
+    }
+    {
+        HostKvStorage tight(8);
+        auto parent=tight.allocate(8,bytes.data()); parent.seal();
+        auto child=parent.fork();
+        rejects(MemoryErrorCode::BudgetExceeded,[&] { child.write(0,bytes.data(),1); });
+        CHECK(parent.storage_identity()==child.storage_identity() && tight.charged_bytes()==8);
+        CHECK(std::memcmp(parent.data(),bytes.data(),8)==0);
+    }
+    {
+        // Once the other owner is gone, writing the survivor must not need a
+        // second page: the entire hard RAM budget is already this one page.
+        HostKvStorage tight(8);
+        auto parent=tight.allocate(8,bytes.data()); parent.seal();
+        auto survivor=parent.fork(); parent.reset();
+        CHECK(survivor.mutable_resident());
+        uint8_t changed=42;
+        try { survivor.write(0,&changed,1); }
+        catch(const MemoryError& error) {
+            std::fprintf(stderr,"surviving owner cannot reuse its page: %s\n",error.what());
+            return 1;
+        }
+        CHECK(survivor.data()[0]==42 && tight.charged_bytes()==8);
+    }
+    {
+        HostKvStorage tight(8);
+        auto parent=tight.allocate(8,bytes.data()); parent.seal();
+        auto survivor=parent.fork(); auto reader=parent.source(); parent.reset();
+        uint8_t changed=42;
+        // Read sources count too: do not mutate data held by an in-flight read
+        // just because the other branch's record was deleted.
+        rejects(MemoryErrorCode::BudgetExceeded,[&] { survivor.write(0,&changed,1); });
+        reader.read(0,copy.data(),copy.size()); CHECK(copy==bytes);
+        auto lease=survivor.lease(); reader={};
+        rejects(MemoryErrorCode::BudgetExceeded,[&] { survivor.write(0,&changed,1); });
+        lease.read(0,copy.data(),copy.size()); CHECK(copy==bytes);
+        lease={}; survivor.write(0,&changed,1);
+        CHECK(survivor.data()[0]==42 && tight.charged_bytes()==8);
+    }
+    {
         auto first = storage.reserve(8), second = storage.reserve(8);
         first = std::move(second);
         CHECK(storage.charged_bytes() == 8 && second.remaining() == 0);

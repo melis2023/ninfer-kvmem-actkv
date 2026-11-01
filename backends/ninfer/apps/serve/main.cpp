@@ -1,4 +1,6 @@
 #include "ninfer_build_id.h"
+#include "product/module_identity.h"
+#include "kvmem/launch_contract.hpp"
 #include "product/logging/engine_diagnostics.h"
 #include "product/logging/logging.h"
 #include "product/logging/startup_log.h"
@@ -206,42 +208,19 @@ void install_stop_handlers() {
 }
 #endif
 
-// Identity of this exact binary for the persisted prefix cache: the build id alone repeats for
-// every uncommitted build, so the executable's size and modification time are included and any
-// rebuild invalidates a saved cache whose bytes it may compute differently.
-std::string binary_identity(const char* argv0) {
-    std::string out;
-#ifdef NINFER_BUILD_ID
-    out = NINFER_BUILD_ID;
-#endif
-    std::error_code error;
-#ifdef _WIN32
-    // argv[0] is whatever the shell typed, which for a PATH launch is not a path to this file.
-    (void)argv0;
-    std::wstring module(MAX_PATH, L'\0');
-    DWORD length = 0;
-    while ((length = GetModuleFileNameW(nullptr, module.data(),
-                                        static_cast<DWORD>(module.size()))) == module.size()) {
-        module.resize(module.size() * 2);
-    }
-    module.resize(length);
-    const std::filesystem::path self(module);
-#else
-    std::filesystem::path self = std::filesystem::read_symlink("/proc/self/exe", error);
-    if (error) { self = std::filesystem::absolute(argv0, error); }
-#endif
-    const auto size = std::filesystem::file_size(self, error);
-    if (!error) { out += ";size=" + std::to_string(size); }
-    const auto time = std::filesystem::last_write_time(self, error);
-    if (!error) {
-        out += ";mtime=" + std::to_string(static_cast<long long>(time.time_since_epoch().count()));
-    }
-    return out;
+// The runtime owns inference code. The portable launcher contains no kernels.
+std::string binary_identity() {
+    return ninfer::product::module_identity(reinterpret_cast<const void*>(&binary_identity),
+                                            NINFER_BUILD_ID);
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--kvmem-capabilities") {
+        std::cout << kvmem::launch_capabilities("ninfer") << '\n';
+        return 0;
+    }
     std::set_terminate(log_terminate);
     ninfer::serve::ServeOptions options;
     try {
@@ -258,10 +237,15 @@ int main(int argc, char** argv) {
         std::cout << ninfer::serve::serve_usage_text(argv[0]);
         return 0;
     }
+    options.build_version = std::string(NINFER_VERSION) + "+" + NINFER_BUILD_ID;
+    if (options.version_requested) {
+        std::cout << "ninfer-serve " << options.build_version << '\n';
+        return 0;
+    }
     // --log-colours on colours the statistics tokens as well as the levels; off keeps the log plain.
     ninfer::serve::set_operational_log_colours(options.log_colours.value_or(false));
     if (!options.context_cache.hybrid.persistent_file.empty()) {
-        options.context_cache.hybrid.persistent_identity = binary_identity(argv[0]);
+        options.context_cache.hybrid.persistent_identity = binary_identity();
     }
     install_stop_handlers();
 
@@ -329,7 +313,7 @@ int main(int argc, char** argv) {
         // has been listenable since bind() either way; the difference is whether a caller arriving
         // during the ten seconds of weight loading gets a documented "still loading" or a hang.
         server.start_serving_during_startup();
-        logger->info("build {}", NINFER_BUILD_ID);
+        logger->info("build {}", options.build_version);
 
         if (!options.slot_save_path.empty()) {
             std::error_code directory_error;

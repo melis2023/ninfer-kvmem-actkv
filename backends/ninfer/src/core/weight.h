@@ -45,10 +45,40 @@ enum class QType : std::uint16_t {
     Q2_G64_FP16 = 28,
     // E4M3FN row codes followed by one binary16 multiplier (RowInterleaved only).
     FP8_E4M3FN_ROW_FP16 = 29,
+    // Native Prism PTQ1_0: 24 base-3 bytes + 2 tail bytes + FP16 scale per 128 weights.
+    PTQ1_G128_FP16 = 30,
+    // Exact ternary reordering: two 13-byte T5 units plus FP16 scale per 128.
+    T5_G128_FP16 = 31,
 };
 
 [[nodiscard]] constexpr bool is_gguf(QType format) {
     return format >= QType::GGUF_Q8_0 && format <= QType::GGUF_Q2_0;
+}
+
+[[nodiscard]] constexpr bool is_ternary(QType format) {
+    return format == QType::T2_G128_FP16 || format == QType::PTQ1_G128_FP16 ||
+           format == QType::T5_G128_FP16;
+}
+
+struct RowSplitFormat {
+    int group = 0;
+    int code_bytes = 0;
+    int high_bytes = 0;
+    int scale_bytes = 0;
+};
+
+[[nodiscard]] constexpr RowSplitFormat row_split_format(QType format) {
+    switch (format) {
+    case QType::Q2_G64_FP16: return {64, 16, 0, 2};
+    case QType::Q4_G64_FP16: return {64, 32, 0, 2};
+    case QType::Q5_G64_FP16: return {64, 32, 8, 2};
+    case QType::Q6_G64_FP16: return {64, 32, 16, 2};
+    case QType::Q8_G32_FP16: return {32, 32, 0, 2};
+    case QType::T2_G128_FP16: return {128, 32, 0, 2};
+    case QType::PTQ1_G128_FP16: return {128, 24, 2, 2};
+    case QType::T5_G128_FP16: return {128, 26, 0, 2};
+    default: return {};
+    }
 }
 
 struct GgufBlockShape {
@@ -96,6 +126,7 @@ enum class QuantLayout : std::uint16_t {
     RowSplitPanel = 4,
     // Rows of whole ggml blocks, as a GGUF stores them.
     GgufBlocks = 5,
+    RowInterleaved = 6,
 };
 
 // Rows per stored panel. Four 32-byte records is exactly one 128-byte line, which is all the

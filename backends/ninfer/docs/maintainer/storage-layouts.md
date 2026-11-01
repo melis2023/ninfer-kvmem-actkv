@@ -12,9 +12,10 @@ The storage registry contains exactly these identities:
 | Identity | Kind | Compatible numeric formats | Logical shape | Object alignment |
 |---|---|---|---|---:|
 | `contiguous_le_v1` | tensor layout | `bf16`, `fp32`, `int32` | rank `0..16` | 256 bytes |
-| `row_split_k128_v1` | tensor layout | `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16`, `t2_g128_fp16` | rank 2 `[N,K]` | 256 bytes |
+| `row_split_k128_v1` | tensor layout | `q2_g64_fp16`, `q4_g64_fp16`, `q5_g64_fp16`, `q6_g64_fp16`, `q8_g32_fp16`, `t2_g128_fp16`, `ptq1_g128_fp16` | rank 2 `[N,K]` | 256 bytes |
 | `block_scale_k16_m128x4_v1` | tensor layout | `nvfp4` | rank 2 `[N,K]`, `N % 128 == 0`, `K % 64 == 0` | 256 bytes |
 | `row_scale_v1` | tensor layout | `fp8_e4m3fn_row_bf16` | rank 2 `[N,K]` | 256 bytes |
+| `row_interleaved_v1` | tensor layout | `fp8_e4m3fn_row_fp16` | rank 2 `[N,K]` | 256 bytes |
 | `gguf_blocks_v1` | tensor layout | the eighteen `gguf_*` formats | rank 2 `[N,K]`, `K % block_values == 0` | 256 bytes |
 | `raw_bytes_v1` | resource encoding | not applicable | nonempty byte string | 1 byte |
 
@@ -86,11 +87,13 @@ group size `G`:
 
 | Format | `b` | `G` | Base bytes per group `B` | High bytes per group `H` |
 |---|---:|---:|---:|---:|
+| `q2_g64_fp16` | 2 | 64 | 16 | 0 |
 | `q4_g64_fp16` | 4 | 64 | 32 | 0 |
 | `q5_g64_fp16` | 5 | 64 | 32 | 8 |
 | `q6_g64_fp16` | 6 | 64 | 32 | 16 |
 | `q8_g32_fp16` | 8 | 32 | 32 | 0 |
 | `t2_g128_fp16` | 2 | 128 | 32 | 0 |
+| `ptq1_g128_fp16` | base 3 | 128 | 24 | 2 |
 
 The layout extends the last axis to a multiple of 128:
 
@@ -121,7 +124,7 @@ zero padding to a 256-byte boundary
 binary16 scale plane
 ```
 
-Q4, Q8 and T2 have no high-bit bytes. They still place the scale plane at the first 256-byte boundary
+Q2, Q4, Q8 and T2 have no high-bit bytes. They still place the scale plane at the first 256-byte boundary
 after the base-code plane. There is no padding after the scale plane inside the object.
 
 Within every plane, traversal order is:
@@ -161,6 +164,10 @@ base[j] = u[4*j] | (u[4*j + 1] << 2) | (u[4*j + 2] << 4) | (u[4*j + 3] << 6)
 
 with `u[i] = q[i] modulo 4`, so every G128 group occupies 32 base bytes and T2 has no high-bit
 plane.
+
+Q2 uses the same quartet bit order as T2, with `u[i] = q[i] + 1` instead of two's complement.
+Each G64 group occupies 16 bytes. Logical padding has integer code zero, hence stored word
+`0b01` and a full padding byte `0x55`; wholly physical groups also have positive-zero scales.
 
 The complete base plane is the concatenation of these per-group byte sequences in plane traversal
 order.
@@ -337,6 +344,15 @@ encoded by concatenating the selected code rows, recomputing the scale-plane ali
 row count, and appending the selected scale words in the same row order. It does not decode or
 requantize either plane.
 
+### 5.1 `row_interleaved_v1`
+
+This layout stores only `fp8_e4m3fn_row_fp16` matrices `[N,K]`. Each row contains its `K`
+E4M3FN bytes followed immediately by its two little-endian binary16 scale bytes. Thus
+`row_bytes = K + 2`, `payload_bytes = N * (K + 2)`, and row `n` starts at `n * row_bytes`.
+There is no padding between rows. Object alignment remains 256 bytes; an artifact part boundary
+may split a row. A row slice or gather copies complete row records without requantization.
+For the Flash-Next table `K=160`, each record is 162 bytes.
+
 ## 6. `gguf_blocks_v1`
 
 The payload is the matrix's rows in order, each row its `K / block_values` blocks in order, every
@@ -378,6 +394,7 @@ Layout decoding yields only persistent logical words:
   FP32 weight divisor of each stacked source matrix;
 - `row_scale_v1` yields the natural row-major E4M3FN code words and one BF16 multiplier per logical
   row;
+- `row_interleaved_v1` yields each row's E4M3FN codes and binary16 multiplier;
 - `gguf_blocks_v1` yields the ggml blocks of each row, unchanged;
 - `raw_bytes_v1` yields the enclosing resource bytes.
 

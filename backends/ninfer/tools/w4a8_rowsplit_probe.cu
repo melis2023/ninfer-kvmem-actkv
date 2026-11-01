@@ -66,7 +66,7 @@ constexpr int K      = 5120;
 constexpr int T      = T_TOKENS;
 // Warp tile, swept: MT m-tiles of 16 rows and NT n-tiles of 8 tokens per warp, over a fixed 4x4
 // warp grid. The accumulator is MT*NT*4 floats per thread and is the only register term big enough
-// to move occupancy, which TODO.md's open entry names as the cause of the ~30%-of-ceiling rate.
+// to move occupancy, which was once named as the cause of the ~30%-of-ceiling rate.
 #ifndef MT
 #define MT 2
 #endif

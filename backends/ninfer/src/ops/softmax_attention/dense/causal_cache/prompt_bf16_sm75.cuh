@@ -1,10 +1,10 @@
 #pragma once
 
-// BF16-cache causal prompt kernel of a Turing (sm_75) build, included by prompt_bf16.cuh after its
-// staging helper; the sm_80+ kernel there keeps this one's contract, tiles and grid. Turing has 64
-// KiB of shared memory per block and no cp.async: one buffer holds K(kb), then V(kb), beside Q, and
-// the kernel takes (Br + Bc) * D * 2 bytes, exactly 64 KiB. It has no BF16 MMA either, so a CTA
-// sweeps its rows on FP16 MMA with Q, K and V as their FP16 roundings
+// BF16-cache causal prompt kernel of the Turing shape set (ops/common/device_tier.h), included by
+// prompt_bf16.cuh after the standard kernel; that kernel keeps this one's contract, tiles and grid.
+// Turing has 64 KiB of shared memory per block and no cp.async: one buffer holds K(kb), then V(kb),
+// beside Q, and the kernel takes (Br + Bc) * D * 2 bytes, exactly 64 KiB. It has no BF16 MMA
+// either, so a CTA sweeps its rows on FP16 MMA with Q, K and V as their FP16 roundings
 // (common/bf16_attention.cuh) and sweeps them again on the BF16 emulation, an out-of-line function,
 // only when a tile holds a value FP16 cannot hold: in one loop body with the fast path, the
 // emulation's code cost the fast path most of its speed. Nothing is written before a sweep ends.
@@ -17,11 +17,14 @@
 
 namespace ninfer::ops {
 
-inline constexpr int kCausalPromptBf16SmemBytes = (kCausalPromptBr + kCausalPromptBc) *
-                                                  kCausalPromptHeadDim *
-                                                  static_cast<int>(sizeof(__nv_bfloat16));
-static_assert(kCausalPromptBf16SmemBytes <= kMaxSharedBytesPerBlock);
+inline constexpr int kCausalPromptBf16TuringSmemBytes = (kCausalPromptBr + kCausalPromptBc) *
+                                                        kCausalPromptHeadDim *
+                                                        static_cast<int>(sizeof(__nv_bfloat16));
+static_assert(kCausalPromptBf16TuringSmemBytes <= shape_max_shared_bytes_per_block(true));
 
+// Turing's forms (sm75_mma.cuh) exist in every image but sm_70's, which never runs this kernel and
+// compiles it empty.
+#if defined(NINFER_SM75_FORMS)
 namespace sm75_prompt_bf16 {
 
 // causal_prompt_stage_kv as FP16 roundings; false when one of this thread's values is beyond FP16's
@@ -192,19 +195,22 @@ sweep_exact(__nv_bfloat16* q_s, const __nv_bfloat16* q, const __nv_bfloat16* cac
 }
 
 } // namespace sm75_prompt_bf16
+#endif
 
 // FlashAttention-2 forward, one CTA per (query 64-row block, query head). Grid is
 // (ceil(tokens/64), q_heads). seqlen_q = tokens, seqlen_k = base_pos + tokens, with
 // bottom-right causal alignment (query row i sees keys [0, base_pos + i]).
 template <typename Geometry, typename Metadata>
 __launch_bounds__(kCausalPromptThreads, 1) __global__
-    void causal_attention_prompt_bf16_kernel(const __nv_bfloat16* __restrict__ q,
-                                             const __nv_bfloat16* __restrict__ cache_k,
-                                             const __nv_bfloat16* __restrict__ cache_v,
-                                             Metadata metadata,
-                                             const std::int32_t* __restrict__ positions,
-                                             float scale, __nv_bfloat16* __restrict__ out,
-                                             std::int32_t width) {
+    void causal_attention_prompt_bf16_turing_kernel(const __nv_bfloat16* __restrict__ q,
+                                                    const __nv_bfloat16* __restrict__ cache_k,
+                                                    const __nv_bfloat16* __restrict__ cache_v,
+                                                    Metadata metadata,
+                                                    const std::int32_t* __restrict__ positions,
+                                                    float scale, __nv_bfloat16* __restrict__ out,
+                                                    std::int32_t width) {
+    if constexpr (!shape_set_in_image(true)) { return; } // not this image's set
+#if defined(NINFER_SM75_FORMS)
     constexpr int Br      = kCausalPromptBr;
     constexpr int Threads = kCausalPromptThreads;
     static_assert(Threads == 128);
@@ -235,6 +241,7 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
     }
     sm75_prompt_bf16::sweep_exact<Geometry>(q_s, q, cache_k, cache_v, block_table, base_pos, scale,
                                             out, q_head, q0, tokens, width);
+#endif
 }
 
 } // namespace ninfer::ops

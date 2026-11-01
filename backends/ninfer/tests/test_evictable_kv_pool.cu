@@ -5,6 +5,7 @@
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/evictable_kv_pool.h"
+#include "core/kv_expert_loan.h"
 #include "core/kv_loan.h"
 #include "core/layout.h"
 #include "core/paged_kv_cache.h"
@@ -297,6 +298,72 @@ int main() {
             const ninfer::KVLoanPlan huge =
                 ninfer::plan_kv_loan(fixture, pages, 64ULL * granule);
             failures += expect(huge.granules.empty(), "a request beyond the pool is refused");
+        }
+
+        // An expert cache over free KV pages, in an arena without a lease window: a loan takes the
+        // free pages beyond the margin and releases the granules inside them; they stay available,
+        // and a reservation the free runs cannot cover recalls the lowest of them, the cache giving
+        // their granules' bytes back first; the recalled pages are backed and writable.
+        {
+            const auto page_stride = static_cast<std::int32_t>(granule / 8 / 64 / 2);
+            ninfer::KVPageGeometry geometry{
+                .planes = {{ninfer::DType::I8, page_stride, 2, 256},
+                           {ninfer::DType::FP16, 1, 2, 256}},
+            };
+            ninfer::LayoutBuilder builder;
+            const ninfer::DeviceKVPagePoolLayout layout = ninfer::plan_device_kv_page_pool(
+                builder, {.page_group_count = 512, .geometry = geometry});
+            const std::size_t needed = builder.finish(256, "expert loan fixture");
+            ninfer::EvictableKVPool arena(device, ninfer::EvictableKVPool::Config{
+                                                      .arena_bytes           = needed,
+                                                      .lendable_prefix_bytes = needed,
+                                                      .window_capacity_bytes = 0,
+                                                  });
+            ninfer::DeviceKVPagePool pages(arena.arena(), layout);
+            const std::uint32_t unit = ninfer::kv_loan_unit_pages(pages, granule);
+            std::uint64_t grown = 0, shrunk = 0;
+            ninfer::KvExpertLoan loan(
+                arena, {&pages}, {unit},
+                ninfer::KvExpertLoan::Cache{[&] { return ++grown; },
+                                            [&](std::uint64_t bytes) {
+                                                shrunk += bytes;
+                                                return bytes;
+                                            }});
+            failures += expect(loan.lend(2 * unit) == 1 && grown == 1, "a loan grows the cache");
+            const std::uint32_t loaned = loan.stats().loaned_pages;
+            failures += expect(loaned == (512 - unit) / unit * unit && pages.loaned_pages() == loaned,
+                               "the loan takes every free page beyond the margin");
+            failures += expect(arena.released_granules() != 0 &&
+                                   loan.stats().released_bytes == arena.released_granules() * granule,
+                               "the granules inside the loaned pages go back to the device");
+            failures += expect(pages.available_pages() == 512 &&
+                                   pages.unpromised_free_pages() == 512 - loaned,
+                               "loaned pages stay available, not free");
+            failures += expect(loan.lend(1) == 0, "nothing is left to lend");
+
+            std::optional<ninfer::DeviceKVPageReservation> small = pages.reserve(512 - loaned);
+            failures += expect(small.has_value() && shrunk == 0,
+                               "a reservation the free runs cover recalls nothing");
+            std::optional<ninfer::DeviceKVPageReservation> big = pages.reserve(3 * unit);
+            failures += expect(big.has_value() && shrunk != 0 && pages.loaned_pages() < loaned &&
+                                   loan.stats().recalls == 1,
+                               "a reservation beyond the free runs recalls loaned pages");
+            std::vector<ninfer::DeviceKVPageLease> live;
+            live.reserve(512);
+            pages.materialize(*small, 512 - loaned, live);
+            pages.materialize(*big, 512 - loaned + 3 * unit, live);
+            std::vector<ninfer::DeviceKVPageHandle> handles;
+            for (const auto& page : live) { handles.push_back(page.handle()); }
+            pages.zero_pages(handles, ninfer::RankStreams(device.stream));
+            CUDA_CHECK(cudaStreamSynchronize(device.stream));
+            failures += expect(true, "recalled pages are backed and writable");
+            live.clear();
+            small.reset();
+            big.reset();
+            loan.recall_all();
+            failures += expect(arena.released_granules() == 0 && pages.loaned_pages() == 0 &&
+                                   pages.unpromised_free_pages() == 512,
+                               "recall_all backs every granule and returns every page");
         }
 
         if (failures != 0) {

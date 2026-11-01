@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "ops/common/blackwell_routes.h"
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan_unified.h"
 
 #include "core/device.h"
@@ -51,6 +52,7 @@ void launch(const Tensor& x, const Weight& weight, Tensor& out, WorkspaceArena& 
 
 void nvfp4_linear_swiglu_a4_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                    WorkspaceArena& workspace, cudaStream_t stream) {
+    require_nvfp4_a4_card();
     if (x.ne[1] <= 32) {
         launch<M32N128>(x, weight, out, workspace, stream);
     } else if (x.ne[1] <= M64N128::kBlockTokens) {

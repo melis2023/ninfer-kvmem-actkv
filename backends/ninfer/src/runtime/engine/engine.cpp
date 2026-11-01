@@ -1,6 +1,7 @@
 #include "ninfer/engine.h"
 #include "text/structured_output.h"
 
+#include "artifact/reader.h"
 #include "core/device.h"
 #include "core/gpu_clock_floor.h"
 #include "core/nvtx.h"
@@ -12,6 +13,8 @@
 #include "runtime/engine/context_cache/hybrid_resource_manager.h"
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/model_instance.h"
+#include "runtime/engine/flint_core.h"
+#include "runtime/engine/gemma4_core.h"
 #include "runtime/engine/qwen4_exp_core.h"
 #include "runtime/engine/slot_spill_guard.h"
 
@@ -37,6 +40,43 @@
 namespace ninfer {
 namespace {
 
+// Gemma 4, Flint and Flash-Next keep context caches of their own, which the checkpoint catalog's
+// options configure; the hybrid prefix cache, the server's default, belongs to the Qwen3.5 Program.
+EngineOptions with_family_context_cache(EngineOptions options) {
+    if (runtime::is_gemma4_artifact(options.artifact_path) ||
+        runtime::is_flint_artifact(options.artifact_path) ||
+        runtime::is_qwen4_exp_artifact(options.artifact_path)) {
+        options.context_cache.mode = ContextCacheMode::Legacy;
+    }
+    return options;
+}
+
+// Without --spec (SpeculativeOptions::automatic), a Flash-Next or Gemma 4 artifact with host or
+// disk experts drafts with the MTP block or assistant it carries: a verification window's routes
+// share the layer's missing experts, which the CPU computes while the cached ones run.
+EngineOptions with_family_speculation(EngineOptions options) {
+    SpeculativeOptions& speculative = options.speculative;
+    if (!speculative.automatic || speculative.backend != SpeculativeBackend::None ||
+        options.expert_residency == ExpertResidency::Device ||
+        options.purpose != EnginePurpose::Generation) {
+        return options;
+    }
+    if (!runtime::is_gemma4_artifact(options.artifact_path) &&
+        !runtime::is_qwen4_exp_artifact(options.artifact_path)) {
+        return options;
+    }
+    if (!artifact::Reader(options.artifact_path).directory().components.contains("mtp")) {
+        return options;
+    }
+    speculative.backend      = SpeculativeBackend::Mtp;
+    speculative.draft_tokens = SpeculativeOptions::kAutomaticDraftTokens;
+    // Flash-Next's chain stops at an unlikely draft, which the round would likely reject.
+    if (runtime::is_qwen4_exp_artifact(options.artifact_path)) {
+        speculative.draft_min_p = SpeculativeOptions::kAutomaticDraftMinP;
+    }
+    return options;
+}
+
 DeviceContext initialize_device(const EngineOptions& options) {
     StartupPhaseScope phase(options.startup_observer, StartupPhase::CudaInitialize);
     if (options.devices.empty()) {
@@ -49,12 +89,39 @@ DeviceContext initialize_device(const EngineOptions& options) {
     return device;
 }
 
+// One diagnostic line per device that EngineOptions::gpu_clock_floor_mhz was asked for.
+void report_gpu_clock_floor(const EngineOptions& options, const GpuClockFloor& floor) {
+    for (const std::string& line : floor.report()) {
+        runtime::publish_diagnostic(
+            options.diagnostic_observer,
+            floor.complete() ? DiagnosticLevel::Info : DiagnosticLevel::Warning,
+            "gpu clock floor: %s", line.c_str());
+    }
+}
+
+// A generation's hold on the clock floor beside its reference to the Engine, both kept until its
+// handle ends; the hold ends first.
+struct HeldEngine {
+    std::shared_ptr<void> engine;
+    std::shared_ptr<void> clock_floor;
+};
+
 runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefaults& defaults,
                                                         SamplingMode mode, RequestOptions options) {
     if (options.execution.thinking.budget && *options.execution.thinking.budget == 0) {
         throw std::invalid_argument("thinking budget must be positive");
     }
     text::validate_structured_output(options.execution.structured_output);
+    if (options.execution.readout_tokens.size() > kMaximumReadoutTokens) {
+        throw std::invalid_argument("readout_tokens names more than " +
+                                    std::to_string(kMaximumReadoutTokens) + " tokens");
+    }
+    if (!options.execution.readout_tokens.empty() && !options.execution.logprobs) {
+        throw std::invalid_argument("readout_tokens requires logprobs");
+    }
+    if (!options.execution.speculative_drafting && options.execution.requested_output_tokens != 1) {
+        throw std::invalid_argument("speculative_drafting off requires one output token");
+    }
     runtime::ResolvedRequestOptions resolved;
     resolved.execution.sampling =
         runtime::resolve_sampling(defaults, mode, options.execution.sampling);
@@ -69,7 +136,9 @@ runtime::ResolvedRequestOptions resolve_request_options(const ModelSamplingDefau
     resolved.execution.thinking                = options.execution.thinking;
     resolved.execution.structured_output       = std::move(options.execution.structured_output);
     resolved.execution.logprobs                = options.execution.logprobs;
-    resolved.stop                              = std::move(options.stop);
+    resolved.execution.readout_tokens          = std::move(options.execution.readout_tokens);
+    resolved.execution.speculative_drafting    = options.execution.speculative_drafting;
+    resolved.stop                            = std::move(options.stop);
     resolved.output                            = options.output;
     resolved.tool_choice                       = std::move(options.tool_choice);
     resolved.ngram_session                      = std::move(options.ngram_session);
@@ -265,15 +334,54 @@ public:
     using ScoringCore = runtime::CausalScoreCore<runtime::ModelInstance>;
     // Qwen3.8-Flash-Next: its own model family and core, which serves generation and scoring.
     using Qwen4ExpCore = runtime::Qwen4ExpCore;
+    // Gemma 4: its own model family and core, which serves generation and scoring.
+    using Gemma4Core = runtime::Gemma4Core;
+    // Flint: likewise.
+    using FlintCore = runtime::FlintCore;
     using Core = std::variant<std::monostate, std::unique_ptr<GenerationCore>,
                               std::unique_ptr<HybridGenerationCore>, std::unique_ptr<ScoringCore>,
-                              std::unique_ptr<Qwen4ExpCore>>;
+                              std::unique_ptr<Qwen4ExpCore>, std::unique_ptr<Gemma4Core>,
+                              std::unique_ptr<FlintCore>>;
 
     explicit Impl(EngineOptions engine_options)
-        : options(runtime::normalize_engine_options(std::move(engine_options))),
+        : options(runtime::normalize_engine_options(
+              with_family_speculation(with_family_context_cache(std::move(engine_options))))),
           device(initialize_device(options)),
           clock_floor(device.device_ids(), options.gpu_clock_floor_mhz) {
+        report_gpu_clock_floor(options, clock_floor);
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
+        if (runtime::is_gemma4_artifact(options.artifact_path)) {
+            if (options.kvmem.selected_tokens != 0) {
+                throw std::invalid_argument("KVMem is not supported for gemma4");
+            }
+            if (options.cuda_memory_policy != CudaMemoryPolicy::DriverDefault) {
+                throw std::invalid_argument("mixed/strict CUDA memory is not supported for gemma4");
+            }
+            auto constructed    = runtime::construct_gemma4(options, device);
+            gemma               = std::move(constructed.instance);
+            load                = std::move(constructed.load);
+            load.cuda_sync_mode = device.sync_mode();
+            model_metadata      = std::move(constructed.model_metadata);
+            sampling_defaults   = gemma->frontend.sampling_defaults();
+            StartupPhaseScope finalize_phase(options.startup_observer,
+                                             StartupPhase::EngineFinalize);
+            core = std::make_unique<Gemma4Core>(*gemma, device, options);
+            finalize_phase.complete();
+            return;
+        }
+        if (runtime::is_flint_artifact(options.artifact_path)) {
+            auto constructed    = runtime::construct_flint(options, device);
+            flint               = std::move(constructed.instance);
+            load                = std::move(constructed.load);
+            load.cuda_sync_mode = device.sync_mode();
+            model_metadata      = std::move(constructed.model_metadata);
+            sampling_defaults   = flint->frontend.sampling_defaults();
+            StartupPhaseScope finalize_phase(options.startup_observer,
+                                             StartupPhase::EngineFinalize);
+            core = std::make_unique<FlintCore>(*flint, device, options);
+            finalize_phase.complete();
+            return;
+        }
         if (runtime::is_qwen4_exp_artifact(options.artifact_path)) {
             if (options.kvmem.selected_tokens != 0) {
                 throw std::invalid_argument("KVMem is not supported for qwen4_exp");
@@ -292,6 +400,27 @@ public:
             core = std::make_unique<Qwen4ExpCore>(*flash, device, options);
             finalize_phase.complete();
             return;
+        }
+        // Native Qwen3.5 MoE host or disk experts: the CPU computes a share of a call's misses,
+        // the GPU's products bit for bit. Routing profiles fill and record their cache.
+        if (options.hybrid_experts.mapped_misses || options.hybrid_experts.tail_skip_rank != 0 ||
+            options.hybrid_experts.prefill_buffers != 0 || options.hybrid_experts.adaptive_cache) {
+            throw std::invalid_argument(
+                "mapped misses, tail skip, prefill buffers and the adaptive expert cache require "
+                "Qwen3.8-Flash-Next host or disk experts");
+        }
+        if ((options.hybrid_experts.dma_share || options.hybrid_experts.cpu_threads != 0) &&
+            options.expert_residency == ExpertResidency::Device) {
+            throw std::invalid_argument("expert DMA shares and CPU threads require host or disk "
+                                        "experts (--expert-residency host|disk)");
+        }
+        if ((!options.hybrid_experts.routing_profile.empty() ||
+             !options.hybrid_experts.record_profile.empty()) &&
+            options.expert_residency == ExpertResidency::Device) {
+            throw std::invalid_argument("expert routing profiles require host or disk experts");
+        }
+        if (options.speculative.draft_min_p != 0) {
+            throw std::invalid_argument("--draft-min-p requires Qwen3.8-Flash-Next MTP");
         }
         auto constructed  = runtime::construct_model(options, device);
         // construct_model returns the resolved options for this instance. Anything the model had
@@ -432,18 +561,27 @@ public:
 
     // The model's frontend and prompt capacity, whichever family it is.
     [[nodiscard]] const models::qwen3_5::Frontend& frontend() const {
-        return flash ? flash->frontend : active->frontend;
+        return gemma   ? gemma->frontend
+               : flint ? flint->frontend
+               : flash ? flash->frontend
+                       : active->frontend;
     }
 
     [[nodiscard]] std::uint32_t capacity() const {
-        return flash ? flash->capacity : active->capacity;
+        return gemma   ? gemma->capacity
+               : flint ? flint->capacity
+               : flash ? flash->capacity
+                       : active->capacity;
     }
 
     EngineOptions options;
     DeviceContext device;
+    // Held by each generation and scoring call (GpuClockFloor::hold).
     GpuClockFloor clock_floor;
     std::unique_ptr<runtime::ModelInstance> active;
     std::unique_ptr<runtime::Qwen4ExpInstance> flash;
+    std::unique_ptr<runtime::Gemma4Instance> gemma;
+    std::unique_ptr<runtime::FlintInstance> flint;
     LoadSummary load;
     ModelMetadata model_metadata;
     ModelSamplingDefaults sampling_defaults;
@@ -581,7 +719,7 @@ PreparedPrompt Engine::prepare(PromptInput input, const PreparationControl& cont
 }
 
 PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids, bool allow_prefix_identity,
-                                      bool anchor_prompt_end) const {
+                                      bool anchor_prompt_end, bool speculative_drafting) const {
     nvtx::ScopedRange prepare_range(nvtx::Name::FrontendPrepare, nvtx::Category::Runtime,
                                     static_cast<std::uint64_t>(token_ids.size()));
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
@@ -590,7 +728,7 @@ PreparedPrompt Engine::prepare_tokens(std::vector<TokenId> token_ids, bool allow
                            context_capacity_error(token_ids.size(), impl_->capacity()));
     }
     auto prepared = impl_->frontend().prepare_tokens(std::move(token_ids), allow_prefix_identity,
-                                                     anchor_prompt_end);
+                                                     anchor_prompt_end, speculative_drafting);
     PromptSummary info = prepared.summary();
     if (info.prompt_tokens > impl_->capacity()) {
         throw std::logic_error("target Frontend admitted prompt tokens beyond capacity");
@@ -625,11 +763,14 @@ std::vector<float> Engine::score_tokens(std::vector<TokenId> tokens, std::uint32
     }
     PreparedPrompt prompt      = prepare_tokens(std::move(tokens), false);
     const std::size_t expected = prompt.summary().prompt_tokens - first_target;
+    const std::shared_ptr<void> clock_floor = impl_->clock_floor.hold();
     std::vector<float> result  = std::visit(
         [&](auto& core) -> std::vector<float> {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>> ||
-                          std::is_same_v<CoreState, std::unique_ptr<Impl::Qwen4ExpCore>>) {
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::Qwen4ExpCore>> ||
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::Gemma4Core>> ||
+                          std::is_same_v<CoreState, std::unique_ptr<Impl::FlintCore>>) {
                 return core->score(std::move(prompt.impl_->value), first_target);
             } else {
                 throw std::logic_error("Engine scoring core is unavailable");
@@ -656,60 +797,213 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
                                 OutputConsumerMode consumer_mode,
                                 GenerationObservationOptions observation,
                                 std::chrono::steady_clock::time_point pending_deadline) {
+    std::vector<GenerationSubmission> one;
+    one.push_back(GenerationSubmission{.prompt           = std::move(prompt),
+                                       .options          = std::move(options),
+                                       .consumer_mode    = consumer_mode,
+                                       .observation      = observation,
+                                       .pending_deadline = pending_deadline});
+    return std::move(submit_group(std::move(one)).front());
+}
+
+namespace {
+
+// A request licensed no output tokens completes at submission, without entering the queue.
+struct ImmediateSubmission {
+    GenerationResult result;
+    OutputConsumerMode consumer_mode = OutputConsumerMode::Aggregate;
+
+    GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
+        const bool streaming = consumer_mode == OutputConsumerMode::Streaming;
+        if (streaming != (sink != nullptr)) {
+            throw std::invalid_argument(
+                "GenerationHandle wait sink does not match its submitted consumer mode");
+        }
+        if (cancellation.requested()) { result.finish_reason = FinishReason::Cancelled; }
+        return std::move(result);
+    }
+
+    [[nodiscard]] std::optional<std::uint32_t> effective_thinking_budget() const noexcept {
+        return result.thinking.effective_budget;
+    }
+};
+
+} // namespace
+
+std::vector<GenerationHandle> Engine::submit_group(std::vector<GenerationSubmission> submissions) {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
     if (impl_->options.purpose != EnginePurpose::Generation) {
         throw std::logic_error("submit requires a Generation Engine");
     }
-    if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
+    struct Resolved {
+        runtime::ResolvedRequestOptions options;
+        ResolvedSamplingParameters sampling;
+        PromptSummary summary;
+        double prepare_seconds = 0.0;
+    };
+    std::vector<Resolved> resolved;
+    resolved.reserve(submissions.size());
+    for (GenerationSubmission& submission : submissions) {
+        if (submission.prompt.impl_ == nullptr) {
+            throw std::invalid_argument("PreparedPrompt is empty");
+        }
+        GenerationObservationOptions& observation = submission.observation;
+        if (observation.live_timings) { observation.phase_timings = true; }
+        if (submission.consumer_mode != OutputConsumerMode::Streaming &&
+            (observation.live_timings || observation.prompt_progress)) {
+            throw std::invalid_argument("live generation observations require a Streaming consumer");
+        }
+        Resolved entry{.options = resolve_request_options(impl_->sampling_defaults,
+                                                          submission.prompt.impl_->sampling_mode,
+                                                          std::move(submission.options))};
+        entry.sampling        = entry.options.execution.sampling;
+        entry.summary         = submission.prompt.impl_->summary;
+        entry.prepare_seconds = submission.prompt.impl_->prepare.seconds;
+        if (entry.summary.prompt_tokens > impl_->options.max_context) {
+            throw RequestError(
+                RequestErrorKind::ContextLengthExceeded,
+                context_capacity_error(entry.summary.prompt_tokens, impl_->options.max_context));
+        }
+        resolved.push_back(std::move(entry));
+    }
+
+    std::vector<GenerationHandle> handles(submissions.size());
+    std::vector<std::size_t> queued;
+    for (std::size_t index = 0; index < submissions.size(); ++index) {
+        Resolved& entry = resolved[index];
+        if (entry.options.execution.requested_output_tokens != 0) {
+            queued.push_back(index);
+            continue;
+        }
+        ImmediateSubmission immediate{.consumer_mode = submissions[index].consumer_mode};
+        immediate.result.prompt                    = entry.summary;
+        immediate.result.finish_reason             = FinishReason::OutputLimit;
+        immediate.result.thinking.requested_budget = entry.options.execution.thinking.budget;
+        // No output is licensed, so the cap never binds: effective equals requested.
+        immediate.result.thinking.effective_budget = entry.options.execution.thinking.budget;
+        immediate.result.timings.prepare_seconds   = entry.prepare_seconds;
+        immediate.result.timings.total_seconds     = entry.prepare_seconds;
+        submissions[index].prompt.impl_.reset();
+        handles[index] = GenerationHandle(
+            std::make_unique<GenerationHandle::Impl>(impl_, std::move(immediate), entry.sampling));
+    }
+    if (queued.empty()) { return handles; }
+
+    std::visit(
+        [&](auto& core) {
+            using CoreState = std::remove_cvref_t<decltype(core)>;
+            if constexpr (std::is_same_v<CoreState, std::monostate>) {
+                throw std::logic_error("Engine core is unavailable");
+            } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
+                throw std::logic_error("Engine generation core is unavailable");
+            } else {
+                // Held before the core can start a request, so its prompt runs at the floor.
+                std::vector<std::shared_ptr<void>> keep_alive;
+                keep_alive.reserve(queued.size());
+                for (std::size_t k = 0; k < queued.size(); ++k) {
+                    std::shared_ptr<void> held = impl_;
+                    if (auto clock_floor = impl_->clock_floor.hold()) {
+                        held = std::make_shared<HeldEngine>(
+                            HeldEngine{.engine = impl_, .clock_floor = std::move(clock_floor)});
+                    }
+                    keep_alive.push_back(std::move(held));
+                }
+                using Core = typename CoreState::element_type;
+                std::vector<typename Core::GroupMember> group;
+                group.reserve(queued.size());
+                for (const std::size_t index : queued) {
+                    GenerationSubmission& submission = submissions[index];
+                    group.push_back(typename Core::GroupMember{
+                        .prompt           = std::move(submission.prompt.impl_->value),
+                        .prompt_summary   = resolved[index].summary,
+                        .prepare_seconds  = resolved[index].prepare_seconds,
+                        .options          = std::move(resolved[index].options),
+                        .consumer_mode    = submission.consumer_mode,
+                        .observation      = submission.observation,
+                        .pending_deadline = submission.pending_deadline});
+                }
+                auto members = core->submit_group(std::move(group));
+                for (std::size_t k = 0; k < queued.size(); ++k) {
+                    handles[queued[k]] = GenerationHandle(std::make_unique<GenerationHandle::Impl>(
+                        std::move(keep_alive[k]), std::move(members[k]),
+                        resolved[queued[k]].sampling));
+                }
+            }
+        },
+        impl_->core);
+    return handles;
+}
+
+GenerationHandle Engine::submit_branches(std::vector<GenerationBranch> branches,
+                                         RequestOptions options, OutputConsumerMode consumer_mode,
+                                         GenerationObservationOptions observation,
+                                         std::chrono::steady_clock::time_point pending_deadline) {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->options.purpose != EnginePurpose::Generation) {
+        throw std::logic_error("submit_branches requires a Generation Engine");
+    }
+    if (branches.empty() || branches.size() > kMaximumGenerationBranches) {
+        throw std::invalid_argument("submit_branches reads 1 to " +
+                                    std::to_string(kMaximumGenerationBranches) + " prompts");
+    }
+    if (!runs_branches()) { throw std::invalid_argument("this Engine runs no branched reads"); }
+    if (options.execution.requested_output_tokens != 1 || !options.execution.logprobs ||
+        options.execution.structured_output.kind != StructuredOutputKind::None ||
+        !options.execution.readout_tokens.empty()) {
+        throw std::invalid_argument("branched reads take one token with logprobs, no structured "
+                                    "output and no readout of their own");
+    }
     if (observation.live_timings) { observation.phase_timings = true; }
     if (consumer_mode != OutputConsumerMode::Streaming &&
         (observation.live_timings || observation.prompt_progress)) {
         throw std::invalid_argument("live generation observations require a Streaming consumer");
     }
-
-    runtime::ResolvedRequestOptions resolved_options = resolve_request_options(
-        impl_->sampling_defaults, prompt.impl_->sampling_mode, std::move(options));
-    const ResolvedSamplingParameters resolved_sampling = resolved_options.execution.sampling;
-
-    const PromptSummary prompt_summary = prompt.impl_->summary;
-    if (prompt_summary.prompt_tokens > impl_->options.max_context) {
-        throw RequestError(
-            RequestErrorKind::ContextLengthExceeded,
-            context_capacity_error(prompt_summary.prompt_tokens, impl_->options.max_context));
+    std::vector<models::qwen3_5::PreparedPrompt> prompts;
+    prompts.reserve(branches.size());
+    auto read         = std::make_shared<std::vector<runtime::ReadBranch>>(branches.size());
+    SamplingMode mode = SamplingMode::Thinking;
+    for (std::size_t index = 0; index < branches.size(); ++index) {
+        GenerationBranch& branch = branches[index];
+        if (branch.prompt.impl_ == nullptr) {
+            throw std::invalid_argument("PreparedPrompt is empty");
+        }
+        if (branch.readout_tokens.size() > kMaximumReadoutTokens) {
+            throw std::invalid_argument("readout_tokens names more than " +
+                                        std::to_string(kMaximumReadoutTokens) + " tokens");
+        }
+        if (branch.prompt.impl_->summary.prompt_tokens > impl_->options.max_context) {
+            throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                               context_capacity_error(branch.prompt.impl_->summary.prompt_tokens,
+                                                      impl_->options.max_context));
+        }
+        if (index == 0) { mode = branch.prompt.impl_->sampling_mode; }
+        (*read)[index].readout_tokens = std::move(branch.readout_tokens);
+        prompts.push_back(std::move(branch.prompt.impl_->value));
     }
-    const double prepare_seconds = prompt.impl_->prepare.seconds;
-    if (resolved_options.execution.requested_output_tokens == 0) {
-        struct ImmediateSubmission {
-            GenerationResult result;
-            OutputConsumerMode consumer_mode = OutputConsumerMode::Aggregate;
-
-            GenerationResult wait(OutputSink* sink, const CancellationView& cancellation) {
-                const bool streaming = consumer_mode == OutputConsumerMode::Streaming;
-                if (streaming != (sink != nullptr)) {
-                    throw std::invalid_argument(
-                        "GenerationHandle wait sink does not match its submitted consumer mode");
-                }
-                if (cancellation.requested()) { result.finish_reason = FinishReason::Cancelled; }
-                return std::move(result);
-            }
-
-            [[nodiscard]] std::optional<std::uint32_t> effective_thinking_budget() const noexcept {
-                return result.thinking.effective_budget;
-            }
-        } immediate{.consumer_mode = consumer_mode};
-
-        immediate.result.prompt                    = prompt_summary;
-        immediate.result.finish_reason             = FinishReason::OutputLimit;
-        immediate.result.thinking.requested_budget = resolved_options.execution.thinking.budget;
-        // No output is licensed, so the cap never binds: effective equals requested.
-        immediate.result.thinking.effective_budget = resolved_options.execution.thinking.budget;
-        immediate.result.timings.prepare_seconds = prepare_seconds;
-        immediate.result.timings.total_seconds   = prepare_seconds;
-        prompt.impl_.reset();
-        return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
-            impl_, std::move(immediate), resolved_sampling));
+    models::qwen3_5::BranchedPrompt split = models::qwen3_5::split_branches(std::move(prompts));
+    const std::uint32_t limit             = branch_token_limit();
+    for (std::size_t index = 0; index < read->size(); ++index) {
+        if (split.suffixes[index].size() > limit) {
+            throw std::length_error("a branch is longer than branch_token_limit()");
+        }
+        (*read)[index].tokens = std::move(split.suffixes[index]);
     }
-
+    options.execution.speculative_drafting = false;
+    runtime::ResolvedRequestOptions resolved =
+        resolve_request_options(impl_->sampling_defaults, mode, std::move(options));
+    const ResolvedSamplingParameters sampling = resolved.execution.sampling;
+    if (sampling.temperature > 0.0F || sampling.presence_penalty != 0.0F ||
+        sampling.frequency_penalty != 0.0F) {
+        throw std::invalid_argument("branched reads are greedy and take no penalties");
+    }
+    resolved.execution.branches  = std::move(read);
+    const PromptSummary summary  = split.prefix.summary();
+    const double prepare_seconds = split.prefix.preparation_stats().seconds;
+    std::shared_ptr<void> held   = impl_;
+    if (auto clock_floor = impl_->clock_floor.hold()) {
+        held = std::make_shared<HeldEngine>(
+            HeldEngine{.engine = impl_, .clock_floor = std::move(clock_floor)});
+    }
     return std::visit(
         [&](auto& core) -> GenerationHandle {
             using CoreState = std::remove_cvref_t<decltype(core)>;
@@ -718,21 +1012,40 @@ GenerationHandle Engine::submit(PreparedPrompt prompt, RequestOptions options,
             } else if constexpr (std::is_same_v<CoreState, std::unique_ptr<Impl::ScoringCore>>) {
                 throw std::logic_error("Engine generation core is unavailable");
             } else {
-                auto submission = core->submit(std::move(prompt.impl_->value), prompt_summary,
-                                               prepare_seconds, std::move(resolved_options),
-                                               consumer_mode, observation, pending_deadline);
+                using Core = typename CoreState::element_type;
+                std::vector<typename Core::GroupMember> group;
+                group.push_back(typename Core::GroupMember{.prompt = std::move(split.prefix),
+                                                           .prompt_summary   = summary,
+                                                           .prepare_seconds  = prepare_seconds,
+                                                           .options          = std::move(resolved),
+                                                           .consumer_mode    = consumer_mode,
+                                                           .observation      = observation,
+                                                           .pending_deadline = pending_deadline});
+                auto members = core->submit_group(std::move(group));
                 return GenerationHandle(std::make_unique<GenerationHandle::Impl>(
-                    impl_, std::move(submission), resolved_sampling));
+                    std::move(held), std::move(members.front()), sampling));
             }
         },
         impl_->core);
 }
 
+bool Engine::runs_branches() const {
+    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
+    if (impl_->options.purpose != EnginePurpose::Generation) { return false; }
+    if (impl_->flash || impl_->gemma || impl_->flint) { return true; }
+    return impl_->active->program->runs_branched_reads();
+}
+
+std::uint32_t Engine::branch_token_limit() const {
+    if (!runs_branches()) { return 0; }
+    if (impl_->flash || impl_->gemma || impl_->flint) {
+        return std::numeric_limits<std::uint32_t>::max();
+    }
+    return impl_->active->program->prefill_batch_capacity();
+}
+
 GenerationResult Engine::generate(PreparedPrompt prompt, RequestOptions options, OutputSink* sink,
                                   const CancellationView& cancellation) {
-    if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    // 0.20 clock floor: hold the GPU clock for the whole synchronous generate.
-    const auto clock_hold = impl_->clock_floor.hold();
     const OutputConsumerMode consumer_mode =
         sink != nullptr ? OutputConsumerMode::Streaming : OutputConsumerMode::Aggregate;
     return submit(std::move(prompt), std::move(options), consumer_mode, {})
@@ -760,7 +1073,7 @@ std::uint32_t Engine::concurrent_output_budget(const PreparedPrompt& prompt) con
         throw std::logic_error("concurrent_output_budget requires a Generation Engine");
     }
     if (prompt.impl_ == nullptr) { throw std::invalid_argument("PreparedPrompt is empty"); }
-    if (impl_->flash) {
+    if (impl_->flash || impl_->gemma || impl_->flint) {
         // One sequence at a time: the whole window past the prompt.
         const std::uint32_t prompt_tokens = prompt.impl_->summary.prompt_tokens;
         return prompt_tokens >= impl_->capacity() ? 0U : impl_->capacity() - prompt_tokens + 1U;

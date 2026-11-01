@@ -3,47 +3,7 @@
 Ternary Bonsai 2 27B and Qwen3.8-27B on one RTX 3090, RTX 4090, RTX 5090 and RTX PRO 6000 each, at
 the models' full 262,144-token window where the card holds it, with this line's defaults: the device
 route profile of each card (built in), `--gdn-state-fp16`, text only, one request at a time unless a
-section says otherwise. The first section compares this line with the previous `master` on the same
-hosts; the RTX PRO 6000 was measured on this line only.
-
-<!-- TABLES -->
-
-## Against the previous master
-
-The public `master` before this round (8a4c2f18) and this line on the same host with the flags of the reference rows below (Ternary Bonsai 2 at the 262,144-token window, Qwen3.8 at the window its row uses on that card), one request; before → after. With speculation the decode columns also move with the drafts accepted, which differ because the two builds' answers part at near-tied tokens; the rows without speculation show what the kernels changed. Prompts get slower in one place, the RTX 5090: Qwen3.8 takes 8 to 10% longer over 8K to 32K tokens and Bonsai 2 up to 40 ms longer up to 8K; from 64K on both gain:
-
-### RTX 5090
-
-| model | KV | speculation | short chat, tok/s | TTFT 32K, s | TTFT 131K, s | TTFT 261K, s | decode after 32K | after 131K | after 261K |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| Bonsai 2 | `rk4v4` | none | 168.3 → 170.3 (+1%) | 5.6 → 5.2 (-8%) | 38.6 → 30.3 (-22%) | 120.0 → 85.1 (-29%) | 155.6 → 157.8 (+1%) | 131.7 → 133.8 (+2%) | 109.6 → 111.6 (+2%) |
-| Bonsai 2 | `rk8v4` | DFlash2, 5 drafts | 352.1 → 362.0 (+3%) | 5.6 → 5.2 (-7%) | 37.6 → 29.8 (-21%) | 115.1 → 82.4 (-28%) | 264.5 → 255.8 (-3%) | 193.7 → 205.2 (+6%) | 190.7 → 183.9 (-4%) |
-| Bonsai 2 | `rk8v4` | MTP, 3 drafts | 316.1 → 316.6 (+0%) | 5.5 → 5.1 (-7%) | 37.3 → 29.5 (-21%) | 114.6 → 81.8 (-29%) | 288.6 → 272.8 (-5%) | 202.9 → 197.9 (-2%) | 193.7 → 200.6 (+4%) |
-| Bonsai 2 | `rk8v4` | none | 168.9 → 170.5 (+1%) | 5.3 → 5.1 (-5%) | 36.9 → 29.4 (-20%) | 114.5 → 81.6 (-29%) | 153.2 → 154.4 (+1%) | 123.0 → 124.0 (+1%) | 98.2 → 99.0 (+1%) |
-| Qwen3.8 | `rk8v4` | DFlash2, 5 drafts | 224.9 → 222.6 (-1%) | 7.9 → 8.5 (+8%) | 46.7 → 42.7 (-9%) | 133.3 → 107.5 (-19%) | 214.2 → 210.8 (-2%) | 141.6 → 156.8 (+11%) | 118.2 → 129.7 (+10%) |
-| Qwen3.8 | `rk8v4` | none | 89.6 → 91.5 (+2%) | 7.8 → 8.5 (+8%) | 46.2 → 42.2 (-9%) | 132.6 → 106.9 (-19%) | 84.8 → 86.6 (+2%) | 74.8 → 76.2 (+2%) | 64.8 → 66.0 (+2%) |
-
-### RTX 4090
-
-| model | KV | speculation | short chat, tok/s | TTFT 32K, s | TTFT 131K, s | TTFT 261K, s | decode after 32K | after 131K | after 261K |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| Bonsai 2 | `rk4v4` | none | 107.8 → 107.9 (+0%) | 6.9 → 6.4 (-8%) | 46.8 → 37.2 (-20%) | 145.2 → 105.2 (-28%) | 97.9 → 99.3 (+1%) | 80.8 → 83.0 (+3%) | 56.5 → 63.8 (+13%) |
-| Bonsai 2 | `rk8v4` | DFlash2, 5 drafts | 244.2 → 244.8 (+0%) | 6.9 → 6.4 (-7%) | 45.6 → 36.9 (-19%) | 139.2 → 103.3 (-26%) | 225.5 → 180.0 (-20%) | 140.6 → 125.8 (-11%) | 112.0 → 122.9 (+10%) |
-| Bonsai 2 | `rk8v4` | MTP, 3 drafts | 199.5 → 203.4 (+2%) | 6.8 → 6.3 (-7%) | 45.3 → 36.6 (-19%) | 138.7 → 102.6 (-26%) | 183.1 → 164.8 (-10%) | 121.4 → 127.7 (+5%) | 112.4 → 111.0 (-1%) |
-| Bonsai 2 | `rk8v4` | none | 108.2 → 108.4 (+0%) | 6.7 → 6.3 (-7%) | 45.0 → 36.2 (-20%) | 138.3 → 102.1 (-26%) | 97.1 → 97.8 (+1%) | 76.0 → 77.3 (+2%) | 55.5 → 56.4 (+2%) |
-| Qwen3.8 | `rk8v4` | DFlash2, 5 drafts | 140.4 → 138.1 (-2%) | 13.5 → 13.2 (-2%) | 71.7 → 62.7 (-13%) | - | 111.8 → 140.3 (+25%) | 94.9 → 90.9 (-4%) | - |
-| Qwen3.8 | `rk8v4` | none | 54.7 → 54.8 (+0%) | 13.3 → 13.0 (-2%) | 71.1 → 62.2 (-12%) | - | 51.7 → 52.0 (+1%) | 45.1 → 45.6 (+1%) | - |
-
-### RTX 3090
-
-| model | KV | speculation | short chat, tok/s | TTFT 32K, s | TTFT 131K, s | TTFT 261K, s | decode after 32K | after 131K | after 261K |
-|---|---|---|---:|---:|---:|---:|---:|---:|---:|
-| Bonsai 2 | `rk4v4` | none | 93.5 → 93.8 (+0%) | 15.0 → 13.3 (-11%) | 105.2 → 77.9 (-26%) | 328.9 → 221.1 (-33%) | 81.7 → 83.7 (+3%) | 60.2 → 64.4 (+7%) | 44.5 → 49.2 (+11%) |
-| Bonsai 2 | `rk8v4` | DFlash2, 5 drafts | 203.8 → 201.4 (-1%) | 15.1 → 13.4 (-11%) | 103.0 → 77.4 (-25%) | 317.4 → 216.9 (-32%) | 157.0 → 135.4 (-14%) | 90.8 → 92.6 (+2%) | 74.1 → 89.7 (+21%) |
-| Bonsai 2 | `rk8v4` | MTP, 3 drafts | 173.6 → 172.2 (-1%) | 14.9 → 13.2 (-11%) | 102.2 → 76.5 (-25%) | 315.9 → 215.4 (-32%) | 134.5 → 150.4 (+12%) | 95.2 → 93.7 (-2%) | 87.5 → 89.3 (+2%) |
-| Bonsai 2 | `rk8v4` | none | 93.4 → 94.1 (+1%) | 14.8 → 13.1 (-11%) | 101.4 → 76.2 (-25%) | 315.1 → 214.5 (-32%) | 83.3 → 84.3 (+1%) | 63.4 → 65.3 (+3%) | 47.8 → 50.0 (+5%) |
-| Qwen3.8 | `rk8v4` | DFlash2, 5 drafts | 113.4 → 117.1 (+3%) | 23.4 → 23.4 (+0%) | 137.0 → 117.7 (-14%) | - | 113.8 → 110.8 (-3%) | 62.7 → 72.6 (+16%) | - |
-| Qwen3.8 | `rk8v4` | none | 48.3 → 48.2 (-0%) | 23.1 → 23.1 (+0%) | 135.7 → 116.4 (-14%) | - | 44.9 → 45.1 (+1%) | 37.7 → 38.4 (+2%) | - |
+section says otherwise.
 
 ## RTX 5090
 
@@ -734,9 +694,8 @@ Routes each card's calibration moved off the compiled tables, with the largest s
 ## How these were measured
 
 **Hardware.** Rented single-GPU hosts, each GPU at its board's default power limit. RTX 3090: 390 W
-for the Ternary Bonsai 2 rows, their comparison with `master` and several requests at once; two
-other boards at 370 W for the Qwen3.8 rows and their comparison with `master`, the draft sweeps,
-the largest context and the fills. RTX 4090: 450 W (the largest-context bisection ran on a second
+for the Ternary Bonsai 2 rows and several requests at once; two other boards at 370 W for the
+Qwen3.8 rows, the draft sweeps, the largest context and the fills. RTX 4090: 450 W (the largest-context bisection ran on a second
 board capped at 400 W; it does not depend on power). RTX 5090: 575 W, on two hosts. RTX PRO 6000:
 the Workstation Edition at 600 W; the Max-Q (300 W) and Server (600 W) editions were calibrated for
 their built-in profiles and not measured here. The server runs pinned to the CPUs of the GPU's NUMA
@@ -777,7 +736,3 @@ requests at 32,768 and 131,072 tokens.
 **Several requests at once.** `--max-concurrency 8 --max-context 16384 --kv-capacity 131072`; N
 short-chat requests sent together, 512 tokens each, and their total generated tokens over the
 wall time from the first request to the last answer.
-
-**Against the previous master.** The public `master` at 8a4c2f18, built the same way on the same
-host and served with the same flags; it has no device profiles, no fast prompt route and no
-wave-aligned prefill chunks, and MTP with ten or more drafts fails there at startup.

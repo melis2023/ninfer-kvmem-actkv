@@ -104,7 +104,9 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     const std::int32_t value_heads = v.ne[1];
     const std::int32_t width       = q.ne[2];
     const std::int32_t rows        = q.ne[3];
-    const bool registered_heads    = qk_heads == 16 && (value_heads == 48 || value_heads == 32);
+    const bool registered_heads    = (qk_heads == 16 && (value_heads == 48 || value_heads == 32 || value_heads == 16)) ||
+                                  (qk_heads == 8 && value_heads == 24) ||
+                                  (qk_heads == 4 && value_heads == 12);
     if (!registered_heads || width < 2 || width > 64 || rows <= 0 || rows > kMaximumRows ||
         (width > 16 && rows != 1)) {
         throw std::invalid_argument(std::string(kOp) + ": unsupported geometry");
@@ -158,7 +160,13 @@ bool is_registered_fold_geometry(const GdnReplayRecordSpec& spec) {
         spec.qk_heads == 16 && spec.value_heads == 48 && spec.conv_channels == 10240;
     const bool geometry_32 =
         spec.qk_heads == 16 && spec.value_heads == 32 && spec.conv_channels == 8192;
-    return spec.layers > 0 && (geometry_48 || geometry_32);
+    const bool geometry_16 =
+        spec.qk_heads == 16 && spec.value_heads == 16 && spec.conv_channels == 6144;
+    // A 27B layer's share on each of two and four tensor-parallel ranks.
+    const bool geometry_shard =
+        (spec.qk_heads == 8 && spec.value_heads == 24 && spec.conv_channels == 5120) ||
+        (spec.qk_heads == 4 && spec.value_heads == 12 && spec.conv_channels == 2560);
+    return spec.layers > 0 && (geometry_48 || geometry_32 || geometry_16 || geometry_shard);
 }
 
 void validate_fold_records(const GdnReplayRecords& records) {

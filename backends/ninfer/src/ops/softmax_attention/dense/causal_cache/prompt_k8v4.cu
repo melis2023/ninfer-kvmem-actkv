@@ -17,11 +17,8 @@ void causal_attention_prompt_k8v4_attention_launch_for(const Tensor& q, const Te
                                                        float scale, const CacheView& cache,
                                                        Metadata metadata, Tensor& out,
                                                        cudaStream_t stream) {
-    configure_cuda_device_once([&] {
-        return cudaFuncSetAttribute(
-            causal_attention_prompt_k8v4_kernel<Geometry, Metadata>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize, kCausalPromptK8V4SmemBytes);
-    });
+    raise_dynamic_shared_memory(causal_attention_prompt_k8v4_kernel<Geometry, Metadata>,
+                                kCausalPromptK8V4SmemBytes);
 
     constexpr auto kStorage = KvCacheStorage::Fp8KeyNvfp4Value;
     const auto* cache_k_ptr = static_cast<const KvKeyCodeT<kStorage>*>(cache.k_pages.data);
@@ -49,6 +46,16 @@ void causal_attention_prompt_k8v4_attention_dispatch(const Tensor& q, const Tens
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
         causal_attention_prompt_k8v4_attention_launch_for<CausalD256H24Kv4>(
             q, positions, scale, cache, metadata, out, stream);
+        return;
+    }
+    if (q.ne[1] == 8) {
+        causal_attention_prompt_k8v4_attention_launch_for<CausalD256H8Kv2>(q, positions, scale, cache,
+                                                                        metadata, out, stream);
+        return;
+    }
+    if (cache.num_kv_heads == 4) {
+        causal_attention_prompt_k8v4_attention_launch_for<CausalD256H16Kv4>(q, positions, scale, cache,
+                                                                        metadata, out, stream);
         return;
     }
     causal_attention_prompt_k8v4_attention_launch_for<CausalD256H16Kv2>(q, positions, scale, cache,

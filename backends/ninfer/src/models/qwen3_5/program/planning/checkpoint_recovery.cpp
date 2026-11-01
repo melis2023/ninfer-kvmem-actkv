@@ -760,28 +760,14 @@ void ProgramImpl::publish_checkpoint_drop(SequenceState& sequence,
                                                          retained->backend_frontier);
     }
     if (speculative_backend == SpeculativeBackend::Mtp) {
-        sequence.mtp_kv_valid    = retained->backend_frontier;
-        sequence.mtp_draft_count = 0;
+        sequence.mtp_kv_valid       = retained->backend_frontier;
+        sequence.mtp_draft_count    = 0;
+        sequence.mtp_drafts_pending = false;
     } else if (is_masked_draft_backend(speculative_backend)) {
         sequence.dflash_context_frontier = retained->main_frontier;
-        // The ring comes from the restored image, not from pending_features.
-        sequence.dflash_pending_base  = retained->main_frontier;
-        sequence.dflash_pending_valid = false;
-        // The ring snapshot covers the trailing window; reselected history below the recent
-        // pages must not feed the draft. Keep the whole ring readable (the recent-page span is
-        // one page by default), matching the reselect and query-restore paths.
-        const std::uint64_t recent_tokens = std::max<std::uint64_t>(
-            static_cast<std::uint64_t>(kvmem_options.recent_blocks()) *
-                static_cast<std::uint64_t>(kPagedKVPageSize),
-            masked_draft_ring_capacity());
-        sequence.dflash_context_floor = retained->main_frontier > recent_tokens
-            ? static_cast<std::uint32_t>(retained->main_frontier - recent_tokens) : 0U;
-        // The restored ring lives in the sequence's current write slot; re-anchor it there so a
-        // later slot change is detected as a fork instead of copying stale lanes over it.
-        sequence.dflash_state_slot =
-            state_store->valid(sequence.state.write) && state_store->valid(sequence.state.read)
-                ? state_store->selectors(sequence.state.read, sequence.state.write).destination
-                : -1;
+        const auto recent = static_cast<std::uint64_t>(kvmem_options.recent_blocks()) * 64ULL;
+        sequence.dflash_context_floor = kvmem_window_tokens && retained->main_frontier > recent
+            ? static_cast<std::uint32_t>(retained->main_frontier - recent) : 0U;
     }
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
     refresh_state_views(sequence);

@@ -18,6 +18,9 @@ struct SnapshotBuffer {
     void (*clear)(void *) = nullptr;
     void * accounting = nullptr;
     void (*account)(void *, int64_t) = nullptr;
+    // Optional admission before allocating a restored buffer. Successful reserve
+    // already charges account; failed reads return that charge on the same owner.
+    bool (*reserve)(void *, uint64_t) = nullptr;
 
     uint64_t ram_bytes() const { return capacity(object); }
     void release() const {
@@ -25,8 +28,10 @@ struct SnapshotBuffer {
         clear(object);
     }
     void restore(SnapshotReader & in) const {
-        read(object, count, in);
-        if (account) account(accounting, int64_t(size));
+        if (reserve && !reserve(accounting, size)) throw std::runtime_error("snapshot Host reservation exceeded budget");
+        try { read(object, count, in); }
+        catch (...) { if (reserve && account) account(accounting, -int64_t(size)); throw; }
+        if (!reserve && account) account(accounting, int64_t(size));
     }
     template<class T> static SnapshotBuffer bind(std::vector<T> & values) {
         static_assert(std::is_arithmetic<T>::value, "plain vector required");

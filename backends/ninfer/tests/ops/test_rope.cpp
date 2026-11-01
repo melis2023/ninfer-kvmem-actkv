@@ -9,6 +9,7 @@
 #include <iostream>
 #include <limits>
 #include <random>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -76,6 +77,70 @@ double yarn_attention_factor(const Geometry& geometry) {
     return geometry.yarn_factor > 1.0F
                ? 0.1 * std::log(static_cast<double>(geometry.yarn_factor)) + 1.0
                : 1.0;
+}
+
+// rope_yarn_frequencies over a schedule theta^(-2i/dim) of `pairs` rotated pairs against the
+// oracle above with that dim: Qwen's quarter-head rotation (64 dims, 32 pairs), Gemma 4's
+// proportional RoPE (the 512-wide head, its first 64 pairs) and the unscaled factor of one.
+int run_frequency_case(const char* label, int dim, int pairs, float theta, float factor,
+                       int native) {
+    const Geometry geometry{label, dim, dim, 1, 1, theta, factor, native};
+    const ops::RopeYarnFrequencies got =
+        ops::rope_yarn_frequencies(dim, pairs, theta, geometry.yarn());
+    int failures = 0;
+    if (got.pairs != pairs) {
+        std::cerr << "FAIL " << label << ": pairs " << got.pairs << " != " << pairs << '\n';
+        ++failures;
+    }
+    for (int pair = 0; pair < pairs; ++pair) {
+        const double plain     = std::pow(static_cast<double>(theta), -2.0 * pair / dim);
+        const double expected  = yarn_frequency(geometry, pair, plain);
+        const double tolerance = 2e-7 * expected;
+        if (std::fabs(static_cast<double>(got.inverse_frequency[pair]) - expected) > tolerance) {
+            std::cerr << "FAIL " << label << ": pair " << pair << " frequency "
+                      << got.inverse_frequency[pair] << " != " << expected << '\n';
+            ++failures;
+        }
+    }
+    for (int pair = pairs; pair < 128; ++pair) {
+        if (got.inverse_frequency[pair] != 0.0F) {
+            std::cerr << "FAIL " << label << ": pair " << pair << " past the schedule is set\n";
+            ++failures;
+            break;
+        }
+    }
+    const double attention = yarn_attention_factor(geometry);
+    if (std::fabs(static_cast<double>(got.attention_factor) - attention) > 1e-6) {
+        std::cerr << "FAIL " << label << ": attention factor " << got.attention_factor
+                  << " != " << attention << '\n';
+        ++failures;
+    }
+    return failures;
+}
+
+int run_frequency_refusals() {
+    int failures = 0;
+    const auto refused = [&](const char* label, auto&& call) {
+        try {
+            call();
+            std::cerr << "FAIL rope_yarn_frequencies accepts " << label << '\n';
+            ++failures;
+        } catch (const std::invalid_argument&) {}
+    };
+    const ops::RopeYarn yarn{2.0F, 262'144};
+    refused("more pairs than dim/2", [&] { (void)ops::rope_yarn_frequencies(64, 33, 1e7F, yarn); });
+    refused("an odd dim", [&] { (void)ops::rope_yarn_frequencies(65, 32, 1e7F, yarn); });
+    refused("past 128 pairs", [&] { (void)ops::rope_yarn_frequencies(512, 129, 1e6F, yarn); });
+    refused("a factor below one", [&] {
+        (void)ops::rope_yarn_frequencies(64, 32, 1e7F, ops::RopeYarn{0.5F, 262'144});
+    });
+    refused("no native window", [&] {
+        (void)ops::rope_yarn_frequencies(64, 32, 1e7F, ops::RopeYarn{2.0F, 0});
+    });
+    refused("position interpolation", [&] {
+        (void)ops::rope_yarn_frequencies(64, 32, 1e7F, ops::RopeYarn{1.0F, 262'144, 2.0F, 4096});
+    });
+    return failures;
 }
 
 std::size_t dense_elements(int head_dim, int heads, int tokens) {
@@ -523,6 +588,16 @@ int main() {
                               31, 16, 8);
     failures +=
         run_single_case({"27b mtp k yarn", 256, 64, 1, 128, kTextTheta, 4.0F, 262'144}, 4, 8192);
+    // Qwen3.8-Flash-Next under YaRN rotates its 24 query and 2 key heads with the single-tensor
+    // form, 1-D and MRoPE, at the factor of its 589,824-token window over 262,144.
+    failures +=
+        run_single_case({"flash q yarn", 256, 64, 1, 128, kTextTheta, 2.25F, 262'144}, 24, 4096);
+    failures +=
+        run_single_case({"flash k yarn", 256, 64, 1, 128, kTextTheta, 2.25F, 262'144}, 2, 4096);
+    failures += run_single_case({"flash q mrope yarn", 256, 64, 3, 7, kTextTheta, 2.25F, 262'144},
+                                24, 2048);
+    failures += run_single_case({"flash k mrope yarn", 256, 64, 3, 7, kTextTheta, 2.25F, 262'144},
+                                2, 2048);
 
     // Linear position interpolation past a threshold the positions cross, 1-D, MRoPE and the
     // single-tensor form: positions up to the threshold keep their angles.
@@ -539,6 +614,20 @@ int main() {
     failures += run_single_case({"35b mtp k text", 256, 64, 1, 5, kTextTheta}, 2, 16384, 8);
 
     failures += run_vision_packed_case();
+
+    // The frequency schedules the in-kernel rotations take: Flash-Next's indexer at Qwen's quarter
+    // head, Gemma 4's full-attention blocks at their proportional schedule, and factor one.
+    failures += run_frequency_case("qwen indexer yarn frequencies", 64, 32, kTextTheta, 2.25F,
+                                   262'144);
+    failures += run_frequency_case("qwen yarn frequencies factor 4", 64, 32, kTextTheta, 4.0F,
+                                   262'144);
+    failures += run_frequency_case("gemma 4 proportional yarn frequencies", 512, 64, 1.0e6F,
+                                   2.0F, 262'144);
+    failures += run_frequency_case("gemma 4 proportional yarn frequencies factor 4", 512, 64,
+                                   1.0e6F, 4.0F, 262'144);
+    failures += run_frequency_case("gemma 4 proportional unscaled", 512, 64, 1.0e6F, 1.0F,
+                                   262'144);
+    failures += run_frequency_refusals();
 
     // DFlash proposal consumes 2..16 tokens; context append uses the single-K form.
     failures += run_pair_case({"35b dflash proposal", 128, 128, 1, 16, kTextTheta}, 32, 8, 262'128);

@@ -45,6 +45,9 @@ struct Activation {
     const __half* data        = nullptr;
     const __nv_bfloat16* bf16 = nullptr;
     __half* pass              = nullptr;
+    // The small-T route's flags of its FP16 plane: nonzero for each 64-value chunk of a column
+    // holding a value beyond FP16 ([T][k / 64]; sm70_small.h).
+    const std::uint8_t* beyond_chunks = nullptr;
     std::int32_t k            = 0;
     std::int32_t tokens       = 0;
     std::int32_t max_rows     = 0;

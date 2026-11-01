@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/dtype.h"
-#include "ninfer/types.h"
+#include "ninfer/kv_cache_storage.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -66,17 +66,21 @@ struct PagedKVStorageLayout {
     case KvCacheStorage::BFloat16:
         return symmetric({DType::BF16, head_dim, DType::U8, 0});
     case KvCacheStorage::Int8Group64:
-        if (head_dim == kD256KVCacheHeadDim) { return symmetric({DType::I8, 256, DType::FP16, 4}); }
+        // INT8-G64: one FP16 scale per 64 values. 256 is the target's full-attention dim; 128
+        // is the DFlash2 draft ring.
+        if (head_dim % 64 == 0) {
+            return symmetric({DType::I8, head_dim, DType::FP16, head_dim / 64});
+        }
         break;
     case KvCacheStorage::RotatedInt8KeyInt4ValueGroup64:
         // RotorQuant rk8v4 (this fork only): the key plane is the same rotated INT8 coding as
         // Int8Group64; the value plane packs two signed 4-bit codes per byte (U8, half the
         // leading extent) with a finer 32-value scale group, so its scale plane is twice as wide.
-        if (head_dim == kD256KVCacheHeadDim) {
+        if (head_dim % 64 == 0) {
             return {storage,
                     head_dim,
-                    {DType::I8, head_dim, DType::FP16, 4},
-                    {DType::U8, head_dim / 2, DType::FP16, 8}};
+                    {DType::I8, head_dim, DType::FP16, head_dim / 64},
+                    {DType::U8, head_dim / 2, DType::FP16, head_dim / 32}};
         }
         break;
     case KvCacheStorage::RotatedLloyd4KeyInt4Value:

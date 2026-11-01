@@ -8,12 +8,15 @@
 // K vector per token, which is the column-major B representation consumed by the
 // row.col MMA atom. M and K come from a compiled geometry; N remains runtime.
 
+#include "core/device.h"
+#include "ops/common/device_limits.h"
 #include "ops/common/mma.cuh"
 
 #include <cuda_bf16.h>
 
 #include <algorithm>
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 
@@ -43,6 +46,7 @@ struct Bf16MmaSchedule {
     static constexpr int kBlockK                               = BlockK;
     static constexpr int kWarpRows                             = WarpRows;
     static constexpr int kWarpCols                             = WarpCols;
+    static constexpr bool kTuringShapes                        = false;
     static constexpr int kPipelineStages                       = PipelineStages;
     static constexpr int kMinBlocks                            = MinBlocks;
     static constexpr Cache kWeightCache                        = WeightCache;
@@ -69,8 +73,22 @@ struct Bf16MmaSchedule {
     static_assert(kPipelineStages >= 2 && kPipelineStages <= 8);
     static_assert(kMinBlocks >= 1);
     static_assert(kWarps >= 1 && kThreads <= 1024);
-    static_assert(kSharedBytes <= 99 * 1024);
+    static_assert(kSharedBytes <= shape_max_shared_bytes_per_block(false));
     static_assert(kRaster != Bf16MmaRaster::Grouped || kRasterGroupRows > 0);
+};
+
+// A schedule's Turing form (ops/common/device_tier.h): Turing copies synchronously
+// (ops/common/memory.cuh), so a ring deeper than two stages -- one being computed, one being
+// filled -- only spends shared memory there, and two stages fit its 64 KiB.
+template <class Schedule>
+struct Bf16MmaTuringSchedule : Schedule {
+    static constexpr bool kTuringShapes = true;
+    static constexpr int kPipelineStages =
+        Schedule::kPipelineStages < 2 ? Schedule::kPipelineStages : 2;
+    static constexpr int kSharedElements =
+        kPipelineStages * (Schedule::kBlockRows + Schedule::kBlockCols) * Schedule::kBlockK;
+    static constexpr int kSharedBytes = kSharedElements * static_cast<int>(sizeof(__nv_bfloat16));
+    static_assert(kSharedBytes <= shape_max_shared_bytes_per_block(true));
 };
 
 struct Bf16MmaOutputTile {
@@ -134,6 +152,7 @@ template <class Geometry, class Schedule, bool FullTokens, class Output>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16_gemm_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const __nv_bfloat16* __restrict__ weight, Output output,
     std::int32_t tokens) {
+    if constexpr (!shape_set_in_image(Schedule::kTuringShapes)) { return; } // not this image's set
     constexpr int M       = Geometry::kOutputRows;
     constexpr int K       = Geometry::kInputRows;
     constexpr int BM      = Schedule::kBlockRows;
@@ -329,6 +348,22 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void bf16
             }
         }
     }
+}
+
+// Launches `blocks` CTAs of bf16_gemm_mma_kernel with the current device's shape set: the schedule
+// as given, or its Turing form (Bf16MmaTuringSchedule).
+template <class Geometry, class Schedule, bool FullTokens, class Output>
+void launch_bf16_gemm_mma(const __nv_bfloat16* x, const __nv_bfloat16* weight, const Output& output,
+                          std::int32_t tokens, int blocks, cudaStream_t stream) {
+    with_shape_set([&]<bool TuringShapes>() {
+        using Shaped = std::conditional_t<TuringShapes, Bf16MmaTuringSchedule<Schedule>, Schedule>;
+        if constexpr (Shaped::kSharedBytes > 48 * 1024) {
+            raise_dynamic_shared_memory(bf16_gemm_mma_kernel<Geometry, Shaped, FullTokens, Output>,
+                                        Shaped::kSharedBytes);
+        }
+        bf16_gemm_mma_kernel<Geometry, Shaped, FullTokens, Output>
+            <<<blocks, Shaped::kThreads, Shaped::kSharedBytes, stream>>>(x, weight, output, tokens);
+    });
 }
 
 } // namespace ninfer::ops::detail

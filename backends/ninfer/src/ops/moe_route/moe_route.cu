@@ -1,13 +1,15 @@
 // ninfer::ops - Qwen3.8-Flash-Next MoE router (contract in include/ninfer/ops/moe_route.h).
-// Two launches: the E + 1 logits (the experts and the shared gate) as a GEMV with one warp per row
-// and the router streamed in 16-byte vectors by every CTA of the device, then one warp per token
-// taking ten rounds of an arg-max over its logits that prefers the lower index on ties (softmax is
-// monotonic).
+// Two steps: the E + 1 logits (the experts and the shared gate) as a GEMV with one warp per row
+// and the router streamed in 16-byte vectors by every CTA of the device (or, for a BF16 input of
+// more than eight tokens, as cuBLAS tensor-core GEMMs with FP32 accumulation), then one warp per
+// token taking ten rounds of an arg-max over its logits that prefers the lower index on ties
+// (softmax is monotonic).
 #include "ninfer/ops/moe_route.h"
 
 #include "core/device.h"
 #include "core/layout.h"
 
+#include <cublas_v2.h>
 #include <cuda_bf16.h>
 
 #include <cmath>
@@ -22,10 +24,13 @@ namespace {
 constexpr int kHidden     = 2560;
 constexpr int kMaxExperts = 512;
 constexpr int kTopK       = 10;
-// The logits GEMV: one warp per row, eight rows and eight token columns per CTA.
-constexpr int kRowWarps    = 8;
+// The logits GEMV: one warp per row, four rows and eight token columns per CTA, so a decode
+// step's 513 rows spread over every multiprocessor.
+constexpr int kRowWarps    = 4;
 constexpr int kColumnChunk = 8;
 constexpr int kVectors     = kHidden / 8; // 16-byte vectors per router row
+constexpr int kVectorsPerLane = kVectors / 32;
+static_assert(kVectors % 32 == 0);
 // The selection: one warp per token, sixteen logits per lane.
 constexpr int kSelectWarps   = 4;
 constexpr int kLogitsPerLane = kMaxExperts / 32;
@@ -73,10 +78,16 @@ __global__ void __launch_bounds__(kRowWarps * 32)
     if (row > experts) { return; }
     const auto* w = reinterpret_cast<const uint4*>(
         row < experts ? router + static_cast<std::int64_t>(row) * kHidden : shared_gate);
+    // Every weight load of the lane is in flight before the first product.
+    uint4 wv[kVectorsPerLane];
+#pragma unroll
+    for (int i = 0; i < kVectorsPerLane; ++i) { wv[i] = __ldg(w + lane + 32 * i); }
     float acc[kColumnChunk] = {};
-    for (int v = lane; v < kVectors; v += 32) {
+#pragma unroll
+    for (int i = 0; i < kVectorsPerLane; ++i) {
+        const int v = lane + 32 * i;
         float wf[8];
-        unpack_bf16x8(__ldg(w + v), wf);
+        unpack_bf16x8(wv[i], wf);
 #pragma unroll
         for (int j = 0; j < kColumnChunk; ++j) {
             if (j < count) {
@@ -90,8 +101,10 @@ __global__ void __launch_bounds__(kRowWarps * 32)
     float mine = 0.0f;
 #pragma unroll
     for (int j = 0; j < kColumnChunk; ++j) {
-        const float v = warp_sum(acc[j]);
-        if (j == lane) { mine = v; }
+        if (j < count) { // uniform across the warp
+            const float v = warp_sum(acc[j]);
+            if (j == lane) { mine = v; }
+        }
     }
     if (lane < count) { logits[static_cast<std::int64_t>(t0 + lane) * (experts + 1) + row] = mine; }
 }
@@ -165,6 +178,37 @@ __global__ void __launch_bounds__(kSelectWarps * 32)
 
 bool aligned16(const void* pointer) { return reinterpret_cast<std::uintptr_t>(pointer) % 16 == 0; }
 
+// One handle per device, created on first use and kept: the stream is set per call.
+cublasHandle_t blas_handle() {
+    static constexpr int kMaxDevices = 16;
+    static cublasHandle_t handles[kMaxDevices]{};
+    int device = 0;
+    CUDA_CHECK(cudaGetDevice(&device));
+    if (device < 0 || device >= kMaxDevices) {
+        throw std::runtime_error("moe_route: device index out of range");
+    }
+    if (handles[device] == nullptr && cublasCreate(&handles[device]) != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error("moe_route: cublasCreate failed");
+    }
+    return handles[device];
+}
+
+// logits rows [first, first + rows) of every token (column-major, ldc = experts + 1) = W . m for
+// W BF16 [rows][2560] and m BF16 [tokens][2560].
+void logits_gemm(cudaStream_t stream, const __nv_bfloat16* w, int rows, const __nv_bfloat16* m,
+                 int tokens, float* logits, int ldc) {
+    const cublasHandle_t handle = blas_handle();
+    if (cublasSetStream(handle, stream) != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error("moe_route: cublasSetStream failed");
+    }
+    const float one = 1.0f, zero = 0.0f;
+    if (cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, rows, tokens, kHidden, &one, w, CUDA_R_16BF,
+                     kHidden, m, CUDA_R_16BF, kHidden, &zero, logits, CUDA_R_32F, ldc,
+                     CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP) != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error("moe_route: logits GEMM failed");
+    }
+}
+
 void require(bool condition, const char* message) {
     if (!condition) { throw std::invalid_argument(std::string("moe_route: ") + message); }
 }
@@ -215,6 +259,10 @@ void moe_route(const Tensor& m, const Tensor& router, const Tensor& shared_gate,
     if (m.dtype == DType::FP32) {
         moe_route_logits_kernel<float><<<grid, kRowWarps * 32, 0, stream>>>(
             static_cast<const float*>(m.data), r, g, experts, tokens, logits_p);
+    } else if (tokens > kColumnChunk) {
+        const auto* x = static_cast<const __nv_bfloat16*>(m.data);
+        logits_gemm(stream, r, experts, x, tokens, logits_p, experts + 1);
+        logits_gemm(stream, g, 1, x, tokens, logits_p + experts, experts + 1);
     } else {
         moe_route_logits_kernel<__nv_bfloat16><<<grid, kRowWarps * 32, 0, stream>>>(
             static_cast<const __nv_bfloat16*>(m.data), r, g, experts, tokens, logits_p);

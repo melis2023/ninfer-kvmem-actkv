@@ -1,6 +1,6 @@
 # NInfer Persistent Tensor Numeric Formats
 
-This reference defines the nine persistent numeric tensor formats accepted by current `.ninfer`
+This reference defines the persistent numeric tensor formats accepted by current `.ninfer`
 artifacts: their logical words, quantization semantics, canonical reference encoders where
 applicable, and conformance boundaries. [Container framing](artifact-container.md),
 [physical layouts](storage-layouts.md), weight recipes and runtime-state codecs are defined
@@ -8,7 +8,7 @@ separately.
 
 ## 1. Registered formats
 
-NInfer has exactly twenty-four persistent numeric tensor formats in five categories.
+NInfer's closed registry has the following persistent numeric formats in five categories.
 
 Direct scalar formats preserve one logical scalar word per tensor element:
 
@@ -22,11 +22,13 @@ Grouped quantized-weight formats preserve signed codes plus one scale per logica
 
 | Canonical name | Code width | Group size | Legal signed codes | Scale | Full-group logical bits/weight |
 |---|---:|---:|---:|---|---:|
+| `q2_g64_fp16` | 2 | 64 | `[-1, 2]`, stored as offset codes `0..3` | one binary16 scale/group | 2.25 |
 | `q4_g64_fp16` | 4 | 64 | `[-8, 7]` | one binary16 scale/group | 4.25 |
 | `q5_g64_fp16` | 5 | 64 | `[-16, 15]` | one binary16 scale/group | 5.25 |
 | `q6_g64_fp16` | 6 | 64 | `[-32, 31]` | one binary16 scale/group | 6.25 |
 | `q8_g32_fp16` | 8 | 32 | `[-127, 127]` | one binary16 scale/group | 8.50 |
 | `t2_g128_fp16` | 2 | 128 | `[-1, 1]` | one binary16 scale/group | 2.125 |
+| `ptq1_g128_fp16` | base 3 | 128 | `[-1, 1]` | one binary16 scale/group | 1.75 |
 
 The block-scaled floating-point weight format is:
 
@@ -34,11 +36,12 @@ The block-scaled floating-point weight format is:
 |---|---|---:|---|---|
 | `nvfp4` | E2M1, 4 bits/weight | 16 | one E4M3FN word/group | one positive FP32 weight divisor per stacked source matrix |
 
-The row-scaled floating-point weight format is:
+The row-scaled floating-point weight formats are:
 
 | Canonical name | Code | Scale granularity | Scale |
 |---|---|---|---|
 | `fp8_e4m3fn_row_bf16` | E4M3FN, 8 bits/weight | one multiplier per logical row | BF16 |
+| `fp8_e4m3fn_row_fp16` | E4M3FN, 8 bits/weight | one multiplier per logical row | IEEE binary16 |
 
 GGUF block formats keep ggml's quantized blocks byte for byte, so a GGUF tensor imports without
 decoding or requantizing:
@@ -46,6 +49,9 @@ decoding or requantizing:
 | Canonical name | ggml type | Block values | Block bytes | Bits/weight |
 |---|---:|---:|---:|---:|
 | `gguf_q8_0` | 8 | 32 | 34 | 8.50 |
+| `gguf_q4_0` | 2 | 32 | 18 | 4.50 |
+| `gguf_q5_0` | 6 | 32 | 22 | 5.50 |
+| `gguf_q2_0` | 42 | 64 | 18 | 2.25 |
 | `gguf_q2_k` | 10 | 256 | 84 | 2.625 |
 | `gguf_q3_k` | 11 | 256 | 110 | 3.4375 |
 | `gguf_q4_k` | 12 | 256 | 144 | 4.50 |
@@ -98,7 +104,7 @@ A **quantization scheme** defines only the persistent logical representation of 
 - the validity rules for codes and scales;
 - the mathematical reconstruction of each represented weight.
 
-The six quantized names above identify schemes in this sense. Their meanings are immutable: a
+The quantized names above identify schemes in this sense. Their meanings are immutable: a
 consumer must not infer a different zero point, scale geometry, code range, or reconstruction rule
 from context.
 
@@ -110,8 +116,10 @@ may preserve an already encoded source or quantize floating-point values.
 
 The built-in `grouped_absmax` method implements the reference encoder in Section 7 for all four
 grouped integer formats. `fp8_row_maxabs` rounds source values to BF16 and quantizes each row to
-E4M3FN codes with a BF16 multiplier. `import_encoded` preserves compatible FP8 or NVFP4 codes,
-scales, and, for NVFP4, the weight divisor of the row's own source matrix. NInfer currently provides no built-in
+E4M3FN codes with a BF16 multiplier. `import_encoded` preserves compatible FP8, NVFP4, T2, native Q2
+or GGUF codes and scales and, for NVFP4, the weight divisor of the row's own source matrix.
+Native `q2_g64_fp16` imports trained GSQ Q2_0 codes; `grouped_absmax` and `grouped_search` refuse
+that target. NInfer currently provides no built-in
 floating-point-to-NVFP4 quantizer.
 
 A recipe can supply a Python callable as its method. Different methods can produce different
@@ -289,7 +297,7 @@ calibration is not part of this weight format. In particular, a
 site-level input divisor used by an NVFP4 execution path is a separate model-role tensor and cannot
 be inferred from `nvfp4`, its block scales, or `d_w`.
 
-### 3.4 `fp8_e4m3fn_row_bf16`
+### 3.4 Row-scaled FP8
 
 `fp8_e4m3fn_row_bf16` is a rank-two weight matrix `[N,K]` with positive dimensions. Every logical
 weight owns one E4M3FN code word, and every logical row owns one BF16 dequantization multiplier. The
@@ -322,6 +330,19 @@ The format does not define how a floating-point source is assigned a scale or ro
 A recipe either preserves already selected code and scale words exactly or names its
 conversion method. Activation quantization and activation scales are separate compute or runtime-state
 concerns and are not persistent fields of this format.
+
+`fp8_e4m3fn_row_fp16` has the same E4M3FN code rules and multiplier semantics, with an IEEE
+binary16 row scale instead of BF16. Scale sign must be positive, including positive zero;
+subnormals are admitted, negative zero and non-finite scales are refused. A zero scale requires
+only signed-zero codes. Its exact reconstruction uses `exact_binary16_to_binary32(s[n])` in the
+equation above. The supported layout is `row_interleaved_v1`, used for Flash-Next n-gram rows.
+
+The `fp8_row_maxabs` producer first represents inputs as BF16. For FP16 scales it computes
+`binary32(max(abs(row)) / 448)`, rounds to binary16 with ties to even, and rescues a positive
+scale rounded to zero as the smallest binary16 subnormal. An overflowing scale is refused.
+It rounds the reciprocal of the stored scale to FP32, multiplies each BF16 input by that
+reciprocal with an FP32 result, clamps to `[-448,448]`, then rounds to E4M3FN with ties to even.
+All-zero rows use positive-zero codes and scale. Each row is independent of chunk boundaries.
 
 ### 3.5 GGUF block formats
 
@@ -429,6 +450,24 @@ columns. It is the native representation of ternary checkpoints, whose values ar
 `scale * {-1, 0, +1}`; a converter repacks them without rounding. The format is defined only in
 the row-split layout.
 
+### 5.2.1 Native PTQ1
+
+The optional T5 packing described below represents the same ternary integers and FP16 scales;
+the two formats have different byte layouts and must never alias one another.
+
+`ptq1_g128_fp16` represents the same ternary values as T2 while preserving Prism PTQ1_0
+packing: every 128-column group has 24 base bytes, two tail bytes and one FP16 multiplier.
+It is supported only in `row_split_k128_v1`, with K a multiple of 128. It is a distinct codec;
+PTQ1 bytes must never be interpreted as T2's two-bit fields.
+
+The first 16 base bytes contain coordinates `16*s + b` for `s=0..4`, `b=0..15`.
+The next eight contain coordinates `80 + 8*s + b`; the two tail bytes contain coordinates
+`120 + 2*s + b` for `s=0..3`. A byte `u` at stage `s` decodes to
+`q = floor(3 * ((u * 3**s) mod 256) / 256) - 1`; the exact weight is `q * scale`.
+The encoder maps five digits (each `q+1`) to their base-3 integer `a` and stores
+`ceil(256*a/243)`. A tail byte uses four digits and `ceil(256*a/81)`.
+Finite signed FP16 scales, zeros and subnormals are preserved bit for bit on import.
+
 ### 5.3 Q8
 
 `q8_g32_fp16` uses an 8-bit two's-complement signed code with the deliberately restricted interval
@@ -440,6 +479,20 @@ This restriction is part of the scheme, not an encoder preference. A kernel may 
 signed-byte load because the registered conversion path establishes the code invariant; that
 implementation convenience does not make `-128` legal. The trusted local runtime does not rescan
 the complete Q8 payload solely to prove an invariant already established by its producer.
+
+### 5.4 Q2
+
+`q2_g64_fp16` preserves the GSQ Q2_0 grid: each unsigned stored two-bit word `u` in `0..3`
+represents integer `q = u - 1` in `[-1, 2]`, and each group of 64 values owns one binary16 scale.
+Its exact weight is `(u - 1) * scale`. This offset encoding differs from T2's two's complement;
+all four Q2 words are valid. An encoded import preserves the original code and scale bits while
+moving them from interleaved GGUF blocks into the native row-split planes.
+
+Q2 accepts every finite binary16 scale word, including both signed zeros and subnormals. When
+the scale is zero, any code remains valid and preserves the source representation. These Q2
+rules override the zero-scale restrictions below; infinity and NaN remain invalid. The producer
+does not round, negate or canonicalize imported scales. Floating-point-to-Q2 quantization is
+outside the current conversion contract.
 
 ## 6. Grouped signed-integer scale and reconstruction semantics
 
@@ -723,3 +776,56 @@ input/output formats, output tolerance, and real target shapes. The
 3.4; a producer that copies an upstream quantized tensor is protected by exact source-word
 comparison, while any source-to-FP8 encoder is protected under its own named profile. Private
 activation quantization, staging, and accumulation remain implementation choices.
+
+
+## Optional native T5 packing
+
+`t5_g128_fp16` / `QType::T5_G128_FP16` uses `row_split_k128_v1`, group 128,
+FP16 scales, no high plane, and 26 code bytes per group. The scale plane follows
+ordinary RowSplit alignment. Matrices require whole 128-column groups; this
+implementation's compute routes require positive K divisible by 1024.
+
+Each 64-column unit occupies 13 bytes. For byte i < 12, g = floor(i/4), j = i%4,
+the five trits are the codes of columns `20*g + 4*m + j`, m=0..4. Byte 12 stores
+columns 60..63 and a zero fifth trit. Codes are 0/1/2 for logical -1/0/+1. Encode
+`v = sum(trit[m] * 3**(4-m))` as `ceil(256*v/243)`. Decode by repeatedly multiplying
+by 3, emitting the high byte and retaining the low byte. Noncanonical bytes and
+nonzero padding trits are rejected by the Python codec. A stored scalar is
+`(code-1) * FP16_scale`, with no zero point. Including scales, storage is 1.75 bits
+per weight, equal to PTQ1; conversion from PTQ1 is a lossless reordering, not a new
+weight quantization.
+
+Execution is opt-in through a separate artifact and `AllowA8` (or `AllowA4`, which
+also admits A8). T5 has no A16 compute fallback; A16-only calls fail explicitly.
+Existing PTQ1/T2 artifacts retain their own paths and policies. The public tensors
+are BF16. Per 128 activation columns, the private quantizer uses symmetric s8
+codes and an FP32 scale, introducing activation rounding within the A8 numerical
+allowance. dp4a serves 1..4 tokens, integer MMA serves 5..32, and larger calls use
+prefill tiles; row tails use the small-token tiled route. Routing is static and
+CUDA Graph capture does not perform host synchronization or persistent allocation.
+
+The same public operations accept T5: linear, residual linear_add, linear_swiglu,
+the Bonsai two-parent attention and GDN projections, ordinary/rotated embedding,
+and the registered full/reduced vocabulary linear_topk heads. Split parents must
+both use T5. Output rows are contiguous; the internal splitter also respects token
+strides for GDN's shared qkv allocation. Every transient allocation is charged to
+the operation's workspace query. Top-k uses A8 projection into BF16 logits before
+the existing reduction; it does not promise identical ranking to A16 near ties.
+
+Hadamard signs remain owned by artifact Uses and model producers. This port
+consumes the represented BF16 rows from existing fused RMSNorm/rotation and
+SwiGLU/rotation producers; it does not repeat rotation or adopt the donor's fully
+fused FP32-producer-to-A8 rounding boundary. The donor's 4090-specific wave-cost
+heuristic is replaced by complete 128-token tiles and a 64-token tail. Other
+shape thresholds and prefetch defaults are inherited starting points, not claims
+of optimal tuning on every GPU.
+
+Source: JGamboa/ninfer-4090-windows at
+e905787f067de89ef6ef28c52d65a2ce91d425ca (Apache-2.0; attribution in NOTICE).
+The integration is a removable patch; format name, QType value and tests belong
+to that patch, not to an unpinned assumption about future upstream compatibility.
+Use `python -m tools.convert.repack_t5 INPUT.ninfer OUTPUT.ninfer` to repack a
+native PTQ1 artifact while retaining other objects byte-for-byte. The converter
+verifies persisted codes/scales and copied-object hashes, saves a verification
+report, and does not overwrite the source. `bonsai2_27b_t5` is also available as a
+conversion recipe. Reverting to PTQ1 uses the original artifact.

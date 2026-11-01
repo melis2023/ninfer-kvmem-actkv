@@ -266,17 +266,27 @@ std::vector<float> decode_tensor(const WeightGeometry& geometry, std::span<const
 }
 
 namespace loading {
-
+namespace {
 std::shared_ptr<const CpuVisionWeights>
-load_cpu_vision(artifact::Binder& binder, const VisionConfig& config, const TextConfig& target) {
+load_cpu_vision_impl(artifact::Binder& binder, const VisionConfig& config, const TextConfig& target,
+                     bool materialize) {
     const artifact::Reader& reader = binder.reader();
     std::unordered_map<std::size_t, std::vector<float>> decoded;
     const auto tensor = [&](const std::string& name, artifact::Shape shape) {
         const artifact::ParameterReference reference =
             binder.parameter(name, std::move(shape), artifact::Residency::Values);
         std::vector<float> out;
-        out.reserve(static_cast<std::size_t>(reference.binding.elements));
+        if (materialize) out.reserve(static_cast<std::size_t>(reference.binding.elements));
         for (const artifact::Part& part : reference.binding.parts) {
+            const auto& geometry = reader.geometry(part.object);
+            const bool supported =
+                (geometry.layout == QuantLayout::Contiguous &&
+                    (geometry.format == QType::BF16 || geometry.format == QType::FP32)) ||
+                (geometry.layout == QuantLayout::RowSplit && code_bits(geometry.format) != 0) ||
+                (geometry.layout == QuantLayout::RowScale && geometry.format == QType::FP8_E4M3FN_ROW_BF16) ||
+                (geometry.layout == QuantLayout::BlockScaleK16M128x4 && geometry.format == QType::NVFP4);
+            if (!supported) throw std::invalid_argument("CPU Vision cannot decode this tensor representation");
+            if (!materialize) continue;
             auto found = decoded.find(part.object.index);
             if (found == decoded.end()) {
                 found =
@@ -308,6 +318,10 @@ load_cpu_vision(artifact::Binder& binder, const VisionConfig& config, const Text
         return first;
     };
 
+    if (!config.num_heads || config.hidden_size % config.num_heads != 0 ||
+        config.hidden_size / config.num_heads != kRotaryHeadDim) {
+        throw std::invalid_argument("CPU Vision requires 72-wide attention heads");
+    }
     const auto h            = config.hidden_size;
     const auto intermediate = config.intermediate_size;
     const auto merger       = config.merger_width();
@@ -355,8 +369,18 @@ load_cpu_vision(artifact::Binder& binder, const VisionConfig& config, const Text
     weights->merger_fc2 =
         projection("vision/merger/fc2", {target.hidden_size, merger}, "vision/merger/activation");
     weights->merger_fc2_bias = tensor("vision/merger/fc2_bias", {target.hidden_size});
+    if (!materialize) return {};
     weights->validate();
     return weights;
+}
+} // namespace
+
+void validate_cpu_vision(artifact::Binder& binder, const VisionConfig& config, const TextConfig& target) {
+    (void)load_cpu_vision_impl(binder, config, target, false);
+}
+std::shared_ptr<const CpuVisionWeights>
+load_cpu_vision(artifact::Binder& binder, const VisionConfig& config, const TextConfig& target) {
+    return load_cpu_vision_impl(binder, config, target, true);
 }
 
 } // namespace loading

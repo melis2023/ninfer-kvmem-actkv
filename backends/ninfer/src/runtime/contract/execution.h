@@ -5,8 +5,21 @@
 #include <array>
 #include <compare>
 #include <span>
+#include <stdexcept>
 
 namespace ninfer::runtime {
+
+// A deferred request asset could not be loaded before its consumer executed. The Engine aborts
+// only that request; this is distinct from an execution invariant or a device-wide failure.
+class RequestResourceError final : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+// Prefill units a prompt may be passed over for shorter ones before it runs ahead of them: each
+// unit goes to the shortest remaining prompt, so a short or prefix-cached request is not held
+// behind a long prompt for its whole prefill, and this bound keeps the long one from starving.
+inline constexpr std::uint32_t kPrefillMaxSkip = 8;
 
 struct LaneId {
     std::uint32_t value = 0;
@@ -57,12 +70,19 @@ struct RawTokenLogprob {
     float logprob     = 0.0f;
     std::array<TokenId, kMaximumTokenLogprobs> top_ids{};
     std::array<float, kMaximumTokenLogprobs> top_values{};
+    // The typed readout (ExecutionOptions::readout_tokens) on the round's first token: the first
+    // readout_count values are the named tokens' log probabilities in the request's order.
+    std::uint32_t readout_count = 0;
+    std::array<float, kMaximumReadoutTokens> readout_values{};
 };
 
 struct GeneratedRound {
     std::span<const TokenId> tokens;
     // Aligned with `tokens` when the request asked for logprobs, else empty.
     std::span<const RawTokenLogprob> logprobs;
+    // A branched read's Begin round (ResolvedExecutionOptions::branches): one record per branch,
+    // in branch order; `tokens` then holds the first branch's token.
+    std::span<const RawTokenLogprob> branches;
 };
 
 struct BatchedGeneratedRound {

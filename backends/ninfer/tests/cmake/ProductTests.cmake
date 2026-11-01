@@ -69,6 +69,14 @@ ninfer_add_test(ninfer_rerank_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_rerank.cpp"
   LIBRARIES ninfer_serve)
 
+ninfer_add_test(ninfer_systemone_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_systemone.cpp"
+  LIBRARIES ninfer_serve)
+
+ninfer_add_test(ninfer_branch_memo_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_branch_memo.cpp"
+  LIBRARIES ninfer_serve)
+
 ninfer_add_test(ninfer_serve_metrics_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_serve_metrics.cpp"
   LIBRARIES ninfer_serve)
@@ -76,6 +84,10 @@ ninfer_add_test(ninfer_serve_metrics_test
 ninfer_add_test(ninfer_request_log_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_request_log.cpp"
   LIBRARIES ninfer_serve)
+
+ninfer_add_test(ninfer_rope_scaling_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_rope_scaling.cpp"
+  LIBRARIES ninfer_core)
 
 ninfer_add_test(ninfer_load_report_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_load_report.cpp"

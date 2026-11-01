@@ -64,7 +64,7 @@ inline void collect_loan_granules(const EvictableKVPool& arena, const DeviceKVPa
 // Draws a loan of at least `bytes` from the highest free pages, growing one run at a time in
 // whole units. Returns an empty plan when the free pages cannot cover the request, or when the
 // pages it would lend are promised to reservations: a free page may back an active request's
-// entitlement, which materializes it later.
+// entitlement, which materializes it later. Pages loaned to an expert cache are not free here.
 [[nodiscard]] inline KVLoanPlan plan_kv_loan(const EvictableKVPool& arena,
                                              const DeviceKVPagePool& pages, std::size_t bytes) {
     KVLoanPlan plan;
@@ -73,7 +73,7 @@ inline void collect_loan_granules(const EvictableKVPool& arena, const DeviceKVPa
     if (bytes == 0 || unit == 0 || granularity == 0) { return plan; }
     const std::size_t want = (bytes + granularity - 1) / granularity;
     if (want > arena.window_capacity_bytes() / granularity) { return plan; }
-    const std::uint32_t available = pages.available_pages();
+    const std::uint32_t available = pages.unpromised_free_pages();
     if (available == 0) { return plan; }
 
     const std::span<const KVPageRun> free_runs = pages.free_runs();

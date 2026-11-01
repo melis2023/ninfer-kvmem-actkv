@@ -6,10 +6,13 @@
 #include "core/layout.h"
 #include "core/device.h"
 #include "core/paged_kv_storage.h"
+#include "ops/common/device_multiprocessors.h"
+#include "ops/common/device_tier.h"
 #include "ops/kv_cache/append/launch.h"
 #include "ops/kv_cache/d256_profile.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_nvfp4_fast_plan.h"
+#include "ops/softmax_attention/dense/causal_cache/prompt_sm70.h"
 
 #include <algorithm>
 #include <cmath>
@@ -48,21 +51,30 @@ std::int32_t causal_attention_chunk_tokens(std::int32_t q_heads, std::int32_t wi
     return 8;
 }
 
+// GQA=4 dense towers use the registered prompt kernels for every width. Each
+// batch lane has its own device-side table/valid-prefix metadata.
+bool dense_gqa4(AttentionHeadGeometry geometry) {
+    return (geometry.query_heads == 8 && geometry.kv_heads == 2) ||
+           (geometry.query_heads == 16 && geometry.kv_heads == 4);
+}
+
 void require_causal_geometry(AttentionHeadGeometry geometry, const char* op) {
     if (!valid_attention_head_geometry(geometry) || geometry.head_dim != kHeadDim ||
         !((geometry.query_heads == 24 && geometry.kv_heads == 4) ||
-          (geometry.query_heads == 16 && geometry.kv_heads == 2))) {
+          (geometry.query_heads == 16 && geometry.kv_heads == 2) || dense_gqa4(geometry))) {
         throw std::invalid_argument(std::string(op) + ": unsupported head geometry");
     }
 }
 
 // Whether a prompt-route launch over this cache runs the fast NVFP4 kernel: NVFP4-G16 storage on a
-// Blackwell build, the fast prompt kernel selected (--fast-prefill-kernel, NINFER_PROMPT_FAST or the
-// profile's attn_prompt_fast), more than 2048 visible keys and a single query row.
+// card running the 120a code, the fast prompt kernel selected (--fast-prefill-kernel,
+// NINFER_PROMPT_FAST or the profile's attn_prompt_fast), more than 2048 visible keys and a single
+// query row.
 bool prompt_nvfp4_fast(KvCacheStorage storage, CausalAttentionExecutionEnvelope envelope,
                        std::int32_t batch_size) {
 #if defined(NINFER_SM120_NVFP4)
     return storage == KvCacheStorage::Nvfp4Group16 && batch_size == 1 &&
+           current_device_blackwell() &&
            detail::causal_attention_prompt_fast_kernel(storage, envelope.fast_prompt_kernel) &&
            detail::nvfp4_fast_prompt_applies(envelope.max_visible_keys);
 #else
@@ -485,20 +497,12 @@ const char* causal_attention_route_name(CausalAttentionRoute route) {
 
 } // namespace detail
 
-std::uint32_t causal_attention_invariant_segment_keys(std::uint32_t max_context) {
-    // The smallest geometry's split capacity, so one segment serves either geometry.
-    constexpr std::uint32_t kMaximumSegments = 85;
-    const std::uint32_t keys =
-        (max_context + kMaximumSegments - 1) / kMaximumSegments + kPagedKVPageSize - 1;
-    return std::max<std::uint32_t>(kPagedKVPageSize,
-                                   keys / kPagedKVPageSize * kPagedKVPageSize);
-}
-
 int causal_softmax_attention_route_family(AttentionHeadGeometry geometry,
                                           KvCacheStorage cache_storage,
                                           CausalAttentionExecutionEnvelope envelope,
                                           std::int32_t batch_size, std::int32_t width) {
     require_causal_geometry(geometry, "causal_softmax_attention route family");
+    if (dense_gqa4(geometry)) return 2;
     switch (detail::causal_attention_resolve_route(geometry.query_heads, width, batch_size,
                                                    cache_storage, envelope)) {
     case detail::CausalAttentionRoute::SmallT:
@@ -516,6 +520,7 @@ int causal_softmax_attention_small_t_launches(AttentionHeadGeometry geometry,
                                               CausalAttentionExecutionEnvelope envelope,
                                               std::int32_t batch_size, std::int32_t width) {
     require_causal_geometry(geometry, "causal_softmax_attention small-T launches");
+    if (dense_gqa4(geometry)) return 0;
     switch (detail::causal_attention_resolve_route(geometry.query_heads, width, batch_size,
                                                    cache_storage, envelope)) {
     case detail::CausalAttentionRoute::SmallT:
@@ -639,12 +644,32 @@ std::size_t causal_softmax_attention_workspace_capacity_bytes(
         batch_size == 1 && (envelope.wide_verification || envelope.small_prefill)
             ? kMaximumSingleRowVerifyTokens
             : kMaximumVerifyTokens;
-    if (min_width <= maximum_verify_tokens) {
+    if (!dense_gqa4(geometry) && min_width <= maximum_verify_tokens) {
         const std::int32_t last = std::min(max_width, maximum_verify_tokens);
         for (std::int32_t width = min_width; width <= last; ++width) {
             maximum = std::max(maximum, exact_capacity(width));
         }
     }
+    if ((batch_size == 1 || dense_gqa4(geometry)) && kv_cache_is_int8_family(cache_storage) &&
+        detail::causal_attention_prompt_fast_kernel(cache_storage, envelope.fast_prompt_kernel)) {
+        // The fast INT8-family prompt kernel's split partials. Only widths past every
+        // graph-captured call split (prompt_i8_fast_plan.h), and those always take the prompt
+        // route, so each plans at the envelope's maximum, which bounds every launch inside it.
+        const detail::CausalPromptI8FastSplitPolicy policy =
+            detail::causal_attention_prompt_fast_split_policy();
+        const std::int32_t multiprocessors = detail::current_device_multiprocessors(170);
+        const bool wide                    = detail::causal_prompt_i8_fast_wide(cache_storage);
+        for (std::int32_t width = std::max(min_width, detail::kCausalPromptI8FastMinSplitWidth);
+             width <= max_width && policy.maximum > 1; ++width) {
+            const detail::CausalPromptI8FastPlan plan = detail::causal_prompt_i8_fast_plan(
+                q_heads, width, envelope.max_visible_keys, multiprocessors, wide, policy);
+            maximum = std::max(
+                maximum, detail::causal_prompt_i8_fast_split_bytes(q_heads, width, plan.splits));
+        }
+    }
+    // The generalized GQA4 route launches prompt attention one lane at a time. It needs the
+    // same split partials as a single lane, but none of the specialized small-T workspaces.
+    if (dense_gqa4(geometry)) return maximum;
     if (prompt_nvfp4_fast(cache_storage, envelope, batch_size)) {
         // The fast NVFP4 prompt kernel's split partials. A launch plans its split count from the
         // visible keys it passes, and fewer keys never select more splits, so each width reserves
@@ -715,6 +740,29 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         }
     }
 
+    if (dense_gqa4(geometry)) {
+        for (int lane = 0; lane < batch; ++lane) {
+            auto q_row = q.slice(3, lane, 1);
+            auto k_row = k.slice(3, lane, 1);
+            auto v_row = v.slice(3, lane, 1);
+            auto pos_row = positions.slice(1, lane, 1);
+            auto valid_row = valid_columns.data ? valid_columns.slice(0, lane, 1) : Tensor{};
+            auto table_row = kv_table_rows.slice(0, lane, 1);
+            auto out_row = out.slice(3, lane, 1);
+            if (detail::causal_attention_prompt_sm70_applies(cache.storage, 1)) {
+                detail::kv_cache_append_batch_launch(k_row, v_row, pos_row, valid_row, table_row, cache, stream);
+                detail::causal_attention_prompt_sm70_launch(q_row, pos_row, valid_row, table_row,
+                                                           scale, cache, out_row, stream);
+            } else {
+                detail::causal_attention_prompt_launch(q_row, k_row, v_row, pos_row, valid_row,
+                    table_row, scale, cache, envelope.max_visible_keys, workspace, out_row,
+                    envelope.fast_prompt_kernel, stream);
+            }
+        }
+        if (gate != nullptr) sigmoid_mul(*gate, out, stream);
+        return;
+    }
+
     auto scope = workspace.scope();
     const detail::CausalAttentionRoute route =
         detail::causal_attention_resolve_route(q.ne[1], width, batch, cache.storage, envelope);
@@ -756,8 +804,17 @@ void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         return;
     }
 #endif
+    if (detail::causal_attention_prompt_sm70_applies(cache.storage, batch)) {
+        detail::kv_cache_append_batch_launch(k, v, positions, valid_columns, kv_table_rows, cache,
+                                             stream);
+        detail::causal_attention_prompt_sm70_launch(q, positions, valid_columns, kv_table_rows,
+                                                    scale, cache, out, stream);
+        if (gate != nullptr) { sigmoid_mul(*gate, out, stream); }
+        return;
+    }
     detail::causal_attention_prompt_launch(q, k, v, positions, valid_columns, kv_table_rows, scale,
-                                           cache, out, envelope.fast_prompt_kernel, stream);
+                                           cache, envelope.max_visible_keys, workspace, out,
+                                           envelope.fast_prompt_kernel, stream);
     if (gate != nullptr) { sigmoid_mul(*gate, out, stream); }
 }
 
@@ -768,6 +825,15 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
                                      WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
     constexpr const char* op = "causal_softmax_attention_cached";
     validate_attention_tensors(q, positions, out, geometry, cache, envelope, scale, op);
+
+    if (dense_gqa4(geometry)) {
+        if (detail::causal_attention_prompt_sm70_applies(cache.storage, 1))
+            detail::causal_attention_prompt_sm70_launch(q, positions, scale, cache, out, stream);
+        else
+            detail::causal_attention_prompt_attention_launch(q, positions, scale, cache,
+                envelope.max_visible_keys, workspace, out, envelope.fast_prompt_kernel, stream);
+        return;
+    }
 
     auto scope = workspace.scope();
     const detail::CausalAttentionRoute route =
@@ -793,7 +859,12 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
         return;
     }
 #endif
-    detail::causal_attention_prompt_attention_launch(q, positions, scale, cache, out,
+    if (detail::causal_attention_prompt_sm70_applies(cache.storage, 1)) {
+        detail::causal_attention_prompt_sm70_launch(q, positions, scale, cache, out, stream);
+        return;
+    }
+    detail::causal_attention_prompt_attention_launch(q, positions, scale, cache,
+                                                     envelope.max_visible_keys, workspace, out,
                                                      envelope.fast_prompt_kernel, stream);
 }
 

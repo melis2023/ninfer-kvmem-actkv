@@ -42,6 +42,9 @@ struct McpProxyExchange {
     std::mutex mutex;
     std::condition_variable cv;
     std::deque<std::string> chunks;
+    // Bytes received and not yet written to the browser: the queued chunks and those the provider
+    // is writing.
+    std::size_t buffered = 0;
     bool head_ready = false;
     bool finished   = false;
     bool abandoned  = false;
@@ -65,6 +68,8 @@ struct McpProxyRelay {
         if (!exchange || !worker.joinable()) { return; }
         std::unique_lock<std::mutex> lock(exchange->mutex);
         exchange->abandoned = true;
+        // Wakes an upstream reader that waits for the browser to drain the buffer.
+        exchange->cv.notify_all();
         // stop() only reaches a socket that exists, so repeat it until the send has returned: one
         // issued before the connection opened would otherwise miss it.
         while (!exchange->finished) {
@@ -93,9 +98,16 @@ void run_upstream(const std::shared_ptr<McpProxyExchange>& exchange, httplib::Re
     upstream.content_receiver = [exchange](const char* data, std::size_t length, std::size_t,
                                            std::size_t) {
         {
-            std::lock_guard<std::mutex> lock(exchange->mutex);
+            std::unique_lock<std::mutex> lock(exchange->mutex);
+            // While the browser is behind, stop reading the upstream socket: the MCP server then
+            // blocks on its own writes instead of filling this process's memory.
+            exchange->cv.wait(lock, [&] {
+                return exchange->abandoned || exchange->buffered == 0 ||
+                       exchange->buffered + length <= kMcpProxyBufferBytes;
+            });
             if (exchange->abandoned) { return false; }
             exchange->chunks.emplace_back(data, length);
+            exchange->buffered += length;
         }
         exchange->cv.notify_all();
         return true;
@@ -103,6 +115,12 @@ void run_upstream(const std::shared_ptr<McpProxyExchange>& exchange, httplib::Re
     const httplib::Result result = exchange->client.send(upstream);
     {
         std::lock_guard<std::mutex> lock(exchange->mutex);
+        // httplib calls no response handler for a 204, which has no body to read.
+        if (result && !exchange->head_ready) {
+            exchange->status           = result->status;
+            exchange->response_headers = result->headers;
+            exchange->head_ready       = true;
+        }
         // A transport failure after the head arrived is a truncated stream, not a failed request:
         // the status is already on its way to the browser.
         if (!result && !exchange->head_ready) { exchange->error = httplib::to_string(result.error()); }
@@ -261,6 +279,8 @@ void relay_mcp_proxy(const httplib::Request& request, httplib::Response& respons
         }
         response.set_header(name, value);
     }
+    // These statuses carry no body, so no chunked stream either.
+    if (response.status == 204 || response.status == 304) { return; }
 
     response.set_chunked_content_provider(
         content_type, [relay](std::size_t, httplib::DataSink& sink) -> bool {
@@ -280,8 +300,17 @@ void relay_mcp_proxy(const httplib::Request& request, httplib::Response& respons
                 ready.swap(shared.chunks);
                 drained = shared.finished && ready.empty();
             }
+            std::size_t written = 0;
             for (const std::string& chunk : ready) {
                 if (!sink.write(chunk.data(), chunk.size())) { return false; }
+                written += chunk.size();
+            }
+            if (written != 0) {
+                {
+                    std::lock_guard<std::mutex> lock(shared.mutex);
+                    shared.buffered -= written;
+                }
+                shared.cv.notify_all();
             }
             if (drained) { sink.done(); }
             return true;

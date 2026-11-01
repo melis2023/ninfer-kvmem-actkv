@@ -12,6 +12,7 @@
 // kernel never writes the cache itself (kv_cache_append_batch_launch does that separately before
 // it runs), so there is no quantize-on-write path to preserve here.
 
+#include "ops/common/device_limits.h"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/kv_cache/nvfp4_group16_codec.cuh"
@@ -61,6 +62,7 @@ inline constexpr int kCausalPromptK8V4SmemBytes =
     kCausalPromptK8V4ScaleBytes + kCausalPromptK8V4StatsBytes;
 
 static_assert(kCausalPromptK8V4DConsumers == 8);
+static_assert(kCausalPromptK8V4SmemBytes <= kMaxSharedBytesPerBlock);
 
 template <typename Geometry, typename Metadata>
 __global__ __maxnreg__(120) void causal_attention_prompt_k8v4_kernel(

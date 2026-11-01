@@ -34,8 +34,9 @@ void require_equal(const std::filesystem::path& artifact, std::uint64_t actual,
 ops::NgramRowFormat row_format(const std::filesystem::path& artifact, const std::string& format) {
     if (format == "gguf_iq4_nl") { return ops::NgramRowFormat::Iq4Nl; }
     if (format == "bf16") { return ops::NgramRowFormat::Bf16; }
+    if (format == "fp8_e4m3fn_row_fp16") { return ops::NgramRowFormat::Fp8E4M3RowScale; }
     throw ArtifactError(artifact.string() + ": the n-gram table is stored as " + format +
-                        "; the runtime decodes gguf_iq4_nl and bf16 rows");
+                        "; the runtime decodes gguf_iq4_nl, bf16 and fp8_e4m3fn_row_fp16 rows");
 }
 
 // What a `ngram` component says about its table, checked against the model's text config.
@@ -101,7 +102,7 @@ Descriptor descriptor(const artifact::Reader& reader, const std::filesystem::pat
 
 // The rows `reader` stores for the table `d` describes.
 NgramTableSource stored_rows(const artifact::Reader& reader, const std::filesystem::path& artifact,
-                             const Descriptor& d) {
+                             const Descriptor& d, const TextConfig& config, bool read_profile) {
     const auto& directory = reader.directory();
     const auto found      = directory.bindings.find(kTableBinding);
     if (found == directory.bindings.end() || found->second.parts.size() != 1) {
@@ -122,11 +123,22 @@ NgramTableSource stored_rows(const artifact::Reader& reader, const std::filesyst
         tensor.bytes != table_bytes) {
         throw ArtifactError(artifact.string() + ": the n-gram table has an unexpected geometry");
     }
+    // Validate the format/layout pair as well as byte count before treating the object as rows.
+    (void)reader.geometry(part.object);
     for (const auto& segment : reader.segments(tensor.offset, table_bytes)) {
         const auto& record = directory.files.at(segment.file_index);
         const std::filesystem::path file =
             segment.file_index == 0 ? artifact : artifact.parent_path() / record.path.value();
         out.layout.segments.push_back({file, segment.file_offset, segment.bytes});
+    }
+    if (read_profile) {
+        const auto& resources = directory.component("ngram").resources;
+        const auto found_profile = resources.find("hot_profile");
+        if (found_profile != resources.end()) {
+            const auto bytes = reader.read_object(found_profile->second);
+            out.hot_profile = decode_ngram_profile(bytes, artifact.string() + ":ngram.hot_profile");
+            check_ngram_profile(*out.hot_profile, derive_ngram_hash_constants(config.ngram), artifact);
+        }
     }
     return out;
 }
@@ -142,7 +154,7 @@ bool is_ngram_table_artifact(const artifact::Reader& reader) {
 NgramTableSource ngram_table_source(const artifact::Reader& reader,
                                     const std::filesystem::path& artifact,
                                     const TextConfig& config,
-                                    const std::filesystem::path& table) {
+                                    const std::filesystem::path& table, bool read_hot_profile) {
     const Descriptor model = descriptor(reader, artifact, config);
     if (table.empty()) {
         if (!reader.directory().bindings.contains(kTableBinding)) {
@@ -153,7 +165,7 @@ NgramTableSource ngram_table_source(const artifact::Reader& reader,
                 "--no-ngram-table runs the model without it, a non-standard experimental mode "
                 "that badly degrades the output");
         }
-        return stored_rows(reader, artifact, model);
+        return stored_rows(reader, artifact, model, config, read_hot_profile);
     }
     const artifact::Reader other(table);
     if (!other.directory().bindings.contains(kTableBinding)) {
@@ -165,7 +177,7 @@ NgramTableSource ngram_table_source(const artifact::Reader& reader,
                             ", sha256 " + theirs.digest.substr(0, 16) + "...) than the model's (" +
                             model.format + ", sha256 " + model.digest.substr(0, 16) + "...)");
     }
-    return stored_rows(other, table, theirs);
+    return stored_rows(other, table, theirs, config, read_hot_profile);
 }
 
 } // namespace ninfer::models::qwen4_exp

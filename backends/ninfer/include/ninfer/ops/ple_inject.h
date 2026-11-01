@@ -48,4 +48,17 @@ void ple_inject(Tensor& stack, const Tensor& key, const Tensor& value,
                 const PleInjectWeights& weights, float eps, Tensor& history,
                 WorkspaceArena& workspace, cudaStream_t stream);
 
+// Record form, for a speculative verification whose positions may be dropped: the same stack
+// update, reading `history` without advancing it, and N of every position written to
+// `normalized` FP32 [streams * hidden, tokens]. ple_history_advance then commits a prefix of the
+// positions; it gives exactly the history ple_inject over that prefix would have left.
+void ple_inject_record(Tensor& stack, const Tensor& key, const Tensor& value,
+                       const PleInjectWeights& weights, float eps, const Tensor& history,
+                       Tensor& normalized, WorkspaceArena& workspace, cudaStream_t stream);
+
+// `history` FP32 [streams * hidden, (taps - 1) * dilation] becomes the last (taps - 1) * dilation
+// positions of (history, normalized), `normalized` FP32 [streams * hidden, tokens] holding N of the
+// positions that follow it. Exact copies.
+void ple_history_advance(Tensor& history, const Tensor& normalized, cudaStream_t stream);
+
 } // namespace ninfer::ops

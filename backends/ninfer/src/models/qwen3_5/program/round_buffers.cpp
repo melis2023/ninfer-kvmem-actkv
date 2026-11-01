@@ -103,6 +103,9 @@ RoundStateLayout begin_round_state_layout(LayoutBuilder& builder, const RoundSta
             add_tensor(builder, DType::FP32, {ops::kLogprobTopK, rows}, "logprob top values");
         layout.logprob_lse    = add_tensor(builder, DType::FP32, {rows}, "logprob lse");
         layout.logprob_active = add_tensor(builder, DType::I32, {1}, "logprob gather flag");
+        const auto readout    = static_cast<std::int32_t>(kMaximumReadoutTokens);
+        layout.readout_ids    = add_tensor(builder, DType::I32, {readout}, "readout token ids");
+        layout.readout_values = add_tensor(builder, DType::FP32, {readout}, "readout logprobs");
     }
     return layout;
 }
@@ -124,7 +127,6 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
     };
     tokens          = ingress_tensor(offsetof(OrdinaryDecodeIngress, tokens), DType::I32);
     cache_positions = ingress_tensor(offsetof(OrdinaryDecodeIngress, cache_positions), DType::I32);
-    logical_frontiers = ingress_tensor(offsetof(OrdinaryDecodeIngress, logical_frontiers), DType::I32);
     rope_positions  = ingress_tensor(offsetof(OrdinaryDecodeIngress, rope_positions), DType::I32);
     text_kv_table_rows =
         ingress_tensor(offsetof(OrdinaryDecodeIngress, text_kv_table_rows), DType::I32);
@@ -132,6 +134,8 @@ OrdinaryDecodeState::OrdinaryDecodeState(DeviceSpan backing,
         ingress_tensor(offsetof(OrdinaryDecodeIngress, state_source_slots), DType::I32);
     state_destination_slots =
         ingress_tensor(offsetof(OrdinaryDecodeIngress, state_destination_slots), DType::I32);
+    sample_positions =
+        ingress_tensor(offsetof(OrdinaryDecodeIngress, sample_positions), DType::I32);
     sampling = reinterpret_cast<const ops::SamplingConfig*>(
         static_cast<const unsigned char*>(ingress.data) +
         offsetof(OrdinaryDecodeIngress, sampling));
@@ -487,6 +491,8 @@ RoundState::RoundState(DeviceSpan backing, const RoundStateLayout& layout) {
         logprob_values       = layout.logprob_values.bind(backing);
         logprob_lse          = layout.logprob_lse.bind(backing);
         logprob_active       = layout.logprob_active.bind(backing);
+        readout_ids          = layout.readout_ids.bind(backing);
+        readout_values       = layout.readout_values.bind(backing);
     }
     if (layout.mtp) { mtp.emplace(backing, *layout.mtp); }
     if (layout.dflash_prefill) { dflash_prefill.emplace(backing, *layout.dflash_prefill); }

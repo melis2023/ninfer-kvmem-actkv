@@ -3,7 +3,8 @@
 // GET /v1/load: a cheap, pollable view of serving capacity, current load, and the Engine's
 // monotonic token counters, for load balancers and gateways that schedule across servers.
 
-#include "ninfer/types.h"
+#include "ninfer/observability/snapshot.h"
+#include "ninfer/types_fwd.h"
 
 #include <cstddef>
 #include <cstdint>

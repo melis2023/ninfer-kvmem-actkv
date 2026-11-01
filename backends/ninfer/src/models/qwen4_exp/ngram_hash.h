@@ -38,6 +38,10 @@ struct NgramHashConstants {
 // Throws std::invalid_argument for a specification the hash cannot represent.
 [[nodiscard]] NgramHashConstants derive_ngram_hash_constants(const NgramHashSpec& spec);
 
+// FNV-1a 64 over the constants (order, heads per order, multipliers, head rows and offsets, table
+// rows, each a little-endian u64): what a hot-row profile records of the hash it counted rows of.
+[[nodiscard]] std::uint64_t ngram_hash_fingerprint(const NgramHashConstants& constants);
+
 // The predecessors of the next token, newest first, as the hash reads them: a sequence starts
 // after `order - 1` EOS tokens, and an EOS predecessor cuts every older one to EOS too.
 struct NgramContext {

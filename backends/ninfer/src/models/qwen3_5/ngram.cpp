@@ -5,6 +5,7 @@
 #include <atomic>
 #include <bit>
 #include <limits>
+#include <new>
 #include <optional>
 #include <stdexcept>
 #include <utility>

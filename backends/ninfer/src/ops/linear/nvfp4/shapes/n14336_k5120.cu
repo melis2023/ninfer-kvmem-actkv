@@ -5,7 +5,7 @@ namespace ninfer::ops::detail {
 namespace {
 using Geometry = Nvfp4Geometry<14336, 5120>;
 using Gemv =
-    Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
+    Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 4>;
 template <int Tokens>
 using Exact     = Nvfp4SimtSchedule<(Tokens <= 12 ? 8 : (Tokens <= 16 ? 16 : 4)), 1, 2,
                                 (Tokens >= 17 && Tokens <= 20) ? 8 : 16, Tokens, 1,

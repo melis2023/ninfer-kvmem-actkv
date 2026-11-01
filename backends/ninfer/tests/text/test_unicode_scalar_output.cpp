@@ -1,3 +1,4 @@
+#include "ninfer/request.h"
 #include "text/structured_output.h"
 #include <iostream>
 #include <iomanip>

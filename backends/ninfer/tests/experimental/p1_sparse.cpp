@@ -44,37 +44,12 @@ int sparse_case(KvCacheStorage storage, const std::vector<int>& prefix, int offs
         compact_positions.push_back(compact_base + i);
     }
     append_cache(expected, k, v, original_positions);
-    std::vector<double> reference(q.size());
+    // Decode actual stored codes/scales through the maintained independent FP64 oracle.
+    // Its page map selects original logical pages independently of the device's compact table.
+    const auto reference = ideal_attention(q, expected, compact_positions, &selected);
     const int keys = compact_base + width;
-    const auto logical_key = [&](int key) { return selected.at(key / 64) * 64 + key % 64; };
-    const bool nvfp4 = storage == KvCacheStorage::Nvfp4Group16;
-    const bool k8v4 = storage == KvCacheStorage::Fp8KeyNvfp4Value;
-    const bool rotated_nvfp4 = nvfp4 || k8v4;
-    const auto represented_q = k8v4 ? quantize_fp8_rotated_queries(q, geometry, width)
-        : nvfp4 ? represent_f16_rotated_queries(q, geometry, width) : q;
-    const auto represented_cache = [&](bool key, int d, int h, int j) {
-        if (!rotated_nvfp4) return cache_value(expected, key, h, logical_key(j), d);
-        const auto index = cache_index(geometry, expected.logical_capacity, h, logical_key(j), d);
-        const auto represented = key ? expected.rotated_k_quantized.at(index)
-                                     : expected.rotated_v_quantized.at(index);
-        return (key && k8v4) ? double(represented) : double(round_to_f16(represented));
-    };
-    naive_dense_softmax_attention(op_geometry(geometry), width, keys, 0.0625,
-        [&](int d, int h, int t) { return double(represented_q.at(q_index(geometry, h, d, t))); },
-        [&](int d, int h, int j) { return represented_cache(true, d, h, j); },
-        [&](int d, int h, int j) { return represented_cache(false, d, h, j); },
-        [&](int t, int j) { return logical_key(j) <= original_positions[t]; },
-        [&](int d, int h, int t, double x) { reference[q_index(geometry, h, d, t)] = x; });
-    if (rotated_nvfp4) {
-        for (int t = 0; t < width; ++t) {
-            for (int h = 0; h < geometry.q_heads; ++h) {
-                std::array<double, kHeadDim> row{};
-                for (int d = 0; d < kHeadDim; ++d) row[d] = reference[q_index(geometry, h, d, t)];
-                normalized_hadamard_d256(row);
-                for (int d = 0; d < kHeadDim; ++d) reference[q_index(geometry, h, d, t)] = row[d];
-            }
-        }
-    }
+    const bool rotated_nvfp4 = storage == KvCacheStorage::Nvfp4Group16 ||
+                               storage == KvCacheStorage::Fp8KeyNvfp4Value;
 
     DeviceCache cache(initial, MappingPattern::Fragmented);
     auto view = cache.batch_view();

@@ -1,3 +1,7 @@
+# The portable launcher reads the same model catalog before it loads a CUDA backend.
+add_library(ninfer_model_catalog STATIC model_catalog.cpp)
+ninfer_internal_includes(ninfer_model_catalog)
+
 add_library(ninfer_serve STATIC
   http_transport.cpp
   console_log.cpp
@@ -8,6 +12,8 @@ add_library(ninfer_serve STATIC
   openai_chat_http.cpp
   text_completion.cpp
   rerank.cpp
+  systemone.cpp
+  decisions_http.cpp
   llamacpp_http.cpp
   openai_common.cpp
   openai_responses_request.cpp
@@ -19,6 +25,7 @@ add_library(ninfer_serve STATIC
   openai_responses_store.cpp
   translate.cpp
   generation_service.cpp
+  branch_memo.cpp
   request_events.cpp
   console_stats.cpp
   operational_log.cpp
@@ -30,13 +37,12 @@ add_library(ninfer_serve STATIC
   openai_responses_http.cpp
   serve_options.cpp
   stop_control.cpp
-  model_catalog.cpp
   model_registry.cpp
 )
 ninfer_internal_includes(ninfer_serve)
-target_link_libraries(ninfer_serve PRIVATE kvmem)
+target_link_libraries(ninfer_serve PUBLIC kvmem PRIVATE ${CMAKE_DL_LIBS})
 target_link_libraries(ninfer_serve
-  PUBLIC ninfer_engine Threads::Threads ninfer::json ninfer::httplib
+  PUBLIC ninfer_engine ninfer_model_catalog Threads::Threads ninfer::json ninfer::httplib
   PRIVATE ninfer_media_acquire ninfer_product_logging ninfer_product_prompt_input
           ${NINFER_CUDART_TARGET})
 

@@ -30,7 +30,7 @@ void gated_rmsnorm_hadamard_d128_launch(const Tensor& x, const Tensor& weight, c
                                         cudaStream_t stream);
 void sigmoid_mul_hadamard_launch(const Tensor& gate, const Tensor& x, const Tensor& signs,
                                  Tensor& out, cudaStream_t stream);
-void embedding_rotated_t2_launch(const Tensor& ids, const Weight& table, const Tensor& signs,
+void embedding_rotated_ternary_launch(const Tensor& ids, const Weight& table, const Tensor& signs,
                                  Tensor& out, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

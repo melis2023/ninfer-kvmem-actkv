@@ -64,11 +64,8 @@ void launch_tma(const std::uint8_t* activation_codes, const std::uint8_t* activa
             activation_codes, activation_scales, weight_codes, weight_scales, tokens,
             Schedule::kWeightCodePromotion);
     constexpr std::size_t kSharedBytes = sizeof(Nvfp4W4a4TmaSharedStorage<Schedule>);
-    configure_cuda_device_once([] {
-        return cudaFuncSetAttribute(nvfp4_w4a4_tma_kernel<Geometry, Schedule, Epilogue, Output>,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    static_cast<int>(kSharedBytes));
-    });
+    raise_dynamic_shared_memory(nvfp4_w4a4_tma_kernel<Geometry, Schedule, Epilogue, Output>,
+                                static_cast<int>(kSharedBytes));
 
     // The last M tile may be partial; the kernel bounds itself by the real token count.
     const dim3 grid(Geometry::kOutputRows / Schedule::kBlockN,

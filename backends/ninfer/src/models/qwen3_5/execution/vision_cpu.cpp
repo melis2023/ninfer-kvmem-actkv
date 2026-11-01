@@ -1,4 +1,5 @@
 #include "models/qwen3_5/execution/vision_cpu.h"
+#include "runtime/contract/execution.h"
 
 #include <algorithm>
 #include <bit>
@@ -512,7 +513,7 @@ std::vector<std::uint16_t> encode_vision_on_cpu(const CpuVisionWeights& weights,
     return out;
 }
 
-CpuVisionSession::CpuVisionSession(std::shared_ptr<const CpuVisionWeights> weights)
+CpuVisionSession::CpuVisionSession(std::shared_ptr<CpuVisionCache> weights)
     : weights_(std::move(weights)) {
     if (!weights_) { throw std::invalid_argument("CPU Vision session has no weights"); }
 }
@@ -535,8 +536,21 @@ void CpuVisionSession::submit_item(std::shared_ptr<const PreparedMediaPayload> p
         try {
             const std::lock_guard turn(encode_turn());
             const auto started = std::chrono::steady_clock::now();
-            results_[slot] =
-                encode_vision_on_cpu(*weights_, payload->span(), control, 0, &cancelled_);
+            if (!cancelled_.load(std::memory_order_acquire)) {
+                std::shared_ptr<const CpuVisionWeights> weights;
+                try {
+                    weights = weights_->acquire();
+                } catch (const std::bad_alloc&) {
+                    throw; // preserve the Engine's Host OOM recovery path
+                } catch (const std::exception& error) {
+                    throw runtime::RequestResourceError(
+                        std::string("CPU Vision weight loading failed: ") + error.what());
+                }
+                results_[slot] =
+                    encode_vision_on_cpu(*weights, payload->span(), control, 0, &cancelled_);
+            } else {
+                results_[slot].clear();
+            }
             worker_seconds_ =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         } catch (...) { error_ = std::current_exception(); }

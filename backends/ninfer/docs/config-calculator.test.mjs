@@ -145,8 +145,7 @@ check("golden: 262144-token int8, no speculation, 27B matches the engine's own r
 });
 
 // --- and the same cross-check for a *speculative* configuration ---------------------------------
-// This is the half TODO.md section 2b flagged as untested, and it was untested because the page's
-// speculative model was known to be wrong. With per-mode terms measured by
+// This half was long untested, because the page's speculative model was known to be wrong. With per-mode terms measured by
 // scripts/sweeps/speculative-memory-terms.ps1, the engine can be asked the same question:
 //
 //   ninfer qwen3_8_27b.ninfer --max-context 262144 --kv-dtype int8 --spec mtp --draft-tokens 3 //       --lm-head-draft

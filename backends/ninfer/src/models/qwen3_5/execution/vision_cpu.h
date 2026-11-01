@@ -1,12 +1,12 @@
 #pragma once
 
 // The Vision tower on CPU threads, for `--vision-residency cpu`. The encoder mirrors the device one
-// op by op (vision.cpp) in FP32 over weights decoded at load; only its merged embeddings reach the
+// op by op (vision.cpp) in FP32 over weights acquired for each encode; only its merged embeddings reach the
 // device, staged per prefill chunk the way overlay results are. One item encodes at a time across
 // the process, since each encode already spreads over every core.
 
 #include "models/qwen3_5/frontend/prepared_prompt.h"
-#include "models/qwen3_5/load/vision_cpu.h"
+#include "models/qwen3_5/load/vision_cpu_cache.h"
 #include "models/qwen3_5/program/vision_control.h"
 
 #include <atomic>
@@ -34,7 +34,7 @@ encode_vision_on_cpu(const CpuVisionWeights& weights, std::span<const std::uint1
 // alternate, so the next item can encode while prefill still reads the previous one.
 class CpuVisionSession {
 public:
-    explicit CpuVisionSession(std::shared_ptr<const CpuVisionWeights> weights);
+    explicit CpuVisionSession(std::shared_ptr<CpuVisionCache> weights);
     ~CpuVisionSession();
 
     CpuVisionSession(const CpuVisionSession&)            = delete;
@@ -62,7 +62,7 @@ public:
     [[nodiscard]] double encode_seconds() const noexcept { return encode_seconds_; }
 
 private:
-    std::shared_ptr<const CpuVisionWeights> weights_;
+    std::shared_ptr<CpuVisionCache> weights_;
     std::thread worker_;
     std::atomic<bool> finished_{false};
     std::atomic<bool> cancelled_{false};

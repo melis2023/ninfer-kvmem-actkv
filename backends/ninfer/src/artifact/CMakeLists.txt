@@ -6,6 +6,7 @@ add_library(ninfer_artifact STATIC
   reader.cpp
   binder.cpp
   materializer.cpp
+  selection.cpp
   transcode.cpp
   permute_row_split.cu
   views.cpp

@@ -48,7 +48,11 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
         throw std::invalid_argument("nvfp4 gdn conv: invalid compute policy");
     }
     if (batch_size > 1) { return {Nvfp4GdnConvScheduleId::Materialized}; }
-    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
+    // AllowNvfp4Int8 keeps the A16 schedule domain: the int8-grouped route serves plain
+    // projections, and this fused conv path's materialized branch quantises through whatever the
+    // inner projection resolver picks, which must not widen on a card without FP4 tensor cores.
+    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
+        policy == LinearPolicy::AllowNvfp4Int8) {
         if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
         if (tokens <= 16) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
         // A single-row copy verification reaches 64 columns through the materialized route.
@@ -59,7 +63,8 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
         throw std::invalid_argument(
             "nvfp4 gdn conv: the A16 route is registered only through T=64, and on sm_80/86/89 A16 "
             "is the only policy available for NVFP4 weights, so this artifact cannot serve a "
-            "prefill chunk wider than 64 columns on this architecture. See TODO.md section 1.");
+            "prefill chunk wider than 64 columns on this architecture. Use a groupwise-int "
+            "artifact here; an sm_120a build runs NVFP4 through AllowA4 at any width.");
     }
     if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
     if (tokens <= 3) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }

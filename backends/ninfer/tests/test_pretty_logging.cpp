@@ -1,4 +1,5 @@
 #include "media/decode/decode.h"
+#include "ninfer/observability/snapshot.h"
 #include "product/logging/engine_diagnostics.h"
 #include "product/logging/logging.h"
 #include "product/logging/startup_log.h"

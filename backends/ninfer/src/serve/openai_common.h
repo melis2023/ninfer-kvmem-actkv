@@ -2,6 +2,7 @@
 
 // OpenAI wire objects shared by Chat Completions and Responses HTTP handlers.
 
+#include "ninfer/observability/snapshot.h"
 #include "serve/request.h"
 #include "serve/request_json.h"
 
@@ -81,6 +82,7 @@ void validate_openai_model(std::string_view requested, std::string_view availabl
 
 std::string new_openai_chat_completion_id();
 std::string new_openai_completion_id();
+std::string new_openai_decision_id();
 std::string new_openai_chat_tool_call_id();
 std::string new_openai_request_id();
 std::string new_openai_response_id();

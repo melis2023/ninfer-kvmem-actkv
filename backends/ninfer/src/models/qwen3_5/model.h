@@ -4,6 +4,7 @@
 #include "artifact/materializer.h"
 #include "models/qwen3_5/auxiliary_replicas.h"
 #include "models/qwen3_5/config.h"
+#include "models/qwen3_5/expert_sources.h"
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/weights.h"
 #include "ninfer/ops/weight_input.h"
@@ -15,7 +16,7 @@
 
 namespace ninfer::models::qwen3_5 {
 
-struct CpuVisionWeights;
+class CpuVisionCache;
 
 struct InstanceInfo {
     std::string name;
@@ -39,6 +40,8 @@ public:
     [[nodiscard]] const LoadOptions& options() const noexcept { return options_; }
 
     [[nodiscard]] const ModelWeights& weights() const noexcept { return weights_; }
+
+    [[nodiscard]] const NativeExpertSources& expert_sources() const noexcept { return experts_; }
 
     [[nodiscard]] const BoundWeight& weight(WeightId id) const { return bound_.at(id.index); }
 
@@ -95,8 +98,8 @@ public:
         return backing_.upload_device_objects_again(device);
     }
 
-    // CPU Vision residency only: the tower decoded to host FP32, shared with every encode session.
-    [[nodiscard]] const std::shared_ptr<const CpuVisionWeights>& cpu_vision() const noexcept {
+    // CPU Vision capability and lazy Host residency, independent of whether weights are loaded.
+    [[nodiscard]] const std::shared_ptr<CpuVisionCache>& cpu_vision() const noexcept {
         return cpu_vision_;
     }
 
@@ -108,7 +111,8 @@ private:
           AuxiliaryReplicas replicas, FrontendResources resources, InstanceInfo info,
           artifact::MaterializedArtifact backing,
           std::optional<VisionOverlayLayout> vision_overlay,
-          std::shared_ptr<const CpuVisionWeights> cpu_vision);
+          std::shared_ptr<CpuVisionCache> cpu_vision,
+          NativeExpertSources experts);
 
     // Destroy all borrowers before backing. The caller keeps DeviceContext alive through cleanup.
     artifact::MaterializedArtifact backing_;
@@ -120,7 +124,8 @@ private:
     FrontendResources resources_;
     InstanceInfo info_;
     std::optional<VisionOverlayLayout> vision_overlay_;
-    std::shared_ptr<const CpuVisionWeights> cpu_vision_;
+    std::shared_ptr<CpuVisionCache> cpu_vision_;
+    NativeExpertSources experts_;
 };
 
 } // namespace ninfer::models::qwen3_5

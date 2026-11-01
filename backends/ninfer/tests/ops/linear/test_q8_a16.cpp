@@ -113,6 +113,25 @@ int q8_a16_biased_activation() {
     }
     return failures;
 }
+
+// The DFlash2 drafter's shapes with activations past FP16's range in some tiles and not others, at
+// the drafter's widths and across the K-split and tiled routes: on Turing the tiles split between
+// FP16 MMA and the BF16 emulation's per-output path, and every output must still meet the oracle.
+constexpr std::array kWideRangeGeometries{Geometry{5120, 17408, 401U}, Geometry{5120, 25600, 409U},
+                                          Geometry{6144, 5120, 419U}, Geometry{34816, 5120, 421U},
+                                          Geometry{5120, 4608, 431U}};
+
+int q8_a16_wide_range_activation() {
+    int failures = 0;
+    for (const auto& shape : kWideRangeGeometries) {
+        std::vector<Invocation> calls;
+        for (int t : {1, 2, 4, 6, 8, 9, 16, 17, 32, 64, 65, 128}) calls.push_back({t});
+        failures += run_shape("Q8_A16_wide_range", ActivationCompute::A16, make_q8_g32_fp16_weight,
+                              {shape.n, shape.k, shape.seed, Comparison::SampledRows, false, calls,
+                               ActivationSigns::CenteredWideRange});
+    }
+    return failures;
+}
 } // namespace
 
 int main() {
@@ -124,8 +143,13 @@ int main() {
         using ninfer::ops::detail::LinearRouteTable;
         int failures = 0;
         for (const LinearRouteTable table : {LinearRouteTable::Legacy, LinearRouteTable::Unified}) {
+            if (table == LinearRouteTable::Unified &&
+                !ninfer::ops::detail::unified_linear_routes_here()) {
+                continue;
+            }
             ninfer::ops::detail::force_linear_route_table(table);
-            const int table_failures = q8_a16_conformance() + q8_a16_biased_activation();
+            const int table_failures =
+                q8_a16_conformance() + q8_a16_biased_activation() + q8_a16_wide_range_activation();
             std::cout << (table_failures == 0 ? "OK" : "FAIL") << " Q8_A16 Linear ("
                       << (table == LinearRouteTable::Legacy ? "legacy" : "unified") << " routes)\n";
             failures += table_failures;

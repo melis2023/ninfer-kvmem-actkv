@@ -2,6 +2,7 @@
 
 #include <httplib.h>
 
+#include <cstddef>
 #include <string>
 #include <string_view>
 
@@ -15,6 +16,11 @@ namespace ninfer::serve {
 inline constexpr const char* kMcpProxyPath         = "/cors-proxy";
 inline constexpr const char* kMcpProxyUrlParam     = "url";
 inline constexpr const char* kMcpProxyHeaderPrefix = "x-llama-server-proxy-header-";
+
+// Upstream bytes one relay holds while the browser reads slower than the MCP server writes. Past
+// it the upstream reader waits for the browser, and TCP stops the MCP server; a single larger chunk
+// still passes once the relay holds nothing.
+inline constexpr std::size_t kMcpProxyBufferBytes = std::size_t{1} << 20;
 
 struct McpProxyTarget {
     std::string host;
@@ -49,7 +55,8 @@ bool is_hop_by_hop_response_header(const std::string& name);
 // Forwards one relay request and streams the upstream reply back. The upstream call runs on its
 // own thread because httplib sends this response's status and headers when the handler returns,
 // while the upstream status is known only once that request is in flight; the body then streams
-// through a chunked provider, which keeps the long-lived MCP GET channel live.
+// through a chunked provider, which keeps the long-lived MCP GET channel live, holding at most
+// kMcpProxyBufferBytes not yet written to the browser.
 void relay_mcp_proxy(const httplib::Request& request, httplib::Response& response);
 
 } // namespace ninfer::serve

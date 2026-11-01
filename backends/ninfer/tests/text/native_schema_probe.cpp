@@ -1,4 +1,5 @@
 // CPU-only stdin JSONL probe for StructuredCompiler. No model, tokenizer, CUDA or HTTP.
+#include "ninfer/request.h"
 #include "text/structured_output.h"
 #include <nlohmann/json.hpp>
 #include <cstdint>

@@ -108,10 +108,7 @@ template <class Schedule, auto Kernel>
 std::size_t nvfp4_w4a4_shared_bytes() {
     constexpr std::size_t bytes = sizeof(Nvfp4W4a4SharedStorage<Schedule>);
     if constexpr (bytes > 48 * 1024) {
-        configure_cuda_device_once([] {
-            return cudaFuncSetAttribute(Kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        static_cast<int>(bytes));
-        });
+        raise_dynamic_shared_memory(Kernel, static_cast<int>(bytes));
     }
     return bytes;
 }
@@ -253,7 +250,7 @@ __device__ __forceinline__ void stage_nvfp4_w4a4_weight(const std::uint8_t* __re
 template <class Geometry, class Schedule, class Epilogue, class OutputPolicy,
           class RowPolicy = Nvfp4W4a4IdentityRows, bool PairRows = false,
           class TokenPolicy  = Nvfp4W4a4IdentityTokens,
-          class RasterPolicy = Nvfp4W4a4MmaRasterRowFast>
+          class RasterPolicy = Nvfp4W4a4MmaRasterRowFast, bool Indirect = false>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4_mma_kernel(
     Nvfp4W4a4MaterializedActivation activation, const std::uint8_t* __restrict__ weight_codes,
@@ -280,6 +277,10 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
     // Liveness first: a dead tile of a routed launch has no work-list entry to read, and reading
     // one would touch arena bytes nothing has written.
     if (!raster_policy.live()) { return; }
+    if constexpr (Indirect) {
+        weight_codes = row_policy.codes();
+        weight_scales = row_policy.scales();
+    }
     raster_policy.blocks(block_row, block_token);
     const int token_begin       = block_token * Schedule::kBlockM;
     constexpr int kRowsPerBlock = PairRows ? Schedule::kBlockN / 2 : Schedule::kBlockN;

@@ -99,9 +99,17 @@ issue_load_bf16_to_float_vec4(View view, const __nv_bfloat16* __restrict__ gmem_
 // The conversion saturates: finite values beyond the FP16 range become +-65504 instead of
 // infinity, and NaN stays NaN.
 static __device__ __forceinline__ __half2 float2_to_f16x2_clamped(float low, float high) {
+#    if defined(NINFER_PRE_SM80_DEVICE)
+    // cvt.f16x2.f32 is sm_80: clamp the finite values first, which leaves NaN to the conversion.
+    const auto saturate = [](float value) {
+        return isnan(value) ? value : fminf(fmaxf(value, -65504.0f), 65504.0f);
+    };
+    return __floats2half2_rn(saturate(low), saturate(high));
+#    else
     std::uint32_t bits;
     asm("cvt.rn.satfinite.f16x2.f32 %0, %1, %2;" : "=r"(bits) : "f"(high), "f"(low));
     return *reinterpret_cast<const __half2*>(&bits);
+#    endif
 }
 
 template <int ROWS, int STRIDE, int THREADS, class View>
@@ -129,9 +137,16 @@ issue_load_f16_to_float_vec4(View view, const __half* __restrict__ gmem_base_row
 // scaled V/K panels it multiplies (shared by every U/W entry), plus the output's decayed A matrix.
 // State-passing operands stay truncated; rounding them changes nothing measurable.
 static __device__ __forceinline__ float round_to_tf32(float value) {
+#    if defined(NINFER_PRE_SM80_DEVICE)
+    // cvt.rna.tf32.f32 is sm_80: round the low 13 mantissa bits to nearest, ties away from zero.
+    const std::uint32_t bits = __float_as_uint(value);
+    if ((bits & 0x7f800000u) == 0x7f800000u) { return value; }
+    return __uint_as_float((bits + 0x1000u) & 0xffffe000u);
+#    else
     std::uint32_t bits;
     asm("cvt.rna.tf32.f32 %0, %1;" : "=r"(bits) : "f"(value));
     return __uint_as_float(bits);
+#    endif
 }
 
 // Per-token q/k L2 normalization factors rsqrt(sum(x^2) + 1e-6), stored head-major [H_qk, T] so

@@ -79,6 +79,8 @@ struct MoeWeights {
     WeightId router, shared_score;
     std::vector<DenseWeights> experts;
     DenseWeights shared;
+    // Absent for a resident bank, including MTP's explicit load-time Q4 storage trade.
+    std::optional<std::size_t> delivery_layer;
 };
 
 struct BlockWeights {
@@ -87,10 +89,22 @@ struct BlockWeights {
     std::variant<DenseWeights, MoeWeights> ffn;
 };
 
+// A tensor-parallel rank's share of one layer beyond rank 0: the norms its share reads, its GDN
+// heads (absent in an attention layer, which rank 0 runs alone) and its dense FFN rows.
+struct RankLayerWeights {
+    WeightId input_norm, post_attention_norm;
+    std::optional<GdnWeights> gdn;
+    DenseWeights ffn;
+};
+
 struct TextWeights {
     WeightId token_embedding, output_head, final_norm;
     WeightUseId output_head_use;
+    // With tensor parallelism, rank 0's share of each layer's GDN heads and dense FFN rows beside
+    // its whole attention.
     std::vector<BlockWeights> layers;
+    // Tensor parallelism: rank_layers[r - 1][layer] is rank r's share of a layer. Empty otherwise.
+    std::vector<std::vector<RankLayerWeights>> rank_layers;
     // Which stage's device holds each whole layer. The identity mapping for one device, which is
     // what keeps every consumer a no-op there; `--devices` adds stages.
     StagePlan stages{1};

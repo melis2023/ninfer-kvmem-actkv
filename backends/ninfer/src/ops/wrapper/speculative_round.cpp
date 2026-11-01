@@ -1,7 +1,7 @@
 #include "ninfer/ops/speculative_round.h"
 #include "ops/common/sampling_workspace.h"
 #include "ops/launcher/speculative_round.h"
-#include "ninfer/types.h"
+#include "ninfer/base.h"
 
 #include <algorithm>
 #include <limits>
@@ -185,8 +185,7 @@ void speculative_accept_coupled_drafts(const Tensor& target_tokens, const Tensor
                                        Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
                                        Tensor& licensed_counts, Tensor& accepted,
                                        std::int32_t token_domain, const SamplingConfig* configs,
-                                       WorkspaceArena& workspace, cudaStream_t stream,
-                                       const Tensor* column_starts) {
+                                       WorkspaceArena& workspace, cudaStream_t stream) {
     constexpr const char* op = "speculative_accept_coupled_drafts";
     const std::int32_t k     = drafts.ne[0];
     const std::int32_t batch = drafts.ne[1];
@@ -194,23 +193,11 @@ void speculative_accept_coupled_drafts(const Tensor& target_tokens, const Tensor
     if (batch < 1) {
         throw std::invalid_argument("speculative_accept_coupled_drafts: B must be >=1");
     }
+    require_matrix(target_tokens, DType::I32, k + 1, batch, op, "target_tokens");
     require_dtype(logits, DType::BF16, op, "logits");
-    if (column_starts != nullptr) {
-        require_vector(*column_starts, DType::I32, batch, op, "column_starts");
-        const std::int32_t columns = target_tokens.ne[0];
-        require_vector(target_tokens, DType::I32, columns, op, "target_tokens");
-        if (columns < batch || logits.ne[0] <= 0 || logits.ne[1] != columns ||
-            logits.ne[2] != 1 || logits.ne[3] != 1) {
-            throw std::invalid_argument(
-                "speculative_accept_coupled_drafts: packed logits must be [physical_rows,columns]");
-        }
-    } else {
-        require_matrix(target_tokens, DType::I32, k + 1, batch, op, "target_tokens");
-        if (logits.ne[0] <= 0 || logits.ne[1] != k + 1 || logits.ne[2] != batch ||
-            logits.ne[3] != 1) {
-            throw std::invalid_argument(
-                "speculative_accept_coupled_drafts: logits must be [physical_rows,K+1,B]");
-        }
+    if (logits.ne[0] <= 0 || logits.ne[1] != k + 1 || logits.ne[2] != batch || logits.ne[3] != 1) {
+        throw std::invalid_argument(
+            "speculative_accept_coupled_drafts: logits must be [physical_rows,K+1,B]");
     }
     if (token_domain <= 0 || token_domain > logits.ne[0]) {
         throw std::invalid_argument(
@@ -232,9 +219,7 @@ void speculative_accept_coupled_drafts(const Tensor& target_tokens, const Tensor
     const DeviceSpan scratch = bytes == 0 ? DeviceSpan{} : workspace.alloc_bytes(bytes);
     detail::speculative_accept_coupled_drafts_launch(
         target_tokens, logits, drafts, current_extents, lengths, anchors, licensed_tokens,
-        licensed_counts, accepted, token_domain, configs,
-        column_starts != nullptr ? static_cast<const std::int32_t*>(column_starts->data) : nullptr,
-        scratch, stream);
+        licensed_counts, accepted, token_domain, configs, scratch, stream);
 }
 
 void speculative_accept_sparse_drafts(

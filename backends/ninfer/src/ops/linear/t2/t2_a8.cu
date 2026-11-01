@@ -31,29 +31,6 @@ namespace a8 = rowsplit_a8;
 
 using Rows = a8::ContiguousRows<1>;
 
-// The padded width a ragged T runs at. Every column tile streams the whole weight, and a wider
-// tile costs less per column: on the RTX 3090 one 128-, 256- and 512-column tile of the text layers
-// take 1 : 1.4 : 2.2 (ninfer_linear_bench, 2026-09-22), so 300 tokens run as one 512-column tile
-// (2.2) rather than three of 128 (3.0), and 600 as three of 256 rather than five of 128.
-std::int32_t padded_tokens(std::int32_t tokens) {
-    struct Tile {
-        std::int32_t columns;
-        std::int32_t cost; // tenths of a 128-column tile
-    };
-
-    constexpr Tile kTiles[] = {{128, 10}, {256, 14}, {512, 22}};
-    std::int32_t best       = 0;
-    std::int32_t best_cost  = 0;
-    for (const Tile& tile : kTiles) {
-        const std::int32_t count = (tokens + tile.columns - 1) / tile.columns;
-        const std::int32_t cost  = count * tile.cost;
-        if (best == 0 || cost < best_cost) {
-            best      = count * tile.columns;
-            best_cost = cost;
-        }
-    }
-    return best;
-}
 
 // NINFER_T2_A8_TILE=off keeps the shared rowsplit_a8_mma.cuh GEMM on the prefill route.
 bool prefill_tile() {
@@ -264,18 +241,10 @@ template <std::int32_t kCols, int NT, class Epilogue>
 void gemm(const Weight& w, Epilogue epilogue, std::int32_t tokens, const std::int8_t* codes,
           const __half* scales, cudaStream_t stream) {
     constexpr int BN       = a8::kWarpsN * NT * 8;
-    const std::size_t smem = a8::shared_bytes<a8::T2Codec, 1, NT, Rows>(kCols);
-    const dim3 grid(w.n / Rows::kRowsPerBlock, padded_tokens(tokens) / BN);
-    auto* kernel = a8::a8_mma_kernel<a8::T2Codec, kCols, 1, NT, Rows, Epilogue>;
-    if (smem > 48 * 1024) {
-        configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        static_cast<int>(smem));
-        });
-    }
-    kernel<<<grid, a8::kThreads, smem, stream>>>(static_cast<const std::uint8_t*>(w.qdata), nullptr,
-                                                 static_cast<const __half*>(w.scales), codes,
-                                                 scales, tokens, Rows{0}, epilogue, 0);
+    const dim3 grid(w.n / Rows::kRowsPerBlock, a8::padded_tokens(tokens) / BN);
+    a8::launch_a8_mma<a8::T2Codec, kCols, 1, NT, Rows, Epilogue>(
+        grid, stream, static_cast<const std::uint8_t*>(w.qdata), nullptr,
+        static_cast<const __half*>(w.scales), codes, scales, tokens, Rows{0}, epilogue, 0);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -284,7 +253,7 @@ void gemm(const Weight& w, Epilogue epilogue, std::int32_t tokens, const std::in
 template <class F>
 void dispatch(std::int32_t input_rows, std::int32_t tokens, F&& f) {
     const auto by_tile = [&]<std::int32_t kCols>() {
-        switch (a8::token_tile(padded_tokens(tokens), 512)) {
+        switch (a8::token_tile(a8::padded_tokens(tokens), 512)) {
         case 512:
             f.template operator()<kCols, 16>();
             return;
@@ -345,6 +314,23 @@ bool tile_rows_fast(std::int32_t output_rows, std::int32_t columns) {
 
 template <std::int32_t kCols, class Epilogue>
 void tile_gemm(const T2A8Activations& x, const Weight& w, Epilogue epilogue, cudaStream_t stream) {
+    if (w.qtype == QType::PTQ1_G128_FP16) {
+        // PTQ1_0's tile: its own schedule (128 rows, a single-buffered int8 plane), and the raw high
+        // plane handed to the kernel -- the only argument the T2 instantiation does not take.
+        using C                      = T2PrefillI8Ptq1;
+        const std::int32_t columns   = tile_columns(x.tokens);
+        const std::string key = "ptq1_i8_tile/" + std::to_string(w.n) + "x" + std::to_string(w.k);
+        const bool rows_fast = device_route_schedule(key, x.tokens) == "rows";
+        const unsigned column_blocks = static_cast<unsigned>(columns / C::kColumns);
+        const unsigned row_blocks    = static_cast<unsigned>(w.n / C::kRows);
+        const dim3 grid = rows_fast ? dim3(row_blocks, column_blocks) : dim3(column_blocks, row_blocks);
+        t2_prefill_i8_kernel<kCols, Epilogue, true><<<grid, C::kThreads, 0, stream>>>(
+            static_cast<const std::uint8_t*>(w.qdata), static_cast<const __half*>(w.scales), x.codes,
+            x.scales, columns, x.tokens, rows_fast, epilogue,
+            static_cast<const std::uint8_t*>(w.qhigh));
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     using C                    = T2PrefillI8;
     const std::int32_t columns = tile_columns(x.tokens);
     const bool rows_fast       = tile_rows_fast(w.n, columns);
@@ -359,13 +345,14 @@ void tile_gemm(const T2A8Activations& x, const Weight& w, Epilogue epilogue, cud
 
 template <class Epilogue>
 void project(const T2A8Activations& x, const Weight& w, Epilogue epilogue, cudaStream_t stream) {
-    if (w.k != x.input_rows || !t2_a8_supported(w, x.tokens)) {
+    if ((w.qtype == QType::PTQ1_G128_FP16) != x.ptq1_tile ||
+        w.k != x.input_rows || !t2_a8_supported(w, x.tokens)) {
         throw std::invalid_argument("t2 a8: unsupported profile");
     }
-    if (route(x.tokens) == Route::SmallT) {
+    if (!x.ptq1_tile && route(x.tokens) == Route::SmallT) {
         return small_route<Epilogue>(x, {&w, epilogue}, nullptr, stream);
     }
-    if (prefill_tile()) {
+    if (x.ptq1_tile || prefill_tile()) {
         by_width(w.k, [&]<std::int32_t kCols>() { tile_gemm<kCols>(x, w, epilogue, stream); });
         return;
     }
@@ -378,7 +365,7 @@ template <class Epilogue>
 void run(const Tensor& x, const Weight& w, Epilogue epilogue, WorkspaceArena& workspace,
          cudaStream_t stream) {
     auto scope = workspace.scope();
-    project(t2_a8_quantize(x, workspace, stream), w, epilogue, stream);
+    project(t2_a8_quantize(x, workspace, stream, w.qtype == QType::PTQ1_G128_FP16), w, epilogue, stream);
 }
 
 void require_plane(const Tensor& plane, std::int32_t tokens, const char* label) {
@@ -428,12 +415,24 @@ bool t2_a8_shape_supported(std::int32_t output_rows, std::int32_t input_rows) {
 }
 
 bool t2_a8_supported(const Weight& w, std::int32_t tokens) {
-    return w.qtype == QType::T2_G128_FP16 && w.layout == QuantLayout::RowSplit &&
-           w.qdata != nullptr && w.scales != nullptr && t2_a8_shape_supported(w.n, w.k) &&
-           route(tokens) != Route::None;
+    const bool ptq1 = w.qtype == QType::PTQ1_G128_FP16;
+    const bool admitted = ptq1 ? w.group == 128 && w.group_size == 128 &&
+                                     w.scale_dtype == DType::FP16 &&
+                                     tokens >= kPtq1TileMinTokens &&
+                                     w.qhigh != nullptr && w.high_plane_bytes != 0
+                              : w.qtype == QType::T2_G128_FP16 && route(tokens) != Route::None;
+    return admitted && w.layout == QuantLayout::RowSplit && w.qdata != nullptr &&
+           w.scales != nullptr && w.padded_shape[1] == w.k &&
+           (ptq1 ? ptq1_a8_shape_supported(w.n, w.k) : t2_a8_shape_supported(w.n, w.k));
 }
 
-std::size_t t2_a8_activation_bytes(std::int32_t input_rows, std::int32_t max_tokens) {
+std::size_t t2_a8_activation_bytes(std::int32_t input_rows, std::int32_t max_tokens, bool ptq1_tile) {
+    if (ptq1_tile) {
+        if (max_tokens < kPtq1TileMinTokens) { return 0; }
+        WorkspaceLayoutBuilder layout;
+        (void)t2_a8_layout_activations(layout, input_rows, max_tokens, true);
+        return layout.peak_bytes(1);
+    }
     const auto round  = [](std::size_t value) { return (value + 255) / 256 * 256; };
     std::size_t bytes = 0;
     if (max_tokens >= t2_a8_min_tokens() && prefill_tile()) {
@@ -442,8 +441,7 @@ std::size_t t2_a8_activation_bytes(std::int32_t input_rows, std::int32_t max_tok
                 round(columns * static_cast<std::size_t>(input_rows / T2PrefillI8::kGroupK) *
                       sizeof(__half));
     } else if (max_tokens >= t2_a8_min_tokens()) {
-        // padded_tokens never exceeds the next multiple of 512, whatever T in [1, max_tokens].
-        bytes = a8::activation_workspace_bytes(input_rows, (max_tokens + 511) / 512 * 512);
+        bytes = a8::padded_activation_workspace_bytes(input_rows, max_tokens);
     }
     const SmallBand band = small_band();
     if (band.lo <= band.hi && max_tokens >= band.lo) {
@@ -477,28 +475,36 @@ std::size_t t2_a8_activation_bytes(std::int32_t input_rows, std::int32_t max_tok
                                                                        T2PrefillI8::kGroupK) *
                                               sizeof(__half)));
         } else if (widest_tile != 0) {
-            bytes = std::max(bytes, a8::activation_workspace_bytes(
-                                        input_rows, (widest_tile + 511) / 512 * 512));
+            bytes = std::max(bytes, a8::padded_activation_workspace_bytes(input_rows, widest_tile));
         }
     }
     return bytes;
 }
 
 std::size_t t2_a8_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
-                                  LinearPolicy policy, std::int32_t max_tokens) {
-    if (!t2_a8_admits(policy) || !t2_a8_shape_supported(output_rows, input_rows)) { return 0; }
-    return t2_a8_activation_bytes(input_rows, max_tokens);
+                                  LinearPolicy policy, std::int32_t max_tokens, bool ptq1_tile) {
+    if (!t2_a8_admits(policy) || !(ptq1_tile ? ptq1_a8_shape_supported(output_rows, input_rows)
+                                           : t2_a8_shape_supported(output_rows, input_rows))) { return 0; }
+    return t2_a8_activation_bytes(input_rows, max_tokens, ptq1_tile);
 }
 
 bool t2_a8_layout_activations(WorkspaceLayoutBuilder& layout, std::int32_t input_rows,
-                              std::int32_t tokens) {
+                              std::int32_t tokens, bool ptq1_tile) {
+    if (ptq1_tile) {
+        if (tokens < kPtq1TileMinTokens) { return false; }
+        const auto columns = static_cast<std::size_t>(tile_columns(tokens));
+        (void)layout.alloc_bytes(columns * input_rows);
+        (void)layout.alloc_bytes(columns * (input_rows / T2PrefillI8::kGroupK) * sizeof(__half));
+        return true;
+    }
     const Route taken = route(tokens);
     if (taken == Route::None) { return false; }
     const bool tile          = taken == Route::Prefill && prefill_tile();
     const std::size_t groups = static_cast<std::size_t>(input_rows) /
                                (tile ? T2PrefillI8::kGroupK : a8::kGroup);
-    const std::size_t columns = static_cast<std::size_t>(
-        taken == Route::SmallT ? tokens : tile ? tile_columns(tokens) : padded_tokens(tokens));
+    const std::size_t columns = static_cast<std::size_t>(taken == Route::SmallT ? tokens
+                                                         : tile ? tile_columns(tokens)
+                                                                : a8::padded_tokens(tokens));
     const std::size_t scale_columns =
         taken == Route::SmallT ? static_cast<std::size_t>(kT2I8MaxColumns) : columns;
     (void)layout.alloc_bytes(columns * static_cast<std::size_t>(input_rows));
@@ -506,14 +512,17 @@ bool t2_a8_layout_activations(WorkspaceLayoutBuilder& layout, std::int32_t input
     return true;
 }
 
-T2A8Activations t2_a8_quantize(const Tensor& x, WorkspaceArena& workspace, cudaStream_t stream) {
+T2A8Activations t2_a8_quantize(const Tensor& x, WorkspaceArena& workspace, cudaStream_t stream, bool ptq1_tile) {
     const std::int32_t input_rows = x.ne[0];
     const std::int32_t tokens     = x.ne[1];
     if (x.dtype != DType::BF16 || x.data == nullptr || !x.is_contiguous() || x.ne[2] != 1 ||
-        x.ne[3] != 1 || route(tokens) == Route::None || !t2_a8_shape_supported(T2PrefillI8::kRows, input_rows)) {
+        x.ne[3] != 1 || (ptq1_tile ? tokens < kPtq1TileMinTokens
+                                                : route(tokens) == Route::None) ||
+        !(ptq1_tile ? ptq1_a8_shape_supported(T2PrefillI8Ptq1::kRows, input_rows)
+                    : t2_a8_shape_supported(T2PrefillI8::kRows, input_rows))) {
         throw std::invalid_argument("t2 a8: x must be a contiguous BF16 [K, T] of a registered K");
     }
-    if (route(tokens) == Route::SmallT) {
+    if (!ptq1_tile && route(tokens) == Route::SmallT) {
         const DeviceSpan codes  = workspace.alloc_bytes(static_cast<std::size_t>(tokens) *
                                                         static_cast<std::size_t>(input_rows));
         const DeviceSpan scales = workspace.alloc_bytes(
@@ -529,9 +538,9 @@ T2A8Activations t2_a8_quantize(const Tensor& x, WorkspaceArena& workspace, cudaS
             reinterpret_cast<const __nv_bfloat16*>(x.data), input_rows, tokens, code_data,
             scale_data);
         CUDA_CHECK(cudaGetLastError());
-        return {code_data, scale_data, tokens, input_rows};
+        return {code_data, scale_data, tokens, input_rows, ptq1_tile};
     }
-    if (prefill_tile()) {
+    if (ptq1_tile || prefill_tile()) {
         using C                    = T2PrefillI8;
         const std::int32_t columns = tile_columns(tokens);
         const std::size_t count    = static_cast<std::size_t>(columns);
@@ -547,9 +556,9 @@ T2A8Activations t2_a8_quantize(const Tensor& x, WorkspaceArena& workspace, cudaS
                     scale_data);
             CUDA_CHECK(cudaGetLastError());
         });
-        return {code_data, scale_data, tokens, input_rows};
+        return {code_data, scale_data, tokens, input_rows, ptq1_tile};
     }
-    const std::size_t columns = static_cast<std::size_t>(padded_tokens(tokens));
+    const std::size_t columns = static_cast<std::size_t>(a8::padded_tokens(tokens));
     const DeviceSpan codes  = workspace.alloc_bytes(columns * static_cast<std::size_t>(input_rows));
     const DeviceSpan scales = workspace.alloc_bytes(
         columns * (static_cast<std::size_t>(input_rows) / a8::kGroup) * sizeof(__half));
@@ -558,7 +567,7 @@ T2A8Activations t2_a8_quantize(const Tensor& x, WorkspaceArena& workspace, cudaS
     dispatch(input_rows, tokens, [&]<std::int32_t kCols, int NT>() {
         quantize<kCols, NT>(x, tokens, code_data, scale_data, stream);
     });
-    return {code_data, scale_data, tokens, input_rows};
+    return {code_data, scale_data, tokens, input_rows, ptq1_tile};
 }
 
 void t2_a8_project_split(const T2A8Activations& x, const Weight& w, Tensor& first,
@@ -572,7 +581,7 @@ void t2_a8_project_split_pair(const T2A8Activations& x, const T2A8Split& a, cons
                               cudaStream_t stream) {
     const SplitStoreEpilogue first  = split_epilogue(x, a);
     const SplitStoreEpilogue second = split_epilogue(x, b);
-    if (route(x.tokens) != Route::SmallT) {
+    if (x.ptq1_tile || route(x.tokens) != Route::SmallT) {
         project(x, a.weight, first, stream);
         project(x, b.weight, second, stream);
         return;

@@ -55,12 +55,10 @@ void tiled_projection(const Tensor& x, const Weight& weight, Tensor& out, cudaSt
                                                  Q8KSplitScaleAccess::Shared, Activation>;
     constexpr int SharedBytes = TileColumns > 64 ? sizeof(Q8KSplitSharedStorage<Schedule>) : 0;
     if constexpr (SharedBytes > 0) {
-        configure_cuda_device_once([] {
-            return cudaFuncSetAttribute(
-                q8_ksplit_mma_kernel<Geometry, TileColumns, Schedule, Q8ContiguousOutput,
-                                     Q8KSplitStoreEpilogue, Q8KSplitIdentityRows, false, true>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, SharedBytes);
-        });
+        raise_dynamic_shared_memory(
+            q8_ksplit_mma_kernel<Geometry, TileColumns, Schedule, Q8ContiguousOutput,
+                                 Q8KSplitStoreEpilogue, Q8KSplitIdentityRows, false, true>,
+            SharedBytes);
     }
     const int columns = x.ne[1];
     Q8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), kRows};

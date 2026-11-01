@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/planning/rebuild_work.h"
+#include "models/qwen3_5/program/planning/prefill_service_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/context_work.h"
 #include <algorithm>
@@ -91,7 +92,9 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
                                      std::uint32_t reuse_base, std::uint32_t prefill_chunk,
                                      std::size_t prefill_splits,
                                      std::span<const CaptureGroup> captures,
-                                     std::span<const std::uint32_t> rewrite_frontiers) noexcept {
+                                     std::span<const std::uint32_t> rewrite_frontiers,
+                                     std::uint32_t window_reserve,
+                                     std::uint32_t mtp_extent) noexcept {
     std::uint64_t prefill_units = 0;
     std::uint32_t segment_begin = reuse_base;
     std::size_t capture_index   = 0;
@@ -107,12 +110,14 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
         if (capture_frontier == frontier) { ++capture_index; }
         if (rewrite_frontier == frontier) { ++rewrite_index; }
         if (frontier <= segment_begin || frontier >= summary.prompt_tokens) { continue; }
-        const std::uint64_t segment = frontier - segment_begin;
-        prefill_units += 1ULL + (segment - 1ULL) / prefill_chunk;
+        prefill_units += prefill_service_units(segment_begin, frontier, prefill_chunk,
+                                               window_reserve);
         segment_begin = frontier;
     }
     const std::uint64_t suffix = summary.prompt_tokens - segment_begin;
-    prefill_units += suffix == 0 ? 1ULL : 1ULL + (suffix - 1ULL) / prefill_chunk;
+    prefill_units += suffix == 0 ? 1ULL :
+        prefill_service_units(segment_begin, summary.prompt_tokens, prefill_chunk,
+                              window_reserve);
     // A capture at the selected reuse base (a shared promotion, an endpoint anchor) is offered
     // before the ordinary zero/suffix prefill step. It executes no model work, but it is still one
     // scheduler service unit.
@@ -121,6 +126,15 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
             return capture.frontier == reuse_base;
         }));
     prefill_units += prefill_splits;
+    // Reserve the MTP tail split for the whole suffix. A capture inside that
+    // final chunk can occur after the shortened step, so charging only the last
+    // capture-separated interval would still undercount. Earlier captures may
+    // make this allowance unnecessary, but cannot increase it.
+    prefill_units +=
+        prefill_service_units(reuse_base, summary.prompt_tokens, prefill_chunk,
+                              window_reserve, mtp_extent) -
+        prefill_service_units(reuse_base, summary.prompt_tokens, prefill_chunk,
+                              window_reserve);
     const std::uint64_t decode_units =
         summary.effective_output_tokens == 0 ? 0ULL : summary.effective_output_tokens - 1ULL;
     return prefill_units + decode_units;
@@ -129,18 +143,46 @@ std::uint64_t projected_service_work(const runtime::RequestPlanSummary& summary,
 std::uint64_t memory_replay_service_work(const runtime::RequestPlanSummary& summary,
                                          const PreparedPromptData& prompt,
                                          std::uint32_t window_tokens,
-                                         std::uint32_t chunk) noexcept {
+                                         std::uint32_t chunk, const KvmemOptions& options,
+                                         std::uint32_t workspace, std::uint32_t mtp_extent) noexcept {
     if (!window_tokens || summary.prompt_tokens <= window_tokens || !prompt.memory_query ||
-        prompt.memory_query->begin == 0 || prompt.memory_query->count == 0) return 0;
+        prompt.memory_query->count == 0) return 0;
+    const auto query=bounded_memory_query(prompt,options.query_max_tokens);
+    if(query.begin==0) return 0;
+    const auto admission=kvmem::query_replay_plan({query.begin,query.begin+query.count},query.begin,
+        summary.prompt_tokens,options.query_replay_max_tokens,64,
+        std::min<uint64_t>((query.begin+63)/64,options.selected_tokens/64),window_tokens/64,workspace);
+    if(!admission.admitted) return 0;
     auto replay = summary;
     replay.effective_output_tokens = 0;
-    const auto begin = static_cast<std::uint32_t>(prompt.memory_query->begin);
+    const auto begin = static_cast<std::uint32_t>(query.begin);
     const auto canonical_chunks = 1ULL + (summary.prompt_tokens - 1ULL) / chunk - begin / chunk;
     return std::max<std::uint64_t>(canonical_chunks, projected_service_work(replay, begin,
-        chunk, 0, {}, prompt.identity.rewrite_execution_frontiers));
+        chunk, 0, {}, prompt.identity.rewrite_execution_frontiers, options.reserve_tokens, mtp_extent));
 }
 
 } // namespace
+
+// The prefill units a branched read's branches take at most: they pack in order into shared passes
+// of prefill_chunk columns and kMaximumPrefillSegments - 1 blocks (the prompt's last chunk may take
+// the remaining segment), and the prompt's last chunk may take a pass of its own before them.
+std::uint64_t branch_service_work(const std::vector<runtime::ReadBranch>* branches,
+                                  std::uint32_t prefill_chunk) noexcept {
+    if (branches == nullptr || branches->empty()) { return 0; }
+    std::uint64_t passes = 1;
+    std::uint32_t tokens = 0, blocks = 0;
+    for (const runtime::ReadBranch& branch : *branches) {
+        const auto length = static_cast<std::uint32_t>(branch.tokens.size());
+        if (blocks != 0 &&
+            (length > prefill_chunk - tokens || blocks == execution::kMaximumPrefillSegments - 1)) {
+            ++passes;
+            tokens = blocks = 0;
+        }
+        tokens += length;
+        ++blocks;
+    }
+    return passes + 1;
+}
 
 runtime::PrefillWork rebuild_work_at_frontier(const PreparedPromptData& prompt,
                                               std::uint32_t frontier, std::uint32_t prefill_chunk,
@@ -228,8 +270,24 @@ KVEntitlementShape ProgramImpl::kv_entitlement_shape() const noexcept {
 }
 
 std::uint32_t ProgramImpl::concurrent_output_budget(std::uint32_t prompt_tokens) const noexcept {
-    // A Device KV lease holds a bounded window of the output, not the whole budget, so lanes do
-    // not compete for the pool up front: the remaining context stays the budget.
+    // KVMem recycles its B+R device window, but admission reserves the complete retained
+    // history. Automatic output must fit that RAM/SSD payload budget as well as context;
+    // otherwise even a short request fails when H/D cannot hold the maximum context.
+    if (kvmem_window_tokens) {
+        if (prompt_tokens == 0 || prompt_tokens > capacity) return 0U;
+        const auto remaining = capacity - prompt_tokens + 1U;
+        const auto page_bytes = text_host_kv_page_stride + backend_host_kv_page_stride;
+        if (!page_bytes) return remaining;
+        const auto pages = std::min<std::uint64_t>(kv_pages_for_tokens(capacity),
+                                                  memory_retained_budget / page_bytes);
+        const auto frontier = std::min<std::uint64_t>(capacity, pages * kPagedKVPageSize);
+        // If the prompt itself cannot fit, preserve admission's capacity error instead
+        // of turning an impossible request into a successful zero-output request.
+        if (prompt_tokens > frontier) return remaining;
+        // The last sampled output is not written to KV (the same boundary as admission).
+        return static_cast<std::uint32_t>(frontier) - prompt_tokens + 1U;
+    }
+    // Growing native leases hold a bounded window, independently of the total output.
     if (context_cache.kv_lease_growth) {
         return prompt_tokens == 0 || prompt_tokens > capacity ? 0U
                                                               : capacity - prompt_tokens + 1U;
@@ -332,15 +390,67 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                                                : FinishReason::ContextCapacity;
     base->sampling                       = translate_sampling(options.sampling);
     base->grammar                        = options.grammar;
+    base->suppressed_tool_open           = options.suppressed_tool_open;
     base->logprobs                       = options.logprobs;
+    base->readout_tokens                 = options.readout_tokens;
+    for (const TokenId id : base->readout_tokens) {
+        if (id < 0 || id >= execution::dimension(parameters.model.resources().public_token_count)) {
+            throw std::invalid_argument("readout token is outside the public token domain");
+        }
+    }
+    if (ngram_draft_window != 0 && options.speculative_drafting && !prompt.ngram_index) {
+        throw std::invalid_argument("a drafting request needs a prompt prepared for drafting");
+    }
+    base->branches = options.branches;
+    if (base->branches) {
+        if (stage_runtime || prefill_hidden.data == nullptr || !round_host) {
+            throw std::invalid_argument("this Program runs no branched reads");
+        }
+        if (base->branches->empty() || !base->readout_tokens.empty() || base->grammar ||
+            !options.logprobs || options.requested_output_tokens != 1 ||
+            options.speculative_drafting || prompt.has_media() ||
+            options.sampling.temperature > 0.0F || options.sampling.presence_penalty != 0.0F ||
+            options.sampling.frequency_penalty != 0.0F) {
+            throw std::invalid_argument("a branched read is a greedy one-token text read");
+        }
+        for (const runtime::ReadBranch& branch : *base->branches) {
+            if (branch.tokens.empty() || branch.readout_tokens.size() > kMaximumReadoutTokens ||
+                branch.tokens.size() > prefill_chunk) {
+                throw std::invalid_argument("a read branch needs 1 to one prefill chunk of tokens");
+            }
+            for (const TokenId id : branch.tokens) {
+                if (id < 0 ||
+                    id >= execution::dimension(parameters.model.resources().public_token_count)) {
+                    throw std::invalid_argument("branch token is outside the public token domain");
+                }
+            }
+            for (const TokenId id : branch.readout_tokens) {
+                if (id < 0 ||
+                    id >= execution::dimension(parameters.model.resources().public_token_count)) {
+                    throw std::invalid_argument("readout token is outside the public token domain");
+                }
+            }
+        }
+        if (std::uint64_t(base->summary.prompt_tokens) + branch_extent(base->branches.get()) >
+            capacity) {
+            throw RequestError(RequestErrorKind::ContextLengthExceeded,
+                               "a branched read's prompt and longest branch exceed the context");
+        }
+    }
+    // A branch block writes its K/V past the prompt frontier: the entitlement covers the longest.
+    const std::uint32_t branch_output =
+        base->branches ? branch_extent(base->branches.get()) + 1U : 0U;
     base->allow_prefix_reuse             = options.allow_prefix_reuse;
+    // A branched read drafts nothing (the Engine turns its drafting off) and publishes no
+    // continuation: its one token follows a branch, not its prompt.
+    base->drafting = options.speculative_drafting || speculative_backend == SpeculativeBackend::None;
     base->summary.publish_continuation =
         options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;
     if (!context_cache.kv_lease_growth) {
         // One formula with concurrent_output_budget (planning/output_budget.h).
         const KVPageEntitlement entitlement =
             kv_page_entitlement(kv_entitlement_shape(), base->summary.prompt_tokens,
-                                base->summary.effective_output_tokens);
+                                std::max(base->summary.effective_output_tokens, branch_output));
         base->text_kv_page_entitlement    = entitlement.main_pages;
         base->backend_kv_page_entitlement = entitlement.backend_pages;
     } else {
@@ -351,7 +461,8 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
         const std::uint32_t leased_output_tokens =
             std::min(base->summary.effective_output_tokens, kv_lease_growth_margin_tokens());
         const std::uint32_t widest             = widest_verify_window();
-        const std::uint32_t main_window_tokens = std::max(leased_output_tokens, widest + 1U);
+        const std::uint32_t main_window_tokens =
+            std::max({leased_output_tokens, widest + 1U, branch_output});
         base->text_kv_page_entitlement         = kv_pages_for_tokens(
             std::min(capacity, base->summary.prompt_tokens + main_window_tokens - 1U));
         if (speculative_backend == SpeculativeBackend::Mtp) {
@@ -553,9 +664,15 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
     };
     const std::size_t cold_prefill_splits =
         base->vision_control_plan ? base->vision_control_plan->items.size() : 0ULL;
+    const auto service_mtp_extent = initial_mtp_prefill_extent(
+        speculative_backend == SpeculativeBackend::Mtp ? draft_window : 0U,
+        base->summary.effective_output_tokens, capacity, base->summary.prompt_tokens);
     base->summary.service_work_quanta =
         projected_service_work(base->summary, 0, prefill_chunk, cold_prefill_splits,
-                               base->capture_groups, prompt.identity.rewrite_execution_frontiers);
+                               base->capture_groups, prompt.identity.rewrite_execution_frontiers,
+                               kvmem_window_tokens ? kvmem_options.reserve_tokens : 0U,
+                               service_mtp_extent) +
+        branch_service_work(base->branches.get(), prefill_chunk);
     base->root_rebuild_work =
         rebuild_work_at_frontier(prompt, base->summary.prompt_tokens, prefill_chunk,
                                  base->capture_groups, prompt.identity.rewrite_execution_frontiers);
@@ -587,7 +704,11 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
     plan->summary                     = base.summary;
     plan->sampling                    = base.sampling;
     plan->grammar                     = base.grammar;
+    plan->suppressed_tool_open        = base.suppressed_tool_open;
     plan->logprobs                    = base.logprobs;
+    plan->readout_tokens              = base.readout_tokens;
+    plan->branches                    = base.branches;
+    plan->drafting                    = base.drafting;
     plan->text_kv_page_entitlement    = base.text_kv_page_entitlement;
     plan->backend_kv_page_entitlement = base.backend_kv_page_entitlement;
     plan->root_rebuild_work           = base.root_rebuild_work;
@@ -924,12 +1045,19 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_lane(
     }
 
     const std::size_t prefill_splits = plan->vision ? plan->vision->uses.size() : 0ULL;
+    const auto service_mtp_extent = initial_mtp_prefill_extent(
+        speculative_backend == SpeculativeBackend::Mtp ? draft_window : 0U,
+        plan->summary.effective_output_tokens, capacity, plan->summary.prompt_tokens);
     plan->summary.service_work_quanta =
         projected_service_work(plan->summary, service_work_base(*plan), prefill_chunk,
                                prefill_splits, plan->capture_groups,
-                               prompt.identity.rewrite_execution_frontiers);
+                               prompt.identity.rewrite_execution_frontiers,
+                               kvmem_window_tokens ? kvmem_options.reserve_tokens : 0U,
+                               service_mtp_extent) +
+        branch_service_work(plan->branches.get(), prefill_chunk);
     plan->summary.service_work_quanta +=
-        memory_replay_service_work(plan->summary, prompt, kvmem_window_tokens, prefill_chunk);
+        memory_replay_service_work(plan->summary, prompt, kvmem_window_tokens, prefill_chunk, kvmem_options,
+            backend_kv_pages ? std::max(draft_window,ngram_draft_window)+draft_window : 0, service_mtp_extent);
     std::uint64_t remaining_vision_items   = 0;
     std::uint64_t remaining_vision_patches = 0;
     if (plan->vision) {
@@ -1481,12 +1609,19 @@ void ProgramImpl::select_shared_captures(AdmissionCandidate& candidate,
               });
 
     const std::size_t prefill_splits = plan.vision ? plan.vision->uses.size() : 0ULL;
+    const auto service_mtp_extent = initial_mtp_prefill_extent(
+        speculative_backend == SpeculativeBackend::Mtp ? draft_window : 0U,
+        plan.summary.effective_output_tokens, capacity, plan.summary.prompt_tokens);
     plan.summary.service_work_quanta =
         projected_service_work(plan.summary, service_work_base(plan), prefill_chunk,
                                prefill_splits, plan.capture_groups,
-                               prompt.identity.rewrite_execution_frontiers);
+                               prompt.identity.rewrite_execution_frontiers,
+                               kvmem_window_tokens ? kvmem_options.reserve_tokens : 0U,
+                               service_mtp_extent) +
+        branch_service_work(plan.branches.get(), prefill_chunk);
     plan.summary.service_work_quanta +=
-        memory_replay_service_work(plan.summary, prompt, kvmem_window_tokens, prefill_chunk);
+        memory_replay_service_work(plan.summary, prompt, kvmem_window_tokens, prefill_chunk, kvmem_options,
+            backend_kv_pages ? std::max(draft_window,ngram_draft_window)+draft_window : 0, service_mtp_extent);
     std::uint64_t vision_items   = 0;
     std::uint64_t vision_patches = 0;
     if (plan.vision) {

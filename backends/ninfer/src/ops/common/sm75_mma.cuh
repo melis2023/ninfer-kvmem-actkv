@@ -23,7 +23,7 @@
 
 #include <cuda_fp16.h>
 
-#if defined(NINFER_SM75)
+#if defined(NINFER_SM75_FORMS)
 namespace ninfer::ops::sm75 {
 
 __device__ __forceinline__ void mma_f16_k8(float& c0, float& c1, float& c2, float& c3, unsigned a0,

@@ -206,6 +206,14 @@ int main() {
         require(ngram_numbered_sources("1: a\n2: b\n3: c\n9: d\n10: e\n11: f\n") ==
                     std::vector<std::string>{"a\nb\nc\n", "d\ne\nf\n"},
                 "discontinuous runs remain separate");
+        std::vector<std::string> visited;
+        ninfer::models::qwen3_5::frontend::for_each_ngram_numbered_source(
+            "1: a\n2: b\n3: c\n9: d\n10: e\n11: f\n", [&](std::string&& source) {
+                visited.push_back(std::move(source));
+                return false;
+            });
+        require(visited == std::vector<std::string>{"a\nb\nc\n"},
+                "a declining visitor stops the scan after its run");
         require(ngram_numbered_sources("1: a\n2\tb\n3: c\n").empty(),
                 "mixed display styles rejected");
         require(ngram_numbered_sources("18446744073709551615: a\n0: b\n1: c\n").empty(),

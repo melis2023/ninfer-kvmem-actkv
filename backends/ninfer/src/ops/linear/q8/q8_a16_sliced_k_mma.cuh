@@ -10,6 +10,7 @@
 // activation and its B fragments and serve identity rows with the plain tile store only.
 
 #include "core/pdl.cuh"
+#include "ops/common/device_limits.h"
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/linear/q8/q8_schedule.cuh"
@@ -485,7 +486,9 @@ __device__ __forceinline__ void q8_a16_sliced_k_mma(Q8LinearOperands operands, O
 // Multi-layer fused Ops call the device contraction after selecting their weight view.
 template <class Schedule, bool FullWeights, class Output, class Epilogue, class RowPolicy>
 __global__
-__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q8_a16_sliced_k_mma_kernel(
+__launch_bounds__(Schedule::kThreads,
+                  resident_ctas_bound(Schedule::kThreads, Schedule::kMinBlocksPerSm)) void
+q8_a16_sliced_k_mma_kernel(
     Q8LinearOperands operands, Output output, Epilogue epilogue, RowPolicy row_policy,
     int token_begin) {
     q8_a16_sliced_k_mma<Schedule, FullWeights>(operands, output, epilogue, row_policy, token_begin);

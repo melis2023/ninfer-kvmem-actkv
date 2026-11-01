@@ -1,5 +1,6 @@
 #include "models/qwen4_exp/expert_stream.h"
 
+#include "core/file_read_error.h"
 #include "models/qwen4_exp/read_pool.h"
 
 #include <algorithm>
@@ -82,15 +83,15 @@ public:
                 std::min<std::size_t>(bytes, std::numeric_limits<DWORD>::max() / 2));
             DWORD done = 0;
             if (!ReadFile(handle_, destination, request, &done, &position) || done == 0) {
-                throw std::runtime_error("expert stream: read failed");
+                throw FileReadError("expert stream: read failed");
             }
 #else
             const ssize_t done =
                 ::pread(descriptor_, destination, bytes, static_cast<off_t>(offset));
             if (done < 0 && errno == EINTR) continue;
             if (done <= 0) {
-                throw std::runtime_error(std::string("expert stream: read failed: ") +
-                                         (done < 0 ? std::strerror(errno) : "end of file"));
+                throw FileReadError(std::string("expert stream: read failed: ") +
+                                    (done < 0 ? std::strerror(errno) : "end of file"));
             }
 #endif
             destination += done;
@@ -229,12 +230,34 @@ struct ExpertStream::Impl {
         CUDA_CHECK(cudaEventSynchronize(half_done[half]));
     }
 
+    // Forgets every resident expert: after a failed read some slot holds an expert it was never
+    // given, and the slots do not record which. Later calls read what they route to again. The
+    // half being filled keeps its cursor, so no staged byte a queued copy still reads is reused.
+    void forget_residents() {
+        for (auto& [rank, pool] : pools) {
+            for (Slot& slot : pool.slots) {
+                slot.layer      = -1;
+                slot.expert     = -1;
+                slot.call       = 0;
+                slot.referenced = false;
+            }
+        }
+        for (Layer& layer : layers) { std::fill(layer.slot_of.begin(), layer.slot_of.end(), -1); }
+        batch_reads.clear();
+        batch_copies.clear();
+    }
+
     // Reads the staged batch in parallel and queues its copies on `stream`.
     void flush(cudaStream_t stream) {
-        reads.run(batch_reads.size(), [&](std::size_t i) {
-            const Read& read = batch_reads[i];
-            read.file->read(read.offset, read.destination, read.bytes);
-        });
+        try {
+            reads.run(batch_reads.size(), [&](std::size_t i) {
+                const Read& read = batch_reads[i];
+                read.file->read(read.offset, read.destination, read.bytes);
+            });
+        } catch (const FileReadError&) {
+            forget_residents();
+            throw;
+        }
         for (const Copy& copy : batch_copies) {
             if (copy.source == nullptr) {
                 CUDA_CHECK(cudaMemsetAsync(copy.target, 0, copy.bytes, stream));
@@ -373,5 +396,11 @@ void ExpertStream::prepare(std::size_t layer, std::span<const std::int32_t> ids)
 }
 
 ExpertStreamStats ExpertStream::stats() const noexcept { return impl_->stats; }
+
+std::pair<std::uintptr_t, std::uintptr_t> ExpertStream::storage(std::size_t rank) const {
+    const auto& pool = impl_->pools.at(rank);
+    const auto begin = reinterpret_cast<std::uintptr_t>(pool.storage.p);
+    return {begin, begin + pool.storage.bytes};
+}
 
 } // namespace ninfer::models::qwen4_exp

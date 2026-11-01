@@ -1,3 +1,12 @@
+if(NINFER_WINDOWS_KERNEL_DLL)
+  # Both the GGML bridge and Ops use one device-tier probe and cache in the DLL.
+  add_library(ninfer_device_tier OBJECT "${CMAKE_CURRENT_LIST_DIR}/common/device_tier.cu")
+  ninfer_internal_includes(ninfer_device_tier)
+  ninfer_cuda_archive(ninfer_device_tier)
+else()
+  target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/common/device_tier.cu")
+endif()
+
 target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/weight_input.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/common/device_route.cpp"
@@ -28,6 +37,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/launcher/scatter.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/sigmoid_gate_mul.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/silu_and_mul.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/launcher/readout_logprobs.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/target_logprobs.cu"
   "${CMAKE_CURRENT_LIST_DIR}/launcher/vision_pos_embed.cu"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/add_bias.cpp"
@@ -61,10 +71,52 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/ple_inject/ngram_rows.cu"
   "${CMAKE_CURRENT_LIST_DIR}/qsa_indexer/qsa_indexer.cu"
   "${CMAKE_CURRENT_LIST_DIR}/sparse_attention/sparse_attention.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/kv_stream/kv_stream.cu"
   "${CMAKE_CURRENT_LIST_DIR}/moe_route/moe_route.cu"
   "${CMAKE_CURRENT_LIST_DIR}/moe_experts/moe_experts_bf16.cu"
   "${CMAKE_CURRENT_LIST_DIR}/moe_experts/moe_experts_gguf.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/moe_experts/moe_experts_native.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/moe_experts/moe_expert_cpu.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/silu_mul.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/wrapper/readout_logprobs.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/target_logprobs.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/wrapper/vision_pos_embed.cpp"
 )
+
+# The GGUF CPU expert products read ggml's i-quant grids (ggml-common.h only) and reproduce the
+# GPU's products bit for bit, so no compiler may fuse their multiplies and adds.
+set(gguf_cpu_no_contract "")
+if(NOT MSVC)
+  set(gguf_cpu_no_contract "-ffp-contract=off")
+endif()
+set_source_files_properties(
+  "${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu_avx2.cpp"
+  PROPERTIES INCLUDE_DIRECTORIES "${PROJECT_SOURCE_DIR}/third_party/ggml-quants/src")
+set_source_files_properties("${CMAKE_CURRENT_LIST_DIR}/moe_experts/gguf_expert_cpu.cpp"
+  PROPERTIES COMPILE_OPTIONS "${gguf_cpu_no_contract}")
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+  set(cpu_expert_dir "${CMAKE_CURRENT_LIST_DIR}/moe_experts")
+  target_sources(ninfer_ops PRIVATE
+    "${cpu_expert_dir}/moe_expert_cpu_avx2.cpp"
+    "${cpu_expert_dir}/moe_expert_cpu_avx512.cpp"
+    "${cpu_expert_dir}/gguf_expert_cpu_avx2.cpp")
+  set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu.cpp" "${cpu_expert_dir}/gguf_expert_cpu.cpp"
+    PROPERTIES COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
+  if(MSVC)
+    set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu_avx2.cpp" "${cpu_expert_dir}/gguf_expert_cpu_avx2.cpp"
+      PROPERTIES COMPILE_OPTIONS /arch:AVX2 COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
+    set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu_avx512.cpp"
+      PROPERTIES COMPILE_OPTIONS /arch:AVX512 COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
+  else()
+    set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu_avx2.cpp"
+      PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c" COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
+    set_source_files_properties("${cpu_expert_dir}/gguf_expert_cpu_avx2.cpp"
+      PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-ffp-contract=off" COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
+    set_source_files_properties("${cpu_expert_dir}/moe_expert_cpu_avx512.cpp"
+      PROPERTIES COMPILE_OPTIONS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni;-mavx512dq;-mf16c;-mfma"
+      COMPILE_DEFINITIONS NINFER_CPU_EXPERT_X86=1)
+  endif()
+endif()

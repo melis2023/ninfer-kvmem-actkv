@@ -1,5 +1,5 @@
-# NInfer on one NVIDIA GPU. Needs the NVIDIA Container Toolkit on the host and a driver of the
-# CUDA 13 branch (580 or newer).
+# NInfer on one NVIDIA GPU. The host needs NVIDIA Container Toolkit and a compatible driver.
+# Set NINFER_CUDA_TAG=cuda12.9 for Volta; the default cuda13.4 includes Blackwell.
 #
 #   docker compose run --rm ninfer download qwen38-27b    fetch the model into ./models
 #   docker compose up -d                                  serve it on http://localhost:8080/v1
@@ -7,7 +7,7 @@
 # Every NINFER_* variable scripts/run.sh documents can be set under `environment`.
 services:
   ninfer:
-    image: ghcr.io/iamwavecut/ninfer-all:latest
+    image: ghcr.io/iamwavecut/ninfer-all:${NINFER_CUDA_TAG:-cuda13.4}
     command: ["run", "qwen38-27b"]
     ports:
       - "8080:8080"

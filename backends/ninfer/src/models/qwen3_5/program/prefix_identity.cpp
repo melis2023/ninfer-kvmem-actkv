@@ -138,6 +138,18 @@ void ResidentPrefixIdentity::reserve(std::size_t tokens) {
     for (auto& axis : positions_) { axis.reserve(tokens); }
 }
 
+std::size_t ResidentPrefixIdentity::allocated_bytes() const noexcept {
+    std::size_t bytes = token_types_.capacity() * sizeof(token_types_[0]) +
+        vision_items_.capacity() * sizeof(VisionItem) +
+        rewrite_execution_frontiers_.capacity() * sizeof(rewrite_execution_frontiers_[0]);
+    for (const auto& axis : positions_) bytes += axis.capacity() * sizeof(axis[0]);
+    for (const auto& item : vision_items_) {
+        bytes += item.timestamps.capacity() * sizeof(item.timestamps[0]);
+        bytes += item.token_spans.capacity() * sizeof(item.token_spans[0]);
+    }
+    return bytes;
+}
+
 void ResidentPrefixIdentity::clear() noexcept {
     token_types_.clear();
     for (auto& axis : positions_) { axis.clear(); }

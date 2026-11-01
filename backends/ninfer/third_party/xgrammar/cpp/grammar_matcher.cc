@@ -1848,6 +1848,33 @@ void GrammarMatcher::Impl::FillBitmaskForCharBudgetBoundary(
   temporary_input_bytes_ = std::move(saved_temporary_input_bytes);
 }
 
+/*!
+ * \brief NInfer: the counted repetition edge of `body_rule_id` that `state` sits on.
+ * \return Nullopt when `state` is not on such a repetition edge.
+ */
+static std::optional<RepeatEdgeRef> GetRepeatEdgeInfo(
+    const Grammar& grammar, const ParserState& state, int32_t body_rule_id
+) {
+  if (state.rule_id < 0) {
+    return std::nullopt;
+  }
+  const auto& rule_fsm = grammar->per_rule_fsms[state.rule_id];
+  if (!rule_fsm.has_value()) {
+    return std::nullopt;
+  }
+  for (const auto& edge : rule_fsm->GetFsm().GetFsm().GetEdges(state.element_id)) {
+    if (!edge.IsRepeatRef()) {
+      continue;
+    }
+    // Match the edge the way EarleyParser::Complete does: by the repeated rule.
+    const auto info = grammar->complete_fsm.GetRepeatEdgeInfo(edge.GetAuxIndex());
+    if (info.RuleId() == body_rule_id) {
+      return info;
+    }
+  }
+  return std::nullopt;
+}
+
 void GrammarMatcher::Impl::FillBitmaskForStates(
     int32_t* bitmask_data_ptr, int index, bool skip_expired, bool debug_print
 ) {
@@ -1899,6 +1926,57 @@ void GrammarMatcher::Impl::FillBitmaskForStates(
     } else if (adaptive_token_mask.store_type == StoreType::kAccepted) {
       for (auto idx : adaptive_token_mask.accepted_indices) {
         tmp_accepted_bitset_.Set(sorted_decoded_vocab[idx].first, true);
+      }
+    }
+    // NInfer: in the body state of a counted repetition, the compiled unit masks are
+    // count-independent (PopulateRepeatMasks). Resolve their budget against the active repetition
+    // parents, which hold the count, keeping each parent's lower bound for exit tokens.
+    if (!adaptive_token_mask.repeat_interior_bitsets.empty() ||
+        !adaptive_token_mask.repeat_interior_tokens.empty() ||
+        !adaptive_token_mask.repeat_exit_tokens.empty()) {
+      // PopulateRepeatMasks classifies only tokens of body rules entered through repeat edges
+      // alone, and none when character budgets are enforced. The mask lists none of these tokens
+      // as accepted, so without a repetition parent this state would silently reject them all.
+      XGRAMMAR_CHECK(
+          !has_char_budget_rules_ && state.rule_start_pos != ParserState::kNoPrevInputPos
+      ) << "The counted-repetition fast path does not apply to this state";
+      int32_t remaining = -1;
+      bool on_repeat = false;
+      for (const auto& [ref_rule_id, parent_state] :
+           rule_id_to_completable_states_[state.rule_start_pos]) {
+        if (ref_rule_id != state.rule_id) {
+          continue;
+        }
+        const auto info = GetRepeatEdgeInfo(grammar_, parent_state, state.rule_id);
+        if (!info.has_value()) {
+          continue;
+        }
+        on_repeat = true;
+        // Once budgets are enforced, an expired parent scans no further byte, so the repetitions
+        // it has left cannot be used.
+        if (skip_expired && IsExpiredState(parent_state)) {
+          continue;
+        }
+        const int32_t budget = info->Upper() - parent_state.repeat_count;
+        remaining = std::max(remaining, budget);
+        for (const auto& [num_repetitions, token_id] : adaptive_token_mask.repeat_exit_tokens) {
+          if (num_repetitions <= budget &&
+              parent_state.repeat_count + num_repetitions >= info->Lower()) {
+            tmp_accepted_bitset_.Set(token_id, true);
+          }
+        }
+      }
+      // The tokens that do not fit are rejected by this state without further work.
+      XGRAMMAR_CHECK(on_repeat) << "A counted-repetition body state has no repetition parent";
+      const auto& counts = adaptive_token_mask.repeat_interior_counts;
+      const auto it = std::upper_bound(counts.begin(), counts.end(), remaining);
+      if (it != counts.begin()) {
+        const size_t bucket = static_cast<size_t>(it - counts.begin()) - 1;
+        tmp_accepted_bitset_ |= adaptive_token_mask.repeat_interior_bitsets[bucket];
+      }
+      for (const auto& [count, token_id] : adaptive_token_mask.repeat_interior_tokens) {
+        if (count > remaining) break;
+        tmp_accepted_bitset_.Set(token_id, true);
       }
     }
   }

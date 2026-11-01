@@ -1,4 +1,8 @@
 #include "serve/http_server.h"
+#include "serve/openai_chat.h"
+#include "serve/kvmem_metrics.h"
+#include "kvmem/monitor.hpp"
+#include "kvmem/monitor_hardware.hpp"
 #include "serve/slot_files.h"
 
 #include "product/logging/logging.h"
@@ -14,6 +18,7 @@
 #include <spdlog/logger.h>
 
 #include <chrono>
+#include <cuda_runtime_api.h>
 #include <exception>
 #include <mutex>
 #include <stdexcept>
@@ -31,7 +36,7 @@ constexpr std::string_view kCorsAllowedHeaders =
 // API routes keep their own 404s. Every other GET path belongs to the WebUI, whose client-side
 // router owns paths the server has no file for.
 bool is_api_path(std::string_view path) {
-    return path == "/v1" || path.starts_with("/v1/") || path == "/health" || path == "/metrics" ||
+    return path.starts_with("/api/monitor/") || path == "/v1" || path.starts_with("/v1/") || path == "/health" || path == "/metrics" ||
            path == "/stats" || path == "/slots" || path == "/props" || path == "/models" ||
            path.starts_with("/models/") || path == "/completion" || path == "/completions" ||
            path == "/tokenize" || path == "/detokenize" || path == "/apply-template" ||
@@ -188,6 +193,8 @@ const char* endpoint_name(std::string_view request_path) noexcept {
         path == "/v1/reranking") {
         return "rerank";
     }
+    if (path == "/v1/systemone") { return "systemone"; }
+    if (path == "/v1/decisions") { return "openai_decisions"; }
     if (path == "/v1/responses") { return "openai_responses"; }
     if (path == "/v1/responses/input_tokens") { return "openai_responses_input_tokens"; }
     if (path == "/v1/messages") { return "anthropic_messages"; }
@@ -206,6 +213,12 @@ std::string response_request_id(const httplib::Response& response) {
 }
 
 } // namespace
+
+bool requires_api_key(const std::string& api_key, bool webui_enabled,
+                      const httplib::Request& request) {
+    return !api_key.empty() && request.path != "/health" && request.method != "OPTIONS" &&
+           !(webui_enabled && request.method == "GET" && !is_api_path(request.path));
+}
 
 void write_openai_error(httplib::Response& response, const ApiError& error) {
     response.status = error.status;
@@ -297,6 +310,8 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
       request_jsonl_(options_.request_log_jsonl, options_.artifact_path, std::move(logger),
                      static_cast<std::uint64_t>(options_.request_log_max_mib) << 20U,
                      options_.request_log_keep) {
+    monitor_ = std::make_unique<kvmem::monitor>();
+    monitor_hardware_ = std::make_unique<kvmem::monitor_hardware>();
     if (options_.log_stats_panel && panel != nullptr && panel->enabled()) {
         console_stats_ = std::make_unique<ConsoleStatsPanel>(std::move(panel));
     }
@@ -342,16 +357,24 @@ void HttpServer::RequestLifecycle::response_failure(const RequestFailure& failur
     owner_->record_response_failure(context_.id, failure);
 }
 
-std::shared_ptr<HttpServer::RequestLifecycle> HttpServer::begin_request(RequestLogContext context) {
-    return std::make_shared<RequestLifecycle>(*this, std::move(context));
+std::shared_ptr<HttpServer::RequestLifecycle> HttpServer::begin_request(RequestLogContext context, PreparedRequest& prepared) {
+    auto lifecycle = std::make_shared<RequestLifecycle>(*this, context);
+    const auto id = std::to_string(context.id);
+    prepared.monitor_update = [this, id](const nlohmann::json& values) { monitor_->update(id, values); };
+    monitor_->update(id, {{"prompt_tokens", prepared.prompt_tokens}, {"generated_tokens", 0}});
+    return lifecycle;
 }
 
 void HttpServer::record_request_start(const RequestLogContext& context) {
+    monitor_->begin(context.protocol, std::to_string(context.id));
+    monitor_->update(std::to_string(context.id), {{"limit", context.requested_output_tokens}, {"model", context.model}});
     request_jsonl_.write_request_start(context);
     operational_log_.request_start(context);
 }
 
 void HttpServer::record_request_rejected(const RequestRejectionLogContext& context) {
+    monitor_->begin(context.protocol, std::to_string(context.id));
+    monitor_->finish(std::to_string(context.id), "error");
     request_jsonl_.write_request_rejected(context);
     metrics_.record_rejection();
     operational_log_.request_rejected(context);
@@ -363,6 +386,8 @@ void HttpServer::record_request_rejected(const RequestRejectionLogContext& conte
 
 void HttpServer::record_request_done(const RequestLogContext& context,
                                      const GenerationOutcome& outcome) {
+    monitor_->update(std::to_string(context.id), kvmem_monitor_outcome(outcome));
+    monitor_->finish(std::to_string(context.id), "completed");
     request_jsonl_.write_request_done(context, outcome);
     metrics_.record_done(outcome);
     operational_log_.request_done(context, outcome);
@@ -371,6 +396,9 @@ void HttpServer::record_request_done(const RequestLogContext& context,
 
 void HttpServer::record_request_failure(const RequestLogContext& context,
                                         const RequestFailure& failure) {
+    monitor_->update(std::to_string(context.id), {{"finish_reason",
+        failure.classification == RequestFailureClass::ClientDisconnected ? "disconnect" : "error"}});
+    monitor_->finish(std::to_string(context.id), failure.classification == RequestFailureClass::ClientDisconnected ? "disconnected" : "error");
     request_jsonl_.write_request_error(context, failure.machine_message);
     metrics_.record_failure();
     operational_log_.request_failure(context, failure);
@@ -378,6 +406,7 @@ void HttpServer::record_request_failure(const RequestLogContext& context,
 }
 
 void HttpServer::record_response_failure(std::uint64_t request_id, const RequestFailure& failure) {
+    monitor_->finish(std::to_string(request_id), failure.classification == RequestFailureClass::ClientDisconnected ? "disconnected" : "error");
     operational_log_.response_failure(request_id, failure);
 }
 
@@ -456,6 +485,11 @@ void HttpServer::stop_stats_reporter() {
 httplib::Server::HandlerResponse HttpServer::pre_route(const httplib::Request& req,
                                                        httplib::Response& res) const {
     ensure_openai_request_id(req, res);
+    // Every response, the loading 503 and authentication failures included, so a caller can tell
+    // which build answered without a credential.
+    if (!options_.build_version.empty()) {
+        res.set_header("X-NInfer-Version", options_.build_version);
+    }
     if (!ready_.load(std::memory_order_acquire)) {
         // Runs for every route, including /health and OPTIONS, so a caller cannot tell "not
         // ready" apart from "unauthenticated" -- and skips the API-key check below, since a
@@ -475,12 +509,7 @@ httplib::Server::HandlerResponse HttpServer::pre_route(const httplib::Request& r
         }
         return httplib::Server::HandlerResponse::Handled;
     }
-    // The MCP relay carries no API key: the WebUI prefixes every header it means for the MCP
-    // server, its own Authorization included, so requiring the key would break the relay
-    // rather than protect it. It is opt-in, and the bind address is its boundary.
-    if (options_.api_key.empty() || req.path == "/health" || req.method == "OPTIONS" ||
-        (options_.webui_mcp_proxy && req.path == kMcpProxyPath) ||
-        (webui_enabled() && req.method == "GET" && !is_api_path(req.path))) {
+    if (!requires_api_key(options_.api_key, webui_enabled(), req)) {
         return httplib::Server::HandlerResponse::Unhandled;
     }
     // Accept both the OpenAI-style bearer token and the Anthropic-style
@@ -607,6 +636,13 @@ void HttpServer::register_routes() {
     server_.Get("/metrics", [this](const httplib::Request& req, httplib::Response& res) {
         handle_metrics(req, res);
     });
+    server_.Get("/api/monitor/snapshot", [this](const httplib::Request&, httplib::Response& res) {
+        auto data = monitor_->snapshot();
+        data["hardware"] = monitor_hardware_->snapshot();
+        data["backend"] = "ninfer";
+        res.set_header("Cache-Control", "no-store");
+        res.set_content(data.dump(), "application/json");
+    });
     server_.Get("/stats", [this](const httplib::Request& req, httplib::Response& res) {
         handle_stats(req, res);
     });
@@ -690,6 +726,14 @@ void HttpServer::register_routes() {
         register_post(endpoint, rerank);
         register_post(api_route_pattern(endpoint), rerank);
     }
+    register_post(api_route_pattern("/systemone"),
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_decisions(req, res, DecisionDialect::SystemOne);
+                  });
+    register_post(api_route_pattern("/decisions"),
+                  [this](const httplib::Request& req, httplib::Response& res) {
+                      handle_decisions(req, res, DecisionDialect::OpenAI);
+                  });
     register_post(api_route_pattern("/responses"),
                   [this](const httplib::Request& req, httplib::Response& res) {
                       handle_responses(req, res);
@@ -751,8 +795,10 @@ void HttpServer::handle_webui(const httplib::Request& req, httplib::Response& re
         return;
     }
     const bool gzip         = req.get_header_value("Accept-Encoding").find("gzip") != std::string::npos;
-    const WebUiAsset* asset = req.path.size() > 1
-                                  ? find_webui_asset(std::string_view(req.path).substr(1), gzip)
+    if (req.path == "/monitor") { res.set_redirect("/monitor/"); return; }
+    const std::string asset_path = req.path == "/monitor/" ? "/monitor/index.html" : req.path;
+    const WebUiAsset* asset = asset_path.size() > 1
+                                  ? find_webui_asset(std::string_view(asset_path).substr(1), gzip)
                                   : nullptr;
     if (asset == nullptr) { asset = find_webui_asset("index.html", gzip); }
     if (asset == nullptr) {
@@ -785,8 +831,9 @@ void HttpServer::handle_slots(const httplib::Request& req, httplib::Response& re
         return;
     }
     GenerationService& service = lease.service();
+    // The Engine's resolved backend: without --spec it may draft (SpeculativeOptions::automatic).
     const bool speculative =
-        service.options().speculative.backend != ninfer::SpeculativeBackend::None;
+        service.engine_options().speculative.backend != ninfer::SpeculativeBackend::None;
     const std::uint32_t context                 = service.options().max_context;
     const std::vector<ninfer::SlotState> states = service.slot_states();
     nlohmann::json slots                        = nlohmann::json::array();
@@ -990,7 +1037,9 @@ void HttpServer::handle_health(httplib::Response& res) const {
         }
     }
     res.status           = available ? 200 : 503;
-    res.set_content(nlohmann::json{{"status", available ? "ok" : "unavailable"}}.dump(),
+    res.set_content(nlohmann::json{{"status", available ? "ok" : "unavailable"},
+                                   {"version", options_.build_version}}
+                        .dump(),
                     "application/json");
 }
 
@@ -1035,12 +1084,14 @@ void HttpServer::handle_props(const httplib::Request& req, httplib::Response& re
     nlohmann::json props = {
         {"default_generation_settings",
          {{"n_ctx", facts.capacity.max_context},
-          {"speculative", options.speculative.backend != ninfer::SpeculativeBackend::None},
+          {"speculative",
+           service.engine_options().speculative.backend != ninfer::SpeculativeBackend::None},
           {"params", std::move(params)}}},
         {"total_slots", facts.capacity.max_concurrency},
         {"model_alias", lease.model()},
         {"model_path", options.artifact_path},
         {"modalities", {{"vision", options.enable_vision}, {"audio", false}}},
+        {"build_info", "ninfer " + options_.build_version},
         {"is_sleeping", service.residency().state == ninfer::ModelResidency::Suspended},
         {"endpoint_slots", true},
         {"endpoint_props", true},
@@ -1049,19 +1100,36 @@ void HttpServer::handle_props(const httplib::Request& req, httplib::Response& re
         {"cors_proxy_enabled", options_.webui_mcp_proxy},
     };
     props["backend"] = "ninfer";
+    kvmem::SpeculativeConfig spec;
+    if (options.speculative.backend == SpeculativeBackend::Mtp) spec.algorithm = kvmem::SpeculativeAlgorithm::Mtp;
+    if (options.speculative.backend == SpeculativeBackend::DFlash) spec.algorithm = kvmem::SpeculativeAlgorithm::DFlash;
+    if (options.speculative.backend == SpeculativeBackend::DFlash2) spec.algorithm = kvmem::SpeculativeAlgorithm::DFlash2;
+    spec.draft_tokens = options.speculative.draft_tokens;
+    spec.adaptive = options.speculative.mtp_policy == MtpDraftPolicy::Adaptive;
+    spec.ngram_draft_tokens = options.speculative.ngram_draft_tokens;
+    props["speculative"] = kvmem::speculative_json<nlohmann::json>(spec,
+        {{kvmem::SpeculativeAlgorithm::Mtp, 15, true, true, 8, 8, "embedded"},
+         {kvmem::SpeculativeAlgorithm::DFlash2, 15, false, true, kMaximumConcurrency, 1, "embedded"}}, metrics_.speculative_statistics());
     const auto& execution = service.engine_options();
     props["execution"] = {{"mode", execution.devices.size() > 1 ? "layer" : "single"},
         {"devices", execution.devices.empty() ? std::vector<int>{execution.device} : execution.devices},
-        {"stage_layers", execution.stage_layers}};
+        {"stage_layers", execution.stage_layers}, {"monitor_devices", facts.monitor_devices}};
+    if (options.enable_vision && options.vision_residency == VisionResidency::Cpu) {
+        const auto memory = service.memory_summary();
+        if (memory.vision_workspace && memory.vision_workspace->cpu_weights_lazy) {
+            const auto& vision = *memory.vision_workspace;
+            props["cpu_vision"] = {{"resident", vision.cpu_weight_bytes != 0}, {"loading", vision.cpu_weights_loading},
+                {"weight_bytes", vision.cpu_weight_bytes}, {"active_encoders", vision.cpu_weight_users},
+                {"load_count", vision.cpu_weight_loads}, {"unload_count", vision.cpu_weight_unloads},
+                {"last_load_seconds", vision.cpu_weight_last_load_seconds},
+                {"idle_timeout_seconds", vision.cpu_weight_idle_seconds}};
+        }
+    }
     props["kvmem"] = {{"enabled", options.kvmem.selected_tokens != 0},
         {"selected_tokens", options.kvmem.selected_tokens},
         {"reserve_tokens", options.kvmem.reserve_tokens},
         {"sink_tokens", options.kvmem.sink_tokens},
         {"recent_tokens", options.kvmem.recent_tokens},
-        {"keep", options.kvmem.keep},
-        {"keep_answer_percent", options.kvmem.keep_answer_percent},
-        {"pin_answer", options.kvmem.keep},
-        {"pin_answer_percent", options.kvmem.keep_answer_percent},
         {"host_payload_budget_bytes", options.kvmem.host_bytes}};
     if (options.kvmem.selected_tokens) {
         props["kvmem"]["usage"] = kvmem_status_json(service.runtime_stats().kvmem);
@@ -1071,12 +1139,12 @@ void HttpServer::handle_props(const httplib::Request& req, httplib::Response& re
             {"active_kv_tiering", true},
             {"ssd_enabled", options.kvmem.disk_bytes != 0},
             {"ssd_persistence", "process"},
-            {"speculative_decoding", options.speculative.backend == SpeculativeBackend::Mtp},
+            {"speculative_decoding", options.speculative.backend != SpeculativeBackend::None},
             {"mtp_drafts", options.speculative.draft_tokens}, {"multimodal", options.enable_vision},
             {"ngram_drafts", options.speculative.ngram_draft_tokens},
             {"ngram_min_match", options.speculative.ngram_min_match},
             {"max_active_requests", options.max_concurrency},
-            {"retained_sessions", options.kvmem.retained_sessions},
+            {"retained_sessions_limit", options.kvmem.retained_sessions},
             {"multi_gpu_mode", execution.devices.size() > 1 ? "layer" : "single"},
             {"shared_host_history", true},
             {"disk_budget_bytes", options.kvmem.disk_bytes},
@@ -1376,6 +1444,26 @@ HttpServer::ModelFacts HttpServer::model_facts(const ModelRegistry::Lease& lease
     }
     // memory_summary() takes the Engine execution lock: computed once per Engine instance.
     ModelFacts facts;
+    // Resolve CUDA-visible ordinals once for this loaded model. NVML ordinals are not
+    // equivalent when CUDA_VISIBLE_DEVICES reorders or hides physical devices.
+    const auto& execution = service.engine_options();
+    const auto devices = execution.devices.empty() ? std::vector<int>{execution.device} : execution.devices;
+    for (int ordinal : devices) {
+        nlohmann::json device = {{"name", "CUDA" + std::to_string(ordinal)}, {"uuid", nullptr}};
+        cudaDeviceProp properties{};
+        if (cudaGetDeviceProperties(&properties, ordinal) == cudaSuccess) {
+            std::string uuid = "GPU-";
+            constexpr char hex[] = "0123456789abcdef";
+            for (int i = 0; i < 16; ++i) {
+                if (i == 4 || i == 6 || i == 8 || i == 10) uuid += '-';
+                const auto byte = static_cast<unsigned char>(properties.uuid.bytes[i]);
+                uuid += hex[byte >> 4]; uuid += hex[byte & 15];
+            }
+            device["uuid"] = uuid;
+            device["name"] = properties.name;
+        }
+        facts.monitor_devices.push_back(std::move(device));
+    }
     facts.service                      = &service;
     facts.metadata                     = service.model_metadata();
     facts.vision                       = service.engine_options().enable_vision;

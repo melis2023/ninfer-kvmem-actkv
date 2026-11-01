@@ -1,8 +1,10 @@
 # KV and speculation sweeps
 
-The PowerShell behind every number in TODO §2b, README's "Choosing a KV format" table, and
-`docs/config-calculator.html`. Committed because §2b asks for re-measurement and reconstructing
-these is an hour of work, not because they are polished tooling.
+The PowerShell measurements behind the KV-format table in [performance](../../docs/performance.md)
+and the constants of [`docs/config-calculator.html`](../../docs/config-calculator.html), written for
+one Windows RTX 3090 host (power-capped at 315 W, 64 GiB of RAM shared with WSL). They are kept so
+those figures can be measured again; they are lab scripts, not polished tooling, and their comments
+cite the notebook they were written for.
 
 All of them expect a Release `build-ninja` and run from the repository root:
 
@@ -50,7 +52,7 @@ about three hours for twelve model/format combinations.
 divides achieved bandwidth by peak. Run that sweep first. Note it only means anything for the
 **dense** model -- applied to the A3B MoE it returns 391% of peak, which is not a result but a
 demonstration that the formula does not hold there, since an MoE never reads its resident weights
-per token. See TODO section 2c.
+per token.
 
 `vision-encode-throughput.ps1` needs a vision-capable artifact and nothing else. It resizes the
 committed `bench/fixtures/ttft/media` photograph rather than generating synthetic images, because a

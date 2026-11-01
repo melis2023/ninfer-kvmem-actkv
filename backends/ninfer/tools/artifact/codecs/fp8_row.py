@@ -1,4 +1,4 @@
-"""Exact E4M3FN code words and BF16 row scales in row_scale_v1 layout."""
+"""Exact E4M3FN words with BF16 scale planes or interleaved binary16 scales."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ from typing import Sequence
 
 import torch
 
-from ..layouts import row_scale_geometry
+from ..layouts import row_interleaved_geometry, row_scale_geometry
 from ._tensor_bytes import (
     Payload,
     _exact_uint8_matrix,
@@ -25,10 +25,14 @@ def _exact_bf16_vector(tensor: torch.Tensor, length: int, label: str) -> torch.T
 def validate_fp8_row_words(codes: torch.Tensor, scales: torch.Tensor) -> None:
     if bool(((codes & 0x7F) == 0x7F).any()):
         raise ValueError("row-scaled FP8 codes must be finite E4M3FN words")
+    if scales.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError("row-scaled FP8 scales must be BF16 or FP16")
     scale_words = scales.view(torch.int16).to(torch.int32) & 0xFFFF
-    invalid_scales = ((scale_words & 0x8000) != 0) | ((scale_words & 0x7F80) == 0x7F80)
+    exponent = 0x7F80 if scales.dtype == torch.bfloat16 else 0x7C00
+    invalid_scales = ((scale_words & 0x8000) != 0) | ((scale_words & exponent) == exponent)
     if bool(invalid_scales.any()):
-        raise ValueError("row-scaled FP8 scales must be nonnegative finite BF16 words")
+        name = "BF16" if scales.dtype == torch.bfloat16 else "FP16"
+        raise ValueError(f"row-scaled FP8 scales must be nonnegative finite {name} words")
     zero_scale = scale_words == 0
     nonzero_code = (codes & 0x7F) != 0
     if bool((zero_scale.unsqueeze(1) & nonzero_code).any()):
@@ -80,6 +84,39 @@ def decode_fp8_row_scaled_words(
     scale_begin = geometry.scale_plane_offset
     scale_bytes = raw[scale_begin : scale_begin + geometry.scale_plane_bytes]
     scales = decode_direct(scale_bytes, "bf16", (geometry.n,))
+    validate_fp8_row_words(codes, scales)
+    return codes, scales
+
+
+def encode_fp8_row_interleaved(
+    code_words: torch.Tensor, row_scales: torch.Tensor, shape: Sequence[int]
+) -> bytes:
+    """Store each row's K E4M3FN bytes immediately before its little-endian FP16 scale."""
+    g = row_interleaved_geometry("fp8_e4m3fn_row_fp16", shape)
+    codes = _exact_uint8_matrix(code_words, (g.n, g.k), "row-scaled FP8 codes")
+    if row_scales.dtype != torch.float16 or tuple(row_scales.shape) != (g.n,):
+        raise TypeError(f"row-scaled FP8 scales must be FP16 with shape ({g.n},)")
+    scales = row_scales.detach().contiguous().cpu()
+    validate_fp8_row_words(codes, scales)
+    raw = torch.empty((g.n, g.row_bytes), dtype=torch.uint8)
+    raw[:, :g.k] = codes
+    # Explicit byte order, independent of the host tensor's word representation.
+    words = scales.view(torch.int16).to(torch.int32) & 0xFFFF
+    raw[:, g.k] = (words & 255).to(torch.uint8)
+    raw[:, g.k + 1] = (words >> 8).to(torch.uint8)
+    return raw.numpy().tobytes()
+
+
+def decode_fp8_row_interleaved_words(
+    payload: Payload, shape: Sequence[int]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    g = row_interleaved_geometry("fp8_e4m3fn_row_fp16", shape)
+    if _payload_length(payload) != g.payload_bytes:
+        raise ValueError(f"interleaved FP8 payload must contain {g.payload_bytes} bytes")
+    raw = _payload_tensor(payload, torch.device("cpu")).reshape(g.n, g.row_bytes)
+    codes = raw[:, :g.k].clone()
+    words = raw[:, g.k].to(torch.int32) | (raw[:, g.k + 1].to(torch.int32) << 8)
+    scales = words.to(torch.int16).view(torch.float16)
     validate_fp8_row_words(codes, scales)
     return codes, scales
 

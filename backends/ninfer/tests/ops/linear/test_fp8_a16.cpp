@@ -1,6 +1,7 @@
 #include "core/weight.h"
 #include "ops/linear/linear_test_common.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/sm70/sm70_project.h"
 
 #include <array>
 #include <exception>
@@ -76,7 +77,12 @@ int run_fp8_a16() {
         try {
             const std::size_t capacity = ops::linear_workspace_capacity_bytes(
                 QType::FP8_E4M3FN_ROW_BF16, 248320, 5120, policy, 1, 2048);
-            if (capacity != 0) {
+            // sm_70's wide route is the one A16 route that holds workspace (ops/linear/sm70).
+            const std::size_t expected =
+                ops::detail::sm70::takes(2048)
+                    ? ops::detail::sm70::workspace_bytes(248320, 5120, 2048)
+                    : 0;
+            if (capacity != expected) {
                 std::cerr << "FP8 vocabulary A16 route reported nonzero workspace\n";
                 ++failures;
             }

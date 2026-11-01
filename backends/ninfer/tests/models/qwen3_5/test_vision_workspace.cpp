@@ -4,6 +4,7 @@
 #include "models/qwen3_5/load.h"
 #include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/program/program.h"
+#include "ops/common/device_tier.h"
 #include <cstdlib>
 
 #include "models/qwen3_5/frontend/prepared_prompt.h"
@@ -22,8 +23,13 @@ int run() {
     if (!artifact || !*artifact) { return 77; }
     static_assert(ninfer::models::qwen3_5::kMaximumVisionItemTokens == 16384);
     // The current Vision route fits below 827 MiB, including arena alignment and empty-scratch
-    // backing. The context growth check below protects the single-item lifetime bound.
-    constexpr std::size_t kWorkspaceCeiling = 827ULL << 20;
+    // backing; a Volta card's wide projections stage FP16 activations and FP32 product planes
+    // (ops/linear/sm70) for 8,192 patches at a time and take 988 MiB for the 16K-token item. The
+    // context growth check below protects the single-item lifetime bound.
+    const auto workspace_ceiling = [] {
+        return ninfer::ops::current_device_volta() ? std::size_t{990} << 20
+                                                   : std::size_t{827} << 20;
+    };
     try {
         int devices       = 0;
         const auto status = cudaGetDeviceCount(&devices);
@@ -58,13 +64,14 @@ int run() {
         // Increasing total context cannot exceed the single Vision item's 16K workspace.
         const auto at_item_limit    = capacity(16384);
         const auto above_item_limit = capacity(131072);
-        if (at_item_limit == 0 || at_item_limit > kWorkspaceCeiling ||
+        if (at_item_limit == 0 || at_item_limit > workspace_ceiling() ||
             above_item_limit != at_item_limit) {
             throw std::runtime_error("Vision workspace exceeded the single-item bound: at=" +
                                      std::to_string(at_item_limit) +
                                      " above=" + std::to_string(above_item_limit));
         }
-        std::cout << "Vision workspace remains bounded for long text context\n";
+        std::cout << "Vision workspace remains bounded for long text context: "
+                  << (at_item_limit >> 20) << " MiB\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

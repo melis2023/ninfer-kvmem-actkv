@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <set>
 #include <string>
 #include <string_view>
@@ -13,8 +14,9 @@
 
 // Token log probabilities on a real model through the public Engine, for any model family:
 // NINFER_LOGPROBS_ARTIFACT names the artifact, NINFER_LOGPROBS_NGRAM_TABLE a Qwen3.8-Flash-Next
-// table artifact, and NINFER_LOGPROBS_SPECULATIVE=mtp|dflash2 verifies the tokens in speculative
-// rounds.
+// table artifact, NINFER_LOGPROBS_SPECULATIVE=mtp|dflash2 verifies the tokens in speculative
+// rounds, and NINFER_LOGPROBS_CONTEXT_CACHE=hybrid admits every request through the hybrid prefix
+// cache.
 namespace {
 
 int g_failures = 0;
@@ -34,8 +36,24 @@ ninfer::EngineOptions engine_options(const char* artifact) {
     options.max_concurrency      = 3;
     options.max_pending_requests = 3;
     options.structured_output    = true;
+    if (const char* devices = std::getenv("NINFER_LOGPROBS_DEVICES"); devices && *devices) {
+        const std::string list(devices);
+        for (std::size_t begin = 0; begin < list.size();) {
+            const auto end = list.find(',', begin);
+            options.devices.push_back(std::stoi(list.substr(begin, end - begin)));
+            if (end == std::string::npos) { break; }
+            begin = end + 1;
+        }
+    }
     if (const char* table = std::getenv("NINFER_LOGPROBS_NGRAM_TABLE"); table && *table) {
         options.ngram_table.path = table;
+    }
+    if (const char* cache = std::getenv("NINFER_LOGPROBS_CONTEXT_CACHE");
+        cache != nullptr && std::string_view(cache) == "hybrid") {
+        options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(options.max_context *
+                                                                          options.max_concurrency);
+        options.context_cache.mode                    = ninfer::ContextCacheMode::Hybrid;
+        options.context_cache.host_cache_budget_bytes = 1ULL << 30;
     }
     if (const char* spec = std::getenv("NINFER_LOGPROBS_SPECULATIVE"); spec && *spec) {
         const std::string_view backend(spec);
@@ -223,6 +241,106 @@ int run() {
         opens                    = text == std::string::npos || bytes[text] == '{';
     }
     check(opens, "the grammar's mask reached the gather");
+
+    // Two constrained requests admitted together: on a Qwen3.5-core model under the hybrid cache
+    // (the server's default) their prompts share one prefill pass, whose rows each sample under
+    // their own lane's first mask. The legacy cache splits a chat prompt at its turn closure, and
+    // no shared pass crosses that split.
+    {
+        const ninfer::RuntimeStats before = engine.runtime_stats();
+        std::vector<ninfer::GenerationSubmission> group;
+        for (const char* question : {"Name one color.", "Name one animal."}) {
+            group.push_back(ninfer::GenerationSubmission{.prompt = engine.prepare(prompt(question)),
+                                                         .options = json});
+        }
+        std::size_t index = 0;
+        for (ninfer::GenerationHandle& handle : engine.submit_group(std::move(group))) {
+            const ninfer::GenerationResult result = handle.wait();
+            const std::string label               = "grouped json " + std::to_string(index++);
+            std::cout << label << ": " << result.content << '\n';
+            check_records(result.content_logprobs, true, label);
+            bool masked = !result.content_logprobs.empty();
+            for (std::size_t k = 0; masked && k < ninfer::kMaximumTokenLogprobs; ++k) {
+                const ninfer::TokenLogprob& first = result.content_logprobs.front();
+                if (first.top_ids[k] < 0) { break; }
+                const std::string& bytes = first.top_bytes[k];
+                const std::size_t text   = bytes.find_first_not_of(" \t\r\n");
+                masked                   = text == std::string::npos || bytes[text] == '{';
+            }
+            check(masked, label + ": its own mask reached the shared pass");
+        }
+        const ninfer::RuntimeStats after = engine.runtime_stats();
+        const std::uint64_t passes = after.shared_prefill_passes - before.shared_prefill_passes;
+        const std::uint64_t requests =
+            after.shared_prefill_requests - before.shared_prefill_requests;
+        std::cout << "grouped json: " << passes << " shared passes of " << requests
+                  << " requests\n";
+        const char* cache         = std::getenv("NINFER_LOGPROBS_CONTEXT_CACHE");
+        const bool hybrid         = cache != nullptr && std::string_view(cache) == "hybrid";
+        const std::uint32_t limit = engine.branch_token_limit();
+        if (hybrid && limit != 0 && limit != std::numeric_limits<std::uint32_t>::max()) {
+            check(passes == 1 && requests == 2, "the constrained requests shared one prefill pass");
+        }
+    }
+
+    // Schemas whose root is not an object constrain the answer from its first token: every
+    // alternative for it opens the root's value, and the answer is that value.
+    const std::string notes_question =
+        "List three short notes about running a local LLM on one GPU. JSON only.";
+    const auto first_opens_with = [](const ninfer::GenerationResult& result, char open) {
+        if (result.content_logprobs.empty()) { return false; }
+        const ninfer::TokenLogprob& first = result.content_logprobs.front();
+        for (std::size_t k = 0; k < ninfer::kMaximumTokenLogprobs; ++k) {
+            if (first.top_ids[k] < 0) { break; }
+            const std::string& bytes = first.top_bytes[k];
+            const std::size_t text   = bytes.find_first_not_of(" \t\r\n");
+            if (text != std::string::npos && bytes[text] != open) { return false; }
+        }
+        return true;
+    };
+    const auto trimmed = [](const std::string& text) {
+        const std::size_t begin = text.find_first_not_of(" \t\r\n");
+        const std::size_t end   = text.find_last_not_of(" \t\r\n");
+        return begin == std::string::npos ? std::string() : text.substr(begin, end - begin + 1);
+    };
+    ninfer::RequestOptions list           = request(true, 160);
+    list.execution.structured_output.kind = ninfer::StructuredOutputKind::JsonSchema;
+    list.execution.structured_output.schema =
+        R"({"type":"array","items":{"type":"string"},"minItems":3,"maxItems":3})";
+    list.execution.structured_output.strict = true;
+    const ninfer::GenerationResult notes =
+        engine.generate(engine.prepare(prompt(notes_question)), list);
+    std::cout << "array: " << notes.content << '\n';
+    check(first_opens_with(notes, '['), "an array root's mask reached the first token");
+    check(trimmed(notes.content).starts_with('[') &&
+              (notes.finish_reason != ninfer::FinishReason::StopToken ||
+               trimmed(notes.content).ends_with(']')),
+          "an array root's answer is an array");
+
+    ninfer::RequestOptions text             = request(true, 96);
+    text.execution.structured_output.kind   = ninfer::StructuredOutputKind::JsonSchema;
+    text.execution.structured_output.schema = R"({"type":"string","minLength":10,"maxLength":100})";
+    const ninfer::GenerationResult note =
+        engine.generate(engine.prepare(prompt(notes_question)), text);
+    std::cout << "string: " << note.content << '\n';
+    check(first_opens_with(note, '"'), "a string root's mask reached the first token");
+
+    ninfer::RequestOptions count             = request(true, 16);
+    count.execution.structured_output.kind   = ninfer::StructuredOutputKind::JsonSchema;
+    count.execution.structured_output.schema = R"({"type":"integer","minimum":1,"maximum":5})";
+    const ninfer::GenerationResult number    = engine.generate(
+        engine.prepare(prompt("How many notes is a short list? JSON only.")), count);
+    std::cout << "integer: " << number.content << '\n';
+    const std::string digits = trimmed(number.content);
+    check(number.finish_reason == ninfer::FinishReason::StopToken && digits.size() == 1 &&
+              digits[0] >= '1' && digits[0] <= '5',
+          "an integer root's answer is an integer within its bounds");
+
+    // The structured requests leave nothing on their lanes: the plain request decodes as before.
+    const ninfer::GenerationResult after =
+        engine.generate(engine.prepare(prompt(question)), request(false, 96));
+    check(after.generated_token_ids == greedy.generated_token_ids && after.content_logprobs.empty(),
+          "a plain request after structured ones is unconstrained and gathers no records");
     return g_failures == 0 ? 0 : 1;
 }
 

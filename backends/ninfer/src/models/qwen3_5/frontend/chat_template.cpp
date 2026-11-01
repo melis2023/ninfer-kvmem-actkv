@@ -1,5 +1,7 @@
 #include "models/qwen3_5/frontend/chat_template.h"
 
+#include "models/qwen3_5/frontend/flint_output.h"
+#include "models/qwen3_5/frontend/gemma_output.h"
 #include "models/qwen3_5/frontend/media_cache.h"
 #include "models/qwen3_5/frontend/prompt_layout.h"
 #include "text/unicode.h"
@@ -32,9 +34,29 @@ std::string_view role_name(ChatRole role) {
 
 bool instruction(ChatRole role) { return role == ChatRole::System || role == ChatRole::Developer; }
 
-// Opener of Qwen's call syntax, written into the generation prompt when the caller forced a
-// function: everything after it can only be that call.
-constexpr std::string_view kToolCallOpen = "<tool_call>\n<function=";
+// What the generation prompt ends with when the caller forced a function: the syntax's call opener
+// up to the function name, then what follows the name. Everything the model produces after it can
+// only continue that call.
+struct ForcedCallOpener {
+    std::string head;
+    std::string_view tail;
+};
+
+ForcedCallOpener forced_call_opener(ToolCallSyntax syntax) {
+    switch (syntax) {
+    case ToolCallSyntax::Qwen:
+        return {.head = "<tool_call>\n<function=", .tail = ">\n"};
+    case ToolCallSyntax::Gemma:
+        // <|tool_call> is a special token, which the tokenizer reads here as it does in the
+        // template's own rendering of an earlier call; the name is the only literal text.
+        return {.head = std::string(kGemmaCallOpen) + std::string(kGemmaCallHead),
+                .tail = kGemmaArgumentsOpen};
+    case ToolCallSyntax::Flint:
+        // <tool_call> is a token of Flint's vocabulary; the arguments follow the name directly.
+        return {.head = std::string(kFlintCallOpen), .tail = {}};
+    }
+    throw std::invalid_argument("invalid tool call syntax");
+}
 
 struct ContentSource {
     std::uint32_t tag = 0;
@@ -42,6 +64,7 @@ struct ContentSource {
     std::vector<std::uint32_t> part_tags;
     std::vector<std::optional<std::size_t>> part_media;
     std::uint32_t reasoning_tag = 0;
+    std::uint32_t tool_calls_tag = 0;
 };
 
 // Thinking efforts in ascending order; bit i of an accepted-effort mask stands for entry i.
@@ -308,6 +331,7 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
         }
         if (!message.tool_calls.empty()) {
             value["tool_calls"] = Json::array();
+            origin.tool_calls_tag = tag(pointer + "/tool_calls");
             for (const auto& call : message.tool_calls) {
                 value["tool_calls"].push_back(
                     {{"id", call.id},
@@ -326,7 +350,14 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
     if (!options.tool_jsons.empty()) {
         context["tools"] = Json::array();
         for (std::size_t i = 0; i < options.tool_jsons.size(); ++i) {
-            context["tools"].push_back(Json::parse(options.tool_jsons[i]));
+            Json tool = Json::parse(options.tool_jsons[i]);
+            // `strict` selects the output contract's grammar; the model reads a definition as its
+            // template was trained on it, without that server flag.
+            if (tool.is_object()) {
+                const auto function = tool.find("function");
+                if (function != tool.end() && function->is_object()) { function->erase("strict"); }
+            }
+            context["tools"].push_back(std::move(tool));
             tool_tags.push_back(tag("/tools/" + std::to_string(i)));
         }
     }
@@ -441,6 +472,7 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
         };
         for (const auto& region : output.regions) {
             if (region.tag == origin.tag || region.tag == origin.reasoning_tag ||
+                region.tag == origin.tool_calls_tag ||
                 std::find(origin.part_tags.begin(), origin.part_tags.end(), region.tag) !=
                     origin.part_tags.end()) {
                 include({region.begin, region.end});
@@ -459,9 +491,29 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
             break;
         }
     }
+    // Tool continuation: score history against the action that opened the tool call,
+    // not against the user's original question. Accept both the raw tool-result turn
+    // and the follow-up user turn immediately after it.
+    const bool tool_continuation =
+        (!messages.empty() && messages.back().role == ChatRole::Tool) ||
+        (messages.size() >= 2 && messages[messages.size() - 2].role == ChatRole::Tool);
+    if (tool_continuation) {
+        for (std::size_t i = messages.size(); i > 0; --i) {
+            const auto& message = messages[i - 1];
+            if (message.role == ChatRole::Assistant && !message.tool_calls.empty()) {
+                result.action_region = content_regions[i - 1];
+                break;
+            }
+        }
+    }
     for (std::size_t i = messages.size(); i > 0; --i) {
         if (real_user(messages[i - 1])) {
-            result.memory_query = content_regions[i - 1];
+            // Ordinary tool continuation is append + Pressure, even on a cold
+            // session. Transport roles, rather than cached Q availability, decide.
+            const bool tools = std::any_of(messages.begin() + i, messages.end(),
+                [](const auto& message) { return message.role == ChatRole::Tool ||
+                    (message.role == ChatRole::User && !real_user(message)); });
+            if (!tools) result.memory_query = content_regions[i - 1];
             break;
         }
     }
@@ -588,15 +640,24 @@ RenderedChat CompiledChatTemplate::render_as(const std::vector<ChatMessage>& mes
             break;
         }
     }
+    if (options.tool_call_syntax == ToolCallSyntax::Flint && !continuation &&
+        options.add_generation_prompt && context.value("enable_thinking", true) == false) {
+        // Flint's template has no thinking switch, and the model opens <think> itself when it
+        // reasons. Disabled thinking closes an empty reasoning block, GLM's switch for the same
+        // role-marker format: after it Flint answers at once.
+        output.text.append(kFlintThinkOpen);
+        output.text.append(kFlintThinkClose);
+    }
     if (!options.forced_tool_name.empty()) {
-        // Qwen's call syntax opens with the function name; everything the model produces after
-        // this can only be that call. The name is caller text, so it is a literal span like any
-        // other user-sourced bytes.
-        output.text.append(kToolCallOpen);
+        // The syntax's call opens with the function name; everything the model produces after
+        // this can only continue that call. The name is caller text, so it is a literal span like
+        // any other user-sourced bytes.
+        const ForcedCallOpener opener = forced_call_opener(options.tool_call_syntax);
+        output.text.append(opener.head);
         const std::size_t name_begin = output.text.size();
         output.text.append(options.forced_tool_name);
         output.literal_spans.push_back(text::ByteSpan{name_begin, output.text.size()});
-        output.text.append(">\n");
+        output.text.append(opener.tail);
     }
     result.text          = std::move(output.text);
     result.literal_spans = std::move(output.literal_spans);

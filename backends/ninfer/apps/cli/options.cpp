@@ -1,6 +1,10 @@
 #include "options.h"
+#include "product/kv_resident_options.h"
+#include "product/ngram_table_options.h"
+#include "product/hybrid_expert_options.h"
 #include "product/cuda_memory_options.h"
 #include "product/post_thinking_options.h"
+#include "product/reasoning_loop_options.h"
 #include "product/rope_yarn_options.h"
 #include "product/speculative_options.h"
 
@@ -149,6 +153,7 @@ std::string usage_text(const char* argv0) {
            "Runs one generation: the answer streams to stdout, reasoning and diagnostics\n"
            "to stderr.\n"
            "  --help, -h                    show this help and exit\n"
+           "  --version                     print the build version and exit\n"
            "\n"
            "INPUT\n"
            "  --prompt TEXT                 one user message\n"
@@ -161,32 +166,32 @@ std::string usage_text(const char* argv0) {
            "CONTEXT\n"
            "  --max-context N               context ceiling in tokens (default 2048)\n"
            "  --prefill-chunk N             prefill chunk in tokens, a multiple of 128\n"
-           "                                (default 1024)\n"
+           "                                (default 1024; 4096 for native MoE experts\n"
+           "                                in host memory or files)\n"
            "  --max-new N                   cap on generated tokens (default 128)\n"
            "  --device N                    CUDA device index (default 0)\n"
            "  --devices A,B,...             one pipeline stage per listed GPU, each owning\n"
            "                                its layers' weights, KV cache and state, the\n"
            "                                first also the embedding, head and round state;\n"
-           "                                Linux/Windows; a repeated id (--devices 0,0)\n"
+           "                                the cards may differ where the build runs on\n"
+           "                                each, and a repeated id (--devices 0,0)\n"
            "                                exercises the path on one GPU\n"
            "  --stage-layers A,B,...        layers per stage (default: split by each GPU's\n"
            "                                free memory)\n"
-           "  --expert-residency device|host|disk  Qwen3.8-Flash-Next: expert banks in GPU\n"
-           "                                memory (default), in pinned host memory read\n"
-           "                                across the bus, or left in the artifact's files\n"
-           "                                and streamed into the device expert cache\n"
-           "  --expert-cache-mib N|auto     with host or disk experts: device memory for the\n"
-           "                                most used experts (default auto: what is free;\n"
-           "                                0 turns the host cache off; disk needs one)\n"
-           "  --ngram-table PATH            Qwen3.8-Flash-Next: the n-gram table artifact,\n"
-           "                                for a model published without its table\n"
-           "  --ngram-ram                   Qwen3.8-Flash-Next: load the n-gram table into\n"
-           "                                RAM instead of reading its rows from the file\n"
-           "  --no-ngram-table              Qwen3.8-Flash-Next: run without the n-gram table.\n"
-           "                                Non-standard experimental mode: the model was\n"
-           "                                trained with the table and degrades badly\n"
-           "                                without it (WikiText-2 perplexity 2.66 -> 5.01)\n"
+           "  --tensor-parallel             the --devices share every layer: GDN heads and\n"
+           "                                dense FFN rows; attention, KV, head and MTP on\n"
+           "                                the first (dense Qwen3.5-core GGUF models)\n"
+           "  --expert-residency device|host|disk  MoE experts on GPU (default), in pinned\n"
+           "                                host memory, or in artifact files\n"
+           "  --expert-cache-mib N|auto     persistent GPU cache (default auto); native Qwen,\n"
+           "                                Gemma and Flint allow 0 (layer banks only).\n"
+           "                                Flash-Next disk requires a nonzero cache\n" +
+           std::string(ninfer::product::kHybridExpertHelp) +
+           std::string(ninfer::product::kNgramTableHelp) +
            "  --no-cuda-graph               decode without CUDA Graphs\n"
+           "  --gpu-clock-floor MHZ         hold the GPUs' graphics clock at MHZ or more while\n"
+           "                                a request runs, so pipeline stages do not wait at\n"
+           "                                idle clocks (needs administrator or root rights)\n"
            "\n"
            "KV CACHE\n"
            "  --kv-capacity N|auto          KV capacity in tokens (default --max-context);\n"
@@ -196,11 +201,17 @@ std::string usage_text(const char* argv0) {
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            "); alias --vram-headroom-mib\n"
            "  --kv-dtype T                  bf16 (default), int8, fp8, rk8v4, rk4v4,\n"
-           "                                rk4v4-e8, rk2v4-e8, nvfp4 or k8v4\n"
+           "                                rk4v4-e8, rk2v4-e8, nvfp4 or k8v4\n" +
+           std::string(product::kKvResidentHelp) +
            "\n"
-           "SPECULATIVE DECODING (off by default)\n"
-           "  --spec mtp|dflash|dflash2     speculative decoding backend\n"
+           "SPECULATIVE DECODING\n"
+           "  --spec none|mtp|dflash|dflash2\n"
+           "                                speculative decoding backend (default: mtp with 3\n"
+           "                                drafts for Flash-Next and Gemma 4 host or disk\n"
+           "                                experts whose artifact has the drafter, else none)\n"
            "  --draft-tokens N              drafts per round, 1..15\n"
+           "  --draft-min-p P              Flash-Next MTP confidence floor, 0..1 (default 0;\n"
+           "                                0.5 when the engine chooses MTP)\n"
            "  --lm-head-draft               draft with the optimized proposal head, which\n"
            "                                the artifact must store (the default when it does)\n"
            "  --full-draft-head             draft with the full output head even when the\n"
@@ -216,10 +227,10 @@ std::string usage_text(const char* argv0) {
            "                                --spec is set, 0 disables it\n"
            "  --ngram-min-match N           shortest match a copy is drawn from, 4..64\n"
            "                                (default 12)\n"
-           "  --lookup-ngram N              context-lookup drafting alongside --spec: the\n"
-           "                                last N tokens are matched against the sequence\n"
-           "                                so far and what followed is proposed (default 0:\n"
-           "                                off)\n"
+           "  --lookup-ngram N              context-lookup drafting alongside --spec (Flint,\n"
+           "                                which has no drafter, without it): the last N\n"
+           "                                tokens are matched against the sequence so far\n"
+           "                                and what followed is proposed (default 0: off)\n"
            "\n"
            "PRECISION & KERNELS (off by default)\n"
            "  --lm-head-q4 | --lm-head-q6   store the output head as Q4 or Q6 while loading\n"
@@ -234,6 +245,13 @@ std::string usage_text(const char* argv0) {
            "  --no-prefill-a8               return full prefill tiles to their A16 routes,\n"
            "                                which is how the integer routes are measured on\n"
            "                                a whole request\n"
+           "  --nvfp4-w4a8-int              NVFP4 weights on int8 tensor cores (W4A8): the\n"
+           "                                stored E2M1 codes feed an s8 MMA mainloop, prefill\n"
+           "                                and decode alike; the route band picks MMQ (own)\n"
+           "                                or grouped (unified), T<=8 runs the row-form kernel\n"
+           "  --nvfp4-w4a16                 on a native-FP4 card, run NVFP4 weights on the\n"
+           "                                dequantising A16 routes instead of W4A4 (no-op\n"
+           "                                elsewhere; wins over --nvfp4-w4a8-int)\n"
            "  --prefill-cublas              hand wide prefill GEMMs to cuBLAS: a large\n"
            "                                prefill speedup for a small perplexity cost;\n"
            "                                wants a larger --prefill-chunk\n"
@@ -271,8 +289,8 @@ std::string usage_text(const char* argv0) {
            "                                mixed/strict: Windows single-GPU text, no WDDM mode.\n"
            "  --use-alt-prefix-caching     hybrid device context cache\n"
            "                                CLI uses no persistent Host retention tier\n"
-           "  --wddm-evictable-budget       Windows D3D12 builds: budget against dedicated\n"
-           "                                memory, holding arenas resident\n"
+           "  --wddm-evictable-budget       Windows builds: budget against dedicated\n"
+           "                                memory, committing arenas at startup\n"
            "\n"
            "SAMPLING\n"
            "  --temperature F               0..2\n"
@@ -300,6 +318,11 @@ std::string usage_text(const char* argv0) {
            "  --reasoning-effort E          none, minimal, low, medium, high, xhigh or max\n"
            "  --thinking-budget N           cap model-origin thinking tokens; inserted\n"
            "                                control tokens count toward --max-new\n"
+           "  --reasoning-loop off|stop|conclude\n"
+           "                                every 512 thinking tokens, test whether the\n"
+           "                                thinking repeats whole passages; stop ends the\n"
+           "                                reply, conclude closes the thinking and lets\n"
+           "                                the model answer (default off)\n"
            "\n"
            "OUTPUT\n"
            "  --json                        constrain the answer to a JSON object\n"
@@ -317,6 +340,7 @@ std::string usage_text(const char* argv0) {
            "                                with no device Vision memory, and caps\n"
            "                                --vision-max-merged at 256 unless given\n"
            "  --vision-cpu                  --vision with --vision-residency cpu\n"
+           "  --cpu-vision-idle-seconds N    Qwen CPU Vision unload after N idle seconds (300; 0 retains)\n"
            "  --vision-max-merged N         merged tokens of one media item (default 16384);\n"
            "                                larger media is downscaled\n"
            "\n"
@@ -334,6 +358,10 @@ std::string usage_text(const char* argv0) {
 
 Options parse_options(int argc, char** argv) {
     Options options;
+    if (argc >= 2 && std::string_view(argv[1]) == "--version") {
+        options.version_requested = true;
+        return options;
+    }
     if (argc >= 2 && (std::string_view(argv[1]) == "--help" || std::string_view(argv[1]) == "-h")) {
         options.help_requested = true;
         return options;
@@ -343,6 +371,7 @@ Options parse_options(int argc, char** argv) {
     bool kv_capacity_explicit = false;
     bool device_explicit      = false;
     bool ngram_width_explicit       = false;
+    bool spec_explicit              = false;
     bool vision_max_merged_explicit = false;
     std::optional<std::size_t> kv_headroom_mib;
     const char* unsupported_prefix_flag = nullptr;
@@ -383,6 +412,8 @@ Options parse_options(int argc, char** argv) {
             options.devices = parse_device_list(value(arg));
         } else if (arg == "--stage-layers") {
             options.stage_layers = parse_stage_layers(value(arg));
+        } else if (arg == "--tensor-parallel") {
+            options.tensor_parallel = true;
         } else if (arg == "--expert-residency") {
             const std::string residency = value(arg);
             if (residency == "device") {
@@ -402,18 +433,21 @@ Options parse_options(int argc, char** argv) {
                 options.expert_cache_bytes =
                     std::uint64_t(parse_u32(mib.c_str(), "expert-cache-mib", true)) << 20;
             }
-        } else if (arg == "--ngram-table") {
-            options.ngram_table.path = value(arg);
-        } else if (arg == "--ngram-ram") {
-            options.ngram_table.ram = true;
-        } else if (arg == "--no-ngram-table") {
-            options.ngram_table.disabled = true;
+        } else if (product::parse_hybrid_expert_option(arg, options.hybrid_experts,
+                                                      [&] { return value(arg); })) {
+        } else if (product::parse_ngram_table_option(arg, options.ngram_table,
+                                                     [&] { return value(arg); })) {
+        } else if (product::parse_kv_resident_option(arg, options.kv_resident_positions,
+                                                     [&] { return value(arg); })) {
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
+            spec_explicit               = true;
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
+        } else if (arg == "--draft-min-p") {
+            options.speculative.draft_min_p = parse_float(value(arg), "draft-min-p", 0.0F, 1.0F);
         } else if (arg == "--ngram-draft-tokens") {
             options.speculative.ngram_draft_tokens =
                 parse_u32(value(arg), "ngram-draft-tokens", true);
@@ -460,6 +494,10 @@ Options parse_options(int argc, char** argv) {
             options.mlp_a8_decode = true;
         } else if (arg == "--no-prefill-a8") {
             options.prefill_a8 = false;
+        } else if (arg == "--nvfp4-w4a8-int") {
+            options.nvfp4_w4a8_int = true;
+        } else if (arg == "--nvfp4-w4a16") {
+            options.nvfp4_w4a16 = true;
         } else if (arg == "--lookup-ngram") {
             options.speculative.lookup_ngram = parse_u32(value("--lookup-ngram"), "lookup-ngram");
         } else if (arg == "--mtp-attention-window") {
@@ -497,10 +535,14 @@ Options parse_options(int argc, char** argv) {
             options.enable_thinking = false;
         } else if (arg == "--thinking-budget") {
             options.thinking_budget = parse_u32(value(arg), "thinking-budget");
+        } else if (arg == "--reasoning-loop") {
+            options.reasoning_loop = ninfer::product::parse_reasoning_loop_action(value(arg));
         } else if (arg == "--reasoning-effort") {
             options.reasoning_effort = parse_reasoning_effort(value(arg));
         } else if (arg == "--vision") {
             options.enable_vision = true;
+        } else if (arg == "--cpu-vision-idle-seconds") {
+            options.cpu_vision_idle_seconds = parse_u32(value(arg), "cpu-vision-idle-seconds", true);
         } else if (arg == "--vision-residency") {
             const std::string_view mode = value(arg);
             if (mode == "resident") {
@@ -534,6 +576,11 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (arg == "--no-cuda-graph") {
             options.use_cuda_graph = false;
+        } else if (arg == "--gpu-clock-floor") {
+            options.gpu_clock_floor_mhz = parse_u32(value(arg), "gpu-clock-floor");
+            if (options.gpu_clock_floor_mhz == 0 || options.gpu_clock_floor_mhz > 5000) {
+                throw std::invalid_argument("--gpu-clock-floor must be in [1, 5000] MHz");
+            }
         } else if (arg == "--stop-token-id") {
             const std::uint32_t token = parse_u32(value(arg), "stop-token-id", true);
             if (token > static_cast<std::uint32_t>(std::numeric_limits<TokenId>::max())) {
@@ -619,6 +666,9 @@ Options parse_options(int argc, char** argv) {
     if (!options.stage_layers.empty() && options.devices.size() < 2) {
         throw std::invalid_argument("--stage-layers needs --devices naming more than one device");
     }
+    if (options.tensor_parallel && options.devices.size() < 2) {
+        throw std::invalid_argument("--tensor-parallel needs --devices naming more than one device");
+    }
     if (kv_headroom_mib.has_value()) {
         if (options.cuda_memory_policy != CudaMemoryPolicy::DriverDefault) {
             throw std::invalid_argument("--kv-headroom-mib is available only with --cuda-memory-policy default");
@@ -645,6 +695,7 @@ Options parse_options(int argc, char** argv) {
         throw std::invalid_argument("--kv-capacity must be at least --max-context");
     }
     product::apply_default_ngram_draft_tokens(options.speculative, ngram_width_explicit);
+    product::apply_automatic_speculation(options.speculative, spec_explicit);
     product::validate_speculative_cli_options(options.speculative);
     if (options.vision_residency != VisionResidency::Resident && !options.enable_vision) {
         throw std::invalid_argument("--vision-residency overlay or cpu requires --vision");
@@ -671,6 +722,10 @@ Options parse_options(int argc, char** argv) {
     if (options.reasoning_effort == ReasoningEffort::None) options.enable_thinking = false;
     if (options.enable_thinking == false && options.thinking_budget) {
         throw std::invalid_argument("--thinking-budget cannot be combined with --no-thinking");
+    }
+    if (options.enable_thinking == false &&
+        options.reasoning_loop != ninfer::ReasoningLoopAction::Off) {
+        throw std::invalid_argument("--reasoning-loop cannot be combined with --no-thinking");
     }
     if (options.greedy) {
         options.sampling.temperature = 0.0F;

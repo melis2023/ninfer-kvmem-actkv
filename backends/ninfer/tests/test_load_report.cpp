@@ -1,3 +1,4 @@
+#include "ninfer/engine_options.h"
 #include "serve/load_report.h"
 
 #include <nlohmann/json.hpp>
@@ -137,6 +138,29 @@ int main() {
         "the load report grew the stats-only ingress peak");
     failures +=
         check(stats.at("queue").at("entries").empty(), "an empty queue reported waiting entries");
+    failures += check(!stats.contains("ngram_table"), "a model without row reads reported n-gram activity");
+    auto ngram_sample = sample;
+    auto& rows = ngram_sample.stats.ngram_table;
+    rows.rows = 64;
+    rows.resident_rows = 16;
+    rows.read_seconds = 0.002;
+    rows.stalls = 1;
+    rows.stall_seconds = 0.0001;
+    rows.latency_histogram[3] = 3;
+    rows.latency_histogram[5] = 1;
+    const auto ngram_stats = Json::parse(make_stats_report(capacity, ngram_sample));
+    failures += check(ngram_stats.contains("ngram_table"), "stats omitted observed n-gram reads");
+    if (ngram_stats.contains("ngram_table")) {
+        const auto& actual = ngram_stats.at("ngram_table");
+        failures += check(actual.at("rows") == 64 && actual.at("resident_rows") == 16 &&
+                              actual.at("batches") == 4 && actual.at("read_seconds") == 0.002 &&
+                              actual.at("stalls") == 1 && actual.at("stall_seconds") == 0.0001 &&
+                              actual.at("read_latency_us").at("p50") == 8 &&
+                              actual.at("read_latency_us").at("p99") == 32,
+                          "stats lost cumulative n-gram counters or latency quantiles");
+    }
+    failures += check(!Json::parse(make_load_report(capacity, ngram_sample)).contains("ngram_table"),
+                      "load report grew stats-only n-gram details");
     sample.stats.queue[0]      = {.request_id = 41, .wait_seconds = 2.5};
     sample.stats.queue[1]      = {.request_id = 43, .wait_seconds = 0.5};
     sample.stats.queue_entries = 2;

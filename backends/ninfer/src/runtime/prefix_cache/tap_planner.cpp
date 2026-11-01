@@ -152,11 +152,12 @@ std::vector<PlannedTap> plan_taps(std::uint32_t prompt_tokens, std::uint32_t bas
             const auto near_tap            = [&](const PlannedTap& tap) {
                 return distance(tap.position, position) < separation;
             };
-            const auto near = [&](std::uint32_t other) {
+            // Not named `near`: the Windows SDK's minwindef.h defines it as an empty macro.
+            const auto near_frontier = [&](std::uint32_t other) {
                 return distance(other, position) < separation;
             };
             if (std::any_of(accepted.begin(), accepted.end(), near_tap) ||
-                std::any_of(existing_frontiers.begin(), existing_frontiers.end(), near) ||
+                std::any_of(existing_frontiers.begin(), existing_frontiers.end(), near_frontier) ||
                 distance(position, base) < separation) {
                 continue;
             }

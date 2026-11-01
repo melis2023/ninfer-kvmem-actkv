@@ -10,9 +10,11 @@ from tools.artifact.layouts import (
     row_scale_geometry,
 )
 from tools.artifact.codecs.fp8_row import (
+    decode_fp8_row_interleaved_words,
     decode_fp8_row_scaled_words,
     dequantize_fp8_row_scaled,
     encode_fp8_row_scaled,
+    encode_fp8_row_interleaved,
 )
 
 
@@ -77,3 +79,27 @@ def test_row_scaled_fp8_rejects_invalid_words_and_signatures():
     nonzero_codes[0, 0] = 0x38
     with pytest.raises(ValueError, match="zero row scale"):
         encode_fp8_row_scaled(nonzero_codes, _bf16_words(0x0000), (1, 2))
+
+
+def test_interleaved_fp8_exact_bytes_and_invalid_words():
+    codes = torch.tensor([[0, 128, 56, 184], [64, 192, 126, 254]], dtype=torch.uint8)
+    scales = torch.tensor([.5, 2], dtype=torch.float16)
+    raw = encode_fp8_row_interleaved(codes, scales, (2, 4))
+    assert raw == bytes([0, 128, 56, 184, 0, 56, 64, 192, 126, 254, 0, 64])
+    decoded, restored = decode_fp8_row_interleaved_words(raw, (2, 4))
+    assert torch.equal(decoded, codes) and torch.equal(restored, scales)
+    assert encoded_size("row_interleaved_v1", "fp8_e4m3fn_row_fp16", (2, 160)) == 324
+    with pytest.raises(ValueError, match="does not accept"):
+        encoded_size("row_scale_v1", "fp8_e4m3fn_row_fp16", (2, 160))
+    with pytest.raises(ValueError, match="does not accept"):
+        encoded_size("row_interleaved_v1", "fp8_e4m3fn_row_bf16", (2, 160))
+    for scale in (-0., -1., float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="nonnegative finite FP16"):
+            encode_fp8_row_interleaved(codes[:1], torch.tensor([scale], dtype=torch.float16), (1, 4))
+    with pytest.raises(ValueError, match="zero row scale"):
+        decode_fp8_row_interleaved_words(bytes([56, 0, 0]), (1, 1))
+    for word in (127, 255):
+        with pytest.raises(ValueError, match="finite E4M3FN"):
+            decode_fp8_row_interleaved_words(bytes([word, 0, 60]), (1, 1))
+    with pytest.raises(ValueError, match="bytes"):
+        decode_fp8_row_interleaved_words(raw[:-1], (2, 4))

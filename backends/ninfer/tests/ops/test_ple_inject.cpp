@@ -1,7 +1,8 @@
 // ple_inject against an FP64 oracle of Qwen3.8-Flash-Next's PLE block at the model's shapes: one
 // call per sequence chunk and the same sequence split across calls (the convolution history
 // carries the positions before a call), from a zero and from a populated history, under graph
-// replay, and a token whose gate score is exactly zero.
+// replay, and a token whose gate score is exactly zero; and the record form of a speculative
+// verification with the history advanced past a committed prefix.
 #include "core/arena.h"
 #include "core/device.h"
 #include "ninfer/ops/ple_inject.h"
@@ -184,6 +185,104 @@ int run_case(const std::string& label, int tokens, const std::vector<int>& split
     return failures;
 }
 
+// The record form over `tokens` positions, then the history advanced by the first `commit` of
+// them: the stack must match the oracle over every position, the history must be untouched by the
+// record and afterwards equal bit for bit what ple_inject over the committed prefix leaves, whose
+// stack must equal the record's first positions bit for bit (a verification that keeps its
+// prefix).
+int run_record(int tokens, int commit, std::uint32_t seed) {
+    const std::string label =
+        "ple_inject_record T=" + std::to_string(tokens) + " commit " + std::to_string(commit);
+    Inputs in;
+    in.stack.resize(static_cast<std::size_t>(kWidth) * tokens);
+    in.key.resize(static_cast<std::size_t>(kWidth) * tokens);
+    in.value.resize(static_cast<std::size_t>(kHidden) * tokens);
+    in.norm_key.resize(kWidth);
+    in.norm_query.resize(kWidth);
+    in.norm_conv.resize(kWidth);
+    in.conv.resize(static_cast<std::size_t>(kWidth) * kTaps);
+    in.history.resize(static_cast<std::size_t>(kWidth) * kHistory);
+    fill_uniform(in.stack, seed, -3.0f, 3.0f);
+    fill_uniform(in.key, seed + 1, -2.0f, 2.0f);
+    fill_uniform(in.value, seed + 2, -2.0f, 2.0f);
+    fill_uniform(in.norm_key, seed + 3, -0.5f, 0.5f);
+    fill_uniform(in.norm_query, seed + 4, -0.5f, 0.5f);
+    fill_uniform(in.norm_conv, seed + 5, -0.5f, 0.5f);
+    fill_uniform(in.conv, seed + 6, -0.6f, 0.6f);
+    fill_uniform(in.history, seed + 7, -1.5f, 1.5f);
+    for (auto* v : {&in.key, &in.value, &in.norm_key, &in.norm_query, &in.norm_conv, &in.conv}) {
+        round_to_bf16(*v);
+    }
+    std::vector<double> expected_stack(in.stack.begin(), in.stack.end());
+    std::vector<double> scratch_history(in.history.begin(), in.history.end());
+    oracle(in, 0, tokens, expected_stack, scratch_history);
+
+    GuardedDeviceBuffer d_stack(in.stack.size() * 4), d_prefix(in.stack.size() * 4),
+        d_key(in.key.size() * 2), d_value(in.value.size() * 2), d_nk(kWidth * 2), d_nq(kWidth * 2),
+        d_nc(kWidth * 2), d_conv(in.conv.size() * 2), d_history(in.history.size() * 4),
+        d_direct(in.history.size() * 4),
+        d_normalized(static_cast<std::size_t>(kWidth) * tokens * 4);
+    const auto copy_bf16 = [](GuardedDeviceBuffer& buffer, const std::vector<float>& values) {
+        const auto bits = encode_bf16(values);
+        buffer.copy_from_host(bits.data(), buffer.bytes());
+    };
+    d_stack.copy_from_host(in.stack.data(), d_stack.bytes());
+    d_prefix.copy_from_host(in.stack.data(), d_prefix.bytes());
+    d_history.copy_from_host(in.history.data(), d_history.bytes());
+    d_direct.copy_from_host(in.history.data(), d_direct.bytes());
+    copy_bf16(d_key, in.key);
+    copy_bf16(d_value, in.value);
+    copy_bf16(d_nk, in.norm_key);
+    copy_bf16(d_nq, in.norm_query);
+    copy_bf16(d_nc, in.norm_conv);
+    copy_bf16(d_conv, in.conv);
+    Tensor t_nk(d_nk.data(), DType::BF16, {kWidth});
+    Tensor t_nq(d_nq.data(), DType::BF16, {kWidth});
+    Tensor t_nc(d_nc.data(), DType::BF16, {kWidth});
+    Tensor t_conv(d_conv.data(), DType::BF16, {kTaps, kWidth});
+    Tensor t_history(d_history.data(), DType::FP32, {kWidth, kHistory});
+    Tensor t_direct(d_direct.data(), DType::FP32, {kWidth, kHistory});
+    const ops::PleInjectWeights weights{&t_nk, &t_nq, &t_nc, &t_conv};
+    WorkspaceArena workspace(ops::ple_inject_workspace_bytes(tokens));
+
+    Tensor t_stack(d_stack.data(), DType::FP32, {kHidden, kStreams, tokens});
+    Tensor t_key(d_key.data(), DType::BF16, {kWidth, tokens});
+    Tensor t_value(d_value.data(), DType::BF16, {kHidden, tokens});
+    Tensor t_normalized(d_normalized.data(), DType::FP32, {kWidth, tokens});
+    ops::ple_inject_record(t_stack, t_key, t_value, weights, kEps, t_history, t_normalized,
+                           workspace, nullptr);
+    cuda_synchronize();
+    const auto untouched = from_device<float>(d_history.data(), in.history.size());
+    int failures = verify_exact((label + " history untouched").c_str(), untouched, in.history);
+    const auto got_stack = from_device<float>(d_stack.data(), in.stack.size());
+    failures +=
+        verify_pointwise(label + " stack", std::vector<double>(got_stack.begin(), got_stack.end()),
+                         expected_stack, {5.0e-5, 5.0e-5});
+
+    Tensor committed(d_normalized.data(), DType::FP32, {kWidth, commit});
+    ops::ple_history_advance(t_history, committed, nullptr);
+    Tensor t_prefix(d_prefix.data(), DType::FP32, {kHidden, kStreams, commit});
+    Tensor t_key_prefix(d_key.data(), DType::BF16, {kWidth, commit});
+    Tensor t_value_prefix(d_value.data(), DType::BF16, {kHidden, commit});
+    ops::ple_inject(t_prefix, t_key_prefix, t_value_prefix, weights, kEps, t_direct, workspace,
+                    nullptr);
+    cuda_synchronize();
+    failures += verify_exact((label + " committed history").c_str(),
+                             from_device<float>(d_history.data(), in.history.size()),
+                             from_device<float>(d_direct.data(), in.history.size()));
+    const auto prefix =
+        from_device<float>(d_prefix.data(), static_cast<std::size_t>(kWidth) * commit);
+    failures += verify_exact(
+        (label + " committed stack").c_str(), prefix,
+        std::vector<float>(got_stack.begin(),
+                           got_stack.begin() + static_cast<std::ptrdiff_t>(prefix.size())));
+    for (auto* buffer : {&d_stack, &d_prefix, &d_key, &d_value, &d_nk, &d_nq, &d_nc, &d_conv,
+                         &d_history, &d_direct, &d_normalized}) {
+        failures += buffer->verify_guards(label.c_str());
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -198,6 +297,10 @@ int main() {
     failures += run_case("ple_inject T=12 as 5+1+6", 12, {5, 1, 6}, false, false, 5102u);
     failures += run_case("ple_inject T=40 start", 40, {40}, true, false, 5103u);
     failures += run_case("ple_inject T=7 as 1x7 graph", 7, {1, 1, 1, 1, 1, 1, 1}, false, true, 5104u);
+    // Verification widths: a prefix shorter than the history window, one past it, and all of it.
+    failures += run_record(4, 2, 5200u);
+    failures += run_record(16, 11, 5201u);
+    failures += run_record(9, 9, 5202u);
     std::cout << (failures == 0 ? "PASS" : "FAIL") << " ple_inject\n";
     return failures == 0 ? 0 : 1;
 }

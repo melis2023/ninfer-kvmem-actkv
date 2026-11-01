@@ -1,7 +1,15 @@
 #include "core/weight.h"
 #include "ninfer/ops/sparse_moe.h"
+#include "core/expert_delivery.h"
+#include "core/layout.h"
+#include "models/qwen3_5/expert_layout.h"
+#include "ops/sparse_moe/streamed.h"
+#include "ops/sparse_moe/streamed_cpu.h"
 
+#include "ops/common/device_route.h"
 #include "ops/op_tester.h"
+#include "ops/sparse_moe/laboratory.h"
+#include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
 #include "ops/quantized_weight.h"
 
 #include <cuda_runtime.h>
@@ -45,8 +53,8 @@ constexpr std::int32_t kSharedGateRows = 2 * kIntermediate;
 // over the measured maximum across the whole case matrix (1.118e-2 against 1.2e-2); #20's floor
 // argument deliberately does not touch it.
 //
-// The gross bound needed a relative term, and finding out why answered the question TODO.md §4
-// asked. Measured with NINFER_OP_REPORT_STATS=1 over the full matrix, the gross error is not
+// The gross bound needed a relative term, and finding out why answered the question of where the
+// gross error comes from. Measured with NINFER_OP_REPORT_STATS=1 over the full matrix, the gross error is not
 // uniformly large -- it steps at a route boundary:
 //
 //     codec     T          max_abs   max_reference   BF16 rounding steps
@@ -819,8 +827,14 @@ public:
         }
     }
 
-    int run(std::int32_t tokens, int first_pattern, bool graph_replay) {
-        const std::string label = std::string(profile_.name) + " T=" + std::to_string(tokens);
+    int run(std::int32_t tokens, int first_pattern, bool graph_replay,
+            bool streamed = false, std::uint64_t cache_bytes = 0,
+            ops::detail::SparseMoeCandidate candidate = ops::detail::SparseMoeCandidate::Automatic) {
+        const bool forced = candidate != ops::detail::SparseMoeCandidate::Automatic;
+        const std::string label = std::string(profile_.name) + " T=" + std::to_string(tokens) +
+            (streamed ? " streamed cache=" + std::to_string(cache_bytes) : " resident") +
+            (forced ? " candidate=" + std::string(ops::detail::sparse_moe_candidate_name(candidate))
+                    : std::string());
         std::vector<float> input(static_cast<std::size_t>(kHidden) * tokens);
         std::vector<float> residual(static_cast<std::size_t>(kHidden) * tokens);
         std::vector<double> reference(static_cast<std::size_t>(kHidden) * tokens);
@@ -852,23 +866,45 @@ public:
         };
         Tensor x(device_input.p, DType::BF16, {kHidden, tokens});
         Tensor destination(destination_storage.data(), DType::BF16, {kHidden, tokens});
-        const std::size_t workspace_bytes = ops::sparse_moe_workspace_capacity_bytes(
-            weights.routed_gate_up.qtype, weights.routed_down.qtype, tokens, tokens);
+        std::size_t workspace_bytes =
+            forced ? ops::detail::sparse_moe_candidate_workspace_bytes(
+                         weights.routed_gate_up.qtype, weights.routed_down.qtype, tokens, candidate)
+                   : ops::sparse_moe_workspace_capacity_bytes(weights.routed_gate_up.qtype,
+                                                              weights.routed_down.qtype, tokens,
+                                                              tokens);
+        if (streamed) {
+            prepare_streaming(weights, cache_bytes);
+            workspace_bytes = ops::detail::sparse_moe_stream_workspace_bytes(
+                tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype);
+        }
         WorkspaceArena workspace(workspace_bytes);
+        const auto execute = [&](cudaStream_t stream) {
+            if (streamed) {
+                ops::detail::sparse_moe_stream(x, weights, destination, *delivery_, 0, workspace,
+                                               stream);
+            } else if (forced) {
+                ops::detail::sparse_moe_candidate(x, weights, ops::SparseMoeEpilogue::AddResidual,
+                                                  destination, candidate, workspace, stream);
+            } else {
+                ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, destination,
+                                workspace, stream);
+            }
+        };
 
         if (graph_replay) {
-            cudaStream_t stream  = nullptr;
+            cudaStream_t stream  = streamed ? stream_device_->stream : nullptr;
             cudaGraph_t graph    = nullptr;
             cudaGraphExec_t exec = nullptr;
-            cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
-                       "create SparseMoe graph stream");
+            if (!streamed) {
+                cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+                           "create SparseMoe graph stream");
+            }
             cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
                        "begin SparseMoe graph capture");
             cuda_check(cudaMemcpyAsync(destination.data, residual_seed.p, destination.bytes(),
                                        cudaMemcpyDeviceToDevice, stream),
                        "capture SparseMoe residual seed");
-            ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, destination, workspace,
-                            stream);
+            execute(stream);
             cuda_check(cudaStreamEndCapture(stream, &graph), "end SparseMoe graph capture");
             cuda_check(cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0),
                        "instantiate SparseMoe graph");
@@ -877,15 +913,40 @@ public:
             cuda_check(cudaStreamSynchronize(stream), "synchronize SparseMoe graph");
             cuda_check(cudaGraphExecDestroy(exec), "destroy SparseMoe graph executable");
             cuda_check(cudaGraphDestroy(graph), "destroy SparseMoe graph");
-            cuda_check(cudaStreamDestroy(stream), "destroy SparseMoe graph stream");
+            if (!streamed) { cuda_check(cudaStreamDestroy(stream), "destroy SparseMoe graph stream"); }
         } else {
-            ops::sparse_moe(x, weights, ops::SparseMoeEpilogue::AddResidual, destination, workspace,
-                            nullptr);
+            execute(streamed ? stream_device_->stream : nullptr);
             cuda_synchronize();
         }
 
-        int failures = verify_reduction(label, destination_storage.values(), reference,
-                                        profile_.criterion(tokens));
+        if (streamed) { delivery_->check(); }
+        if (std::getenv("NINFER_NATIVE_STREAM_TIMING") &&
+            (tokens == 1 || tokens == 8 || tokens == 32)) {
+            const auto stream = streamed ? stream_device_->stream : nullptr;
+            cudaEvent_t start = nullptr, stop = nullptr;
+            cuda_check(cudaEventCreate(&start), "create native Op timer");
+            cuda_check(cudaEventCreate(&stop), "create native Op timer");
+            for (unsigned trial = 0; trial < 3; ++trial) {
+                const auto before = streamed ? delivery_->stats() : ExpertDeliveryStats{};
+                cuda_check(cudaEventRecord(start, stream), "start native Op timer");
+                cuda_check(cudaMemcpyAsync(destination.data, residual_seed.p, destination.bytes(),
+                                           cudaMemcpyDeviceToDevice, stream), "reset timed residual");
+                execute(stream);
+                cuda_check(cudaEventRecord(stop, stream), "stop native Op timer");
+                cuda_check(cudaEventSynchronize(stop), "wait native Op timer");
+                float ms = 0;
+                cuda_check(cudaEventElapsedTime(&ms, start, stop), "read native Op timer");
+                const auto after = streamed ? delivery_->stats() : ExpertDeliveryStats{};
+                std::cout << "NATIVE_OP_TIMING " << label << " trial=" << trial
+                          << " gpu_ms=" << ms << " route_pairs=" << after.pairs - before.pairs
+                          << " hit_pairs=" << after.pair_hits - before.pair_hits
+                          << " copied_bytes=" << after.copied_bytes - before.copied_bytes << '\n';
+            }
+            cuda_check(cudaEventDestroy(start), "destroy native Op timer");
+            cuda_check(cudaEventDestroy(stop), "destroy native Op timer");
+        }
+        last_output_ = destination_storage.values();
+        int failures = verify_reduction(label, last_output_, reference, profile_.criterion(tokens));
         failures += destination_storage.verify_guards(label);
         failures +=
             verify_exact((label + " input preservation").c_str(),
@@ -923,6 +984,70 @@ public:
     }
 
 private:
+    void prepare_streaming(const ops::SparseMoeWeights& weights, std::uint64_t cache_bytes) {
+        if (!stream_device_) { stream_device_ = std::make_unique<DeviceContext>(); }
+        if (delivery_ && stream_cache_ == cache_bytes && stream_cpu_share_ == cpu_share) { return; }
+        delivery_.reset();
+        stream_cpu_.reset();
+        ExpertDeliveryLayer layer;
+        layer.experts.resize(kExperts);
+        if (stream_sources_.empty()) {
+            for (const auto* bank : {&weights.routed_gate_up, &weights.routed_down}) {
+                const bool gu = bank == &weights.routed_gate_up;
+                const auto layout = models::qwen3_5::expert_projection_layout(
+                    bank->qtype, gu ? 1024 : 2048, gu ? 2048 : 512,
+                    bank->qtype == QType::NVFP4 ? (gu ? 512 : 2048) : 0);
+                const std::array<const void*, 4> addresses{
+                    bank->qdata, bank->qhigh, bank->scales, bank->weight_divisors};
+                const std::array<std::uint64_t, 4> sizes{
+                    layout.code_bytes, layout.high_bytes, layout.scale_bytes,
+                    bank->qtype == QType::NVFP4 ? (gu ? 8U : 4U) : 0U};
+                for (unsigned plane = 0; plane < 4; ++plane) {
+                    stream_plane_sizes_.push_back(sizes[plane]);
+                    if (!sizes[plane]) { stream_sources_.push_back(nullptr); continue; }
+                    auto host = std::make_unique<PinnedHostBuffer>(sizes[plane] * kExperts);
+                    cuda_check(cudaMemcpy(host->data(), addresses[plane], sizes[plane] * kExperts,
+                                           cudaMemcpyDeviceToHost), "stage streaming oracle source");
+                    stream_sources_.push_back(std::move(host));
+                }
+            }
+        }
+        for (unsigned expert = 0; expert < kExperts; ++expert) {
+            auto& payload = layer.experts[expert];
+            std::size_t code_blob = 0;
+            for (unsigned plane = 0; plane < 8; ++plane) {
+                if (plane % 4 == 0) { code_blob = payload.size(); }
+                const auto bytes = stream_plane_sizes_[plane];
+                if (expert == 0) { layer.aliases.push_back({bytes ? payload.size() : code_blob, 0}); }
+                if (!bytes) { continue; }
+                ExpertBlob blob;
+                blob.bytes = bytes;
+                blob.pinned = static_cast<const std::byte*>(stream_sources_[plane]->data()) + expert * bytes;
+                blob.pinned_region = reinterpret_cast<std::uintptr_t>(stream_sources_[plane]->data());
+                payload.push_back(std::move(blob));
+            }
+        }
+        ExpertDeliveryOptions options;
+        options.pair_capacity = ops::detail::kSparseMoeStreamPairs;
+        options.cache_bytes = cache_bytes;
+        if (cpu_share > 0) {
+            // The CPU computes this share of each narrow call's misses (streamed_cpu.h).
+            ops::detail::StreamCpuLayer cpu_layer{weights.routed_gate_up.qtype, weights.routed_down.qtype, {}};
+            std::copy(layer.aliases.begin(), layer.aliases.end(), cpu_layer.aliases.begin());
+            stream_cpu_ = std::make_unique<ops::detail::SparseMoeStreamCpu>(
+                std::vector<ops::detail::StreamCpuLayer>{cpu_layer});
+            options.cpu.products      = stream_cpu_.get();
+            options.cpu.input_bytes   = ops::detail::SparseMoeStreamCpu::input_bytes();
+            options.cpu.product_bytes = ops::detail::SparseMoeStreamCpu::product_bytes();
+            options.cpu.share         = cpu_share;
+            options.cpu.threads       = 4;
+        }
+        delivery_ = std::make_unique<ExpertDelivery>(stream_device_->rank(0),
+            std::vector<std::filesystem::path>{}, std::vector<ExpertDeliveryLayer>{std::move(layer)}, options);
+        stream_cache_ = cache_bytes;
+        stream_cpu_share_ = cpu_share;
+    }
+
     const CodecProfile& profile_;
     std::vector<float> router_;
     std::vector<std::uint16_t> router_bits_;
@@ -938,9 +1063,22 @@ private:
     quantized_weight::PackedWeight shared_up_host_;
     quantized_weight::PackedWeight shared_down_host_;
     std::vector<std::vector<double>> references_;
+
+public:
+    // The output of the last run, for placement comparisons at the same input.
+    std::vector<double> last_output_;
+    std::unique_ptr<DeviceContext> stream_device_;
+    std::vector<std::unique_ptr<PinnedHostBuffer>> stream_sources_;
+    std::vector<std::uint64_t> stream_plane_sizes_;
+    std::unique_ptr<ops::detail::SparseMoeStreamCpu> stream_cpu_;
+    std::unique_ptr<ExpertDelivery> delivery_;
+    std::uint64_t stream_cache_ = 0;
+    double stream_cpu_share_ = 0;
+    // The share of a narrow streamed call's misses the CPU computes.
+    double cpu_share = 0;
 };
 
-int run_profile(const CodecProfile& profile) {
+int run_profile(const CodecProfile& profile, bool streamed = false) {
     SparseMoeFixture fixture(profile);
     int failures        = 0;
     std::size_t witness = 0;
@@ -951,16 +1089,89 @@ int run_profile(const CodecProfile& profile) {
                                   profile.routed_gate_up, profile.routed_down, tokens, tokens));
         // Decode starts with the exact top-8 boundary tie; multi-token cases cycle the tie,
         // high/low expert ids, and a different ordering of the same experts.
-        failures += fixture.run(tokens, index == 0 ? 1 : 0,
-                                profile.verify_graph_replay &&
-                                    (tokens == 2 || tokens == 4 || tokens == 6 || tokens == 8 ||
-                                     tokens == 16 || tokens == 32 || tokens == 64));
+        if (streamed) {
+            // A same-workload resident comparator, except NVFP4 where the prefill route changes
+            // activation precision and an sm_86 build cannot execute it.
+            std::vector<double> resident;
+            if (profile.routed_gate_up != QType::NVFP4) {
+                failures += fixture.run(tokens, index == 0 ? 1 : 0, tokens == 8 || tokens == 32);
+                resident = fixture.last_output_;
+            }
+            std::vector<double> first;
+            for (const std::uint64_t cache : {0ULL, 16ULL << 20, 128ULL << 20}) {
+                failures += fixture.run(tokens, index == 0 ? 1 : 0, tokens == 8 || tokens == 32,
+                                          true, cache);
+                // Delivered experts run the resident arithmetic: the same bits at the same T.
+                if (!resident.empty() && fixture.last_output_ != resident) {
+                    std::cerr << profile.name << " T=" << tokens << " cache=" << cache
+                              << ": streamed output differs from resident\n";
+                    ++failures;
+                }
+                if (first.empty()) { first = fixture.last_output_; }
+            }
+            // The CPU's share of the misses: the GPU's products bit for bit, whatever the split.
+            for (const double share : {1.0, 0.5}) {
+                for (const std::uint64_t cache : {0ULL, 16ULL << 20}) {
+                    fixture.cpu_share = share;
+                    failures += fixture.run(tokens, index == 0 ? 1 : 0, tokens == 8, true, cache);
+                    fixture.cpu_share = 0;
+                    // A call of fewer than 16 tokens routes under half the experts: narrow.
+                    if (share == 1.0 && cache == 0 && tokens < 16 &&
+                        fixture.delivery_->stats().cpu_pairs == 0) {
+                        std::cerr << profile.name << " T=" << tokens << ": the CPU computed no pair\n";
+                        ++failures;
+                    }
+                    if (fixture.last_output_ != first) {
+                        std::cerr << profile.name << " T=" << tokens << " cache=" << cache
+                                  << " CPU share " << share << ": output differs from the GPU's\n";
+                        ++failures;
+                    }
+                }
+            }
+        } else {
+            failures += fixture.run(tokens, index == 0 ? 1 : 0,
+                                    profile.verify_graph_replay &&
+                                        (tokens == 2 || tokens == 4 || tokens == 6 || tokens == 8 ||
+                                         tokens == 16 || tokens == 32 || tokens == 64));
+        }
     }
     const std::size_t interval = ops::sparse_moe_workspace_capacity_bytes(
         profile.routed_gate_up, profile.routed_down, 1, profile.token_cases.back());
-    if (interval != witness) {
+    if (!streamed && interval != witness) {
         std::cerr << profile.name << ": interval workspace capacity missed a route witness\n";
         ++failures;
+    }
+    failures += fixture.verify_persistent_inputs();
+    return failures;
+}
+
+// The laboratory candidates a device profile may select, held to the same oracle: Q4 prefill
+// tiles forced narrow and wide around the profile bands, Small-T across the Q8 frontier range a
+// profile may move (T20..T46), and the profile-driven Q8 frontier itself.
+int run_candidates(const CodecProfile& profile) {
+    using Candidate = ops::detail::SparseMoeCandidate;
+    SparseMoeFixture fixture(profile);
+    int failures = 0;
+    if (profile.routed_gate_up == QType::Q4_G64_FP16) {
+        for (const Candidate candidate : {Candidate::PrefillNarrow, Candidate::PrefillWide}) {
+            for (const std::int32_t tokens : {47, 64, 768, 1024}) {
+                failures += fixture.run(tokens, 0, tokens == 64, false, 0, candidate);
+            }
+        }
+    }
+    if (profile.routed_gate_up == QType::Q8_G32_FP16) {
+        for (const std::int32_t tokens : {20, 32, 33, 46}) {
+            failures += fixture.run(tokens, 0, tokens == 32, false, 0, Candidate::SmallT);
+        }
+        const ops::DeviceRouteForce frontier("sparse_moe/prefill/q8-q8", "33");
+        if (ops::detail::sparse_moe_uses_prefill(32, profile.routed_gate_up, profile.routed_down) ||
+            !ops::detail::sparse_moe_uses_prefill(33, profile.routed_gate_up, profile.routed_down)) {
+            std::cerr << profile.name << ": profile frontier 33 did not move the prefill route\n";
+            ++failures;
+        }
+        for (const std::int32_t tokens : {20, 32, 33}) {
+            failures += fixture.run(tokens, 0, tokens == 32);
+        }
     }
     failures += fixture.verify_persistent_inputs();
     return failures;
@@ -970,8 +1181,10 @@ int run_profile(const CodecProfile& profile) {
 
 int main(int argc, char** argv) {
     const bool wide_only = argc == 2 && std::string_view(argv[1]) == "--wide-only";
-    if (argc != 1 && !wide_only) {
-        std::cerr << "usage: " << argv[0] << " [--wide-only]\n";
+    const bool streamed = argc == 2 && std::string_view(argv[1]) == "--streaming";
+    const bool candidates_only = argc == 2 && std::string_view(argv[1]) == "--candidates-only";
+    if (argc != 1 && !wide_only && !streamed && !candidates_only) {
+        std::cerr << "usage: " << argv[0] << " [--wide-only|--streaming|--candidates-only]\n";
         return 2;
     }
     if (cuda_unavailable()) {
@@ -1019,10 +1232,30 @@ int main(int argc, char** argv) {
         for (CodecProfile& profile : profiles) { profile.token_cases = kWideTokens; }
     }
 
+    // One delivery call covers each call's columns: Small-T through its widest call (T=46 below
+    // the Q4 frontier), the Q8 frontier at T=20, and grouped slices beyond.
+    constexpr std::array<std::int32_t, 13> stream_tokens{1, 2, 8, 9, 13, 20, 32, 46, 47, 64, 257, 768, 4097};
+    constexpr std::array<std::int32_t, 5> stream_nvfp4_small_tokens{1, 2, 8, 9, 12};
+    if (streamed) {
+        for (auto& profile : profiles) {
+            // Expert delivery preserves the compiled arithmetic domain. NVFP4 prefill needs
+            // Blackwell; other builds still cover decode, the delivery boundary and Small-T.
+            if (profile.routed_gate_up == QType::NVFP4 && !kNvfp4Prefill) {
+                profile.token_cases = stream_nvfp4_small_tokens;
+            } else {
+                profile.token_cases = stream_tokens;
+            }
+        }
+    }
     int failures = 0;
+    if (candidates_only) {
+        for (const CodecProfile& profile : profiles) { failures += run_candidates(profile); }
+        std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_moe laboratory candidates\n";
+        return failures == 0 ? 0 : 1;
+    }
     for (const CodecProfile& profile : profiles) {
         if (wide_only && profile.routed_gate_up == QType::NVFP4 && !kNvfp4Prefill) { continue; }
-        failures += run_profile(profile);
+        failures += run_profile(profile, streamed);
     }
     std::cout << (failures == 0 ? "OK" : "FAIL") << " sparse_moe correctness\n";
     return failures == 0 ? 0 : 1;

@@ -1,6 +1,6 @@
 #include "serve/stop_control.h"
 
-#include "ninfer/types.h"
+#include "ninfer/engine_options.h"
 
 #include <atomic>
 #include <chrono>

@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <limits>
+#include <optional>
 #include <set>
 #include <stdexcept>
 
@@ -56,6 +57,81 @@ GdnWeights bind_gdn(Bindings& b, const TextConfig& text, const std::string& p) {
     return out;
 }
 
+using Range = std::pair<std::uint64_t, std::uint64_t>;
+
+// The `rank`-th of `ranks` equal parts of `count` units, `unit` wide each.
+Range share(std::uint64_t count, std::uint64_t unit, std::size_t rank, std::size_t ranks) {
+    const std::uint64_t each = count / ranks * unit;
+    return {each * rank, each * (rank + 1)};
+}
+
+Range offset(Range range, std::uint64_t by) { return {range.first + by, range.second + by}; }
+
+ParameterPiece rows(Range range) { return {ParameterPiece::Cut::Rows, {range}}; }
+
+ParameterPiece columns(std::vector<Range> ranges) {
+    return {ParameterPiece::Cut::Columns, std::move(ranges)};
+}
+
+// A copy of a whole parameter for a rank: rank 0 binds it as it is, another rank a piece that
+// covers it.
+WeightId bind_replica(Bindings& b, const std::string& name, const artifact::Shape& shape,
+                      const std::vector<std::string>& inputs, std::optional<QType> format,
+                      std::size_t rank) {
+    if (rank == 0) { return b.parameter(name, shape, inputs, format); }
+    const ParameterPiece whole = shape.size() == 2 ? rows({0, shape[0]}) : columns({{0, shape[0]}});
+    return b.piece(name, shape, inputs, format, rank, whole);
+}
+
+// A rank's share of a GDN mixer: its value heads, the key heads they read, and their convolution
+// channels; the output projection takes the matching input columns. The gated norm is per head,
+// and the gating projection is small, so every rank holds all of both and keeps its heads' gates.
+GdnWeights bind_gdn_share(Bindings& b, const TextConfig& text, const std::string& p,
+                          std::size_t rank, std::size_t ranks) {
+    const auto& g      = text.gdn.value();
+    const auto h       = text.hidden_size;
+    const auto k       = g.key_width();
+    const auto v       = g.value_width();
+    const auto heads   = g.linear_num_value_heads;
+    const Range key    = share(g.linear_num_key_heads, g.linear_key_head_dim, rank, ranks);
+    const Range value  = share(heads, g.linear_value_head_dim, rank, ranks);
+    const auto input   = std::vector<std::string>{p + "mixer_input"};
+    GdnWeights out;
+    out.query        = b.piece(p + "gdn/query", {k, h}, input, {}, rank, rows(key));
+    out.key          = b.piece(p + "gdn/key", {k, h}, input, {}, rank, rows(key));
+    out.value        = b.piece(p + "gdn/value", {v, h}, input, {}, rank, rows(value));
+    out.z            = b.piece(p + "gdn/z", {v, h}, input, {}, rank, rows(value));
+    out.a_projection = bind_replica(b, p + "gdn/a_projection", {heads, h}, input, {}, rank);
+    out.b_projection = bind_replica(b, p + "gdn/b_projection", {heads, h}, input, {}, rank);
+    out.a_log        = bind_replica(b, p + "gdn/a_log", {heads}, {}, QType::FP32, rank);
+    out.dt_bias      = bind_replica(b, p + "gdn/dt_bias", {heads}, {}, QType::FP32, rank);
+    out.convolution  = b.piece(p + "gdn/convolution", {g.linear_conv_kernel_dim, g.conv_channels()},
+                               {}, QType::BF16, rank,
+                               columns({key, offset(key, k), offset(value, 2 * k)}));
+    out.norm   = bind_replica(b, p + "gdn/norm", {g.linear_value_head_dim}, {}, QType::BF16, rank);
+    out.output = b.piece(p + "gdn/output", {h, v}, {p + "gdn/gated_output"}, {}, rank,
+                         columns({value}));
+    return out;
+}
+
+// A rank's share of a dense FFN: its intermediate rows of gate and up, and those input columns of
+// down.
+DenseWeights bind_dense_share(Bindings& b, std::uint64_t h, std::uint64_t intermediate,
+                              const std::string& p, std::size_t rank, std::size_t ranks) {
+    const Range part  = share(intermediate, 1, rank, ranks);
+    const auto input  = std::vector<std::string>{p + "ffn_input"};
+    return {b.piece(p + "mlp/gate", {intermediate, h}, input, {}, rank, rows(part)),
+            b.piece(p + "mlp/up", {intermediate, h}, input, {}, rank, rows(part)),
+            b.piece(p + "mlp/down", {h, intermediate}, {p + "mlp/product"}, {}, rank,
+                    columns({part}))};
+}
+
+// A norm every rank reads.
+WeightId bind_norm_replica(Bindings& b, const std::string& name, std::uint64_t width,
+                           std::size_t rank) {
+    return bind_replica(b, name, {width}, {}, QType::BF16, rank);
+}
+
 MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& prefix) {
     const auto& moe   = std::get<MoeConfig>(config.ffn);
     const auto p      = prefix + "moe/";
@@ -67,11 +143,18 @@ MoeWeights bind_moe(Bindings& b, const TextConfig& config, const std::string& pr
     out.router       = b.parameter(p + "router", {moe.num_experts, h}, {input});
     out.shared_score = b.parameter(p + "shared_score", {1, h}, {input});
     out.experts.reserve(moe.num_experts);
+    const auto residency = prefix.starts_with("mtp/") && b.resident_mtp_experts
+                               ? artifact::Residency::Device
+                           : b.expert_residency == ExpertResidency::Host
+                               ? artifact::Residency::Pinned
+                           : b.expert_residency == ExpertResidency::Disk
+                               ? artifact::Residency::Values
+                               : artifact::Residency::Device;
     for (std::uint32_t e = 0; e < moe.num_experts; ++e) {
         const auto ep = p + "experts/" + std::to_string(e) + "/";
-        out.experts.push_back({b.parameter(ep + "gate", {ir, h}, {input}),
-                               b.parameter(ep + "up", {ir, h}, {input}),
-                               b.parameter(ep + "down", {h, ir}, {ep + "product"})});
+        out.experts.push_back({b.parameter(ep + "gate", {ir, h}, {input}, {}, residency),
+                               b.parameter(ep + "up", {ir, h}, {input}, {}, residency),
+                               b.parameter(ep + "down", {h, ir}, {ep + "product"}, {}, residency)});
     }
     out.shared = {b.parameter(p + "shared/gate", {shared, h}, {input}),
                   b.parameter(p + "shared/up", {shared, h}, {input}),
@@ -133,6 +216,12 @@ BlockWeights bind_block(Bindings& b, const TextConfig& config, const std::string
 }
 
 StagePlan plan_stage_plan(std::uint32_t layers, const LoadOptions& options) {
+    if (options.tensor_parallel) {
+        if (!options.stage_layers.empty()) {
+            throw std::invalid_argument("--stage-layers and --tensor-parallel cannot be combined");
+        }
+        return StagePlan(layers);
+    }
     if (options.ranks <= 1) {
         if (!options.stage_layers.empty()) {
             throw std::invalid_argument("--stage-layers needs --devices naming more than one device");
@@ -157,10 +246,51 @@ StagePlan plan_stage_plan(std::uint32_t layers, const LoadOptions& options) {
     return StagePlan::even(layers, options.ranks);
 }
 
+namespace {
+
+// Tensor parallelism: rank 0's share of a layer beside its whole attention, and every other
+// rank's share.
+BlockWeights bind_block_shares(Bindings& b, const TextConfig& config, const std::string& p,
+                               MixerKind mixer, std::size_t ranks,
+                               std::vector<std::vector<RankLayerWeights>>& rank_layers) {
+    const auto* dense = std::get_if<DenseConfig>(&config.ffn);
+    if (dense == nullptr) {
+        throw std::invalid_argument("--tensor-parallel supports models with a dense FFN");
+    }
+    BlockWeights out;
+    out.input_norm          = bind_norm_replica(b, p + "input_norm", config.hidden_size, 0);
+    out.post_attention_norm = bind_norm_replica(b, p + "post_attention_norm", config.hidden_size, 0);
+    if (mixer == MixerKind::FullAttention) {
+        out.mixer = bind_attention(b, config, p);
+    } else {
+        out.mixer = bind_gdn_share(b, config, p, 0, ranks);
+    }
+    out.ffn = bind_dense_share(b, config.hidden_size, dense->intermediate_size, p, 0, ranks);
+    for (std::size_t rank = 1; rank < ranks; ++rank) {
+        RankLayerWeights share;
+        share.input_norm = bind_norm_replica(b, p + "input_norm", config.hidden_size, rank);
+        share.post_attention_norm =
+            bind_norm_replica(b, p + "post_attention_norm", config.hidden_size, rank);
+        if (mixer != MixerKind::FullAttention) {
+            share.gdn = bind_gdn_share(b, config, p, rank, ranks);
+        }
+        share.ffn = bind_dense_share(b, config.hidden_size, dense->intermediate_size, p, rank, ranks);
+        rank_layers[rank - 1].push_back(std::move(share));
+    }
+    return out;
+}
+
+} // namespace
+
 TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& options,
                       StagePlan stages) {
     TextWeights out;
     out.stages = std::move(stages);
+    if (options.tensor_parallel) {
+        // Divisibility of the heads and rows, before any piece is cut.
+        (void)tensor_parallel_share(config, options.ranks);
+        out.rank_layers.resize(options.ranks - 1);
+    }
     out.token_embedding =
         b.parameter("text/token_embedding", {config.vocab_size, config.hidden_size});
     std::vector<std::string> head_inputs{"text/final_hidden"};
@@ -172,8 +302,13 @@ TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& 
     out.final_norm  = b.direct("text/final_norm", {config.hidden_size});
     out.layers.reserve(config.num_hidden_layers);
     for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {
-        out.layers.push_back(
-            bind_block(b, config, "text/layers/" + std::to_string(i) + "/", config.layer_types[i]));
+        const std::string prefix = "text/layers/" + std::to_string(i) + "/";
+        if (options.tensor_parallel) {
+            out.layers.push_back(bind_block_shares(b, config, prefix, config.layer_types[i],
+                                                   options.ranks, out.rank_layers));
+            continue;
+        }
+        out.layers.push_back(bind_block(b, config, prefix, config.layer_types[i]));
         // A layer lives on its stage. The embedding, final norm and head stay on rank 0 with the
         // round state, sampling and prefill buffers that reach them directly: the last stage sends
         // the residual back, one extra hop per forward pass.

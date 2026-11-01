@@ -1,6 +1,7 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "ninfer/base.h"
+#include "ninfer/observability/execution.h"
 
 #include <cstddef>
 #include <cstdint>

@@ -39,32 +39,19 @@ struct DeviceExecutionView {
     std::int32_t multiprocessor_count = 0;
 };
 
-// CUDA function attributes are scoped to a device context. A process-wide `static` result
-// therefore leaves the same kernel unconfigured the first time it launches on a second GPU, which
-// shows up as a launch failure or silently wrong output rather than as a clear error. Give each
-// launcher specialization a cheap, device-keyed cache instead.
-//
-// Single-GPU behaviour is unchanged: the map holds exactly one entry.
-template <typename Configure>
-void configure_cuda_device_once(Configure&& configure) {
-    static std::mutex mutex;
-    static std::unordered_map<int, cudaError_t> results;
+// Raises `kernel`'s dynamic shared memory limit on the current device to at least `bytes`, once per
+// device and kernel. Function attributes belong to one device context, so each GPU needs its own
+// call. The key is the host stub the calling translation unit launches: CUDA 13's nvcc gives a
+// template kernel's stub internal linkage in every translation unit that instantiates it
+// (-static-global-template-stub, on by default), and each stub launches its own copy of the device
+// function, with attributes of its own. A cache keyed by a type or by a function-local static in a
+// header is merged across translation units by the linker, so it would configure only the first
+// copy and leave the next launch of another to fail with cudaErrorInvalidValue.
+void raise_dynamic_shared_memory(const void* kernel, int bytes);
 
-    int device = -1;
-    CUDA_CHECK(cudaGetDevice(&device));
-
-    cudaError_t result = cudaSuccess;
-    {
-        const std::scoped_lock lock(mutex);
-        const auto existing = results.find(device);
-        if (existing != results.end()) {
-            result = existing->second;
-        } else {
-            result = std::forward<Configure>(configure)();
-            results.emplace(device, result);
-        }
-    }
-    CUDA_CHECK(result);
+template <class... Args>
+void raise_dynamic_shared_memory(void (*kernel)(Args...), int bytes) {
+    raise_dynamic_shared_memory(reinterpret_cast<const void*>(kernel), bytes);
 }
 
 // The most ranks one context holds. Layer pipelines and tensor groups are both bounded well below
@@ -126,8 +113,8 @@ struct DeviceContext {
 
     explicit DeviceContext(int device_id = 0);
     // One entry keeps the single-device route. Several entries open one rank per entry for
-    // model-parallel execution, up to kMaxRanks: matching compute capability is required across
-    // all of them, before any weight is uploaded. Peer access is only probed and recorded as a
+    // model-parallel execution, up to kMaxRanks. Every device must run this build's code, checked
+    // before any weight is uploaded; their compute capabilities may differ. Peer access is only probed and recorded as a
     // capability -- it is not required, since transfers stage through pinned host memory when it is
     // unavailable (see StageLink).
     explicit DeviceContext(std::span<const int> device_ids);

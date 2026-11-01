@@ -22,7 +22,7 @@
 // 0.023-0.031 at its own widths, and the cost is the activation quantisation error the A16 route
 // does not have.
 //
-// What ncu says this kernel is, which is not what the roofline predicted. docs/performance.md put
+// What ncu says this kernel is, which is not what the roofline predicted. An earlier reading put
 // gate_up at T=32 at ~68% of the card's bf16 MMA peak and called C8 tensor-rate bound, which is why
 // int8 was the lever. It is not what binds here: at 64 registers and no spills this kernel runs at
 // 74% L1/TEX throughput against 42% DRAM and 47% SM, so operand movement through L1 and shared

@@ -12,7 +12,7 @@ namespace {
 template <class Geometry>
 void launch(const Tensor& x, const Weight& weight, Tensor& residual, cudaStream_t stream) {
     using Schedule =
-        Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
+        Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 4>;
     constexpr int kBlocks = Geometry::kOutputRows / Schedule::kRowsPerCta;
     const float inverse   = 1.0F / weight.weight_scale_divisor;
     auto* output          = static_cast<__nv_bfloat16*>(residual.data);

@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "ops/common/blackwell_routes.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
 
 #include "core/device.h"
@@ -106,6 +107,7 @@ void launch_nvfp4_w4a4_mma_banded(const Weight& weight, Tensor& q, Tensor& gate,
 void nvfp4_attn_input_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                   Tensor& k, Tensor& v, Nvfp4W4a4Workspace workspace,
                                   cudaStream_t stream) {
+    require_nvfp4_a4_card();
     const std::int32_t tokens = x.ne[1];
     launch_nvfp4_w4a4_quantize(x, weight, workspace,
                                nvfp4_attn_input_tma_route(tokens) ? Nvfp4ScaleLayout::Tiled

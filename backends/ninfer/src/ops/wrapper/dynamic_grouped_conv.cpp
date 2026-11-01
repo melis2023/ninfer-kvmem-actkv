@@ -60,12 +60,6 @@ std::uint64_t required_q8_payload_bytes(std::int32_t input_rows) {
 }
 
 void require_finish_projection_weight(const Weight& weight, std::int32_t input_rows) {
-    if (weight.qtype == QType::NVFP4) {
-        if (weight.n != kHidden || weight.k != input_rows) {
-            throw std::invalid_argument("linear dynamic grouped conv add: invalid projection_weight");
-        }
-        return; // the full NVFP4 payload contract is validated by the linear route
-    }
     const std::uint64_t payload_bytes = required_q8_payload_bytes(input_rows);
     if (weight.qtype != QType::Q8_G32_FP16 || weight.layout != QuantLayout::RowSplit ||
         weight.scale_dtype != DType::FP16 || weight.group_size != 32 || weight.group != 32 ||
@@ -83,9 +77,9 @@ void require_finish_projection_weight(const Weight& weight, std::int32_t input_r
 // A row-split projection of any other format goes through Linear, which validates its registered
 // format and shape; the fused routes are Q8's.
 bool materialized_projection(const Weight& weight, std::int32_t input_rows) {
-    const bool row_split   = weight.layout == QuantLayout::RowSplit;
-    const bool gguf_blocks = weight.layout == QuantLayout::GgufBlocks && is_gguf(weight.qtype);
-    return weight.qtype != QType::Q8_G32_FP16 && (row_split || gguf_blocks) &&
+    return weight.qtype != QType::Q8_G32_FP16 &&
+           (weight.layout == QuantLayout::RowSplit ||
+            (weight.layout == QuantLayout::GgufBlocks && is_gguf(weight.qtype))) &&
            weight.ndim == 2 && weight.n == kHidden && weight.k == input_rows &&
            weight.qdata != nullptr && weight.payload != nullptr;
 }
@@ -205,13 +199,14 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
                                                        finish_delta, workspace, stream);
 }
 
-std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(std::int32_t input_rows,
+std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(QType projection_type,
+                                                                     std::int32_t input_rows,
                                                                      std::int32_t min_width,
                                                                      std::int32_t max_width,
                                                                      std::int32_t min_batch_size,
                                                                      std::int32_t max_batch_size) {
     return detail::q8_linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-        input_rows, min_width, max_width, min_batch_size, max_batch_size);
+        projection_type, input_rows, min_width, max_width, min_batch_size, max_batch_size);
 }
 
 void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_weight,
@@ -235,10 +230,10 @@ void linear_dynamic_grouped_conv_add(const Tensor& x, const Weight& projection_w
                    "finish_delta");
     require_tensor(residual, DType::BF16, kHidden, width, batch_size, 1, kAddOp, "residual");
     if (projection_weight.qtype == QType::NVFP4) {
-        require_finish_projection_weight(projection_weight, input_rows);
+        if (projection_weight.n != kHidden || projection_weight.k != input_rows)
+            throw std::invalid_argument("linear dynamic grouped conv add: invalid projection_weight");
         (void)detail::validate_nvfp4_weight(projection_weight, kAddOp);
-        require_finish_nonoverlap(x, projection_weight, base_kernel, finish_delta, residual,
-                                  workspace);
+        require_finish_nonoverlap(x, projection_weight, base_kernel, finish_delta, residual, workspace);
         detail::materialized_linear_dynamic_grouped_conv_add_dispatch(
             x, projection_weight, base_kernel, finish_delta, residual, workspace, stream);
         return;

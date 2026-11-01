@@ -34,7 +34,7 @@ std::string refusal(const char* body) {
     return {};
 }
 
-GenerationOutcome judged(std::vector<std::pair<std::string, double>> alternatives) {
+ninfer::TokenLogprob judged(std::vector<std::pair<std::string, double>> alternatives) {
     ninfer::TokenLogprob answer;
     answer.top_ids.fill(-1);
     for (std::size_t k = 0; k < alternatives.size(); ++k) {
@@ -45,12 +45,13 @@ GenerationOutcome judged(std::vector<std::pair<std::string, double>> alternative
     answer.id      = answer.top_ids[0];
     answer.bytes   = answer.top_bytes[0];
     answer.logprob = answer.top_values[0];
-    GenerationOutcome out;
-    out.content_logprobs.push_back(std::move(answer));
-    return out;
+    return answer;
 }
 
-bool near(double a, double b) { return std::abs(a - b) < 1e-5; }
+const RerankAnswers kNoAnswers{};
+
+// Not named `near`: the Windows SDK's minwindef.h defines it as an empty macro.
+bool close_to(double a, double b) { return std::abs(a - b) < 1e-5; }
 
 void parsing() {
     const auto jina = parse_rerank_request(RequestJson::parse(
@@ -70,30 +71,45 @@ void parsing() {
            "top_n must be positive");
     expect(refusal(R"({"query": "q", "documents": [3]})") == "documents", "a document is text");
 
-    const auto judgement = make_rerank_judgement(jina, "b");
+    const RerankAnswers answers{.tokens = {5, 6, 7, 8}, .yes = {true, true, false, false}};
+    const auto judgement = make_rerank_judgement(jina, "b", answers);
     expect(judgement.messages.size() == 2 &&
                judgement.messages[0].role == ninfer::ChatRole::System &&
-               judgement.messages[1].content.at(0).text.find("<Query>: q\n<Document>: b") !=
-                   std::string::npos,
-           "the judging prompt holds the query and the document");
-    expect(judgement.enable_thinking == false && judgement.max_tokens == 1 &&
-               judgement.logprobs && judgement.graft && judgement.graft->empty(),
-           "one answer token with its alternatives, no thinking, no graft");
+               judgement.messages[1].content.size() == 2 &&
+               judgement.messages[1].content[0].text.ends_with("<Query>: q\n<Document>: ") &&
+               judgement.messages[1].content[0].cache_boundary_after &&
+               judgement.messages[1].content[1].text == "b",
+           "the query ends the shared part at a cache boundary, the document follows it");
+    expect(judgement.enable_thinking == false && judgement.max_tokens == 1 && judgement.logprobs &&
+               judgement.graft && judgement.graft->empty() &&
+               judgement.readout_tokens == answers.tokens,
+           "one answer token with its alternatives and the answers' readout, no thinking or graft");
 }
 
 void scoring() {
-    expect(near(rerank_score(judged({{"yes", 0.6}, {"no", 0.2}, {"maybe", 0.1}})), 0.75),
+    expect(close_to(rerank_score(judged({{"yes", 0.6}, {"no", 0.2}, {"maybe", 0.1}}), kNoAnswers),
+                    0.75),
            "P(yes) / (P(yes) + P(no))");
-    expect(near(rerank_score(judged({{"no", 0.5}, {"Yes", 0.2}, {"yes", 0.1}, {"No", 0.1}})),
-                0.3 / 0.9),
+    expect(close_to(rerank_score(judged({{"no", 0.5}, {"Yes", 0.2}, {"yes", 0.1}, {"No", 0.1}}),
+                                 kNoAnswers),
+                    0.3 / 0.9),
            "capitalized answers count with their lower-case forms");
-    expect(near(rerank_score(judged({{"yes", 0.9}, {"the", 0.01}})), 0.9 / 0.91),
+    expect(close_to(rerank_score(judged({{"yes", 0.9}, {"the", 0.01}}), kNoAnswers), 0.9 / 0.91),
            "a missing answer counts as likely as the least likely alternative");
-    expect(near(rerank_score(judged({{"the", 0.5}, {"a", 0.2}})), 0.5),
+    expect(close_to(rerank_score(judged({{"the", 0.5}, {"a", 0.2}}), kNoAnswers), 0.5),
            "a judgement that answers neither scores one half");
+    // The exact readout: yes and Yes against no and No over the whole vocabulary.
+    const RerankAnswers answers{.tokens = {5, 6, 7, 8}, .yes = {true, true, false, false}};
+    ninfer::TokenLogprob exact = judged({{"the", 0.5}});
+    exact.readout = {static_cast<float>(std::log(0.2)), static_cast<float>(std::log(0.1)),
+                     static_cast<float>(std::log(0.05)), static_cast<float>(std::log(0.05))};
+    expect(close_to(rerank_score(exact, answers), 0.3 / 0.4),
+           "the exact readout scores the answers outside the alternatives");
     bool refused = false;
     try {
-        (void)rerank_score(GenerationOutcome{});
+        ninfer::TokenLogprob empty;
+        empty.top_ids.fill(-1);
+        (void)rerank_score(empty, kNoAnswers);
     } catch (const std::runtime_error&) { refused = true; }
     expect(refused, "a judgement without an answer token is an error, not a score");
 }

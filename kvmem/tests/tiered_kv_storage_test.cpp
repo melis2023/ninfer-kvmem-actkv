@@ -15,6 +15,42 @@
 #endif
 
 static void pressure(const std::filesystem::path & directory) {
+    {
+        HostKvStorage shared(8,std::make_shared<SpillFile>(directory,8));
+        std::array<uint8_t,8> original{{1,2,3,4,5,6,7,8}},got{};
+        auto parent=shared.allocate(8,original.data()); parent.seal();
+        auto survivor=parent.fork(); parent.reset();
+        const auto before=shared.io_stats();
+        uint8_t changed=91; survivor.write(2,&changed,1); survivor.seal();
+        CHECK(shared.charged_bytes()==8 && shared.disk_bytes()==0);
+        CHECK(shared.io_stats().written_bytes==before.written_bytes);
+        shared.trim(0); // The same survivor also promotes a cold sole-owned page.
+        survivor.write(3,&changed,1);
+        survivor.read(0,got.data(),got.size());
+        CHECK(got[2]==91 && got[3]==91 && got[0]==1 && got[7]==8);
+        CHECK(shared.charged_bytes()==8 && shared.disk_bytes()==0);
+    }
+    {
+        HostKvStorage shared(8,std::make_shared<SpillFile>(directory,32));
+        std::array<uint8_t,8> original{{1,2,3,4,5,6,7,8}},got{};
+        auto parent=shared.allocate(8,original.data()); parent.seal();
+        shared.trim(0);
+        const auto before=shared.io_stats();
+        auto child=parent.fork();
+        CHECK(shared.disk_bytes()==8 && shared.charged_bytes()==0);
+        CHECK(shared.io_stats().read_bytes==before.read_bytes);
+        uint8_t changed=91; child.write(2,&changed,1); child.seal();
+        parent.read(0,got.data(),8); CHECK(got==original);
+        child.read(0,got.data(),8); CHECK(got[2]==91 && got[0]==1 && got[7]==8);
+        CHECK(shared.disk_bytes()==8 && shared.charged_bytes()==8);
+        parent.reset();
+        CHECK(shared.disk_bytes()==0);
+        shared.trim(0);
+        auto grandchild=child.fork(); child.reset();
+        grandchild.read(0,got.data(),8); CHECK(got[2]==91);
+        grandchild.reset();
+        CHECK(shared.disk_bytes()==0 && shared.charged_bytes()==0);
+    }
     auto file = std::make_shared<SpillFile>(directory, 512);
     HostKvStorage storage(48, file);
     std::vector<HostKvRecord> history;

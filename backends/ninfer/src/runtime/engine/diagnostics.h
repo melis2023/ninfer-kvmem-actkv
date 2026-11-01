@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "ninfer/engine_options.h"
 
 #include <cstdarg>
 #include <cstdio>

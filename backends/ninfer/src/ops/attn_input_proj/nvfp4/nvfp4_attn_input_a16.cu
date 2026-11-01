@@ -55,7 +55,7 @@ void nvfp4_attn_input_a16_launch(const Tensor& x, const Weight& weight, Tensor& 
     }
     {
         launch_nvfp4_a16_mma<
-            Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>, 5120>>(
+            Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 1, 3>, 5120>>(
             p, output, epilogue, stream);
         return;
     }

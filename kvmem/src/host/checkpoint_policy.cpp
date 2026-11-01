@@ -1,4 +1,4 @@
-﻿#include "kvmem/checkpoint_policy.hpp"
+#include "kvmem/checkpoint_policy.hpp"
 #include <cerrno>
 #include <cstring>
 #include <limits>

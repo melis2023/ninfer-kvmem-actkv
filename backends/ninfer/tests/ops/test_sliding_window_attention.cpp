@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/cyclic_kv_cache.h"
+#include "core/device.h"
 #include "ops/op_tester.h"
 #include "ops/softmax_attention/oracle.h"
 
@@ -23,7 +24,7 @@ namespace {
 constexpr int kD       = 128;
 constexpr int kQHeads  = 32;
 constexpr int kKVHeads = 8;
-constexpr int kWindow  = 4096;
+int kWindow = 4096;
 constexpr float kScale = 0.08838834764831844055f;
 constexpr ops::AttentionHeadGeometry kGeometry{kD, kQHeads, kKVHeads};
 
@@ -65,14 +66,15 @@ void sliding_window_attention_oracle(const std::vector<float>& q, const std::vec
                                      const std::vector<float>& context_k,
                                      const std::vector<float>& context_v,
                                      const std::vector<int>& positions, int context_length,
-                                     int valid_columns, std::vector<double>& out) {
+                                     int valid_columns, std::vector<double>& out,
+                                     int floor = 0) {
     const int tokens = static_cast<int>(positions.size());
     out.assign(static_cast<std::size_t>(kD) * kQHeads * tokens, 0.0);
 
     for (int token = 0; token < valid_columns; ++token) {
         const int query_position = positions[static_cast<std::size_t>(token)];
-        const int context_begin  = std::max(0, query_position - (kWindow - 1));
-        const int context_keys   = context_length - context_begin;
+        const int context_begin = std::max(floor, std::max(0, query_position - (kWindow - 1)));
+        const int context_keys = std::max(0, context_length - context_begin);
         const int key_count      = context_keys + valid_columns;
         naive_dense_softmax_attention(
             kGeometry, 1, key_count, static_cast<double>(kScale),
@@ -100,8 +102,8 @@ CyclicKVCacheLayerView make_context_view(DeviceBuffer& k, DeviceBuffer& v, int l
     return {
         .k               = Tensor(k.p, DType::BF16, {kD, kWindow, kKVHeads, lane_capacity}),
         .v               = Tensor(v.p, DType::BF16, {kD, kWindow, kKVHeads, lane_capacity}),
-        .capacity        = kWindow,
-        .padded_capacity = kWindow,
+        .capacity        = static_cast<std::uint32_t>(kWindow),
+        .padded_capacity = static_cast<std::uint32_t>(kWindow),
         .num_kv_heads    = kKVHeads,
         .head_dim        = kD,
         .lane_capacity   = lane_capacity,
@@ -114,7 +116,8 @@ enum class InputProfile {
 };
 
 int run_case(int tokens, int context_length, InputProfile profile = InputProfile::Random,
-             int envelope_max = -1, int valid_columns = -1) {
+             int envelope_max = -1, int valid_columns = -1, int floor = -1,
+             bool graph_replay = false) {
     if (envelope_max < 0) envelope_max = context_length;
     if (valid_columns < 0) valid_columns = tokens;
     const std::size_t q_count        = static_cast<std::size_t>(kD) * kQHeads * tokens;
@@ -160,7 +163,7 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     }
     std::vector<double> reference;
     sliding_window_attention_oracle(q, query_k, query_v, context_k, context_v, positions,
-                                    context_length, valid_columns, reference);
+                                    context_length, valid_columns, reference, std::max(floor, 0));
 
     const auto q_expected         = bf16_bits(q);
     const auto query_k_expected   = bf16_bits(query_k);
@@ -178,6 +181,7 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     DeviceBuffer d_positions = to_device_i32(positions);
     DeviceBuffer d_valid     = to_device(valid_expected);
     DeviceBuffer d_lane      = to_device(lane_expected);
+    DeviceBuffer d_floor     = to_device_i32({std::max(floor, 0)});
     GuardedDeviceBuffer d_out(q_count * sizeof(std::uint16_t));
     d_out.fill(0x7f);
 
@@ -187,6 +191,7 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     Tensor positions_tensor(d_positions.p, DType::I32, {tokens, 1});
     Tensor valid_tensor(d_valid.p, DType::I32, {1});
     Tensor lane_tensor(d_lane.p, DType::I32, {1});
+    Tensor floor_tensor = floor >= 0 ? Tensor(d_floor.p, DType::I32, {1}) : Tensor{};
     Tensor out_tensor(d_out.data(), DType::BF16, {kD, kQHeads, tokens, 1});
     CyclicKVCacheLayerView context = make_context_view(d_context_k, d_context_v);
     const ops::SlidingWindowAttentionExecutionEnvelope envelope{
@@ -197,7 +202,7 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     DeviceArena workspace(std::max<std::size_t>(workspace_bytes, 1));
 
     ops::sliding_window_attention(q_tensor, query_k_tensor, query_v_tensor, positions_tensor,
-                                  valid_tensor, lane_tensor, kGeometry, kWindow, kScale, context,
+                                  valid_tensor, lane_tensor, floor_tensor, kGeometry, kWindow, kScale, context,
                                   envelope, workspace, out_tensor, nullptr);
     cuda_synchronize();
 
@@ -208,6 +213,7 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
         label += " envelope=[0," + std::to_string(envelope_max) + "]";
     }
     if (profile == InputProfile::WindowBoundary) label += " window-boundary";
+    if (floor >= 0) label += " floor=" + std::to_string(floor);
 
     int failures =
         valid_columns == 0
@@ -216,6 +222,31 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
             : verify_reduction(label.c_str(), from_device_bf16(d_out.data(), q_count), reference,
                                kSlidingWindowBf16Criterion);
     failures += d_out.verify_guards((label + " output guards").c_str());
+    if (graph_replay) {
+        cudaStream_t stream{};
+        cudaGraph_t graph{};
+        cudaGraphExec_t executable{};
+        CUDA_CHECK(cudaStreamCreate(&stream));
+        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+        ops::sliding_window_attention(q_tensor, query_k_tensor, query_v_tensor, positions_tensor,
+                                      valid_tensor, lane_tensor, floor_tensor, kGeometry, kWindow,
+                                      kScale, context, envelope, workspace, out_tensor, stream);
+        CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+        CUDA_CHECK(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0));
+        // Reuse one captured envelope after a reselection changes the device-side floor.
+        for (int replay_floor : {context_length - 3, context_length, context_length + 1}) {
+            CUDA_CHECK(cudaMemcpy(d_floor.p, &replay_floor, sizeof(replay_floor), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaGraphLaunch(executable, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            sliding_window_attention_oracle(q, query_k, query_v, context_k, context_v, positions,
+                                            context_length, valid_columns, reference, replay_floor);
+            failures += verify_reduction((label + " graph floor=" + std::to_string(replay_floor)).c_str(),
+                from_device_bf16(d_out.data(), q_count), reference, kSlidingWindowBf16Criterion);
+        }
+        CUDA_CHECK(cudaGraphExecDestroy(executable));
+        CUDA_CHECK(cudaGraphDestroy(graph));
+        CUDA_CHECK(cudaStreamDestroy(stream));
+    }
     failures += verify_exact((label + " q unchanged").c_str(),
                              from_device<std::uint16_t>(d_q, q_count), q_expected);
     failures +=
@@ -243,7 +274,7 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
     return failures;
 }
 
-int run_batch_case() {
+int run_batch_case(bool with_floors = false) {
     constexpr int tokens                 = 2;
     constexpr int batch                  = 2;
     const std::size_t row_q_count        = static_cast<std::size_t>(kD) * kQHeads * tokens;
@@ -270,6 +301,7 @@ int run_batch_case() {
     const std::vector<int> positions{4096, 4097, 65, 65};
     const std::vector<std::int32_t> valid{2, 1};
     const std::vector<std::int32_t> lanes{1, 0};
+    const std::vector<std::int32_t> floors{4093, 65};
 
     DeviceBuffer d_q         = to_device(bf16_bits(q));
     DeviceBuffer d_query_k   = to_device(bf16_bits(query_k));
@@ -279,6 +311,7 @@ int run_batch_case() {
     DeviceBuffer d_positions = to_device_i32(positions);
     DeviceBuffer d_valid     = to_device(valid);
     DeviceBuffer d_lanes     = to_device(lanes);
+    DeviceBuffer d_floors    = to_device(floors);
     GuardedDeviceBuffer d_out(row_q_count * batch * sizeof(std::uint16_t));
     d_out.fill(0x7f);
 
@@ -288,6 +321,7 @@ int run_batch_case() {
     Tensor positions_tensor(d_positions.p, DType::I32, {tokens, batch});
     Tensor valid_tensor(d_valid.p, DType::I32, {batch});
     Tensor lanes_tensor(d_lanes.p, DType::I32, {batch});
+    Tensor floors_tensor = with_floors ? Tensor(d_floors.p, DType::I32, {batch}) : Tensor{};
     Tensor out_tensor(d_out.data(), DType::BF16, {kD, kQHeads, tokens, batch});
     constexpr ops::SlidingWindowAttentionExecutionEnvelope envelope{0, 4096};
     DeviceArena workspace(std::max<std::size_t>(ops::sliding_window_attention_workspace_capacity_bytes(
@@ -316,13 +350,14 @@ int run_batch_case() {
         std::vector<double> row_expected;
         sliding_window_attention_oracle(row_q, row_query_k, row_query_v, row_context_k,
                                         row_context_v, row_positions, row_positions.front(),
-                                        valid[static_cast<std::size_t>(b)], row_expected);
+                                        valid[static_cast<std::size_t>(b)], row_expected,
+                                        with_floors ? floors[static_cast<std::size_t>(b)] : 0);
         std::copy(row_expected.begin(), row_expected.end(),
                   expected.begin() + static_cast<std::ptrdiff_t>(b * row_q_count));
     }
 
     ops::sliding_window_attention(q_tensor, query_k_tensor, query_v_tensor, positions_tensor,
-                                  valid_tensor, lanes_tensor, kGeometry, kWindow, kScale, context,
+                                  valid_tensor, lanes_tensor, floors_tensor, kGeometry, kWindow, kScale, context,
                                   envelope, workspace, out_tensor, nullptr);
     cuda_synchronize();
 
@@ -371,6 +406,16 @@ int main() {
     failures += run_case(8, 65, InputProfile::Random, 96, 0);
     failures += run_case(8, 4096, InputProfile::Random, 4096, 0);
     failures += run_batch_case();
+    failures += run_batch_case(true);
+    // Logical positions outlive the cyclic ring. Qualify both supported ring sizes, masked
+    // suffixes, empty context, and device floor changes under a captured CUDA Graph.
+    for (int window : {4096, 2048}) {
+        kWindow = window;
+        failures += run_case(4, 65, InputProfile::Random, 96, 4, 63, true);
+        failures += run_case(4, 8194, InputProfile::Random, 262144, 4, 8178, true);
+        failures += run_case(16, 8194, InputProfile::Random, 262144, 16, 8194);
+        failures += run_case(8, 8194, InputProfile::Random, 262144, 0, 8194);
+    }
     } catch (const std::exception& error) {
         std::cerr << "sliding_window_attention threw: " << error.what() << (char)10;
         return 1;

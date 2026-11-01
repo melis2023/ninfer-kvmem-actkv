@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -113,7 +114,8 @@ struct Observed {
 // constrained engine is first forced to evict the snapshot image and most of its blocks, so the
 // same snapshot comes back through the Host slabs. Both restores carry identical bytes and resume
 // at the same frontier with the same chunking, so greedy generation must match token for token.
-int exercise_restore_exact(const char* artifact, ninfer::SpeculativeBackend backend) {
+int exercise_restore_exact(const char* artifact, ninfer::SpeculativeBackend backend,
+                           bool fixed_fixture = true) {
     const std::vector<ninfer::TokenId> first = synthetic_tokens(1500, 1);
     std::vector<ninfer::TokenId> second(first.begin(), first.begin() + 1400);
     const std::vector<ninfer::TokenId> suffix = synthetic_tokens(300, 2);
@@ -123,6 +125,11 @@ int exercise_restore_exact(const char* artifact, ninfer::SpeculativeBackend back
     const std::vector<ninfer::TokenId> pressure = synthetic_tokens(3900, 3);
 
     const auto run = [&](ninfer::EngineOptions options, bool apply_pressure) {
+        // The general admission scenario accepts an ordinary full MTP head and
+        // measures the captured frontier instead of assuming a fixture's tap layout.
+        if (!fixed_fixture && backend == ninfer::SpeculativeBackend::Mtp) {
+            options.speculative.proposal_head = ninfer::ProposalHead::Full;
+        }
         ninfer::Engine engine(std::move(options));
         (void)engine.generate(engine.prepare_tokens(first), greedy(8));
         if (apply_pressure) { (void)engine.generate(engine.prepare_tokens(pressure), greedy(4)); }
@@ -138,9 +145,16 @@ int exercise_restore_exact(const char* artifact, ninfer::SpeculativeBackend back
     // flexible prompt-tail tap, realized at its start.
     constexpr std::uint32_t kExpectedReuse = 2 * kPrefillChunk;
     int failures                           = 0;
-    if (device.reused != kExpectedReuse || host.reused != kExpectedReuse) {
+    if (fixed_fixture && (device.reused != kExpectedReuse || host.reused != kExpectedReuse)) {
         std::cerr << "restore-exact: reused device=" << device.reused << " host=" << host.reused
                   << ", expected the prompt-tail snapshot at " << kExpectedReuse << '\n';
+        ++failures;
+    }
+    if (!fixed_fixture && (device.reused == 0 || device.reused > 1400 ||
+                           device.reused % kBlock != 0 || host.reused != device.reused)) {
+        std::cerr << "restore-admission: Device/Host frontier must match, be block-aligned, "
+                     "and remain inside the shared 1400-token prefix; device="
+                  << device.reused << " host=" << host.reused << '\n';
         ++failures;
     }
     if (device.stats.hybrid_host_image_restores != 0 ||
@@ -556,6 +570,266 @@ int exercise_turns(const char* artifact, std::size_t host_bytes) {
     return failures;
 }
 
+// Typed decision reads (src/serve/systemone.cpp) without the drafter: one-token reads of one
+// state, Disposable, with explicit boundaries after the system turn and after the state part, on
+// an Engine drafting with `backend`. The drafter never changes what the target computes, so the
+// reads' first tokens and log probabilities equal those of drafting reads, bit for bit, and they
+// resume where drafting reads resume. The state snapshot the first read leaves keeps the drafter's
+// state: a drafting chat over the same state then drafts and accepts exactly as it does after
+// drafting reads. A drafting-free request for more than one token is refused.
+int exercise_drafting_off(const char* artifact, ninfer::SpeculativeBackend backend) {
+    const char* name = backend == ninfer::SpeculativeBackend::Mtp ? "drafting-off-mtp"
+                                                                  : "drafting-off-dflash2";
+    const ninfer::ChatMessage system = text_message(
+        ninfer::ChatRole::System,
+        "You answer typed questions about a state with one label only: the letter of the best "
+        "option, yes or no, or the number of the level. No words before or after the label.");
+    std::string state = "State:\n";
+    for (int line = 0; line < 24; ++line) {
+        state += "Entry " + std::to_string(line) + ": the parcel passed hub " +
+                 std::to_string(line * 7 % 13) + " and waited " + std::to_string(line % 5 + 1) +
+                 " hours.\n";
+    }
+    std::string long_question = "Question: Which hub held the parcel longest? Options:\n";
+    for (int hub = 0; hub < 13; ++hub) {
+        long_question += static_cast<char>('A' + hub);
+        long_question += ". hub " + std::to_string(hub) + "\n";
+    }
+    long_question += "Reply with a single letter and nothing else.";
+    const std::array<std::string, 3> questions{
+        "Question: Did the parcel pass hub 3? Answer with one word, yes or no, in lower case.",
+        long_question,
+        "Question: How many hours did it wait at most? Reply with a single number."};
+    const auto prompt = [&](const std::string& question, bool read) {
+        ninfer::ChatMessage user = text_message(ninfer::ChatRole::User, state);
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = question, .media = {}});
+        ninfer::PromptInput input;
+        input.messages                = {system, user};
+        input.options.enable_thinking = false;
+        if (read) {
+            input.context_cache.retention            = ninfer::CacheRetentionHint::Disposable;
+            input.context_cache.update_session_index = false;
+        }
+        input.context_cache.markers = {
+            ninfer::PromptCacheMarker{
+                .after_message_count = 1,
+                .kind                = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                .evidence            = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+                .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary},
+            ninfer::PromptCacheMarker{
+                .after_message_count      = 2,
+                .kind                     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                .evidence                 = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+                .location                 = ninfer::PromptCacheMarkerLocation::MessagePartBoundary,
+                .after_message_part_count = 1}};
+        return input;
+    };
+    const auto read_options = [](bool drafting, std::uint32_t outputs) {
+        ninfer::RequestOptions options          = greedy(outputs);
+        options.execution.logprobs              = true;
+        options.execution.speculative_drafting = drafting;
+        return options;
+    };
+    struct Run {
+        std::vector<ninfer::TokenLogprob> reads;
+        std::vector<std::uint32_t> reused;
+        ninfer::GenerationResult chat;
+    };
+    const auto run = [&](bool drafting) {
+        ninfer::Engine engine(hybrid_options(artifact, backend, 16384, 1ULL << 30, 8));
+        Run out;
+        for (const std::string& question : questions) {
+            const ninfer::GenerationResult result =
+                engine.generate(engine.prepare(prompt(question, true)), read_options(drafting, 1));
+            out.reads.push_back(result.content_logprobs.at(0));
+            out.reused.push_back(result.reused_prompt_tokens);
+        }
+        out.chat = engine.generate(
+            engine.prepare(prompt("Summarize the parcel's route in two sentences.", false)),
+            greedy(32));
+        return out;
+    };
+    const Run drafting = run(true);
+    const Run off      = run(false);
+
+    int failures = 0;
+    for (std::size_t read = 0; read < questions.size(); ++read) {
+        const ninfer::TokenLogprob& a = drafting.reads[read];
+        const ninfer::TokenLogprob& b = off.reads[read];
+        if (a.id != b.id || a.logprob != b.logprob || a.top_ids != b.top_ids ||
+            a.top_values != b.top_values) {
+            std::cerr << name << ": read " << read
+                      << " differs from the drafting read (token " << a.id << " vs " << b.id
+                      << ")\n";
+            ++failures;
+        }
+    }
+    if (off.reused != drafting.reused || off.reused[1] == 0 || off.reused[2] != off.reused[1] ||
+        off.reused[0] >= off.reused[1]) {
+        std::cerr << name << ": reads reused " << off.reused[0] << '/' << off.reused[1] << '/'
+                  << off.reused[2] << " tokens, drafting reads " << drafting.reused[0] << '/'
+                  << drafting.reused[1] << '/' << drafting.reused[2]
+                  << "; expected the later reads at the state boundary\n";
+        ++failures;
+    }
+    const ninfer::SpeculativeStats& a = drafting.chat.speculative;
+    const ninfer::SpeculativeStats& b = off.chat.speculative;
+    if (off.chat.generated_token_ids != drafting.chat.generated_token_ids ||
+        off.chat.reused_prompt_tokens != drafting.chat.reused_prompt_tokens ||
+        off.chat.reused_prompt_tokens < off.reused[1] || b.drafted_tokens == 0 ||
+        a.rounds != b.rounds || a.drafted_tokens != b.drafted_tokens ||
+        a.accepted_tokens != b.accepted_tokens ||
+        a.accepted_per_position != b.accepted_per_position) {
+        std::cerr << name << ": the chat after the reads reused " << off.chat.reused_prompt_tokens
+                  << " tokens and accepted " << b.accepted_tokens << " of " << b.drafted_tokens
+                  << " drafts in " << b.rounds << " rounds; after drafting reads "
+                  << drafting.chat.reused_prompt_tokens << ", " << a.accepted_tokens << " of "
+                  << a.drafted_tokens << " in " << a.rounds
+                  << (off.chat.generated_token_ids == drafting.chat.generated_token_ids
+                          ? " (same tokens)\n"
+                          : " (different tokens)\n");
+        ++failures;
+    }
+    bool refused = false;
+    try {
+        ninfer::Engine engine(hybrid_options(artifact, backend, 16384, 1ULL << 30, 8));
+        (void)engine.generate(engine.prepare(prompt(questions[0], true)), read_options(false, 2));
+    } catch (const std::exception&) { refused = true; }
+    if (!refused) {
+        std::cerr << name << ": a drafting-free request for two tokens was accepted\n";
+        ++failures;
+    }
+    return failures;
+}
+
+// Typed decision reads submitted as one group: their last prompt chunks (the questions, after the
+// cached state boundary) run in one shared prefill pass, admitted while the first one's last
+// chunk is staged (without concurrent prefill too) or with concurrent prefill (the MTP Engine, its
+// reads drafting-free). Each read must produce what it produces alone: the same first token and
+// reuse, its log probability and readout values within the rounding the wider projections allow.
+int exercise_shared_prefill(const char* artifact, ninfer::SpeculativeBackend backend) {
+    const char* name =
+        backend == ninfer::SpeculativeBackend::Mtp ? "shared-prefill-mtp" : "shared-prefill";
+    const ninfer::ChatMessage system = text_message(
+        ninfer::ChatRole::System,
+        "You answer typed questions about a state with one label only. No words before or after "
+        "the label.");
+    std::string state = "State:\n";
+    for (int line = 0; line < 20; ++line) {
+        state += "Entry " + std::to_string(line) + ": the parcel passed hub " +
+                 std::to_string(line * 5 % 11) + " and waited " + std::to_string(line % 4 + 1) +
+                 " hours.\n";
+    }
+    const std::array<std::string, 4> questions{
+        "Question: Did the parcel pass hub 3? Answer yes or no.",
+        "Question: Did the parcel pass hub 12? Answer yes or no.",
+        "Question: Which hub came first? Options:\nA. hub 0\nB. hub 5\nC. hub 10\nReply with "
+        "one letter.",
+        "Question: How many hours did the parcel wait at most? Reply with a single number."};
+    const auto prompt = [&](const std::string& question) {
+        ninfer::ChatMessage user = text_message(ninfer::ChatRole::User, state);
+        user.parts.push_back(ninfer::MessagePart{
+            .kind = ninfer::MessagePartKind::Text, .text = question, .media = {}});
+        ninfer::PromptInput input;
+        input.messages                                   = {system, user};
+        input.options.enable_thinking                    = false;
+        input.context_cache.retention                    = ninfer::CacheRetentionHint::Disposable;
+        input.context_cache.update_session_index         = false;
+        input.context_cache.markers = {
+            ninfer::PromptCacheMarker{
+                .after_message_count = 1,
+                .kind                = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                .evidence            = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+                .location            = ninfer::PromptCacheMarkerLocation::MessageBoundary},
+            ninfer::PromptCacheMarker{
+                .after_message_count      = 2,
+                .kind                     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+                .evidence                 = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+                .location                 = ninfer::PromptCacheMarkerLocation::MessagePartBoundary,
+                .after_message_part_count = 1}};
+        return input;
+    };
+    ninfer::RequestOptions read          = greedy(1);
+    read.execution.logprobs              = true;
+    read.execution.speculative_drafting = false;
+    read.execution.readout_tokens        = {9, 13, 220, 1000, 4000};
+    ninfer::EngineOptions options = hybrid_options(artifact, backend, 16384, 1ULL << 30, 8);
+    options.max_concurrency       = 4;
+    options.max_pending_requests  = 8;
+    options.concurrent_prefill    = backend == ninfer::SpeculativeBackend::Mtp;
+
+    struct Read {
+        ninfer::TokenLogprob logprob;
+        std::uint32_t reused = 0;
+    };
+    const auto first_read = [&](const ninfer::GenerationResult& result) {
+        return Read{.logprob = result.content_logprobs.at(0),
+                    .reused  = result.reused_prompt_tokens};
+    };
+    // Alone: the first read leaves the state boundary, then each read runs by itself.
+    std::vector<Read> alone;
+    {
+        ninfer::Engine engine(options);
+        (void)engine.generate(engine.prepare(prompt(questions[0])), read);
+        for (const std::string& question : questions) {
+            alone.push_back(first_read(engine.generate(engine.prepare(prompt(question)), read)));
+        }
+    }
+    // Together: after the same first read, the reads are submitted as one group.
+    std::vector<Read> together;
+    ninfer::RuntimeStats before;
+    ninfer::RuntimeStats after;
+    {
+        ninfer::Engine engine(options);
+        (void)engine.generate(engine.prepare(prompt(questions[0])), read);
+        before = engine.runtime_stats();
+        std::vector<ninfer::GenerationSubmission> group;
+        for (const std::string& question : questions) {
+            group.push_back(ninfer::GenerationSubmission{.prompt  = engine.prepare(prompt(question)),
+                                                         .options = read});
+        }
+        for (ninfer::GenerationHandle& handle : engine.submit_group(std::move(group))) {
+            together.push_back(first_read(handle.wait()));
+        }
+        after = engine.runtime_stats();
+    }
+
+    int failures = 0;
+    const std::uint64_t passes   = after.shared_prefill_passes - before.shared_prefill_passes;
+    const std::uint64_t requests = after.shared_prefill_requests - before.shared_prefill_requests;
+    if (passes != 1 || requests != questions.size()) {
+        std::cerr << name << ": the group shared " << passes << " passes (" << requests
+                  << " requests); expected one pass of " << questions.size() << '\n';
+        ++failures;
+    }
+    // The pass's wider projections round differently and the head's logits are BF16: a value may
+    // move by one BF16 step of its logit (0.125 between 16 and 32, 0.25 up to 64; measured on an
+    // RTX 3090: at most 0.125).
+    constexpr float kTolerance = 0.26F;
+    for (std::size_t index = 0; index < questions.size(); ++index) {
+        const Read& a = alone[index];
+        const Read& b = together[index];
+        float worst   = std::fabs(a.logprob.logprob - b.logprob.logprob);
+        bool shaped   = a.logprob.readout.size() == read.execution.readout_tokens.size() &&
+                      b.logprob.readout.size() == a.logprob.readout.size();
+        for (std::size_t k = 0; shaped && k < a.logprob.readout.size(); ++k) {
+            worst = std::max(worst, std::fabs(a.logprob.readout[k] - b.logprob.readout[k]));
+        }
+        std::cerr << name << ": read " << index << " token " << b.logprob.id << " reused "
+                  << b.reused << ", largest log probability change " << worst << '\n';
+        if (a.logprob.id != b.logprob.id || a.reused != b.reused || !shaped ||
+            !(worst <= kTolerance)) {
+            std::cerr << name << ": read " << index << " together gave token " << b.logprob.id
+                      << " (logprob " << b.logprob.logprob << ", reused " << b.reused
+                      << "), alone token " << a.logprob.id << " (logprob " << a.logprob.logprob
+                      << ", reused " << a.reused << ")\n";
+            ++failures;
+        }
+    }
+    return failures;
+}
+
 std::vector<std::uint8_t> gradient_ppm(int size, int phase) {
     std::vector<std::uint8_t> ppm;
     const std::string header =
@@ -643,10 +917,15 @@ int main() {
     }
     const char* selected            = std::getenv("NINFER_HYBRID_REAL_SCENARIO");
     const std::string_view scenario = selected != nullptr && *selected != '\0' ? selected : "all";
-    constexpr std::array<std::string_view, 11> kScenarios{"all",
+    constexpr std::array<std::string_view, 16> kScenarios{"all",
+                                                          "restore-admission",
                                                           "restore-exact",
                                                           "restore-exact-mtp",
                                                           "restore-exact-dflash2",
+                                                          "drafting-off-mtp",
+                                                          "drafting-off-dflash2",
+                                                          "shared-prefill",
+                                                          "shared-prefill-mtp",
                                                           "turns",
                                                           "turns-device-only",
                                                           "vision",
@@ -661,6 +940,10 @@ int main() {
     int failures = 0;
     try {
         const bool all = scenario == "all";
+        if (scenario == "restore-admission") {
+            failures += exercise_restore_exact(artifact, ninfer::SpeculativeBackend::None, false);
+            failures += exercise_restore_exact(artifact, ninfer::SpeculativeBackend::Mtp, false);
+        }
         if (all || scenario == "restore-exact") {
             failures += exercise_restore_exact(artifact, ninfer::SpeculativeBackend::None);
         }
@@ -669,6 +952,18 @@ int main() {
         }
         if (all || scenario == "restore-exact-dflash2") {
             failures += exercise_restore_exact(artifact, ninfer::SpeculativeBackend::DFlash2);
+        }
+        if (all || scenario == "drafting-off-mtp") {
+            failures += exercise_drafting_off(artifact, ninfer::SpeculativeBackend::Mtp);
+        }
+        if (all || scenario == "drafting-off-dflash2") {
+            failures += exercise_drafting_off(artifact, ninfer::SpeculativeBackend::DFlash2);
+        }
+        if (all || scenario == "shared-prefill") {
+            failures += exercise_shared_prefill(artifact, ninfer::SpeculativeBackend::None);
+        }
+        if (all || scenario == "shared-prefill-mtp") {
+            failures += exercise_shared_prefill(artifact, ninfer::SpeculativeBackend::Mtp);
         }
         if (all || scenario == "turns") { failures += exercise_turns(artifact, 1ULL << 30); }
         if (all || scenario == "turns-device-only") { failures += exercise_turns(artifact, 0); }

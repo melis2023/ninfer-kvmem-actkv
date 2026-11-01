@@ -13,6 +13,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_small_t_unified.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_w4a4.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_a16.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_int8.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_a4.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_linear_add_plan_unified.cpp"

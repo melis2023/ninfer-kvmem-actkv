@@ -37,6 +37,7 @@
 // padded region [k, padded_k) are never used.
 
 #include "core/pdl.cuh"
+#include "ops/common/device_limits.h"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/warp.cuh"
@@ -290,7 +291,8 @@ struct Q5Split4StoreEpilogue {
 template <class SC, int kTt, int kFullSlabs, int kStride, bool SplitOutput = false,
           int SplitRow = 0, class Epilogue = Q5Split4StoreEpilogue, bool TriggerPdl = false,
           bool JoinPdl = false>
-__launch_bounds__(128, kQ5Split4BlocksPerSm<kTt>) __global__ void q5_rowsplit_gemm_simt_split4_kernel(
+__launch_bounds__(128, resident_ctas_bound(128, kQ5Split4BlocksPerSm<kTt>)) __global__ void
+q5_rowsplit_gemm_simt_split4_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
     __nv_bfloat16* __restrict__ out, __nv_bfloat16* __restrict__ out_tail, std::int32_t n,

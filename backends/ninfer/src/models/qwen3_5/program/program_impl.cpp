@@ -1,6 +1,7 @@
 #include "kvmem/spill_io.hpp"
 #include "models/qwen3_5/program/structured_round.h"
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/load/vision_cpu_cache.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/execution/linear.h"
@@ -41,25 +42,26 @@ std::uint32_t normalized_private_capacity(const ContextCacheOptions& options) {
     return *options.max_private_continuations;
 }
 
-// Overlay Vision residency backs the persistent arena with virtual memory so free KV granules can
-// fund a Vision window. The lendable prefix ends past the last page-major KV plane.
+// The persistent arena is virtual memory whose free KV granules can fund a Vision window (overlay
+// Vision residency) or an elastic expert cache (host or disk experts on one device). The lendable
+// prefix ends past the last page-major KV plane.
 std::unique_ptr<EvictableKVPool> make_kv_arena(DeviceContext& device,
                                                const execution::Parameters& parameters,
-                                               const SequencePlanImpl& plan) {
-    if (!plan.features.overlay_vision()) { return nullptr; }
-    const EvictableWeightPool* const pool = parameters.model.weight_pool();
-    if (pool == nullptr || !pool->mirror_captured()) {
-        throw std::logic_error("overlay Vision weight pool has no captured window");
-    }
-    const std::size_t window      = pool->window_capacity_bytes();
+                                               const SequencePlanImpl& plan, bool expert_loan) {
     const std::size_t granularity = EvictableKVPool::device_granularity(device);
-    if (window == 0 || granularity == 0 || plan.persistent.lendable_kv_end_bytes == 0) {
-        return nullptr;
-    }
-    // A KV cache smaller than one window can never fund a concurrent encode. The Engine still runs:
-    // every window then borrows the weight tail.
+    if (granularity == 0 || plan.persistent.lendable_kv_end_bytes == 0) { return nullptr; }
     const std::size_t lendable = plan.persistent.lendable_kv_end_bytes / granularity * granularity;
-    if (window > lendable) { return nullptr; }
+    std::size_t window = 0;
+    if (plan.features.overlay_vision()) {
+        const EvictableWeightPool* const pool = parameters.model.weight_pool();
+        if (pool == nullptr || !pool->mirror_captured()) {
+            throw std::logic_error("overlay Vision weight pool has no captured window");
+        }
+        // A KV cache smaller than one window can never fund a concurrent encode. The Engine still
+        // runs: every window then borrows the weight tail.
+        window = pool->window_capacity_bytes() <= lendable ? pool->window_capacity_bytes() : 0;
+    }
+    if (window == 0 && !expert_loan) { return nullptr; }
     return std::make_unique<EvictableKVPool>(
         device, EvictableKVPool::Config{
                     .arena_bytes           = plan.persistent.bytes,
@@ -156,19 +158,29 @@ make_stage_runtime(DeviceContext& device, const execution::Parameters& parameter
     const StageLinkOptions residual{.slot_bytes   = columns * hidden * sizeof(std::uint16_t),
                                     .slots        = 2,
                                     .force_staged = force_staged};
-    // Six int32 control tensors and one KVMem logical-origin scalar, plus alignment. Only the position pair is ever full
-    // width in prefill (cache `columns`, multimodal rope `3 * columns`), so the sum stays inside
-    // `6 * columns`; `run_staged` checks the packed size against this slot regardless.
-    const StageLinkOptions control{.slot_bytes   = (6 * columns + 16) * sizeof(std::int32_t),
+    const StageLinkOptions control{.slot_bytes   = stage_control_bytes(columns),
                                    .slots        = 2,
                                    .force_staged = force_staged};
+    for (std::size_t stage = 1; stage < stages; ++stage) {
+        runtime->control.emplace_back(device, 0, stage, control);
+    }
+    if (text.tensor_parallel()) {
+        // Rank 0 hands every rank the pass's residual; the layers' sums keep the replicas equal.
+        for (std::size_t rank = 1; rank < stages; ++rank) {
+            runtime->forward.emplace_back(device, 0, rank, residual);
+        }
+        auto& tp = runtime->tensor_parallel.emplace();
+        tp.shard = qwen3_5::tensor_parallel_share(parameters.model.config().text, stages);
+        tp.exchange = std::make_unique<TensorParallelExchange>(
+            device, TensorParallelExchangeOptions{.slot_bytes   = columns * hidden * sizeof(float),
+                                                  .force_staged = force_staged});
+        for (std::size_t rank = 1; rank < stages; ++rank) { tp.joined.emplace_back(device.rank(rank)); }
+        return runtime;
+    }
     for (std::size_t stage = 0; stage + 1 < stages; ++stage) {
         runtime->forward.emplace_back(device, stage, stage + 1, residual);
     }
     runtime->back.emplace(device, stages - 1, 0, residual);
-    for (std::size_t stage = 1; stage < stages; ++stage) {
-        runtime->control.emplace_back(device, 0, stage, control);
-    }
     // A masked drafter reads target features from layers that may sit on later stages; such a stage
     // sends each tapped layer's output to rank 0 as soon as the layer has run, on a stream of its
     // own, so the transfer overlaps the stage's later layers.
@@ -231,7 +243,8 @@ std::vector<DeviceArena> make_rank_workspaces(DeviceContext& device,
 } // namespace
 
 ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const SequencePlanImpl& plan,
-                         DeviceContext& device_in, const StartupObserver& startup_observer)
+                         DeviceContext& device_in, const StartupObserver& startup_observer,
+                         std::unique_ptr<execution::NativeExpertRuntime> expert_runtime)
     : parameters(parameters_in), device(device_in), capacity(plan.capacity),
       kv_capacity(plan.kv_capacity),
       kvmem_window_tokens(plan.kvmem_window_tokens),
@@ -252,7 +265,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       use_cuda_graph(plan.use_cuda_graph), causal_scoring(plan.causal_scoring),
       kv_payload_bytes(plan.persistent.kv_payload_bytes),
       graph_allowance_bytes(plan.graph_allowance_bytes), workspace_plan(plan.workspace),
-      kv_arena(make_kv_arena(device_in, parameters_in, plan)),
+      kv_arena(make_kv_arena(device_in, parameters_in, plan,
+                             expert_runtime && expert_runtime->elastic() && device_in.size() == 1)),
       suspendable(make_suspendable_storage(device_in, parameters_in, plan, kv_arena != nullptr)),
       persistent(kv_arena                 ? DeviceArena(kv_arena->arena())
                  : suspendable.persistent ? DeviceArena(suspendable.persistent->span())
@@ -267,8 +281,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       work(DeviceSpan{workspace_storage.base(), plan.workspace.general_capacity}),
       continuation_states(continuation_capacity), continuation_slots(continuation_capacity),
       shared_prefix_states(shared_prefix_capacity), shared_prefix_slots(shared_prefix_capacity),
+      experts(std::move(expert_runtime)),
       round_host(plan.causal_scoring ? std::nullopt
-                                     : std::make_optional<PinnedHostBuffer>(sizeof(TokenId))),
+                                     : std::make_optional<PinnedHostBuffer>(
+                                           kMaximumConcurrency * sizeof(TokenId))),
       score_logprobs_host(plan.causal_scoring ? std::make_optional<PinnedHostBuffer>(
                                                     kCausalScoreTile * sizeof(float))
                                               : std::nullopt),
@@ -371,7 +387,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     text_kv_addresses = std::make_unique<KVAddressSpaceStore>(
         *text_kv_pages, decoder->text_kv.execution_tables(), address_capacity,
         decoder->text_kv.execution_tables().logical_page_capacity());
-    if (vision_broker && kv_arena) {
+    if (vision_broker && kv_arena && kv_arena->window_capacity_bytes() != 0) {
         // A loan changes the admission capacity, so it may not race a sealed plan: refuse one while
         // a context transaction or a pressure-planning session is in flight, or while any lane has
         // been provisionally admitted (prefill staged) but hasn't yet bound its own KV entitlement
@@ -389,6 +405,28 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
                 return true;
             },
             [this] { advance_resource_revision(); });
+    }
+    if (kv_arena && experts && experts->elastic() && device.size() == 1) {
+        // Free pages kept back from the loan: a few small reservations' worth (prompt chunks,
+        // checkpoint tails), and a Vision window's.
+        const auto keep = [&](const DeviceKVPagePool& pool) {
+            std::size_t page_bytes = 0;
+            for (std::size_t plane = 0; plane < pool.plane_count(); ++plane) {
+                page_bytes += static_cast<std::size_t>(pool.plane(plane).nb[3]);
+            }
+            const std::uint32_t tokens = std::max<std::uint32_t>(8192, 2 * prefill_chunk);
+            std::uint64_t pages = (tokens + kPagedKVPageSize - 1) / kPagedKVPageSize;
+            if (page_bytes != 0) { pages += (kv_arena->window_capacity_bytes() + page_bytes - 1) / page_bytes; }
+            return static_cast<std::uint32_t>(std::min<std::uint64_t>(pages, pool.capacity_pages()));
+        };
+        std::vector<DeviceKVPagePool*> pools{&decoder->text_kv.page_pool()};
+        if (decoder->mtp_kv) { pools.push_back(&decoder->mtp_kv->page_pool()); }
+        std::vector<std::uint32_t> margins;
+        for (const DeviceKVPagePool* pool : pools) { margins.push_back(keep(*pool)); }
+        kv_expert_loan = std::make_unique<KvExpertLoan>(
+            *kv_arena, std::move(pools), std::move(margins),
+            KvExpertLoan::Cache{[this] { return experts->grow_cache(); },
+                                [this](std::uint64_t bytes) { return experts->shrink_cache(bytes); }});
     }
     state_images = std::make_unique<qwen3_5::StateImageDevicePool>(backings,
                                                                     plan.persistent.state_images);
@@ -462,6 +500,14 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             *backend_kv_pages, backend->execution_tables(), address_capacity,
             backend->execution_tables().logical_page_capacity());
     }
+    if (kvmem_window_tokens) {
+        const auto policy=kvmem::CheckpointPolicy::environment();
+        if(policy.enabled) {
+            const auto budget=policy.host_bytes*max_concurrency;
+            const auto staging=kvmem_options.disk_bytes ? state_images->host_layout().image_bytes : 0;
+            memory_checkpoint_pool->configure(budget>staging ? budget-staging : 0,1);
+        }
+    }
     if (kvmem_options.disk_bytes) {
         const auto page_bytes = text_host_kv_page_stride + backend_host_kv_page_stride;
         const auto pages = std::uint64_t(kvmem_window_tokens / 64) * max_concurrency;
@@ -478,6 +524,13 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             std::min<std::size_t>(2, max_concurrency));
         memory_transfer_storage = kvmem::HostKvStorage(2 * headroom);
         memory_state_staging = kvmem::HostKvStorage(state_bytes);
+    } else if (kvmem_window_tokens && kvmem_options.host_bytes) {
+        // Prepare zero-filled RAM records off the GPU executor. The queue is bounded;
+        // payload allocations still consume the existing request Host reservation.
+        const auto page_bytes = text_host_kv_page_stride + backend_host_kv_page_stride;
+        const auto headroom = std::uint64_t(kvmem_window_tokens / 64) * max_concurrency * page_bytes;
+        memory_io = std::make_unique<kvmem::StorageIoQueue>(
+            std::max<std::size_t>(2, max_concurrency + 1), headroom, 1);
     }
     pressure_text_page_scratch_.resize(text_kv_pages->capacity());
     pressure_text_selected_pages_.reserve(text_kv_pages->capacity());
@@ -528,8 +581,22 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         // The 1 GiB floor inside the clamp is memory the run still needs after this point and that
         // no plan accounts for (module loads, graph instantiation, launch-local backing); halving
         // what remains is the conservative split, so the cache never takes more than it leaves.
-        std::size_t free_device = 0, total_device = 0;
-        if (cudaMemGetInfo(&free_device, &total_device) == cudaSuccess) {
+        // Every GPU of a pipeline can address pinned host memory, so the buffer is sized for the
+        // rank with the least device memory free; that a mapping is charged to each of them is an
+        // assumption, measured on one card only.
+        std::size_t free_device       = std::numeric_limits<std::size_t>::max();
+        bool measured                 = false;
+        const std::size_t active_rank = device.active_rank();
+        for (std::size_t rank = 0; rank < device.size(); ++rank) {
+            device.activate_rank(rank);
+            std::size_t free_rank = 0, total_rank = 0;
+            if (cudaMemGetInfo(&free_rank, &total_rank) == cudaSuccess) {
+                free_device = std::min(free_device, free_rank);
+                measured    = true;
+            }
+        }
+        device.activate_rank(active_rank);
+        if (measured) {
             reserved_bytes =
                 clamp_host_kv_reservation_bytes(reserved_bytes, free_device, minimum_stride);
         }
@@ -592,16 +659,19 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     prefill_hidden = plan.persistent.prefill_hidden.bind(backing);
     if (!plan.persistent.memory_statistics.empty()) {
         const auto& config = parameters.model.config().text;
-        const auto query_workspace = plan.persistent.memory_query_workspace.bind(backing);
-        memory_query_scorer = std::make_unique<kvmem::PageSoftmaxCuda>(
-            device.rank(0).device, query_workspace.data, query_workspace.bytes(),
-            (capacity + 63U) / 64U, config.attention->num_attention_heads,
-            config.attention->num_key_value_heads, config.attention->head_dim);
+        if (plan.persistent.memory_query_workspace) {
+            const auto query_workspace=plan.persistent.memory_query_workspace->bind(backing);
+            memory_query_scorer=std::make_unique<kvmem::PageSoftmaxCuda>(device.rank(0).device,
+                query_workspace.data,query_workspace.bytes(),(capacity+63U)/64U,
+                config.attention->num_attention_heads,config.attention->num_key_value_heads,config.attention->head_dim);
+        }
         memory_statistics.emplace();
         memory_statistics->key_width = config.attention->key_width();
         memory_statistics->query_width = config.attention->query_width();
         memory_statistics->layers = config.full_attention_layers;
-        memory_statistics->query_columns = std::min(plan.prefill_chunk, plan.capacity);
+        memory_statistics->mean_query = kvmem_options.query_meanq_cosine;
+        memory_statistics->query_columns = memory_statistics->mean_query ? 1U :
+            std::min({plan.prefill_chunk, plan.capacity, kvmem_options.query_max_tokens});
         memory_statistics->columns = (std::min(plan.prefill_chunk, plan.capacity) + 126U) / 64U;
         memory_statistics->ranks.resize(device.size());
         memory_candidate_statistics = *memory_statistics;
@@ -617,26 +687,27 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             auto& candidates = memory_candidate_statistics->ranks[rank];
             stats.first_layer = candidates.first_layer = layout.first_layer;
             candidates.block_tokens = 1;
+            if(rank==0) stats.attention_tokens=layout.attention_tokens.bind(backings[rank]);
+            candidates.attention_tokens=stats.attention_tokens;
             if (!layout.layers) { continue; }
             stats.key_sums = layout.key_sums.bind(backings[rank]);
-            stats.query_sums = layout.query_sums.bind(backings[rank]);
+            stats.query_values = layout.query_values.bind(backings[rank]);
             stats.attention_queries = layout.attention_queries.bind(backings[rank]);
-            stats.attention_rows = layout.attention_rows.bind(backings[rank]);
-            stats.attention_positions = layout.attention_positions.bind(backings[rank]);
-            stats.attention_scratch = layout.attention_scratch.bind(backings[rank]);
-            stats.attention_norms = layout.attention_norms.bind(backings[rank]);
-            stats.attention_output = layout.attention_output.bind(backings[rank]);
-            if (rank == 0) stats.attention_tokens = layout.attention_tokens.bind(backings[rank]);
+            stats.attention_rows=layout.attention_rows.bind(backings[rank]);
+            stats.attention_positions=layout.attention_positions.bind(backings[rank]);
+            stats.attention_scratch=layout.attention_scratch.bind(backings[rank]);
+            stats.attention_norms=layout.attention_norms.bind(backings[rank]);
+            stats.attention_output=layout.attention_output.bind(backings[rank]);
             stats.ranges = layout.ranges.bind(backings[rank]);
             candidates.key_sums = layout.candidate_keys.bind(backings[rank]);
-            candidates.query_sums = stats.query_sums;
+            candidates.query_values = stats.query_values;
             candidates.attention_queries = stats.attention_queries;
             candidates.attention_tokens = stats.attention_tokens;
-            candidates.attention_rows = stats.attention_rows;
-            candidates.attention_positions = stats.attention_positions;
-            candidates.attention_scratch = stats.attention_scratch;
-            candidates.attention_norms = stats.attention_norms;
-            candidates.attention_output = stats.attention_output;
+            candidates.attention_rows=stats.attention_rows;
+            candidates.attention_positions=stats.attention_positions;
+            candidates.attention_scratch=stats.attention_scratch;
+            candidates.attention_norms=stats.attention_norms;
+            candidates.attention_output=stats.attention_output;
             candidates.ranges = stats.ranges;
             candidates.candidate_origin = layout.candidate_origin.bind(backings[rank]);
             DeviceBinding binding(device.rank(rank).device);
@@ -662,7 +733,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         structured_round = std::make_unique<qwen3_5::StructuredRound>(
             plan.persistent.grammar_masks->bind(backing),
             parameters.model.resources().public_token_count, widest_verify_window() + 1U,
-            max_concurrency);
+            max_concurrency,
+            speculative_backend == SpeculativeBackend::DFlash ||
+                speculative_backend == SpeculativeBackend::DFlash2);
         io.structured = structured_round.get();
     }
     active_continuations.fill(continuation_capacity);
@@ -738,8 +811,12 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         const std::size_t free_before = device.free_bytes();
         prepare_graphs();
         device.synchronize();
+        if (experts) { experts->check(); }
         const std::size_t free_after = device.free_bytes();
-        graph_measured_bytes         = free_before > free_after ? free_before - free_after : 0;
+        graph_measured_bytes =
+            free_after == 0 ? std::nullopt
+                            : std::optional<std::size_t>(
+                                  free_before > free_after ? free_before - free_after : 0);
         if (residency) {
             // WDDM clamps CUDA free at zero once the process is over budget. Use
             // the process's observed dedicated delta so Graph usage does not
@@ -755,6 +832,26 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     work.reset_peak();
     workspace_logical_peak_bytes = 0;
     create_hybrid_prefix_cache(startup_observer);
+    // Warm-up deliveries, the transport's asynchronous prefetches included, stay out of the
+    // request counters, and their routes out of the cache: it starts from the routing profile.
+    if (experts) {
+        experts->drain();
+        experts->prime();
+        expert_startup_stats = experts->stats();
+    }
+    if (kv_expert_loan) {
+        // The cache grows only into what loans free: the memory free now stays free.
+        experts->set_keep_free_bytes(device.free_bytes());
+        lend_kv_to_experts();
+    }
+}
+
+void ProgramImpl::lend_kv_to_experts() {
+    if (!kv_expert_loan) { return; }
+    // At least this many pages move at once, so a lend (which drains the expert service) stays
+    // rare: 16,384 tokens.
+    constexpr std::uint32_t kMinimumPages = 16384 / kPagedKVPageSize;
+    kv_expert_loan->lend(kMinimumPages);
 }
 
 void ProgramImpl::synchronize_transfer_streams() const {
@@ -870,7 +967,7 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             execution::PrefillContext schedule_state{
                 {device, parameters, work, state_images->linear(0), nullptr, io, prefill_hidden,
                  prefill_chunk, proposal_head, stage_runtime.get(), rope_yarn, fast_prefill_kernel,
-                 mtp_attention_window},
+                 mtp_attention_window, experts.get()},
                 decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
                 {},
                 decoder->text_kv,
@@ -970,6 +1067,9 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
         memory.enabled = true;
         memory.selected_tokens = kvmem_options.selected_tokens;
         memory.reserve_tokens = kvmem_options.reserve_tokens;
+        memory.retained_sessions_limit = kvmem_options.retained_sessions;
+        for (const auto& request : requests)
+            if (request.lifecycle != Lifecycle::Empty) ++memory.active_sessions;
         memory.host_payload_budget_bytes = kvmem_options.host_bytes;
         memory.transfer_staging_bytes = (memory_kv_staging ? memory_kv_staging->size() : 0) +
             memory_transfer_storage.charged_bytes() + memory_state_staging.charged_bytes();
@@ -978,6 +1078,7 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
         memory.statistics_staging_bytes =
             (memory_statistics_host ? memory_statistics_host->size() : 0) +
             (memory_candidate_host ? memory_candidate_host->size() : 0);
+        memory.checkpoint_bytes += memory_checkpoint_pool->allocated_bytes();
         memory.resident_pages = text_kv_pages->physical_pool().allocated_pages();
         memory.mtp_resident_pages = backend_kv_pages
             ? backend_kv_pages->physical_pool().allocated_pages() : 0;
@@ -994,6 +1095,7 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
         memory.disk_payload_budget_bytes = kvmem_options.disk_bytes;
         memory.retained_payload_budget_bytes = memory_retained_budget;
         for (const auto& request : requests) memory.active_payload_reservation_bytes += request.memory_payload_reservation;
+        std::vector<const KvmemPrefixCheckpoint*> seen;
         const auto collect = [&](const KvmemWindowState& window) {
             // Moves into the history directory leave scalar fields behind until lane
             // retirement. Ownership of statistics identifies the live history.
@@ -1003,9 +1105,11 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
             memory.history_swaps += window.swaps;
             memory.history_spilled_bytes += window.spilled_bytes;
             memory.history_restored_bytes += window.restored_bytes;
-            for (const auto kind : kKvmemCheckpointKinds) {
-                if (const auto* checkpoint = memory_checkpoint(window, kind)) {
-                    if (checkpoint->state) memory.checkpoint_bytes += checkpoint->state->size();
+            for (const auto kind : checkpoint_kinds(window)) {
+                if (const auto* checkpoint = memory_checkpoint(window, kind);
+                    checkpoint && std::find(seen.begin(), seen.end(), checkpoint) == seen.end()) {
+                    seen.push_back(checkpoint);
+                    memory.checkpoint_bytes += checkpoint->metadata_bytes();
                     memory.checkpoint_tokens = std::max(memory.checkpoint_tokens,
                         static_cast<std::uint32_t>(checkpoint->prefix.size()));
                 }
@@ -1017,6 +1121,8 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
             ++memory.retained_sessions;
             collect(*history);
         }
+        if(memory_coverage_transfer && std::find(seen.begin(),seen.end(),memory_coverage_transfer->checkpoint.get())==seen.end())
+            memory.checkpoint_bytes+=memory_coverage_transfer->checkpoint->metadata_bytes();
         memory.host_payload_bytes = memory_payload_storage.charged_bytes();
     }
     out.device          = device.device;
@@ -1059,12 +1165,34 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
                              : (workspace_plan.vision_resident ? VisionResidency::Resident
                                                                : VisionResidency::Overlay),
         };
+        if (const auto& cpu = parameters.model.cpu_vision()) {
+            const auto summary = cpu->summary();
+            auto& vision = *out.vision_workspace;
+            vision.cpu_weights_lazy = true;
+            vision.cpu_weights_loading = summary.loading;
+            vision.cpu_weight_bytes = summary.bytes;
+            vision.cpu_weight_users = summary.users;
+            vision.cpu_weight_loads = summary.loads;
+            vision.cpu_weight_unloads = summary.unloads;
+            vision.cpu_weight_last_load_seconds = summary.last_load_seconds;
+            vision.cpu_weight_idle_seconds = parameters.model.options().cpu_vision_idle_seconds;
+        }
         if (const EvictableWeightPool* const pool = parameters.model.weight_pool();
             !workspace_plan.vision_resident && pool != nullptr) {
             out.vision_workspace->window_capacity_bytes = pool->window_capacity_bytes();
             out.vision_workspace->pinned_weight_bytes   = parameters.model.pinned_weights().size();
             out.vision_workspace->mirror_bytes          = pool->mirror_bytes();
         }
+    }
+    if (experts) {
+        for (std::size_t rank = 0; rank < device.size(); ++rank) {
+            out.expert_cache_bytes += experts->memory(rank).cache_bytes;
+        }
+        const auto m = experts->memory(0);
+        const auto overhead = m.bank_bytes + m.metadata_bytes;
+        out.workspace.capacity_bytes += overhead;
+        out.workspace.used_bytes += overhead;
+        out.workspace.peak_used_bytes += overhead;
     }
     out.workspace_logical_peak_bytes = workspace_logical_peak_bytes;
     out.cuda_graph_allowance_bytes   = graph_allowance_bytes;
@@ -1101,6 +1229,18 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
                  .workspace = ArenaMemorySummary{
                      workspace_storage_by_rank.at(rank - 1).capacity(), 0,
                      rank < work.rank_count() ? work.peak_used_for_rank(rank) : 0}});
+        }
+        if (experts) {
+            for (std::size_t rank = 0; rank < out.devices.size(); ++rank) {
+                const auto m = experts->memory(rank);
+                out.devices[rank].expert_cache_bytes = m.cache_bytes;
+                if (rank == 0) { continue; }
+                const auto overhead = m.bank_bytes + m.metadata_bytes;
+                auto& workspace = out.devices[rank].workspace;
+                workspace.capacity_bytes += overhead;
+                workspace.used_bytes += overhead;
+                workspace.peak_used_bytes += overhead;
+            }
         }
     }
     return out;

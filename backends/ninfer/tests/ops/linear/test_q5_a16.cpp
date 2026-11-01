@@ -436,6 +436,10 @@ int main() {
         using ninfer::ops::detail::LinearRouteTable;
         int failures = 0;
         for (const LinearRouteTable table : {LinearRouteTable::Legacy, LinearRouteTable::Unified}) {
+            if (table == LinearRouteTable::Unified &&
+                !ninfer::ops::detail::unified_linear_routes_here()) {
+                continue;
+            }
             ninfer::ops::detail::force_linear_route_table(table);
             const int table_failures = q5_a16_conformance();
             std::cout << (table_failures == 0 ? "OK" : "FAIL") << " Q5_A16 Linear ("

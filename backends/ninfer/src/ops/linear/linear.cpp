@@ -1,3 +1,5 @@
+#include "ops/linear/t5/t5_project.h"
+
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"
 
@@ -5,13 +7,19 @@
 #include "ops/linear/fp8/fp8_dispatch.h"
 #include "ops/linear/gguf/gguf_linear.h"
 #include "ops/linear/nvfp4/nvfp4_dispatch.h"
+#include "ops/linear/ptq1/ptq1_dispatch.h"
 #include "ops/linear/q4/q4_dispatch.h"
 #include "ops/linear/q5/q5_dispatch.h"
 #include "ops/linear/q6/q6_dispatch.h"
 #include "ops/linear/q8/q8_dispatch.h"
+#include "ops/linear/sm70/sm70_dequantize.h"
+#include "ops/linear/sm70/sm70_gemm.h"
+#include "ops/linear/sm70/sm70_integer.h"
+#include "ops/linear/sm70/sm70_project.h"
 #include "ops/linear/t2/t2_a8.h"
 #include "ops/linear/t2/t2_dispatch.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -49,8 +57,11 @@ void validate_linear_policy(LinearPolicy policy) {
 
 void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& out,
                                LinearPolicy policy) {
-    if (x.dtype != DType::BF16 || out.dtype != DType::BF16) {
-        throw std::invalid_argument("linear: x/out must be BF16");
+    if (x.dtype != DType::BF16 ||
+        (out.dtype != DType::BF16 &&
+         !(out.dtype == DType::FP32 && (w.qtype == QType::BF16 || is_gguf(w.qtype))))) {
+        throw std::invalid_argument(
+            "linear: x must be BF16 and out BF16 (or FP32 for BF16 and GGUF weights)");
     }
     (void)checked_numel(x, "x");
     (void)checked_numel(out, "out");
@@ -75,8 +86,31 @@ void validate_linear_semantics(const Tensor& x, const Weight& w, const Tensor& o
     validate_linear_policy(policy);
 }
 
+// The sm_70 routes take every dense format; without an arena, the widths that need none.
+// The sm_70 routes take every dense format, but not the NVFP4 int8 family: that policy is the
+// caller telling this Op which kernels it wants, and sm_70's FP16 route is not one of them.
+bool sm70_route(const Tensor& x, const Weight& w, const Tensor& out, LinearPolicy policy,
+                const WorkspaceArena* workspace) {
+    return policy != LinearPolicy::AllowNvfp4Int8 && out.dtype == DType::BF16 &&
+           detail::sm70::covers(w, x.ne[1]) &&
+           (workspace != nullptr || detail::sm70::direct_tokens(x.ne[1]));
+}
+
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      WorkspaceArena* workspace, cudaStream_t stream) {
+    if (sm70_route(x, w, out, policy, workspace)) {
+        const detail::sm70::Destination all{
+            static_cast<__nv_bfloat16*>(out.data), w.n, 0, 0, w.n, false};
+        if (workspace == nullptr) {
+            detail::sm70::project_for(detail::sm70::prepare_direct(x), w, {&all, 1}, stream);
+            return;
+        }
+        auto scope            = workspace->scope();
+        const auto activation = detail::sm70::prepare_for(
+            x, w.n, *workspace, stream, detail::sm70::integer_takes(w, x.ne[1], policy));
+        detail::sm70::project_for(activation, w, {&all, 1}, stream);
+        return;
+    }
     if (is_gguf(w.qtype)) {
         if (workspace == nullptr) {
             throw std::invalid_argument("linear: a GGUF weight needs the workspace overload");
@@ -96,6 +130,18 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         return;
     case QType::Q8_G32_FP16:
         detail::q8_dispatch(x, w, out, policy, stream);
+        return;
+    case QType::T5_G128_FP16: {
+        Tensor* outputs[]{&out};
+        detail::t5_project(x, w, outputs, false, policy, workspace, stream);
+        return;
+    }
+    case QType::PTQ1_G128_FP16:
+        if (workspace != nullptr && detail::t2_a8_admits(policy) && detail::t2_a8_supported(w, x.ne[1])) {
+            detail::t2_a8_linear(x, w, out, *workspace, stream);
+            return;
+        }
+        detail::ptq1_dispatch(x, w, out, policy, stream);
         return;
     case QType::T2_G128_FP16:
         if (workspace != nullptr && detail::t2_a8_admits(policy) &&
@@ -122,20 +168,9 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
     throw std::invalid_argument("linear: unsupported weight qtype");
 }
 
-} // namespace
-
-std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,
-                                            std::int32_t input_rows, LinearPolicy policy,
-                                            std::int32_t min_tokens, std::int32_t max_tokens) {
-    validate_linear_policy(policy);
-    if (min_tokens <= 0 || max_tokens < min_tokens) {
-        throw std::invalid_argument("linear workspace: invalid token interval");
-    }
-
-    if (is_gguf(qtype)) {
-        const detail::GgufShape shape{qtype, output_rows, input_rows};
-        return detail::gguf_project_workspace_bytes({&shape, 1}, min_tokens, max_tokens);
-    }
+std::size_t linear_route_workspace_bytes(QType qtype, std::int32_t output_rows,
+                                         std::int32_t input_rows, LinearPolicy policy,
+                                         std::int32_t min_tokens, std::int32_t max_tokens) {
     switch (qtype) {
     case QType::Q4_G64_FP16:
         (void)detail::select_q4_launch(output_rows, input_rows, min_tokens, policy);
@@ -153,6 +188,13 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         (void)detail::select_q8_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_q8_launch(output_rows, input_rows, max_tokens, policy);
         return 0;
+    case QType::T5_G128_FP16:
+        if (output_rows <= 0) { throw std::invalid_argument("linear workspace: T5 rows must be positive"); }
+        return detail::t5_workspace_capacity_bytes(policy, input_rows, max_tokens);
+    case QType::PTQ1_G128_FP16:
+        detail::validate_ptq1_shape(output_rows, input_rows, min_tokens, policy);
+        detail::validate_ptq1_shape(output_rows, input_rows, max_tokens, policy);
+        return detail::t2_a8_workspace_bytes(output_rows, input_rows, policy, max_tokens, true);
     case QType::T2_G128_FP16:
         (void)detail::select_t2_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_t2_launch(output_rows, input_rows, max_tokens, policy);
@@ -173,6 +215,30 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         break;
     }
     throw std::invalid_argument("linear workspace: unsupported weight qtype");
+}
+
+
+} // namespace
+
+std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,
+                                            std::int32_t input_rows, LinearPolicy policy,
+                                            std::int32_t min_tokens, std::int32_t max_tokens) {
+    validate_linear_policy(policy);
+    if (min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("linear workspace: invalid token interval");
+    }
+
+    if (is_gguf(qtype)) {
+        const detail::GgufShape shape{qtype, output_rows, input_rows};
+        return detail::gguf_project_workspace_bytes({&shape, 1}, min_tokens, max_tokens);
+    }
+    const auto routes = [&](std::int32_t lo, std::int32_t hi) {
+        return linear_route_workspace_bytes(qtype, output_rows, input_rows, policy, lo, hi);
+    };
+    // Every width of a dense format takes an sm_70 route there, except the NVFP4 int8 family.
+    if (policy == LinearPolicy::AllowNvfp4Int8) { return routes(min_tokens, max_tokens); }
+    return detail::sm70::capacity(qtype, output_rows, input_rows, min_tokens, max_tokens, policy,
+                                  routes);
 }
 
 void linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,

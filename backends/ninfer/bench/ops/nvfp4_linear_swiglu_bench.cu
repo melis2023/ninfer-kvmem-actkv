@@ -80,8 +80,11 @@ Options parse_options(int argc, char** argv) {
             } else if (value == "a4") {
                 options.policy  = ops::LinearPolicy::AllowA4;
                 options.t_sweep = {5, 48, 49, 56, 64, 65, 96, 97, 128, 256, 1024};
+            } else if (value == "nvfp4int8") {
+                options.policy  = ops::LinearPolicy::AllowNvfp4Int8;
+                options.t_sweep = {1, 2, 3, 4, 5, 6, 7, 8, 16};
             } else {
-                throw std::invalid_argument("--policy must be a16 or a4");
+                throw std::invalid_argument("--policy must be a16, a4, or nvfp4int8");
             }
         } else if (argument == "--t-sweep") {
             options.t_sweep = parse_t_sweep(next("--t-sweep"));
@@ -116,7 +119,9 @@ Options parse_options(int argc, char** argv) {
 }
 
 const char* policy_name(ops::LinearPolicy policy) {
-    return policy == ops::LinearPolicy::AllowA4 ? "A4" : "A16";
+    if (policy == ops::LinearPolicy::AllowA4) { return "A4"; }
+    if (policy == ops::LinearPolicy::AllowNvfp4Int8) { return "NVFP4I8"; }
+    return "A16";
 }
 
 void write_csv(const Options& options, const std::vector<Result>& results,

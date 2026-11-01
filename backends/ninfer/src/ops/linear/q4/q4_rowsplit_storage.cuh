@@ -67,6 +67,29 @@ struct Q4MmaDecodeAtom {
         }
     }
 
+#if defined(NINFER_SM75_FORMS)
+    // decode_eight as FP16 pairs, for Turing's FP16 MMA: 1024 + (n ^ 8) less 1032, the same
+    // integers, formed by native FP16 arithmetic where BF16 arithmetic has none on Turing.
+    static __device__ __forceinline__ void decode_eight_f16(unsigned word, unsigned (&out)[4]) {
+        const unsigned kBias  = 0x64086408u; // fp16 1032.0 in both halves
+        const unsigned kMagic = 0x64006400u; // fp16 1024.0 in both halves
+        word ^= 0x88888888u;
+        const unsigned lo        = word & 0x0f0f0f0fu;
+        const unsigned hi        = (word >> 4) & 0x0f0f0f0fu;
+        const unsigned even      = __byte_perm(lo, hi, 0x5140);
+        const unsigned odd       = __byte_perm(lo, hi, 0x7362);
+        const unsigned biased[4] = {
+            __byte_perm(even, kMagic, 0x7150), __byte_perm(even, kMagic, 0x7372),
+            __byte_perm(odd, kMagic, 0x7150), __byte_perm(odd, kMagic, 0x7372)};
+#    pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const __half2 value =
+                __hsub2(half2_from_bits(biased[i]), half2_from_bits(kBias));
+            out[i] = *reinterpret_cast<const unsigned*>(&value);
+        }
+    }
+#endif
+
     static __device__ __forceinline__ __nv_bfloat162 decode_pair(const std::uint8_t* codes,
                                                                  const std::uint8_t* scale_ptr,
                                                                  std::int64_t group_index,

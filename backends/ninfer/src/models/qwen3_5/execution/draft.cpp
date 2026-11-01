@@ -155,7 +155,8 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
         ops::rmsnorm(projected, state.execution.parameters.draft->context_norm, config.rms_norm_eps,
                      false, context, state.execution.device.stream);
 
-        if (config.dflash2) {
+        if (config.dflash2 &&
+            dflash_state(state).local_layer(0).storage == KvCacheStorage::BFloat16) {
             std::array<ops::ContextKVMaterializeLayerView, ops::kContextKVMaterializeLayers> layers;
             if (config.num_hidden_layers != layers.size() ||
                 config.local_layer_count() != layers.size() || config.rms_norm_eps != 1e-6F ||
@@ -255,7 +256,7 @@ void finish_dynamic_branch(ExecutionCore& execution, const Tensor& input,
     const int width = input.ne[1], batch = input.ne[2];
     WorkspaceArena scratch(
         execution.work.alloc_bytes(ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-            input.ne[0], width, width, batch, batch)));
+            projection.weight.qtype, input.ne[0], width, width, batch, batch)));
     ops::linear_dynamic_grouped_conv_add(input, projection.weight, weights.base_kernel,
                                          finish_delta, residual, scratch, execution.device.stream);
 }
@@ -622,19 +623,15 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                             state_destinations, dflash_rows,
                             {0, static_cast<std::uint32_t>(frame.append_positions.ne[0])});
 
-        // A draftless round (neural_proposal_drafts == 0) skips the drafter entirely: the target
-        // verifies the anchor alone, which is the whole point of the bypass. Every other round
-        // must fill its own neural proposal frame.
         const auto proposal_k = state.neural_proposal_drafts;
-        const bool draftless  = proposal_k == 0;
-        if (!draftless && (proposal_k > kDFlashDecodeMaximumDrafts || proposal_k > k ||
-                           (!state.ngram && proposal_k != k))) {
+        if (proposal_k == 0 || proposal_k > kDFlashDecodeMaximumDrafts || proposal_k > k ||
+            (!state.ngram && proposal_k != k)) {
             throw std::logic_error("neural proposal is outside its supported frame");
         }
         // A neural round verifies at the drafter's own width. A batch>1 ngram round also runs the
         // drafter, at the round's wider width: its leading proposal_k drafts are unchanged under a
         // wider causal proposal, and rows without a copy verify only those (their extent).
-        if (!draftless && (!state.ngram || batch_size > 1)) {
+        if (!state.ngram || batch_size > 1) {
             propose_batch_impl(state, frame, batch_size, k, envelopes);
         }
         if (state.ngram) {
@@ -680,6 +677,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
                          &state.text_cache);
         card.set_stage_runtime(state.execution.stages);
+        card.set_expert_runtime(state.execution.experts);
         card.set_rope_yarn(state.execution.rope_yarn);
         DFlashFeatureSink sink =
             batch_feature_sink_impl(state, active_lanes, valid_columns, width, batch_size);
@@ -706,7 +704,9 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                                                    : Tensor{},
                     .proposal_q =
                         frame.proposal_q.data ? frame.proposal_q.slice(2, 0, batch_size) : Tensor{},
-                    .frontiers       = frontiers,
+                    // Sampling keys remain logical when KVMem compacts target KV positions.
+                    .frontiers = state.execution.parameters.model.config().draft->dflash2
+                                     ? draft_frontiers : frontiers,
                     .anchors         = anchors,
                     .licensed_tokens = licensed_tokens,
                     .licensed_counts = licensed_counts,

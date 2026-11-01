@@ -69,4 +69,11 @@ void nvfp4_attn_input_dispatch(const Tensor& x, const Weight& weight, Tensor& q,
                                Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                                cudaStream_t stream);
 
+// The chain predicate behind the int8 fused-edge entry, evaluated at the device profile's
+// `nvfp4_int8/attn_input` band. True means the unified chain answers this call and the caller may
+// skip its standalone rmsnorm and call unified::nvfp4_attn_input_int8_fused_norm_launch; false means
+// the own chain answers it, and that launch would build the own chain's interleaved plane and refuse.
+[[nodiscard]] bool nvfp4_attn_input_int8_fused_norm_eligible(LinearPolicy policy,
+                                                             std::int32_t tokens);
+
 } // namespace ninfer::ops::detail

@@ -1,7 +1,7 @@
 #pragma once
 
 // Implements: include/ninfer/ops/argmax.h
-// Match: contiguous BF16 [physical_rows,C], valid_rows <= physical_rows, with
+// Match: contiguous BF16 or FP32 [physical_rows,C], valid_rows <= physical_rows, with
 // tuned routes qualified for the 248077-row and 131072-row vocabularies.
 // Algorithm assumptions: one CTA reduces each blockDim.x-row tile and an atomic
 // winner selects the exact value/lower-id maximum per column.
@@ -19,6 +19,14 @@ namespace ninfer::ops {
 // larger 2-D grid exposes enough resident CTAs without oversized reductions.
 inline constexpr int kArgmaxBlock          = 512;
 inline constexpr int kArgmaxItemsPerThread = 1;
+
+__device__ __forceinline__ float argmax_logit(const __nv_bfloat16* logits, std::int64_t index) {
+    return __bfloat162float(logits[index]);
+}
+
+__device__ __forceinline__ float argmax_logit(const float* logits, std::int64_t index) {
+    return logits[index];
+}
 
 __device__ __forceinline__ bool argmax_better(float value, std::int32_t index, float best_value,
                                               std::int32_t best_index) {
@@ -55,16 +63,17 @@ __device__ __forceinline__ void argmax_block_reduce(float& value, std::int32_t& 
     if (warp == 0) { argmax_warp_reduce(value, index); }
 }
 
+template <typename Logit>
 __launch_bounds__(kArgmaxBlock) __global__
-    void argmax_kernel(const __nv_bfloat16* logits, std::int32_t* out, std::int32_t valid_rows,
+    void argmax_kernel(const Logit* logits, std::int32_t* out, std::int32_t valid_rows,
                        std::int32_t physical_rows) {
     const std::int32_t t    = static_cast<std::int32_t>(blockIdx.x);
     const std::int64_t base = static_cast<std::int64_t>(t) * physical_rows;
 
-    float best_value        = __bfloat162float(logits[base]);
+    float best_value        = argmax_logit(logits, base);
     std::int32_t best_index = 0;
     for (std::int32_t v = static_cast<std::int32_t>(threadIdx.x); v < valid_rows; v += blockDim.x) {
-        const float value = __bfloat162float(logits[base + v]);
+        const float value = argmax_logit(logits, base + v);
         if (argmax_better(value, v, best_value, best_index)) {
             best_value = value;
             best_index = v;
@@ -93,8 +102,9 @@ __launch_bounds__(kArgmaxBlock) __global__
     if (threadIdx.x == 0) { out[t] = indices[0]; }
 }
 
+template <typename Logit>
 __launch_bounds__(kArgmaxBlock) __global__
-    void argmax_tiled_atomic_kernel(const __nv_bfloat16* logits, std::int32_t* out,
+    void argmax_tiled_atomic_kernel(const Logit* logits, std::int32_t* out,
                                     std::int32_t valid_rows, std::int32_t physical_rows) {
     pdl::enter();
     const std::int32_t t    = static_cast<std::int32_t>(blockIdx.y);
@@ -108,7 +118,7 @@ __launch_bounds__(kArgmaxBlock) __global__
     for (int item = 0; item < kArgmaxItemsPerThread; ++item) {
         const std::int32_t v = tile_start + threadIdx.x + item * blockDim.x;
         if (v < valid_rows) {
-            const float value = __bfloat162float(logits[base + v]);
+            const float value = argmax_logit(logits, base + v);
             if (argmax_better(value, v, best_value, best_index)) {
                 best_value = value;
                 best_index = v;
@@ -121,9 +131,41 @@ __launch_bounds__(kArgmaxBlock) __global__
 
     int current = out[t];
     while (true) {
-        const float current_value = __bfloat162float(logits[base + current]);
+        const float current_value = argmax_logit(logits, base + current);
         if (!argmax_better(best_value, best_index, current_value, current)) { break; }
         const int observed = atomicCAS(reinterpret_cast<int*>(out + t), current, best_index);
+        if (observed == current) { break; }
+        current = observed;
+    }
+}
+
+__global__ void argmax_second_init(const std::int32_t* first, std::int32_t* second,
+                                  std::int32_t tokens) {
+    const auto t = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+    if (t < tokens) { second[t] = first[t] == 0 ? 1 : 0; }
+}
+
+__launch_bounds__(kArgmaxBlock) __global__
+void argmax_second_kernel(const __nv_bfloat16* logits, const std::int32_t* first,
+                          std::int32_t* second, std::int32_t valid_rows,
+                          std::int32_t physical_rows) {
+    const auto t = static_cast<std::int32_t>(blockIdx.y);
+    const std::int64_t base = static_cast<std::int64_t>(t) * physical_rows;
+    const auto v = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+    float value = -CUDART_INF_F;
+    std::int32_t index = INT32_MAX;
+    if (v < valid_rows && v != first[t]) {
+        value = __bfloat162float(logits[base + v]);
+        index = v;
+    }
+    argmax_block_reduce(value, index);
+    if (threadIdx.x != 0 || index == INT32_MAX) { return; }
+    int current = second[t];
+    for (;;) {
+        if (!argmax_better(value, index, __bfloat162float(logits[base + current]), current)) {
+            break;
+        }
+        const int observed = atomicCAS(reinterpret_cast<int*>(second + t), current, index);
         if (observed == current) { break; }
         current = observed;
     }

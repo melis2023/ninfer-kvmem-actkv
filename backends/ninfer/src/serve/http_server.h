@@ -1,4 +1,5 @@
 #pragma once
+namespace kvmem { class monitor; class monitor_hardware; }
 
 #include "serve/console_stats.h"
 #include "serve/generation_service.h"
@@ -10,6 +11,7 @@
 #include "serve/request_log.h"
 #include "serve/serve_metrics.h"
 #include "serve/serve_options.h"
+#include "serve/systemone.h"
 #include "serve/text_completion.h"
 
 #include <httplib.h>
@@ -28,6 +30,13 @@
 namespace ninfer::serve {
 
 void write_openai_error(httplib::Response& response, const ApiError& error);
+
+// Whether a request must carry the configured API key (none configured: never). Every API route
+// does, the MCP relay included: the WebUI sends this server's key as its own Authorization and the
+// MCP server's headers prefixed (mcp_proxy.h). /health, CORS preflights and the WebUI's pages do
+// not.
+[[nodiscard]] bool requires_api_key(const std::string& api_key, bool webui_enabled,
+                                    const httplib::Request& request);
 void write_anthropic_error(httplib::Response& response, const ApiError& error,
                            const std::string& request_id);
 
@@ -128,7 +137,7 @@ private:
         std::atomic<State> state_{State::Pending};
     };
 
-    [[nodiscard]] std::shared_ptr<RequestLifecycle> begin_request(RequestLogContext context);
+    [[nodiscard]] std::shared_ptr<RequestLifecycle> begin_request(RequestLogContext context, PreparedRequest& prepared);
 
     [[nodiscard]] httplib::Server::HandlerResponse pre_route(const httplib::Request& req,
                                                              httplib::Response& res) const;
@@ -174,12 +183,16 @@ private:
                                 TextCompletionDialect dialect);
     // POST /rerank, /reranking, /v1/rerank and /v1/reranking: the documents scored by the model.
     void handle_rerank(const httplib::Request& req, httplib::Response& res);
+    // POST /v1/systemone and /v1/decisions: typed questions about a state, one read each.
+    void handle_decisions(const httplib::Request& req, httplib::Response& res,
+                          DecisionDialect dialect);
     void handle_props(const httplib::Request& req, httplib::Response& res) const;
     void handle_webui(const httplib::Request& req, httplib::Response& res) const;
 
     // What the server reports about one loaded model, computed once per Engine instance: an
     // unload and a later load start a new one.
     struct ModelFacts {
+        nlohmann::json monitor_devices = nlohmann::json::array();
         const GenerationService* service = nullptr;
         LoadCapacity capacity;
         ninfer::ModelMetadata metadata;
@@ -236,6 +249,8 @@ private:
     OperationalLog operational_log_;
     // Mutable: a model's server_start record is written when a const handler first sees it.
     mutable JsonlRequestLog request_jsonl_;
+    std::unique_ptr<kvmem::monitor> monitor_;
+    std::unique_ptr<kvmem::monitor_hardware> monitor_hardware_;
     ServeMetrics metrics_;
     std::unique_ptr<ConsoleStatsPanel> console_stats_;
     httplib::Server server_;

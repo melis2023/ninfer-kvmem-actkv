@@ -54,6 +54,19 @@ __device__ __forceinline__ unsigned q8_ksplit_bf16_pair_from_s8(unsigned values)
     return result.bits;
 }
 
+#if defined(NINFER_SM75_FORMS)
+// Turing has neither BF16 MMA nor BF16 arithmetic: the pair above runs __hsub2_rn in software and
+// mma_bf16 converts all six operands on every call. The codes are integers, exact in FP16 as in
+// BF16, so a Turing build forms the FP16 pair directly: code + 128 in the mantissa of 1024.0, then
+// 1024 + 128 subtracted, natively and exactly.
+__device__ __forceinline__ unsigned q8_ksplit_f16_pair_from_s8(unsigned values) {
+    const unsigned biased = __byte_perm(values ^ 0x8080u, 0x64646464u, 0x5140);
+    const __half2 code    = __hsub2(*reinterpret_cast<const __half2*>(&biased),
+                                    __half2half2(__ushort_as_half(0x6480u)));
+    return *reinterpret_cast<const unsigned*>(&code);
+}
+#endif
+
 // The contraction owns the shared layout; tiled launchers use the same type for opt-in capacity.
 template <class Schedule>
 union alignas(16) Q8KSplitSharedStorage {
@@ -206,10 +219,155 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
     cp_wait<0>();
     __syncthreads();
 
+#if defined(NINFER_SM75_DEVICE)
+    // Turing copies synchronously (ops/common/memory.cuh), so a stage issued between this group's
+    // barriers would wait out its whole load latency there. The next group's codes and scales, and
+    // its activations when they take at most two 16-byte loads a lane, are loaded into registers
+    // before this group's MMAs and stored after the barrier that ends its reads. A wider
+    // activation tile is staged at that barrier as before: holding it in registers costs more
+    // occupancy than the latency it hides.
+    constexpr bool kSharedScales = Schedule::kScaleAccess == Q8KSplitScaleAccess::Shared;
+    constexpr bool kPaddedStage = Schedule::kActivationStage == Q8KSplitActivationStage::PaddedZero;
+    constexpr int kCodeChunks   = kGroupK / 16;
+    constexpr int kCodeLoads    = (kCodeChunks + 31) / 32;
+    constexpr int kScaleChunksPerRow = Schedule::kScaleBytesPerRow / 16;
+    constexpr int kScaleChunks       = kMmaRows * kScaleChunksPerRow;
+    constexpr int kScaleLoads =
+        kSharedScales ? (kScaleChunks + kWarps * 32 - 1) / (kWarps * 32) : 1;
+    constexpr int kXLoadsMax  = ((kPaddedStage ? kTileCols : ActiveCols) * (kTileK / 8) + 31) / 32;
+    constexpr bool kPrefetchX = kXLoadsMax <= 2;
+    constexpr int kXLoads     = kPrefetchX ? kXLoadsMax : 1;
+    uint4 next_codes[Schedule::kRowsPerLoaderWarp][kCodeLoads];
+    uint4 next_scales[kScaleLoads];
+    uint4 next_x[kXLoads];
+    unsigned direct_scale_pair      = 0;
+    unsigned next_direct_scale_pair = 0;
+
+    const auto load_direct_scale_pair = [&](int group_k0) {
+        const int scale_row = row_policy.weight_row(cta_row0, gid + lid * 8);
+        return *reinterpret_cast<const unsigned*>(
+            scales + (static_cast<std::int64_t>(scale_row) * Geometry::kGroupsPerRow +
+                      group_k0 / 32 + warp_koff / 32) *
+                         2);
+    };
+    // Activation item `item` of this warp's slice as stage_x copies it: its column and 8-element
+    // K offset, and whether that column is read from x (zero-filled otherwise).
+    const int x_items =
+        (kRuntimeActive ? live_columns : (kPaddedStage ? kTileCols : ActiveCols)) * (kTileK / 8);
+    const auto x_item = [&](int item, int& col, int& k8) {
+        col = item / (kTileK / 8);
+        k8  = item - col * (kTileK / 8);
+        if constexpr (TiledColumns && !kRuntimeActive) {
+            return col < live_columns;
+        } else if constexpr (kRuntimeActive || !kPaddedStage || ActiveCols == kTileCols) {
+            return true;
+        } else {
+            return col < ActiveCols;
+        }
+    };
+    const auto load_next = [&](int group_k0) {
+#    pragma unroll
+        for (int row_item = 0; row_item < Schedule::kRowsPerLoaderWarp; ++row_item) {
+            const int weight_row =
+                row_policy.weight_row(cta_row0, warp * Schedule::kRowsPerLoaderWarp + row_item);
+#    pragma unroll
+            for (int load = 0; load < kCodeLoads; ++load) {
+                const int chunk = lane + 32 * load;
+                if (chunk < kCodeChunks) {
+                    next_codes[row_item][load] = load_global<uint4, Schedule::kWeightCache>(
+                        codes + static_cast<std::int64_t>(weight_row) * kHidden + group_k0 +
+                        chunk * 16);
+                }
+            }
+        }
+        if constexpr (kPrefetchX) {
+#    pragma unroll
+            for (int load = 0; load < kXLoads; ++load) {
+                const int item = lane + 32 * load;
+                int col, k8;
+                if (item < x_items) {
+                    next_x[load] =
+                        x_item(item, col, k8)
+                            ? load_global<uint4, Schedule::kActivationCache>(
+                                  &x[static_cast<std::int64_t>(column_policy(column_offset + col)) *
+                                         kHidden +
+                                     group_k0 + warp * kTileK + k8 * 8])
+                            : make_uint4(0u, 0u, 0u, 0u);
+                }
+            }
+        }
+        if constexpr (kSharedScales) {
+#    pragma unroll
+            for (int load = 0; load < kScaleLoads; ++load) {
+                const int item = tid + load * kWarps * 32;
+                if (item < kScaleChunks) {
+                    const int row        = item / kScaleChunksPerRow;
+                    const int chunk      = item - row * kScaleChunksPerRow;
+                    const int weight_row = row_policy.weight_row(cta_row0, row);
+                    next_scales[load]    = load_global<uint4, Schedule::kWeightCache>(
+                        scales + (static_cast<std::int64_t>(weight_row) * Geometry::kGroupsPerRow +
+                                  group_k0 / 32 + chunk * 8) *
+                                     2);
+                }
+            }
+        } else if (lid < 2) {
+            next_direct_scale_pair = load_direct_scale_pair(group_k0);
+        }
+    };
+    const auto store_next = [&](int group_k0) {
+#    pragma unroll
+        for (int row_item = 0; row_item < Schedule::kRowsPerLoaderWarp; ++row_item) {
+            const int row = warp * Schedule::kRowsPerLoaderWarp + row_item;
+#    pragma unroll
+            for (int load = 0; load < kCodeLoads; ++load) {
+                const int chunk = lane + 32 * load;
+                if (chunk < kCodeChunks) {
+                    *reinterpret_cast<uint4*>(&code_shared[row][(chunk ^ (row & 7)) * 16]) =
+                        next_codes[row_item][load];
+                }
+            }
+        }
+        if constexpr (kPrefetchX) {
+#    pragma unroll
+            for (int load = 0; load < kXLoads; ++load) {
+                const int item = lane + 32 * load;
+                int col, k8;
+                if (item < x_items) {
+                    (void)x_item(item, col, k8);
+                    *reinterpret_cast<uint4*>(
+                        &b_shared[warp][col * kTileK + q8_ksplit_swizzle_64(col, k8 * 8)]) =
+                        next_x[load];
+                }
+            }
+        } else {
+            stage_x(group_k0);
+        }
+        if constexpr (kSharedScales) {
+#    pragma unroll
+            for (int load = 0; load < kScaleLoads; ++load) {
+                const int item = tid + load * kWarps * 32;
+                if (item < kScaleChunks) {
+                    const int row   = item / kScaleChunksPerRow;
+                    const int chunk = item - row * kScaleChunksPerRow;
+                    *reinterpret_cast<uint4*>(&scale_shared[row][chunk * 16]) = next_scales[load];
+                }
+            }
+        } else {
+            direct_scale_pair = next_direct_scale_pair;
+        }
+    };
+    if constexpr (!kSharedScales) {
+        if (lid < 2) { direct_scale_pair = load_direct_scale_pair(0); }
+    }
+#endif
+
     constexpr int kGroupUnroll = kHidden <= 6144 ? kGroups : 12;
 #pragma unroll kGroupUnroll
     for (int group_index = 0; group_index < kGroups; ++group_index) {
         const int group_k0 = group_index * kGroupK;
+#if defined(NINFER_SM75_DEVICE)
+        if (group_index + 1 < kGroups) { load_next(group_k0 + kGroupK); }
+#endif
 
         unsigned lane_scale_pair = 0;
         if (lid < 2) {
@@ -218,11 +376,15 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
                 lane_scale_pair =
                     *reinterpret_cast<const unsigned*>(&scale_shared[scale_row][warp_koff / 16]);
             } else {
+#if defined(NINFER_SM75_DEVICE)
+                lane_scale_pair = direct_scale_pair;
+#else
                 const int scale_row = row_policy.weight_row(cta_row0, gid + lid * 8);
                 lane_scale_pair     = *reinterpret_cast<const unsigned*>(
                     scales + (static_cast<std::int64_t>(scale_row) * Geometry::kGroupsPerRow +
                               group_k0 / 32 + warp_koff / 32) *
                                  2);
+#endif
             }
         }
         const unsigned top_scale_pair = __shfl_sync(kMask, lane_scale_pair, lane & ~3);
@@ -248,12 +410,51 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
                     return static_cast<unsigned>(
                         *reinterpret_cast<const unsigned short*>(&code_shared[code_row][offset]));
                 };
+#if defined(NINFER_SM75_DEVICE)
+                // The FP16 codes and, when every live activation of the tile is an FP16 value, the
+                // converted activations are the operands mma_bf16 would form, issued in its order,
+                // so the bits are the same; a tile holding any other live activation runs
+                // mma_bf16, which settles each output on its own operands. A lane's activations
+                // are column ni * 8 + gid; a column past the live extent is never staged and holds
+                // whatever the shared memory held before, and its outputs are discarded, so it
+                // does not choose the path.
+                const unsigned code0 = load_code_pair(gid, code_col);
+                const unsigned code1 = load_code_pair(gid + 8, code_col);
+                const unsigned code2 = load_code_pair(gid, code_col + 8);
+                const unsigned code3 = load_code_pair(gid + 8, code_col + 8);
+                const unsigned hf0   = q8_ksplit_f16_pair_from_s8(code0);
+                const unsigned hf1   = q8_ksplit_f16_pair_from_s8(code1);
+                const unsigned hf2   = q8_ksplit_f16_pair_from_s8(code2);
+                const unsigned hf3   = q8_ksplit_f16_pair_from_s8(code3);
+#    pragma unroll
+                for (int ni = 0; ni < kNt; ++ni) {
+                    unsigned bf0, bf1;
+                    const int br = ni * 8 + b_rin;
+                    ldmatrix_x2(
+                        bf0, bf1,
+                        smem_addr(&b_shared[k_split][br * kTileK +
+                                                     q8_ksplit_swizzle_64(br, ks * 16 + b_koff)]));
+                    const bool dead = ni * 8 + gid >= live_columns;
+                    if (__all_sync(kMask, dead || (sm75::bf16x2_exact_in_fp16(bf0) &&
+                                                   sm75::bf16x2_exact_in_fp16(bf1)))) {
+                        mma_f16(group_acc[ni][0], group_acc[ni][1], group_acc[ni][2],
+                                group_acc[ni][3], hf0, hf1, hf2, hf3, sm75::bf16x2_to_half2(bf0),
+                                sm75::bf16x2_to_half2(bf1));
+                    } else {
+                        mma_bf16(group_acc[ni][0], group_acc[ni][1], group_acc[ni][2],
+                                 group_acc[ni][3], q8_ksplit_bf16_pair_from_s8(code0),
+                                 q8_ksplit_bf16_pair_from_s8(code1),
+                                 q8_ksplit_bf16_pair_from_s8(code2),
+                                 q8_ksplit_bf16_pair_from_s8(code3), bf0, bf1);
+                    }
+                }
+#else
                 const unsigned af0 = q8_ksplit_bf16_pair_from_s8(load_code_pair(gid, code_col));
                 const unsigned af1 = q8_ksplit_bf16_pair_from_s8(load_code_pair(gid + 8, code_col));
                 const unsigned af2 = q8_ksplit_bf16_pair_from_s8(load_code_pair(gid, code_col + 8));
                 const unsigned af3 =
                     q8_ksplit_bf16_pair_from_s8(load_code_pair(gid + 8, code_col + 8));
-#pragma unroll
+#    pragma unroll
                 for (int ni = 0; ni < kNt; ++ni) {
                     unsigned bf0, bf1;
                     const int br = ni * 8 + b_rin;
@@ -264,6 +465,7 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
                     mma_bf16(group_acc[ni][0], group_acc[ni][1], group_acc[ni][2], group_acc[ni][3],
                              af0, af1, af2, af3, bf0, bf1);
                 }
+#endif
             }
             const unsigned top_bits = group == 0 ? top_scale_pair & 0xffffu : top_scale_pair >> 16;
             const unsigned bot_bits = group == 0 ? bot_scale_pair & 0xffffu : bot_scale_pair >> 16;
@@ -280,10 +482,14 @@ q8_ksplit_mma(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restric
 
         if (group_index + 1 < kGroups) {
             __syncthreads();
+#if defined(NINFER_SM75_DEVICE)
+            store_next(group_k0 + kGroupK);
+#else
             stage_codes(group_k0 + kGroupK);
             stage_x(group_k0 + kGroupK);
             cp_commit();
             cp_wait<0>();
+#endif
             __syncthreads();
         }
     }

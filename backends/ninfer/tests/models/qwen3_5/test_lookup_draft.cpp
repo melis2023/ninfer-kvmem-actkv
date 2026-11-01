@@ -3,7 +3,7 @@
 // depend on: that a miss reports zero rather than a stale or partial draft, that the *most recent*
 // occurrence is the one continued, and that a proposal never runs off the end of the ledger.
 
-#include "models/qwen3_5/program/speculative/lookup_draft.h"
+#include "runtime/contract/lookup_draft.h"
 
 #include <cstdio>
 #include <exception>
@@ -13,7 +13,7 @@
 namespace {
 
 using namespace ninfer;
-using namespace ninfer::qwen3_5;
+using namespace ninfer::runtime;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }

@@ -40,6 +40,28 @@ normalized_hadamard_d256_group_value_from_h64(float x0, float x1, float x2, floa
     return __fmul_rn(out, 0x1p-4f);
 }
 
+// One full warp owns one D128 row. Lane l carries dimensions l+32*r in values[r].
+__device__ __forceinline__ void normalized_hadamard_d128_inplace(float (&values)[4], int lane) {
+    hadamard_d32_columns_inplace(values, lane);
+
+#pragma unroll
+    for (int span = 1; span < 4; span <<= 1) {
+#pragma unroll
+        for (int base = 0; base < 4; base += 2 * span) {
+#pragma unroll
+            for (int offset = 0; offset < span; ++offset) {
+                const float low              = values[base + offset];
+                const float high             = values[base + offset + span];
+                values[base + offset]        = __fadd_rn(low, high);
+                values[base + offset + span] = __fsub_rn(low, high);
+            }
+        }
+    }
+
+    // 1 / sqrt(128)
+    for (float& value : values) { value = __fmul_rn(value, 0.08838834764831844055f); }
+}
+
 // One full warp owns one D256 row. Lane l carries dimensions l+32*r in values[r]. The fixed
 // normalized Sylvester transform is shared by persistent K preparation and transient Q
 // preparation; it never materializes an intermediate row outside registers.

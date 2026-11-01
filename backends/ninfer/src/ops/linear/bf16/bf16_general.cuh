@@ -1,9 +1,9 @@
 #pragma once
 
 // General-purpose BF16 x BF16 GEMM fallback for shapes the specialised bf16 linear path does not
-// tile (for example a full-precision vocab projection kept as BF16 by a QAT checkpoint). Computes
-// out[T, N] = x[T, K] * weight[N, K]^T with an fp32 accumulation and a BF16 store, matching the
-// contiguous token-major layout of the specialised kernels. Tiling is fixed and the extents are
+// tile (for example a full-precision vocab projection kept as BF16 by a QAT checkpoint), and for
+// every FP32 result. Computes out[T, N] = x[T, K] * weight[N, K]^T with an fp32 accumulation and a
+// BF16 or FP32 store, matching the contiguous token-major layout of the specialised kernels. Tiling is fixed and the extents are
 // runtime, so any (N, K, T) is handled without a per-shape instantiation. Up to eight tokens over
 // 16-byte rows take the GEMV form instead: one warp per output row streams the row once.
 
@@ -13,6 +13,10 @@
 #include <cstdint>
 
 namespace ninfer::ops::detail {
+
+__device__ __forceinline__ void store_result(__nv_bfloat16* p, float v) { *p = __float2bfloat16_rn(v); }
+__device__ __forceinline__ void store_result(float* p, float v) { *p = v; }
+
 constexpr std::int32_t kTileN         = 32;
 constexpr std::int32_t kTileT         = 32;
 constexpr std::int32_t kTileK         = 32;
@@ -21,9 +25,10 @@ constexpr std::int32_t kThreadCols    = kThreads / 16;      // 16
 constexpr std::int32_t kRowsPerThread = kTileN / 16;        // 2
 constexpr std::int32_t kColsPerThread = kTileT / kThreadCols;  // 2
 
+template <class Out>
 __global__ void bf16_general_gemm_kernel(const __nv_bfloat16* __restrict__ x,
                                          const __nv_bfloat16* __restrict__ weight,
-                                         __nv_bfloat16* __restrict__ out, std::int32_t N,
+                                         Out* __restrict__ out, std::int32_t N,
                                          std::int32_t K, std::int32_t T) {
     __shared__ __nv_bfloat16 ws[kTileN][kTileK + 1];
     __shared__ __nv_bfloat16 wx[kTileT][kTileK + 1];
@@ -84,8 +89,7 @@ __global__ void bf16_general_gemm_kernel(const __nv_bfloat16* __restrict__ x,
             for (std::int32_t cc = 0; cc < kColsPerThread; ++cc) {
                 const std::int32_t col = token0 + tcol * kColsPerThread + cc;
                 if (col < T) {
-                    out[static_cast<std::int64_t>(col) * N + row] =
-                        __float2bfloat16_rn(accum[rr][cc]);
+                    store_result(out + static_cast<std::int64_t>(col) * N + row, accum[rr][cc]);
                 }
             }
         }
@@ -93,7 +97,7 @@ __global__ void bf16_general_gemm_kernel(const __nv_bfloat16* __restrict__ x,
 }
 
 // One warp per output row: the row in 16-byte vectors (K a multiple of 8), every token's sum in a
-// register, FP32 accumulation and a BF16 store.
+// register, FP32 accumulation and a BF16 or FP32 store.
 constexpr std::int32_t kGemvMaxTokens = 8;
 constexpr std::int32_t kGemvWarps     = 8;
 
@@ -107,11 +111,11 @@ __device__ __forceinline__ void unpack_bf16x8(const uint4& v, float (&out)[8]) {
     }
 }
 
-template <int T>
+template <int T, class Out>
 __global__ void __launch_bounds__(kGemvWarps * 32)
     bf16_general_gemv_kernel(const __nv_bfloat16* __restrict__ x,
                              const __nv_bfloat16* __restrict__ weight,
-                             __nv_bfloat16* __restrict__ out, std::int32_t N, std::int32_t K) {
+                             Out* __restrict__ out, std::int32_t N, std::int32_t K) {
     const std::int32_t row  = static_cast<std::int32_t>(blockIdx.x) * kGemvWarps +
                               static_cast<std::int32_t>(threadIdx.x >> 5);
     const std::int32_t lane = static_cast<std::int32_t>(threadIdx.x & 31);
@@ -141,7 +145,7 @@ __global__ void __launch_bounds__(kGemvWarps * 32)
     if (lane == 0) {
 #pragma unroll
         for (int t = 0; t < T; ++t) {
-            out[static_cast<std::int64_t>(t) * N + row] = __float2bfloat16_rn(acc[t]);
+            store_result(out + static_cast<std::int64_t>(t) * N + row, acc[t]);
         }
     }
 }

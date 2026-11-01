@@ -1,7 +1,7 @@
 #pragma once
 
 #include "core/transfer_work.h"
-#include "ninfer/types.h"
+#include "ninfer/observability/snapshot.h"
 #include "runtime/contract/resources.h"
 
 #include <array>

@@ -35,10 +35,22 @@ xgrammar::Grammar build(const Contract& contract, const StructuredOutputOptions&
     std::optional<xgrammar::Grammar> json;
     if (body.kind != StructuredOutputKind::None) {
         text::validate_structured_output(body);
-        json = xgrammar::JSONSchemaToGrammar(
+        if (body.kind == StructuredOutputKind::Regex) {
+            json = xgrammar::Grammar::FromRegex(body.grammar);
+        } else if (body.kind == StructuredOutputKind::Grammar) {
+            json = xgrammar::Grammar::FromEBNF(body.grammar, "root");
+        } else if (body.kind == StructuredOutputKind::Choice) {
+            xgrammar::GrammarBuilder choices;
+            std::vector<int32_t> alternatives;
+            for (const auto& value : body.choices)
+                alternatives.push_back(choices.AddByteString(value));
+            json = choices.Get(choices.AddRuleWithHint("root", choices.AddChoices(alternatives)));
+        } else {
+            json = xgrammar::JSONSchemaToGrammar(
             body.kind == StructuredOutputKind::JsonObject ? "{\"type\":\"object\"}"
                 : text::normalize_json_schema(body.schema), true, std::nullopt, std::nullopt,
             body.strict, 8);
+        }
     }
     if (json && contract.tools.empty()) return *json;
     xgrammar::GrammarBuilder builder;

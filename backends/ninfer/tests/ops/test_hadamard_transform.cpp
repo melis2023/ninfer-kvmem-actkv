@@ -3,6 +3,7 @@
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/sigmoid_mul.h"
 #include "ops/op_tester.h"
+#include "ops/quantized_weight.h"
 #include "core/device.h"
 #include "core/decode_graph.h"
 
@@ -395,15 +396,47 @@ int run_sigmoid_mul_hadamard_case(std::int32_t width, std::int64_t columns, bool
     return failures;
 }
 
+int run_ptq1_embedding() {
+    constexpr int width = 5120, rows = 37;
+    auto table = quantized_weight::make_ptq1_patterned_weight(rows, width, 731U);
+    DeviceBuffer backing = to_device(table.payload);
+    const auto signs = random_signs(width, 733U);
+    DeviceBuffer sign_data = to_device_bf16(signs);
+    Tensor sign_tensor(sign_data.p, DType::BF16, {width});
+    int failures = 0;
+    for (int count : {1, 3, 17, 65}) {
+        std::vector<std::int32_t> ids(count);
+        for (int i = 0; i < count; ++i) ids[i] = (i * 17 + 36) % rows;
+        auto id_data = to_device(ids);
+        Tensor id_tensor(id_data.p, DType::I32, {count});
+        GuardedDeviceBuffer output(std::size_t(width) * count * 2);
+        Tensor out(output.data(), DType::BF16, {width, count});
+        std::vector<float> values(std::size_t(width) * count);
+        for (int t = 0; t < count; ++t)
+            for (int k = 0; k < width; ++k)
+                values[std::size_t(t) * width + k] =
+                    static_cast<float>(quantized_weight::logical_weight_fp64(table, ids[t], k));
+        const auto expected = hadamard_oracle(values, signs, width, count, true);
+        ops::embedding_rotated(id_tensor, table.device_weight(backing.p), sign_tensor, out, nullptr);
+        cuda_synchronize();
+        failures += verify_reduction("PTQ1 embedding", from_device_bf16(output.data(), values.size()),
+                                     expected, hadamard_bf16_criterion());
+        failures += output.verify_guards("PTQ1 embedding guards");
+    }
+    return failures;
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
 
+    if (argc == 2 && std::string(argv[1]) == "--ptq1-only") { return run_ptq1_embedding() == 0 ? 0 : 1; }
     int failures                 = verify_oracles_agree();
+    failures += run_ptq1_embedding();
     const std::int32_t widths[]  = {1024, 5120, 6144, 17408};
     const std::int64_t columns[] = {1, 2, 7, 8, 15, 16, 31, 32, 64, 128, 1024};
     std::uint32_t seed           = 3100U;

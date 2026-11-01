@@ -10,11 +10,12 @@ Model::Model(Config config, LoadOptions options, ModelWeights weights,
              FrontendResources resources, InstanceInfo info,
              artifact::MaterializedArtifact backing,
              std::optional<VisionOverlayLayout> vision_overlay,
-             std::shared_ptr<const CpuVisionWeights> cpu_vision)
+             std::shared_ptr<CpuVisionCache> cpu_vision, NativeExpertSources experts)
     : backing_(std::move(backing)), config_(std::move(config)), options_(options),
       weights_(std::move(weights)), bound_(std::move(bound)), replicas_(std::move(replicas)),
       resources_(std::move(resources)), info_(std::move(info)),
-      vision_overlay_(std::move(vision_overlay)), cpu_vision_(std::move(cpu_vision)) {}
+      vision_overlay_(std::move(vision_overlay)), cpu_vision_(std::move(cpu_vision)),
+      experts_(std::move(experts)) {}
 
 Model::~Model() = default;
 

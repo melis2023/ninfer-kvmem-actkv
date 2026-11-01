@@ -16,7 +16,7 @@ extern const Nvfp4LinearShape kNvfp4N34816K5120;
 extern const Nvfp4LinearShape kNvfp4N5120K6144;
 extern const Nvfp4LinearShape kNvfp4N5120K17408;
 
-// DFlash2 drafter matrices (NVFP4 weight-only A16 routes).
+// DFlash2 weight-only A16 projections (melis2023).
 extern const Nvfp4LinearShape kNvfp4DFlash2Feature;
 extern const Nvfp4LinearShape kNvfp4DFlash2FeatureT;
 extern const Nvfp4LinearShape kNvfp4DFlash2Qkv;

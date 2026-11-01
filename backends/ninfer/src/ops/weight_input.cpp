@@ -181,9 +181,11 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
                         k == std::vector<std::uint64_t>{512, 2048} && third == q && fourth == k
                   : q == std::vector<std::uint64_t>{2048, 2048} && k == q &&
                         third == std::vector<std::uint64_t>{4096, 2048} && fourth == third;
-    require(dense || moe, "input projection: unsupported logical projection geometry");
     if (std::any_of(inputs.begin(), inputs.end(), gguf_parent)) {
-        require(dense, "input projection: GGUF parts need the dense geometry");
+        require(q[1] == k[1] && q[1] == third[1] && q[1] == fourth[1] &&
+                    (attention ? third == q && fourth == k && q[0] % k[0] == 0
+                               : k == q && fourth == third && third[0] % q[0] == 0),
+                "input projection: inconsistent GGUF logical geometry");
         const auto q = static_cast<std::int32_t>(matrix(inputs[0])[0]);
         const auto k = static_cast<std::int32_t>(matrix(inputs[1])[0]);
         if (attention) {
@@ -195,6 +197,7 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
         const std::array<std::int32_t, 4> rows{0, q, q + k, 0};
         return gguf_projection(inputs, outputs, rows);
     }
+    require(dense || moe, "input projection: unsupported native logical projection geometry");
     const auto joined = concatenate_rows(inputs);
     if (contiguous(joined)) {
         auto result       = single(inputs);
@@ -211,10 +214,13 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
     const auto second = single(inputs.last<2>());
     const bool q4_q5 =
         first.weight.qtype == QType::Q4_G64_FP16 && second.weight.qtype == QType::Q5_G64_FP16;
-    const bool t2 =
-        first.weight.qtype == QType::T2_G128_FP16 && second.weight.qtype == QType::T2_G128_FP16;
-    require(q4_q5 || t2, "input projection: paired native form requires Q4 and Q5, or two T2");
-    return PairedProjectionWeights{first.weight, second.weight, LinearPolicy::A16Only,
+    const bool ternary = is_ternary(first.weight.qtype) &&
+                         first.weight.qtype == second.weight.qtype;
+    require(q4_q5 || ternary,
+            "input projection: requires Q4/Q5 or two ternary parents of the same format");
+    const auto pair_policy = first.weight.qtype == QType::T5_G128_FP16
+                                 ? common_policy(inputs) : LinearPolicy::A16Only;
+    return PairedProjectionWeights{first.weight, second.weight, pair_policy,
                                    common_signs(inputs)};
 }
 
@@ -261,8 +267,8 @@ ProjectionWeights prepare_gdn_input_proj_weights(const WeightInput& query, const
 
 ProjectionWeights prepare_gdn_gating_proj_weights(const WeightInput& a, const WeightInput& b) {
     const auto& shape = matrix(a);
-    require(shape == matrix(b) && (shape == std::vector<std::uint64_t>{48, 5120} ||
-                                   shape == std::vector<std::uint64_t>{32, 2048}),
+    require(shape == matrix(b) && shape[0] > 0 && shape[0] % 16 == 0 &&
+                shape[1] > 0 && shape[1] % 128 == 0,
             "GDN control: unsupported A/B geometry");
     const std::array inputs{a, b};
     if (contiguous(concatenate_rows(inputs))) {
@@ -270,7 +276,6 @@ ProjectionWeights prepare_gdn_gating_proj_weights(const WeightInput& a, const We
         require(result.weight.qtype == QType::BF16, "GDN control requires BF16 weights");
         return result;
     }
-    require(shape[0] == 48, "GDN control: this geometry requires a combined parent");
     const auto first  = prepare_linear_weight(a);
     const auto second = prepare_linear_weight(b);
     require(first.weight.qtype == QType::BF16 && second.weight.qtype == QType::BF16,

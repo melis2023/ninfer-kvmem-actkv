@@ -1,4 +1,5 @@
 #include "ops/linear/t2/t2_dispatch.h"
+#include "ops/linear/ptq1/ptq1_dispatch.h"
 
 #include <cstdlib>
 #include <stdexcept>
@@ -76,6 +77,7 @@ T2Launch select_t2_launch(std::int32_t n, std::int32_t k, std::int32_t t, Linear
     case LinearPolicy::AllowA8:
     case LinearPolicy::AllowA8Int:
     case LinearPolicy::AllowA8IntDecode:
+    case LinearPolicy::AllowNvfp4Int8: // never admitted by a T2 weight; reads as A16
     case LinearPolicy::AllowPrefillCublas:
         return select_t2_a16_launch(n, k, t);
     case LinearPolicy::AllowA4:
@@ -89,6 +91,10 @@ void t2_dispatch(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy pol
     // The kernels address row-major records; the panel permutation is a Q4-family device form.
     if (w.layout != QuantLayout::RowSplit || w.qdata == nullptr || w.scales == nullptr) {
         throw std::invalid_argument("t2 linear: requires a row-split weight");
+    }
+    if (w.qtype == QType::PTQ1_G128_FP16) {
+        ptq1_dispatch(x, w, out, policy, stream);
+        return;
     }
     const T2Launch launch = select_t2_launch(w.n, w.k, x.ne[1], policy);
     launch(x, w, out, stream);

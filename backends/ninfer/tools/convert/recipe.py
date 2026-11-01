@@ -67,7 +67,7 @@ def default_layout(format: str) -> str:
     if isinstance(kind, DirectFormat):
         return "contiguous_le_v1"
     if isinstance(kind, Fp8RowFormat):
-        return "row_scale_v1"
+        return "row_interleaved_v1" if kind.scale_dtype == "fp16" else "row_scale_v1"
     if isinstance(kind, Nvfp4Format):
         return "block_scale_k16_m128x4_v1"
     if isinstance(kind, GgufFormat):

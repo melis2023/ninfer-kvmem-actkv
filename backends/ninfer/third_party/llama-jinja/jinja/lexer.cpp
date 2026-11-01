@@ -70,6 +70,36 @@ lexer_result lexer::tokenize(const std::string& source) {
                 }
                 // add escaped char
                 char escaped_char = src[pos++];
+                // NInfer: Python's \xHH and \uHHHH, a code point written as UTF-8 (Flint's
+                // template strips "\x00" from message text).
+                if (escaped_char == 'x' || escaped_char == 'u') {
+                    const size_t digits = escaped_char == 'x' ? 2 : 4;
+                    if (pos + digits > src.size()) {
+                        throw lexer_exception("truncated \\x or \\u escape", source, pos);
+                    }
+                    unsigned long code = 0;
+                    for (size_t i = 0; i < digits; ++i) {
+                        const char hex = src[pos + i];
+                        if (!std::isxdigit(static_cast<unsigned char>(hex))) {
+                            throw lexer_exception("invalid \\x or \\u escape", source, pos);
+                        }
+                        const bool digit = std::isdigit(static_cast<unsigned char>(hex)) != 0;
+                        code             = code * 16 + static_cast<unsigned long>(
+                                                digit ? hex - '0' : std::tolower(hex) - 'a' + 10);
+                    }
+                    pos += digits;
+                    if (code < 0x80) {
+                        str += static_cast<char>(code);
+                    } else if (code < 0x800) {
+                        str += static_cast<char>(0xC0 | (code >> 6));
+                        str += static_cast<char>(0x80 | (code & 0x3F));
+                    } else {
+                        str += static_cast<char>(0xE0 | (code >> 12));
+                        str += static_cast<char>(0x80 | ((code >> 6) & 0x3F));
+                        str += static_cast<char>(0x80 | (code & 0x3F));
+                    }
+                    continue;
+                }
                 if (escape_chars.find(escaped_char) == escape_chars.end()) {
                     throw lexer_exception(std::string("unknown escape character \\") + escaped_char,
                                           source, pos);

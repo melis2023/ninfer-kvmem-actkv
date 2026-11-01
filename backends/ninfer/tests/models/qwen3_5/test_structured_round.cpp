@@ -1,13 +1,16 @@
 #include "models/qwen3_5/program/structured_round.h"
 #include "core/decode_graph.h"
 #include "core/device.h"
+#include "ninfer/request.h"
 #include "ops/op_tester.h"
+#include <array>
 #include <iostream>
 using namespace ninfer;
 using namespace ninfer::test;
 
 int main() {
     if (cuda_unavailable()) { return 77; }
+    const char* phase = "DFlash rounds";
     try {
         // Reserve a wider copy window than the actual one-token neural round.
         // Compact draft rows must not be read using the maximum reserved pitch.
@@ -17,12 +20,13 @@ int main() {
         auto masks  = arena.alloc(DType::I32, {words, width, lanes});
         auto drafts = arena.alloc(DType::I32, {1, lanes});
         auto wide_drafts = arena.alloc(DType::I32, {width - 1, lanes});
-        models::qwen3_5::StructuredRound round(masks, vocab_size, width, lanes);
+        models::qwen3_5::StructuredRound round(masks, vocab_size, width, lanes, true);
         // Seed the maximum-width host frame deterministically. A compact copy must replace
         // each row, rather than leaving zero draft tokens in later reserved rows.
         CUDA_CHECK(cudaMemsetAsync(wide_drafts.data, 0, wide_drafts.bytes(), device.stream));
-        round.begin_dflash();
+        round.begin();
         round.enqueue_dflash(wide_drafts, device.stream);
+        round.wait(device.stream);
         device.synchronize();
         round.check();
         std::vector<std::string> vocab(vocab_size);
@@ -36,12 +40,15 @@ int main() {
             device.synchronize();
         };
         DecodeGraphDefinition definition;
-        definition.capture(device.stream, [&] { round.enqueue_dflash(drafts, device.stream); });
+        definition.capture(device.stream, [&] {
+            round.enqueue_dflash(drafts, device.stream);
+            round.wait(device.stream);
+        });
         DecodeGraphExecutable executable;
         executable.instantiate(definition);
         // Changing compact rows and physical lanes must work without recapturing the graph.
         for (int pass = 0; pass < 3; ++pass) {
-            round.begin_dflash();
+            round.begin();
             round.set_dflash_row(pass, 7 - pass, 1, grammar);
             set_drafts('{');
             executable.launch(device.stream);
@@ -77,11 +84,14 @@ int main() {
                                        cudaMemcpyHostToDevice, device.stream));
             device.synchronize();
             DecodeGraphDefinition varying_definition;
-            varying_definition.capture(device.stream, [&] { round.enqueue_dflash(frame, device.stream); });
+            varying_definition.capture(device.stream, [&] {
+                round.enqueue_dflash(frame, device.stream);
+                round.wait(device.stream);
+            });
             DecodeGraphExecutable varying_executable;
             varying_executable.instantiate(varying_definition);
             for (int pass = 0; pass < 3; ++pass) {
-                round.begin_dflash();
+                round.begin();
                 round.set_dflash_row(2 - pass, 5 + pass, draft_width, grammar);
                 varying_executable.launch(device.stream);
                 device.synchronize();
@@ -94,7 +104,7 @@ int main() {
                 }
             }
         }
-        round.begin_dflash();
+        round.begin();
         auto dead_vocab = std::vector<std::string>(vocab_size, "q");
         dead_vocab.back().clear();
         text::StructuredCompiler dead_compiler(dead_vocab, {128});
@@ -108,15 +118,90 @@ int main() {
             round.check();
         } catch (const std::exception&) { raised = true; }
         if (!raised) { throw std::runtime_error("host callback exception was not surfaced"); }
-        round.begin_dflash();
+        round.begin();
         set_drafts('{');
         executable.launch(device.stream);
         device.synchronize();
         round.check(); // reset clears both retained requests and the error
-        std::cout << "OK structured graph: lane remap, replay, exception transport, reset\n";
+
+        // An ordinary or MTP round: the masks start on the host before the launch, and the
+        // captured sampling point waits for their upload through an external event node.
+        phase = "host-started rounds";
+        DeviceArena host_arena(words * width * lanes * 4 * 2 + 2048);
+        auto host_masks = host_arena.alloc(DType::I32, {words, width, lanes});
+        auto observed   = host_arena.alloc(DType::I32, {words, width});
+        models::qwen3_5::StructuredRound host_round(host_masks, vocab_size, width, lanes, false);
+        const auto observe_lane = [&](std::uint32_t lane) {
+            host_round.wait(device.stream);
+            CUDA_CHECK(cudaMemcpyAsync(observed.data, host_round.device_mask(lane),
+                                       observed.bytes(), cudaMemcpyDeviceToDevice, device.stream));
+        };
+        // The second lane's graph replaces the first by an executable update, as Program switches
+        // graph profiles.
+        std::array<DecodeGraphDefinition, 2> host_definitions;
+        DecodeGraphExecutable host_executable;
+        for (const std::uint32_t lane : {3U, 6U}) {
+            DecodeGraphDefinition& host_definition = host_definitions[lane == 3U ? 0 : 1];
+            host_definition.capture(device.stream, [&] { observe_lane(lane); });
+            if (lane == 3U) {
+                host_executable.instantiate(host_definition);
+            } else {
+                host_executable.update(host_definition);
+            }
+            const std::string tokens = "{\"a\":1}";
+            for (std::size_t extent = 0; extent < 4; ++extent) {
+                CUDA_CHECK(cudaMemsetAsync(host_masks.data, 0, host_masks.bytes(), device.stream));
+                CUDA_CHECK(cudaMemsetAsync(observed.data, 0, observed.bytes(), device.stream));
+                device.synchronize();
+                std::vector<TokenId> lane_drafts(tokens.begin(), tokens.begin() + extent);
+                host_round.begin();
+                host_round.start(lane, *grammar, lane_drafts);
+                host_round.publish();
+                host_executable.launch(device.stream);
+                device.synchronize();
+                host_round.check();
+                const auto bits = from_device<std::uint32_t>(observed.data, words * (extent + 1));
+                std::vector<std::uint32_t> expected(words * (extent + 1));
+                grammar->fill_masks(expected, lane_drafts);
+                if (!std::equal(expected.begin(), expected.end(), bits.begin())) {
+                    throw std::runtime_error("host-started masks were not uploaded before the "
+                                             "captured sampling point");
+                }
+                if (!(host_round.seconds(lane) > 0.0)) {
+                    throw std::runtime_error("host-started mask job time was not kept");
+                }
+            }
+        }
+        phase = "host-started round without a structured lane";
+        // No structured lane: the published event is complete and the replay does not wait.
+        host_round.begin();
+        host_round.publish();
+        {
+            DecodeGraphDefinition idle_definition;
+            idle_definition.capture(device.stream, [&] { observe_lane(0); });
+            DecodeGraphExecutable idle_executable;
+            idle_executable.instantiate(idle_definition);
+            idle_executable.launch(device.stream);
+            device.synchronize();
+        }
+        host_round.check();
+        phase = "host-started mask error";
+        host_round.begin();
+        host_round.start(1, *dead_grammar, {});
+        host_round.publish();
+        raised = false;
+        try {
+            // The upload stream has collected the job once the event completes.
+            host_round.wait(device.stream);
+            device.synchronize();
+            host_round.check();
+        } catch (const std::exception&) { raised = true; }
+        if (!raised) { throw std::runtime_error("host-started mask error was not surfaced"); }
+        std::cout << "OK structured graph: lane remap, replay, exception transport, reset, "
+                     "host-started masks\n";
         return 0;
     } catch (const std::exception& e) {
-        std::cerr << e.what() << '\n';
+        std::cerr << phase << ": " << e.what() << '\n';
         return 1;
     }
 }

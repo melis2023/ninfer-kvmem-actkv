@@ -6,6 +6,7 @@
 
 #include "core/arena.h"
 #include "core/device.h"
+#include "core/vmm.h"
 #include "cuda_availability.h"
 
 #include <cuda.h>
@@ -66,6 +67,10 @@ int main() {
     if (count_err != cudaSuccess) {
         std::cerr << "cudaGetDeviceCount failed: " << cudaGetErrorString(count_err) << '\n';
         return 1;
+    }
+    if (!ninfer::vmm::supported(0)) {
+        std::cout << "SKIP: device 0 has no virtual memory management\n";
+        return 77;
     }
 
     try {

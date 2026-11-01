@@ -1,5 +1,7 @@
 #include "runtime/engine/kv_capacity.h"
 
+#include "ninfer/engine_options.h"
+
 #include <algorithm>
 #include <limits>
 #include <stdexcept>

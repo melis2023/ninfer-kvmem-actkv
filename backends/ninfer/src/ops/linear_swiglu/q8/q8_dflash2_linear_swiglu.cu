@@ -25,10 +25,8 @@ constexpr std::int32_t kFirstSmallT  = 1;
 constexpr std::int32_t kLastSmallT   = 40;
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, cudaStream_t);
 
-template <int Capacity>
-void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
-    using Schedule =
-        Q8KSplitSchedule<Capacity == 24 ? 8 : 4, Capacity, 2, Q8KSplitScaleAccess::Shared>;
+template <int Capacity, class Schedule>
+void launch_tile_schedule(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
     using RowPolicy = Q8SwiGluPairedRows<kIntermediate>;
     static_assert((Geometry::kInputRows % Schedule::kGroupK) == 0);
     static_assert((kIntermediate % RowPolicy::kOutputRowsPerCta) == 0);
@@ -45,6 +43,22 @@ void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_
         static_cast<const std::uint8_t*>(weight.scales), ignored_output, epilogue, row_policy,
         x.ne[1]));
     CUDA_CHECK(cudaGetLastError());
+}
+
+// The route's schedule, or its four-K-warp form where the device profile names it
+// (q8_ksplit_config.h).
+template <int Capacity>
+void launch_tile(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {
+    using Schedule =
+        Q8KSplitSchedule<Capacity == 24 ? 8 : 4, Capacity, 2, Q8KSplitScaleAccess::Shared>;
+    if constexpr (kQ8KSplitHasFourWarpForm<Schedule>) {
+        if (q8_ksplit_four_warps<Geometry>(x.ne[1])) {
+            launch_tile_schedule<Capacity, Q8KSplitFourWarpSchedule<Schedule>>(x, weight, out,
+                                                                               stream);
+            return;
+        }
+    }
+    launch_tile_schedule<Capacity, Schedule>(x, weight, out, stream);
 }
 
 template <std::size_t... Offsets>

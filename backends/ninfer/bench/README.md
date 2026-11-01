@@ -37,7 +37,8 @@ Python interpreter; a benchmark-only configuration does not require one.
 ## Product benchmark
 
 The benchmark slices exact token counts from `bench/fixtures/bench_corpus.ids`, calls
-`Engine::prepare_tokens()`, then calls `Engine::generate()` once for each repetition. It does not
+`Engine::prepare_tokens()`, then calls `Engine::submit(..., Aggregate, {.phase_timings=true}).wait()`
+once for each repetition. It does not
 have a private prefill/decode loop and does not call model implementation interfaces.
 
 The matrix contains three independently measured test kinds:
@@ -55,6 +56,13 @@ keeps the requested token count exact without adding another generation path. Wh
 enabled and the matrix contains decode work, one ordinary public generation request primes the
 decode graph before warmups and measured repetitions.
 
+JSON also exports each repetition's `first_token_seconds`, `prompt_wall_seconds`,
+`generation_wall_seconds` and output token IDs. Program prefill/decode time does not include every
+Engine or memory-policy operation. For observed generation throughput, divide the timed output
+count by `generation_wall_seconds` (first through last accepted token). Use `prompt_wall_seconds`
+for prompt throughput and `total_seconds` for whole-request latency. No transfer verification is
+enabled implicitly.
+
 ## CLI
 
 ```text
@@ -66,7 +74,9 @@ ninfer_bench --weights <artifact.ninfer>
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
           [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4>] [--fast-prefill-kernel]
-          [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft]
+          [--expert-residency <device|host|disk>] [--expert-cache-mib <N|auto>]
+          [--expert-dma-share <F|auto>] [--expert-cpu-threads <n>]
+          [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft|--full-draft-head]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
 ```
@@ -81,9 +91,15 @@ Example:
   -p 512,2048 -n 128 -pg '2048,128' -r 5 --warmup 1
 ```
 
-Select a backend with `--spec mtp|dflash|dflash2 --draft-tokens K` (K=1..15 for every backend);
-`--lm-head-draft` selects the optimized proposal head. CUDA Graph decode is
-enabled by default.
+Select a backend with `--spec mtp|dflash|dflash2 --draft-tokens K` (K=1..15 for every backend).
+Drafts use the optimized proposal head when the artifact stores one; `--lm-head-draft` requires it
+and `--full-draft-head` keeps the full output head. CUDA Graph decode is enabled by default.
+
+`--expert-residency host|disk` keeps a MoE model's routed experts in pinned host memory or in the
+artifact's files, as the CLI does; `--expert-cache-mib` sizes the device expert cache, and
+`--expert-dma-share` and `--expert-cpu-threads` set the hybrid CPU share as `ninfer` does. The
+report's configuration records the residency, the cache bytes and the delivery counters of the
+whole run (`expert_routes`, `expert_hits`, `expert_admissions`, `expert_transferred_bytes`).
 
 `--profile-measured` is a benchmark-only profiler boundary. It requires exactly one selected test
 and `-r 1`, synchronizes after warmup, and brackets only the measured repetition with
@@ -99,6 +115,27 @@ For a DFlash2 companion artifact:
 ```
 
 The benchmark disables context retention because every repetition is an independent root request.
+The KVMem integration accepts the shared `--kvmem-*` CLI contract. With
+`--kvmem-budget B --kvmem-gen-reserve G`, Main KV capacity is exactly `B+G`, independent of the
+logical `--max-ctx` limit, and the JSON memory section records B and G. To compare against native
+NInfer at equal active history, first use the same P=B prompt and an output count smaller than G:
+
+```bash
+# Native engine: logical and physical capacity B+G=2560.
+./build/bench/ninfer_bench --weights model.ninfer --max-ctx 2560 \
+  --kv-dtype int8 --prefill-chunk 256 -pg '2048,256' --warmup 1 -r 3 -o json
+# Integrated engine: same input, capacity, KV format and execution settings.
+./build/bench/ninfer_bench --weights model.ninfer --max-ctx 2560 \
+  --kv-dtype int8 --prefill-chunk 256 -pg '2048,256' --warmup 1 -r 3 -o json \
+  --kvmem-budget 2048 --kvmem-gen-reserve 512 --kvmem-host-mib 8192 --kvmem-lrfu
+```
+
+G is reserved KV capacity, not the actual requested output count (`-pg P,N` requests N+1 tokens).
+Hold the artifact, GPU, graph, MTP/ngram and kernel settings fixed too. Confirm capacity in the
+reports and active KV in a separate `--kvmem-verify-transfers` run; this expensive validation must
+not enter timings. Long-history runs beyond B+G measure additional retrieval/paging work and use
+different inputs, so report them separately from the equal-input comparison.
+
 Schema v16 records `speculative_backend`, `draft_tokens`, `ngram_draft_tokens`, `ngram_min_match`,
 and the proposal head independently; JSON and CSV identify DFlash2 explicitly. MTP alone reserves
 its extra lookahead KV margin. Schema v17 adds `rope_yarn_factor`.
@@ -159,7 +196,7 @@ matching test, phase, and roof it reports the measured time change and the fract
 the pre-change gap to the roof that the change closed; a negative value moved the run
 away from the roof. A baseline already at or above a roof reports `n/a` for that roof's
 gap closure. Tests or phases present in only one run are listed as unmatched.
-The tool requires schema v16 or v17 and `--spec none`. It rejects speculative runs because proposals,
+The tool requires schema v16, v17 or v18 and `--spec none`. It rejects speculative runs because proposals,
 verification, and acceptance make output tokens an invalid proxy for executed model work.
 
 Projection compute work is counted as `2 * matrix elements` for each executed text projection.
@@ -315,10 +352,17 @@ cmake --build build --parallel --target ninfer_benches
   --qtype fp8 --policy a8 --n 16384 --k 5120 --t 1024
 ```
 
-Linear tuning measures every valid T through 128 and the two bulk anchors, 512 and 1024.
-[Linear tuning and performance reports](../docs/maintainer/linear-tuning.md) defines workload
-priorities, dispatch tradeoffs, and the final curve and metric tables. Respect each Op's extent
-alignment; these measurement targets do not limit supported T.
+Linear tuning measures every valid T through 128 and the two bulk anchors, 512 and 1024
+([Op development](../docs/maintainer/op-development.md)). Respect each Op's extent alignment; these
+measurement targets do not limit supported T. Where a boundary between schedules should sit is a
+separate question that `ninfer_linear_schedule_bench` answers: it times every candidate launch of a
+shape at the same column count, including candidates the shape table never selects, and names the
+one the table routes to:
+
+```bash
+./build/bench/ninfer_benches ninfer_linear_schedule_bench q4:131072x5120 --repeat 11 --spread
+./build/bench/ninfer_benches ninfer_linear_schedule_bench q8:2048x16384 --tokens 24,32,40,48 --only k32,mma
+```
 
 A continuous small-T sweep reuses one packed weight and one maximum-T activation/output
 allocation:
@@ -998,10 +1042,14 @@ it is not a mode of Attention input projection. End-to-end target measurement us
 ## 35B sparse-MoE dFlash benchmark
 
 `ninfer_sparse_moe_bench` measures the complete routed-plus-shared post-mixer Op for the 35B Text
-Q4+Q5/Q6 profiles and the MTP Q8+Q8 profile. It is a long-lived public Op benchmark: fixture setup
-uses `sparse_moe_workspace_capacity_bytes()`, and every eager or captured measurement calls only
-`ninfer::ops::sparse_moe()`. Production dispatch exclusively owns decode, Small-T, prefill,
-workspace views, launch decomposition, and schedule selection.
+Q4+Q5/Q6 profiles and the MTP Q8+Q8 profile. The default `--candidate auto` uses the public
+workspace query and `ninfer::ops::sparse_moe()`; production dispatch owns its route and schedule.
+An explicit `--candidate` (`decode`, `small-t` for T=2..46, `prefill`, `prefill-narrow`,
+`prefill-wide`) runs the internal laboratory path with the same validation and complete Op, so a
+device profile's `sparse_moe/*` bands ([device profiles](../docs/device-profiles.md)) can be chosen
+by measurement. The two forced tile widths bypass the adaptive prefill dispatch; NVFP4 has one
+prefill tile. `ninfer_sparse_moe_test --candidates-only` holds the candidates a profile may name to
+the FP64 oracle.
 
 CUDA Graph replay is the default and authoritative execution mode. The benchmark eagerly
 materializes the public call, captures it with stable tensor and workspace addresses, instantiates
@@ -1024,8 +1072,8 @@ cmake --build build --parallel --target ninfer_benches
 Each cold sample flushes 256 MiB before the timed interval. `trace-like` is the primary
 single-sequence verification distribution; `independent` and `same` bound zero and complete expert
 overlap. `--execution eager|graph|both` and `--cache cold|warm|both` change only the harness around
-the same public call. The CSV `timed_scope` is `full_sparse_moe_device_body`; it contains no private
-route, candidate, grid, block, or launch-count fields.
+the same selected call. The CSV `timed_scope` is `full_sparse_moe_device_body`, and its `candidate`
+column records the requested route. These are Op measurements, not Engine speedups.
 
 `unique_weight_gbps` counts the router, shared weights, and each selected expert's encoded weights
 once, so it is a distribution-aware useful-traffic lower bound rather than measured DRAM traffic.
@@ -1127,8 +1175,8 @@ cmake --build build --parallel --target ninfer_benches
 ```
 
 The G2/G3/G4 benchmark uses physical rows 248320 and valid token domain 248077. G2 covers optional
-occurrence counts and batched sampling at `B=1,2,4,8`; G3 covers one-hot MTP windows (`K=1..5` in
-the default matrix; `--mtp-k` accepts up to 15).
+occurrence counts and batched sampling at `B=1,2,4,8`; G3 covers MTP windows under coupled
+verification (`K=1..5` in the default matrix; `--mtp-k` accepts up to 15).
 With no arguments it runs the G2/G3 greedy/stochastic matrix. G4 covers DFlash2 sparse-q acceptance
 with `K=1..15`, 16 proposal candidates, `P=0..K`, and `B=1..8`. `--drafts` defaults to the
 checkpoint recommendation of seven; the default extent is the selected K.
@@ -1179,6 +1227,19 @@ effects are measured through the public Engine benchmark or the target round ben
 
 ## Pointwise Op benchmarks
 
+`ninfer_benches ninfer_hyper_connection_bench` compares the public HC write/read composition
+with `hyper_connection_write_read` at 4 streams, hidden 2560, lowrank 320 and
+T=1/4/8/9/16/128/512. It covers BF16 and FP32 block outputs, reused operands and a 64 MiB L2
+eviction. Each result reports 61 alternating baseline/candidate CUDA Graph samples, median,
+p95 and graph node counts; restoring identical input stacks and inject weights is outside timing.
+This measures the complete Op composition, not whole-model throughput.
+
+`ninfer_benches ninfer_qsa_indexer_bench` measures the public indexer at T=1/4/8/16/127/128/129/512
+and capacities 700/8192/32768. It records 33 CUDA Graph samples, median and p95 with reused
+inputs and a 64 MiB L2 eviction, including query preparation and top-512 selection. The wider
+route uses TF32 high/residual MMA and preserves FP32 pooled keys. This is an Op measurement;
+the selection oracle is `ninfer_qsa_indexer_test`.
+
 The Section 5 benchmarks cover the complete Qwen3.6-35B pointwise matrix. Default invocation runs
 all registered small, established, maximum-video, and maximum-image shapes. `--control` preserves
 the selected kernel topology and payload while replacing the mathematical operation with minimal
@@ -1228,7 +1289,7 @@ closed.
 
 Table, JSON, and CSV reports identify the architecture, model instance, artifact, Engine configuration,
 load summary, memory capacity, KV payload, workspace peak, phase throughput, and speculative
-statistics. JSON schema version 17 records the public value objects directly:
+statistics. JSON schema version 18 records the public value objects directly:
 
 - `load`: architecture, public name, actual formats, prefill signature, load/upload time,
   file/H2D/staging bytes and Device/Host object counts;

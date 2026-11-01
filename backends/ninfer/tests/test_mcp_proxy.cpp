@@ -1,7 +1,14 @@
 #include "serve/mcp_proxy.h"
 
+#include "serve/http_server.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstddef>
 #include <iostream>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -20,6 +27,203 @@ httplib::Request proxy_request(const std::string& url, const httplib::Headers& h
     request.headers = headers;
     request.params.emplace(kMcpProxyUrlParam, url);
     return request;
+}
+
+// The byte at stream offset i of the upstream reply.
+char pattern_byte(std::size_t i) { return static_cast<char>((i * 131 + i / 4096) & 0xff); }
+
+// An httplib server on a free loopback port, listening on its own thread until destroyed.
+struct LoopbackServer {
+    httplib::Server server;
+    std::thread thread;
+    int port = 0;
+
+    void start() {
+        port   = server.bind_to_any_port("127.0.0.1");
+        thread = std::thread([this] { server.listen_after_bind(); });
+        server.wait_until_ready();
+    }
+
+    ~LoopbackServer() {
+        server.stop();
+        if (thread.joinable()) { thread.join(); }
+    }
+};
+
+// An MCP server whose reply to POST /mcp is `total` pattern bytes in 64 KiB chunks, as fast as the
+// relay reads them; `sent` counts the bytes its socket accepted.
+struct StreamingUpstream {
+    static constexpr std::size_t kChunk = 64 * 1024;
+    LoopbackServer loopback;
+    std::size_t total;
+    std::atomic<std::size_t> sent{0};
+    std::atomic<bool> ended{false};
+
+    explicit StreamingUpstream(std::size_t bytes) : total(bytes) {
+        loopback.server.Post("/mcp", [this](const httplib::Request&, httplib::Response& response) {
+            response.set_chunked_content_provider(
+                "text/event-stream",
+                [this](std::size_t offset, httplib::DataSink& sink) {
+                    if (offset >= total) {
+                        sink.done();
+                        return true;
+                    }
+                    std::string chunk(std::min(kChunk, total - offset), '\0');
+                    for (std::size_t i = 0; i < chunk.size(); ++i) {
+                        chunk[i] = pattern_byte(offset + i);
+                    }
+                    if (!sink.write(chunk.data(), chunk.size())) { return false; }
+                    sent += chunk.size();
+                    return true;
+                },
+                [this](bool) { ended = true; });
+        });
+        loopback.start();
+    }
+};
+
+// This server's relay route alone.
+struct Relay {
+    LoopbackServer loopback;
+
+    Relay() {
+        const auto relay = [](const httplib::Request& request, httplib::Response& response) {
+            relay_mcp_proxy(request, response);
+        };
+        loopback.server.Post(kMcpProxyPath, relay);
+        loopback.server.Delete(kMcpProxyPath, relay);
+        loopback.start();
+    }
+};
+
+std::string relay_path(int upstream_port) {
+    return std::string(kMcpProxyPath) + "?" + kMcpProxyUrlParam + "=" +
+           httplib::encode_query_component("http://127.0.0.1:" + std::to_string(upstream_port) +
+                                           "/mcp");
+}
+
+// POSTs to the relay for the upstream's /mcp; `receive` sees every chunk of the relayed body and
+// returns false to hang up.
+httplib::Result post_through(const Relay& relay, const StreamingUpstream& upstream,
+                             httplib::ContentReceiverWithProgress receive) {
+    httplib::Client client("127.0.0.1", relay.loopback.port);
+    client.set_read_timeout(std::chrono::seconds(30));
+    httplib::Request request;
+    request.method = "POST";
+    request.path   = relay_path(upstream.loopback.port);
+    request.body   = R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})";
+    request.set_header("Content-Type", "application/json");
+    request.content_receiver = std::move(receive);
+    return client.send(request);
+}
+
+// A browser that stops reading must stop the relay reading the MCP server: the relay holds at most
+// kMcpProxyBufferBytes, and the sockets between the three hold a few MiB more. Unbounded, the relay
+// takes the whole 256 MiB into memory within the pause. After it, every byte arrives in order.
+int test_slow_reader_bounds_the_relay() {
+    constexpr std::size_t kTotal        = std::size_t{256} << 20;
+    constexpr std::size_t kStallCeiling = std::size_t{64} << 20;
+    StreamingUpstream upstream(kTotal);
+    Relay relay;
+    std::size_t received          = 0;
+    std::size_t sent_during_stall = 0;
+    bool in_order                 = true;
+    const httplib::Result result  = post_through(
+        relay, upstream, [&](const char* data, std::size_t length, std::size_t, std::size_t) {
+            if (received == 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+                sent_during_stall = upstream.sent.load();
+            }
+            for (std::size_t i = 0; i < length && in_order; ++i) {
+                in_order = data[i] == pattern_byte(received + i);
+            }
+            received += length;
+            return true;
+        });
+    int failures = 0;
+    failures += check(result && result->status == 200, "the relayed stream did not complete");
+    failures += check(sent_during_stall < kStallCeiling,
+                      "the relay kept reading the MCP server while the browser did not read");
+    failures +=
+        check(received == kTotal && in_order, "the relayed body lost, added or reordered bytes");
+    if (failures != 0) {
+        std::cerr << "  sent during the stall " << sent_during_stall << ", received " << received
+                  << " of " << kTotal << '\n';
+    }
+    return failures;
+}
+
+// A browser that hangs up while the relay waits for it to drain must release the MCP server: the
+// waiting upstream reader wakes and the upstream connection closes.
+int test_hang_up_releases_the_upstream() {
+    StreamingUpstream upstream(std::size_t{256} << 20);
+    Relay relay;
+    bool first = true;
+    (void)post_through(relay, upstream, [&](const char*, std::size_t, std::size_t, std::size_t) {
+        if (!first) { return false; }
+        first = false;
+        // Long enough for the relay's buffer to fill and its reader to wait.
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        return true;
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!upstream.ended && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return check(upstream.ended && upstream.sent < upstream.total,
+                 "the MCP server's reply kept streaming after the browser hung up");
+}
+
+// Replies without a body (204 to the DELETE that ends a session, 202 to a notification) reach the
+// browser with their status and headers, and leave its kept-alive connection fit for the next
+// request.
+int test_bodyless_replies_pass() {
+    LoopbackServer upstream;
+    upstream.server.Delete("/mcp", [](const httplib::Request&, httplib::Response& response) {
+        response.status = 204;
+        response.set_header("Mcp-Session-Id", "ended");
+    });
+    upstream.server.Post("/mcp", [](const httplib::Request&, httplib::Response& response) {
+        response.status = 202;
+    });
+    upstream.start();
+    Relay relay;
+    httplib::Client client("127.0.0.1", relay.loopback.port);
+    client.set_keep_alive(true);
+    const std::string path         = relay_path(upstream.port);
+    const httplib::Result ended    = client.Delete(path);
+    const httplib::Result accepted = client.Post(path, "{}", "application/json");
+    int failures                   = 0;
+    failures += check(ended && ended->status == 204 && ended->body.empty() &&
+                          ended->get_header_value("Mcp-Session-Id") == "ended",
+                      "a 204 reply did not reach the browser as it was");
+    failures += check(accepted && accepted->status == 202 && accepted->body.empty(),
+                      "a bodyless 202 after a 204 on the same connection did not arrive");
+    return failures;
+}
+
+int test_relay_requires_the_api_key() {
+    const auto request = [](const std::string& method, const std::string& path) {
+        httplib::Request r;
+        r.method = method;
+        r.path   = path;
+        return r;
+    };
+    int failures = 0;
+    failures += check(requires_api_key("key", true, request("POST", kMcpProxyPath)) &&
+                          requires_api_key("key", true, request("GET", kMcpProxyPath)) &&
+                          requires_api_key("key", false, request("DELETE", kMcpProxyPath)),
+                      "the MCP relay was reachable without the configured API key");
+    failures += check(!requires_api_key("", true, request("POST", kMcpProxyPath)),
+                      "the relay asked for a key no one configured");
+    failures += check(!requires_api_key("key", true, request("OPTIONS", kMcpProxyPath)) &&
+                          !requires_api_key("key", true, request("GET", "/health")) &&
+                          !requires_api_key("key", true, request("GET", "/")),
+                      "a preflight, /health or a WebUI page required the API key");
+    failures += check(requires_api_key("key", true, request("POST", "/v1/chat/completions")) &&
+                          requires_api_key("key", false, request("GET", "/")),
+                      "an API route, or GET / without a WebUI, skipped the API key");
+    return failures;
 }
 
 } // namespace
@@ -123,6 +327,11 @@ int main() {
                           header_name_is("content-TYPE", "content-type") &&
                           !header_name_is("Content-Length", "content-type"),
                       "case-insensitive header matching is wrong");
+
+    failures += test_relay_requires_the_api_key();
+    failures += test_slow_reader_bounds_the_relay();
+    failures += test_hang_up_releases_the_upstream();
+    failures += test_bodyless_replies_pass();
 
     if (failures == 0) { std::cout << "mcp proxy ok\n"; }
     return failures == 0 ? 0 : 1;

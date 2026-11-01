@@ -136,7 +136,7 @@ TextConfig parse_text_config(const Json& value) {
         .seed = artifact::require_u64(value.at("ngram_seed"), "ngram_seed", false),
     };
     const auto& ple = value.at("ple_layers");
-    if (!ple.is_array() || ple.empty()) { throw ArtifactError("ple_layers must name blocks"); }
+    if (!ple.is_array()) { throw ArtifactError("ple_layers must be an array of blocks"); }
     for (const auto& block : ple) {
         const auto index = artifact::require_u64(block, "PLE block", false);
         if (index >= out.num_hidden_layers ||
@@ -176,6 +176,28 @@ TextConfig parse_text_config(const Json& value) {
     require_value(out.ngram.ngram_size, 3, "ngram_size");
     require_value(out.ngram.heads_per_ngram, 8, "heads_per_ngram");
     require_value(out.ple_embed_dim / out.ngram_heads(), 160, "n-gram head width");
+    return out;
+}
+
+MtpConfig parse_mtp_config(const Json& value, const TextConfig& text) {
+    artifact::require_members(value, {"architectures", "rope_theta", "num_experts"}, {},
+                              "Qwen4Exp MTP config");
+    const auto& architectures = value.at("architectures");
+    if (!architectures.is_array() || architectures.size() != 1 ||
+        architectures[0] != "Qwen4ExpMTP") {
+        throw ArtifactError("Qwen4Exp MTP config: architecture mismatch");
+    }
+    MtpConfig out;
+    out.rope_theta  = positive_float(value, "rope_theta");
+    out.num_experts = integer(value, "num_experts");
+    // The sparse-attention kernels rotate at the text model's theta.
+    if (out.rope_theta != text.rope_theta) {
+        throw ArtifactError("the MTP block's rope_theta differs from the text model's");
+    }
+    if (out.num_experts < text.num_experts_per_tok || out.num_experts > 512) {
+        throw ArtifactError("the MTP block keeps " + std::to_string(out.num_experts) +
+                            " experts; this engine implements 10 to 512");
+    }
     return out;
 }
 

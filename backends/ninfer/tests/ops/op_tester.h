@@ -17,6 +17,8 @@
 #include "core/arena.h"
 #include "core/tensor.h" // ninfer::DType, ninfer::Tensor (for op call sites)
 #include "cuda_availability.h"
+#include "ops/common/device_tier.h"
+#include "ops/linear/nvfp4/nvfp4_int8_route.h"
 #include "ops/op_check.h"
 
 #include <cuda_runtime.h>
@@ -30,6 +32,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <random>
 #include <span>
 #include <stdexcept>
@@ -59,28 +62,31 @@ inline void cuda_synchronize(cudaStream_t stream) {
 // FP8 A8 and NVFP4 A4 execution issue tensor-core instructions that exist only on sm_100a /
 // sm_120a and have no Ampere fallback, so those translation units are compiled out under
 // NINFER_SM8X_COMPAT and their entry points throw instead. A 120a build on that path still
-// compiles both (NINFER_SM120_FP8, NINFER_SM120_NVFP4).
+// compiles both (NINFER_SM120_FP8, NINFER_SM120_NVFP4); a build of several architectures with
+// 120a runs them on the cards that run its 120a code only, and its entry points throw the same
+// refusal on the others (ops/common/blackwell_routes.h).
+inline bool a8_execution_available() {
 #if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_FP8)
-inline constexpr bool kA8ExecutionAvailable = false;
+    return false;
 #else
-inline constexpr bool kA8ExecutionAvailable = true;
+    return ops::current_device_blackwell();
 #endif
-#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_NVFP4)
-inline constexpr bool kA4ExecutionAvailable = false;
-#else
-inline constexpr bool kA4ExecutionAvailable = true;
-#endif
+}
 
-// True when an exception is one of the A8/A4 units refusing to run because this build targets an
-// architecture whose kernels were compiled out. On a build where those kernels exist the answer is
-// always false, so such a throw still fails the test.
+inline bool a4_execution_available() {
+#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_NVFP4)
+    return false;
+#else
+    return ops::current_device_blackwell();
+#endif
+}
+
+// True when an exception is one of the A8/A4 units refusing to run because the current card does
+// not run the code they need. Where those kernels run the answer is always false, so such a throw
+// still fails the test.
 inline bool unsupported_arch_refusal(const std::exception& error) {
-    if constexpr (kA8ExecutionAvailable && kA4ExecutionAvailable) {
-        (void)error;
-        return false;
-    } else {
-        return std::string_view(error.what()).find("requires an sm_") != std::string_view::npos;
-    }
+    if (a8_execution_available() && a4_execution_available()) { return false; }
+    return std::string_view(error.what()).find("requires an sm_") != std::string_view::npos;
 }
 
 // Runs one Op test case, reporting an unsupported-architecture refusal as a skip rather than a
@@ -90,17 +96,13 @@ inline bool unsupported_arch_refusal(const std::exception& error) {
 // runs and is checked.
 template <typename Case>
 int run_case_allowing_arch_skip(std::string_view label, Case&& body) {
-    if constexpr (kA8ExecutionAvailable && kA4ExecutionAvailable) {
-        (void)label;
+    if (a8_execution_available() && a4_execution_available()) { return body(); }
+    try {
         return body();
-    } else {
-        try {
-            return body();
-        } catch (const std::exception& error) {
-            if (!unsupported_arch_refusal(error)) { throw; }
-            std::cout << "SKIP " << label << ": " << error.what() << "\n";
-            return 0;
-        }
+    } catch (const std::exception& error) {
+        if (!unsupported_arch_refusal(error)) { throw; }
+        std::cout << "SKIP " << label << ": " << error.what() << "\n";
+        return 0;
     }
 }
 
@@ -414,5 +416,24 @@ inline int verify_reduction(std::string_view label, std::span<const double> got,
               << " reference=" << stats.reference_at_maximum << '\n';
     return 1;
 }
+
+// Pin the NVFP4 int8 wide mainloop for one scope. Two reasons a harness needs it rather than the
+// route table alone: (1) the table is what the device profile calibrates, so a case can hold the
+// table's answer while still asking for the other mainloop; (2) the narrow band below the crossover,
+// which runs the legacy chain's port or the unified chain's own narrow kernel by the same answer. So
+// a profile that claims an integer-quantized activation path has to say which kernel it means;
+// otherwise the harness moves with the table and reports green for a kernel that never ran.
+// Nesting-safe: whatever was in force is restored on scope exit.
+class ScopedNvfp4Int8Mainloop {
+public:
+    explicit ScopedNvfp4Int8Mainloop(ops::detail::Nvfp4Int8Mainloop mainloop)
+        : previous_(ops::detail::force_nvfp4_int8_mainloop(mainloop)) {}
+    ~ScopedNvfp4Int8Mainloop() { ops::detail::force_nvfp4_int8_mainloop(previous_); }
+    ScopedNvfp4Int8Mainloop(const ScopedNvfp4Int8Mainloop&)            = delete;
+    ScopedNvfp4Int8Mainloop& operator=(const ScopedNvfp4Int8Mainloop&) = delete;
+
+private:
+    std::optional<ops::detail::Nvfp4Int8Mainloop> previous_;
+};
 
 } // namespace ninfer::test

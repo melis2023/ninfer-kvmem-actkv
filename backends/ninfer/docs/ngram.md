@@ -72,10 +72,13 @@ spans but increase per-round attention, projection, replay and workspace costs, 
 short and long contexts; the longest supported width need not be fastest.
 
 The mixed-FP8 27B target retains 16-bit activations for FP8 residual projections
-during 17..64-column single-request verification. Its ordinary narrow path uses
-that precision already; crossing the core's 22/25-column A8 thresholds otherwise
-adds another quantization change. Weight and KV formats and prefill are unchanged.
-This does not promise identical floating-point results between different widths.
+in 17..64-column verification rows, whether the round verifies one request or
+several. Its ordinary narrow single-request path uses that precision already;
+crossing the core's 22/25-column A8 thresholds would otherwise change a row's
+quantization with the round it shares, and the error a shared 8-bit round leaves in
+the KV and GDN state can flip a later greedy near-tie. Narrower multi-request rounds
+still cross those thresholds. Weight and KV formats and prefill are unchanged. This
+does not promise identical floating-point results between different widths.
 
 ## Operation
 
@@ -117,10 +120,11 @@ budget is exhausted. This only limits optional proposal sources: it never trunca
 the target prompt to make an oversized request valid. Preparation cancellation
 is checked around source tokenization.
 
-Every proposed token is verified by the target. MTP and DFlash retain their deterministic-draft
-acceptance paths; DFlash2 represents the proposal as a one-hot distribution in its existing
-sparse verifier. Existing target commit, stop, cancellation and cache-restore ownership remain
-authoritative. Ordinary neural rounds keep their original verification width.
+Every proposed token is verified by the target. MTP and DFlash verify a copied proposal with
+their coupled acceptance, which keeps it while it equals the target's own draw at each position;
+DFlash2 represents the proposal as a one-hot distribution in its existing sparse verifier.
+Existing target commit, stop, cancellation and cache-restore ownership remain authoritative.
+Ordinary neural rounds keep their original verification width.
 
 This implementation is position-indexed, not a literal port of llama.cpp's hashed next-token
 chain. It does not promise bit-identical output across different verification widths: floating
@@ -210,13 +214,6 @@ test must demonstrate accepted ngram proposals, not just successfully enabling a
 The product `ninfer_bench` accepts the same ngram flags and preserves these
 counters in table, CSV and JSON reports. Its ordinary one-token decode seed is
 not a copy workload; see [benchmark guidance](../bench/README.md).
-
-The [scope proposal](https://github.com/Neroued/ninfer/issues/234) links RTX 5090
-copy, edit and compaction measurements with their artifacts, toolchain, commands
-and correctness checks. Those pre-v3 results belong to the source revisions in
-the [evidence release](https://github.com/remesis/ninfer/releases/tag/ngram-mod-evidence-20260912),
-not to later rebases. Remeasure the relevant workload before attributing the same
-gain to another revision or configuration.
 
 ## Real-Artifact Checks
 

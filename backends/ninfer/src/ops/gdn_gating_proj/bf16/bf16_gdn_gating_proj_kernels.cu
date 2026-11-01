@@ -11,6 +11,8 @@
 #include <cuda_bf16.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
@@ -257,26 +259,44 @@ void require_shape35(const Weight& w, const char* name) {
     }
 }
 
-template <class Geometry, int SplitK>
-constexpr std::int32_t cooperative_resident_ctas_per_sm() noexcept {
+// CTAs of one cooperative split-K kernel the current device holds per SM, the lesser of its
+// full-tile and predicated forms: the occupancy of the compiled kernel (its registers, block size
+// and shared memory) on that device, so a Turing SM's 64 KiB of shared memory and an sm_86 SM's
+// 100 KiB each give their own count. A cooperative grid larger than this times the SM count is
+// refused by the driver. Zero when the query fails.
+template <class Geometry, int SplitK, int Warps, bool NormalizeInput, int NormTokenCapacity>
+std::int32_t cooperative_resident_ctas_per_sm() noexcept {
     static_assert(SplitK > 1);
-    if constexpr (std::is_same_v<Geometry, Bf16Gdn27Geometry>) {
-        static_assert(SplitK == 8 || SplitK == 4 || SplitK == 2);
-        // Measured on the sm_86 build (cuobjdump -res-usage): BN128 split-8/4/2 are all run at
-        // 8 warps (256 threads) here, at 65 registers; registers and the 40-KiB shared-memory
-        // allocation both admit two resident CTAs per SM uniformly across the three.
-        return 2;
-    } else {
-        static_assert(std::is_same_v<Geometry, Bf16Gdn35Geometry>);
-        static_assert(SplitK == 32 || SplitK == 16 || SplitK == 8 || SplitK == 4 || SplitK == 2);
-        // Measured on the sm_86 build (cuobjdump -res-usage): split-32 uses 122-126 registers
-        // with 256 threads and is register-bound to two resident CTAs per SM; split-16 uses 56
-        // registers and reaches the 4-CTA shared-memory bound; split-8/4/2 use 74 registers and
-        // are register-bound to three. These are kernel facts, not a device-wide SM-count policy.
-        if (SplitK == 32) { return 2; }
-        if (SplitK == 16) { return 4; }
-        return 3;
+    constexpr int kCachedDevices = 64;
+    static std::array<std::atomic<std::int32_t>, kCachedDevices> cache{};
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) { return 0; }
+    const bool cached = device >= 0 && device < kCachedDevices;
+    if (cached) {
+        const std::int32_t known =
+            cache[static_cast<std::size_t>(device)].load(std::memory_order_relaxed);
+        if (known > 0) { return known; }
     }
+    constexpr int kSmemBytes = kBf16GdnSmemBytes<Geometry::kBlockN>;
+    const auto occupancy     = [](auto kernel) -> int {
+        int blocks = 0;
+        if (cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes) !=
+                cudaSuccess ||
+            cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, kernel, Warps * 32,
+                                                              kSmemBytes) != cudaSuccess) {
+            return 0;
+        }
+        return blocks;
+    };
+    const std::int32_t ctas = std::min(
+        occupancy(bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, true, Warps,
+                                                       NormalizeInput, NormTokenCapacity>),
+        occupancy(bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, false, Warps,
+                                                       NormalizeInput, NormTokenCapacity>));
+    if (cached && ctas > 0) {
+        cache[static_cast<std::size_t>(device)].store(ctas, std::memory_order_relaxed);
+    }
+    return ctas;
 }
 
 template <class Geometry, int SplitK, int Warps = kBf16GdnWarps, bool NormalizeInput = false,
@@ -297,12 +317,10 @@ bool launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
                         static_cast<unsigned>(SplitK));
         auto launch = [&](auto full_tokens) {
             constexpr bool FullTokens     = decltype(full_tokens)::value;
-            configure_cuda_device_once([&] {
-                return cudaFuncSetAttribute(
-                    bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,
-                                                         NormalizeInput, NormTokenCapacity>,
-                    cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes);
-            });
+            raise_dynamic_shared_memory(
+                bf16_gdn_gating_proj_gemm_mma_kernel<Geometry, SplitK, FullTokens, Warps,
+                                                     NormalizeInput, NormTokenCapacity>,
+                kSmemBytes);
             if constexpr (SplitK > 1) {
                 cudaLaunchConfig_t config{};
                 config.gridDim          = grid;
@@ -363,10 +381,10 @@ bool launch_bf16_prefill_mma(Bf16GdnGatingTokenVariant variant, const Tensor& x,
     } else {
         constexpr std::int64_t kCtasPerTokenTile =
             static_cast<std::int64_t>(Geometry::kHeads / kBf16GdnBlockM) * SplitK;
-        constexpr std::int32_t kResidentCtasPerSm =
-            cooperative_resident_ctas_per_sm<Geometry, SplitK>();
         const std::int64_t resident_ctas =
-            static_cast<std::int64_t>(multiprocessor_count) * kResidentCtasPerSm;
+            static_cast<std::int64_t>(multiprocessor_count) *
+            cooperative_resident_ctas_per_sm<Geometry, SplitK, Warps, NormalizeInput,
+                                             NormTokenCapacity>();
         const std::int64_t max_token_tiles = resident_ctas / kCtasPerTokenTile;
         if (max_token_tiles < 1) { return false; }
 
@@ -633,6 +651,78 @@ void bf16_gdn_gating_proj_35_mma_unsplit_launch(Bf16GdnGatingTokenVariant varian
     (void)launch_bf16_prefill_mma<Bf16Gdn35Geometry, 1, 8>(variant, x, nullptr, 0.0F, nullptr,
                                                            a_weight, b_weight, A_log, dt_bias,
                                                            nullptr, g, beta, stream);
+}
+
+std::int32_t bf16_gdn_gating_proj_mma_resident_ctas_per_sm(bool geometry35,
+                                                           std::int32_t split_k) noexcept {
+    if (geometry35) {
+        switch (split_k) {
+        case 32:
+            return cooperative_resident_ctas_per_sm<Bf16Gdn35Geometry, 32, 8, false, 0>();
+        case 16:
+            return cooperative_resident_ctas_per_sm<Bf16Gdn35Geometry, 16, 8, false, 0>();
+        case 8:
+            return cooperative_resident_ctas_per_sm<Bf16Gdn35Geometry, 8, 8, false, 0>();
+        case 4:
+            return cooperative_resident_ctas_per_sm<Bf16Gdn35Geometry, 4, 8, false, 0>();
+        case 2:
+            return cooperative_resident_ctas_per_sm<Bf16Gdn35Geometry, 2, 8, false, 0>();
+        default:
+            return 0;
+        }
+    }
+    switch (split_k) {
+    case 8:
+        return cooperative_resident_ctas_per_sm<Bf16Gdn27Geometry, 8, 8, false, 0>();
+    case 4:
+        return cooperative_resident_ctas_per_sm<Bf16Gdn27Geometry, 4, 8, false, 0>();
+    case 2:
+        return cooperative_resident_ctas_per_sm<Bf16Gdn27Geometry, 2, 8, false, 0>();
+    default:
+        return 0;
+    }
+}
+
+
+namespace {
+// One warp computes both FP32 control reductions for a (token, value-head) pair.
+__global__ void gdn_control_general(const __nv_bfloat16* x, const __nv_bfloat16* a,
+    const __nv_bfloat16* b, const float* alog, const float* bias, float* g, float* beta,
+    int hidden, int heads, int tokens) {
+    const auto row = static_cast<std::int64_t>(blockIdx.x) * 8 + threadIdx.x / 32;
+    if (row >= static_cast<std::int64_t>(heads) * tokens) return;
+    const int lane = threadIdx.x % 32, head = row % heads;
+    const auto input = x + (row / heads) * hidden;
+    const auto wa = a + static_cast<std::int64_t>(head) * hidden;
+    const auto wb = b + static_cast<std::int64_t>(head) * hidden;
+    float sum_a = 0, sum_b = 0;
+    for (int k = lane; k < hidden; k += 32) {
+        const float value = __bfloat162float(input[k]);
+        sum_a = fmaf(value, __bfloat162float(wa[k]), sum_a);
+        sum_b = fmaf(value, __bfloat162float(wb[k]), sum_b);
+    }
+    for (int delta = 16; delta; delta /= 2) {
+        sum_a += __shfl_down_sync(0xffffffff, sum_a, delta);
+        sum_b += __shfl_down_sync(0xffffffff, sum_b, delta);
+    }
+    if (lane == 0) {
+        g[row] = -expf(alog[head]) * softplus(sum_a + bias[head]);
+        beta[row] = sigmoid(sum_b);
+    }
+}
+} // namespace
+
+void bf16_gdn_gating_proj_general_launch(const Tensor& x, const Weight& a_weight,
+    const Weight& b_weight, const Tensor& alog, const Tensor& bias,
+    Tensor& g, Tensor& beta, cudaStream_t stream) {
+    const auto blocks = (static_cast<std::int64_t>(g.ne[0]) * x.ne[1] + 7) / 8;
+    if (blocks > 2147483647) throw std::invalid_argument("GDN control grid exceeds CUDA limit");
+    gdn_control_general<<<static_cast<unsigned>(blocks), 256, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(a_weight.qdata),
+        static_cast<const __nv_bfloat16*>(b_weight.qdata), static_cast<const float*>(alog.data),
+        static_cast<const float*>(bias.data), static_cast<float*>(g.data), static_cast<float*>(beta.data),
+        x.ne[0], g.ne[0], x.ne[1]);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 } // namespace ninfer::ops::detail

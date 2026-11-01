@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/pdl.cuh"
+#include "ops/common/device_limits.h"
 #include "ops/common/warp.cuh"
 #include "ops/linear/common/epilogue.cuh"
 #include "ops/linear/q5/q5_schedule.cuh"
@@ -12,7 +13,9 @@ namespace ninfer::ops::detail {
 template <class Schedule, bool FullK, bool FullTokens, class Output, class Epilogue,
           bool TriggerPdl = false, bool JoinPdl = false>
 __global__
-__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q5_a16_direct_simt_kernel(
+__launch_bounds__(Schedule::kThreads,
+                  resident_ctas_bound(Schedule::kThreads, Schedule::kMinBlocksPerSm)) void
+q5_a16_direct_simt_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales, Output output,
     Epilogue epilogue, int rows, int k, int tokens, int padded_k, int token_begin) {

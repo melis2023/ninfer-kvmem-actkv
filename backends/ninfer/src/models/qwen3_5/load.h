@@ -1,11 +1,14 @@
 #pragma once
 
 #include "models/qwen3_5/model.h"
-#include "ninfer/types.h"
+#include "ninfer/kv_cache_storage.h"
+#include "ninfer/startup.h"
+#include "ops/common/device_tier.h"
 
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <vector>
 
 namespace ninfer::artifact {
 class Reader;
@@ -35,13 +38,21 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     explicit LoadPlan(std::unique_ptr<Impl> impl);
-    friend LoadPlan plan_load(const artifact::Reader&, LoadOptions);
+    friend LoadPlan plan_load(const artifact::Reader&, LoadOptions, std::filesystem::path,
+                              std::vector<ops::DeviceTier>);
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*,
                                                     const artifact::MaterializeOptions&);
 };
 
-[[nodiscard]] LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options = {});
+// `rank_tiers` holds the code tier of each pipeline rank's device (ops/common/device_tier.h), which
+// decides the stored layout of the projection weights that rank reads; empty takes the current
+// device's tier for every rank.
+[[nodiscard]] LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options = {},
+                                 std::filesystem::path artifact_path     = {},
+                                 std::vector<ops::DeviceTier> rank_tiers = {});
+// The code tier of each rank's device, in rank order.
+[[nodiscard]] std::vector<ops::DeviceTier> rank_tiers(const DeviceContext& device);
 // How many layers each of `free_bytes.size()` pipeline stages should own so that the most KV cache
 // fits on every device at once, given the bytes free on each. Sized from the artifact's stored
 // layers; the head stage (rank 0) also carries the embedding, head and round buffers. The default

@@ -1,9 +1,10 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "ninfer/request.h"
 
 #include <filesystem>
 #include <string>
+#include <string_view>
 
 namespace ninfer::product {
 
@@ -11,6 +12,9 @@ namespace ninfer::product {
 [[nodiscard]] PromptInput prompt_from_messages(const std::filesystem::path& path,
                                                std::optional<bool> enable_thinking,
                                                bool vision_enabled);
+[[nodiscard]] PromptInput prompt_from_messages_json(std::string_view json,
+                                                    std::optional<bool> enable_thinking,
+                                                    bool vision_enabled);
 
 // Make the requested final-response contract visible to the model before preparation.
 // Grammar enforcement remains an execution responsibility.

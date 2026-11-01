@@ -3,9 +3,8 @@
 #include "models/qwen3_5/program/graft_injection.h"
 #include "models/qwen3_5/program/planning/startup.h"
 #include "models/qwen3_5/program/program_impl.h"
-#include "core/startup.h"
-#include <algorithm>
-#include <cstdio>
+#include "core/resident_memory.h"
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -323,7 +322,10 @@ RequestBasePlan Program::plan_request(const PreparedPrompt& prompt,
 }
 
 std::vector<float> Program::causal_score(PreparedPrompt&& prompt, std::uint32_t first_target) {
-    return impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), first_target);
+    if (impl_->experts) { impl_->experts->check(); }
+    auto result = impl_->causal_score(PreparedPromptAccess::take(std::move(prompt)), first_target);
+    if (impl_->experts) { impl_->experts->check(); }
+    return result;
 }
 
 std::optional<AdmissionCandidate> Program::inspect_admission(
@@ -454,11 +456,46 @@ void Program::update_sampling(SequenceHandle sequence, const ResolvedSamplingPar
     impl_->update_sampling(sequence, sampling);
 }
 
+StructuredReadiness Program::structured_readiness(SequenceHandle sequence) {
+    return impl_->structured_readiness(sequence);
+}
+
 bool Program::wait_context_transfer() noexcept { return impl_->wait_context_transfer(); }
 
 PrefillProgress Program::advance_prefill(SequenceHandle sequence,
                                          runtime::ExecutionTiming* failed_timing) {
-    return impl_->advance_prefill(sequence, failed_timing);
+    if (impl_->experts) { impl_->experts->check(); }
+    auto result = impl_->advance_prefill(sequence, failed_timing);
+    if (impl_->experts) { impl_->experts->check(); }
+    return result;
+}
+
+std::optional<PrefillBatchUnit>
+Program::prefill_batch_unit(SequenceHandle sequence) const noexcept {
+    return impl_->prefill_batch_unit(sequence);
+}
+
+std::uint32_t Program::prefill_batch_capacity() const noexcept { return impl_->prefill_chunk; }
+
+std::uint32_t Program::prefill_batch_segments() const noexcept {
+    return static_cast<std::uint32_t>(execution::kMaximumPrefillSegments);
+}
+
+bool Program::runs_branched_reads() const noexcept {
+    return !impl_->kvmem_window_tokens && !impl_->stage_runtime && impl_->prefill_hidden.data != nullptr &&
+           impl_->round_host.has_value();
+}
+
+std::uint32_t Program::pending_branch_tokens(SequenceHandle sequence) const noexcept {
+    return impl_->pending_branch_tokens(sequence);
+}
+
+runtime::ExecutionTiming Program::prefill_batch(std::span<const SequenceHandle> sequences,
+                                                runtime::ExecutionTiming* failed_timing) {
+    if (impl_->experts) { impl_->experts->check(); }
+    auto result = impl_->prefill_batch(sequences, failed_timing);
+    if (impl_->experts) { impl_->experts->check(); }
+    return result;
 }
 
 CaptureAssessment
@@ -535,7 +572,10 @@ runtime::ContextTransactionReserveStatus Program::reserve_active_capture_with_pr
 PendingBatch Program::decode(std::span<const SequenceHandle> sequences,
                              std::span<const runtime::RoundBudget> budgets,
                              runtime::ExecutionTiming* failed_timing) {
-    return impl_->decode(sequences, budgets, failed_timing);
+    if (impl_->experts) { impl_->experts->check(); }
+    auto result = impl_->decode(sequences, budgets, failed_timing);
+    if (impl_->experts) { impl_->experts->check(); }
+    return result;
 }
 
 runtime::ExecutionTiming
@@ -543,15 +583,21 @@ Program::append_forced_tokens(std::span<const SequenceHandle> sequences,
                               std::span<const TokenId> row_major_tokens, std::uint32_t row_stride,
                               std::span<const std::optional<std::uint32_t>> prefix_execution_splits,
                               runtime::ExecutionTiming* failed_timing) {
-    return impl_->append_forced_tokens(sequences, row_major_tokens, row_stride,
-                                       prefix_execution_splits, failed_timing);
+    if (impl_->experts) { impl_->experts->check(); }
+    auto result = impl_->append_forced_tokens(sequences, row_major_tokens, row_stride,
+                                               prefix_execution_splits, failed_timing);
+    if (impl_->experts) { impl_->experts->check(); }
+    return result;
 }
 
 CommitResult Program::commit(PendingBatch&& pending,
                              std::span<const runtime::CommitDecision> decisions,
                              runtime::CommitObservation observation,
                              runtime::ExecutionTiming* failed_timing) {
-    return impl_->commit(std::move(pending), decisions, observation, failed_timing);
+    CommitResult result = impl_->commit(std::move(pending), decisions, observation, failed_timing);
+    // A finished request's pages may have come free: the expert cache can take them.
+    impl_->lend_kv_to_experts();
+    return result;
 }
 
 DiscardResult Program::abort_pending(PendingBatch&& pending) noexcept {
@@ -559,10 +605,6 @@ DiscardResult Program::abort_pending(PendingBatch&& pending) noexcept {
 }
 
 FinishResult Program::finish(SequenceHandle sequence) noexcept { return impl_->finish(sequence); }
-void Program::retain_generated_spans(SequenceHandle sequence, std::uint32_t generated_begin,
-                                     std::uint32_t thinking_end) noexcept {
-    impl_->retain_generated_spans(sequence, generated_begin, thinking_end);
-}
 
 AbortResult Program::abort(SequenceHandle sequence) noexcept { return impl_->abort(sequence); }
 
@@ -703,6 +745,22 @@ PhysicalUsageSnapshot Program::physical_usage() const noexcept { return impl_->p
 
 MemorySummary Program::memory_summary() const noexcept { return impl_->memory_summary(); }
 
+ExpertResidencyStats Program::expert_residency_stats() const {
+    ExpertResidencyStats out;
+    if (!impl_->experts) { return out; }
+    const auto stats = impl_->experts->stats() - impl_->expert_startup_stats;
+    out.routes = stats.pairs;
+    out.hits = stats.pair_hits;
+    out.cpu_routes = stats.cpu_pairs;
+    out.admitted = stats.admissions + stats.lent_admissions;
+    out.transferred_bytes = stats.copied_bytes;
+    for (std::size_t rank = 0; rank < impl_->device.size(); ++rank) {
+        const auto memory = impl_->experts->memory(rank);
+        out.slots += memory.cache_slots + memory.lent_slots;
+    }
+    return out;
+}
+
 std::uint32_t Program::concurrent_output_budget(std::uint32_t prompt_tokens) const noexcept {
     return impl_->concurrent_output_budget(prompt_tokens);
 }
@@ -754,43 +812,62 @@ std::size_t prepare_vision_overlay(const execution::Parameters& parameters, Devi
 std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
                                         SequencePlan&& plan, DeviceContext& device,
                                         const StartupObserver& startup_observer) {
+    return create_program(parameters, std::move(plan), device, startup_observer, {});
+}
+
+std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
+                                        SequencePlan&& plan, DeviceContext& device,
+                                        const StartupObserver& startup_observer,
+                                        std::unique_ptr<execution::NativeExpertRuntime> experts) {
     if (plan.impl_ == nullptr) { throw std::invalid_argument("sequence plan is empty"); }
     if (plan.impl_->parameters != &parameters) {
         throw std::invalid_argument("sequence plan belongs to another model instance");
     }
-    auto impl =
-        std::make_unique<detail::ProgramImpl>(parameters, *plan.impl_, device, startup_observer);
+    if (!experts && !parameters.model.expert_sources().layers.empty()) {
+        std::vector<std::uint64_t> reserved{plan.impl_->device_reservation_bytes};
+        reserved.insert(reserved.end(), plan.impl_->extra_rank_reservation_bytes.begin(),
+                         plan.impl_->extra_rank_reservation_bytes.end());
+        experts = std::make_unique<execution::NativeExpertRuntime>(
+            parameters.model, device, reserved, plan.impl_->expert_cache_bytes);
+    }
+    auto impl = std::make_unique<detail::ProgramImpl>(parameters, *plan.impl_, device,
+                                                      startup_observer, std::move(experts));
     plan.impl_.reset();
     return std::unique_ptr<Program>(new Program(std::move(impl)));
 }
 
-std::optional<std::size_t> measure_cuda_graph_bytes(const execution::Parameters& parameters,
-                                                    DeviceContext& device,
-                                                    const EngineOptions& options) {
-    if (!options.use_cuda_graph) return std::nullopt;
+std::optional<std::size_t> measure_cuda_graph_bytes(
+    const execution::Parameters& parameters, DeviceContext& device, const EngineOptions& options) {
+    if (!options.use_cuda_graph) { return std::nullopt; }
     auto probe_options = options;
-    // The probe measures the graph set only; its own reservation must not feed back into the
-    // plan. The context-cache shape stays exactly as configured because the plan validates its
-    // Host inventory whether or not the cache is captured.
     probe_options.cuda_graph_allowance_bytes = 0;
     try {
-        const auto pages = std::max<std::uint32_t>(1U, options.max_concurrency);
-        auto plan = detail::make_graph_probe_plan(parameters, device, probe_options, pages);
+        auto plan = detail::make_graph_probe_plan(parameters, device, probe_options);
         auto probe = create_program(parameters, SequencePlan(std::move(plan)), device,
                                     StartupObserver{});
         const auto measured = probe->memory_summary().cuda_graph_measured_bytes;
         probe.reset();
         device.synchronize();
         return measured;
-    } catch (const std::exception& error) {
-        std::fprintf(stderr, "CUDA graph probe failed: %s\n", error.what());
-        device.synchronize();
-        return std::nullopt;
+    } catch (const CudaError& error) {
+        if (error.status() != cudaErrorMemoryAllocation) { throw; }
+        const auto pending = cudaGetLastError();
+        if (pending != cudaSuccess && pending != cudaErrorMemoryAllocation) {
+            CUDA_CHECK(pending);
+        }
+    } catch (const core::VramCapacityError&) {
+        // The real planner retains the static allowance when the probe cannot fit.
+    } catch (const std::bad_alloc&) {
+        // Includes Host allocation pressure; all temporary owners have unwound.
     }
+    device.synchronize();
+    return std::nullopt;
 }
 
 void Program::inject_graft(const PromptGraft& graft) {
+    if (impl_->experts) { impl_->experts->check(); }
     inject_direct_graft(*impl_, graft);
+    if (impl_->experts) { impl_->experts->check(); }
 }
 
 std::vector<Program::GraftCatalogEntry> Program::graft_catalog_entries() {

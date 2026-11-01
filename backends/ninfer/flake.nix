@@ -186,9 +186,7 @@
 
       # Qwen3.6-35B-A3B (official v3 artifact, with the DFlash bundle), pinned to match
       # `scripts/download-model.sh qwen36-35b-a3b`. The DFlash bundle costs nothing in VRAM unless
-      # --spec dflash is selected, so the published RTX 3090 concurrency measurements -- taken
-      # against the v2 pins c8b8c1c0/560f227e, whose weight bytes v3 preserves -- still apply.
-      # See README.md and docs/rtx-3090-windows.md.
+      # --spec dflash is selected.
       download-qwen36-35b = mkDownload {
         name = "download-qwen36-35b";
         filename = "qwen3_6_35b_a3b.ninfer";

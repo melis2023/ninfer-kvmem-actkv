@@ -78,7 +78,8 @@ ninfer::bench::RepTiming run_repetition(ninfer::Engine& engine,
                                   : test.n_prompt;
     auto prompt = engine.prepare_tokens(ninfer::bench::prompt_slice(corpus, prompt_tokens), false);
     ninfer::GenerationResult generated =
-        engine.generate(std::move(prompt), benchmark_request(test));
+        engine.submit(std::move(prompt), benchmark_request(test),
+                      ninfer::OutputConsumerMode::Aggregate, {.phase_timings = true}).wait();
 
     const std::uint32_t expected = test.requested_output_tokens();
     if (generated.generated_token_ids.size() != expected) {
@@ -94,6 +95,7 @@ ninfer::bench::RepTiming run_repetition(ninfer::Engine& engine,
     timing.timings                 = generated.timings;
     timing.speculative             = std::move(generated.speculative);
     timing.generated_output_tokens = expected;
+    timing.generated_token_ids = std::move(generated.generated_token_ids);
     return timing;
 }
 
@@ -153,6 +155,11 @@ int main(int argc, char** argv) {
         engine_options.max_context   = max_context;
         engine_options.rope_yarn_factor = options.rope_yarn_factor;
         engine_options.kv_capacity   = ninfer::KvCapacityPolicy::explicit_capacity(max_context);
+        engine_options.kvmem = options.kvmem;
+        if (options.kvmem.selected_tokens) {
+            engine_options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(
+                static_cast<std::uint32_t>(options.kvmem.device_tokens()));
+        }
         engine_options.prefill_chunk = options.prefill_chunk;
         engine_options.fast_prefill_kernel        = options.fast_prefill_kernel;
         engine_options.kv_cache      = options.kv_cache;
@@ -162,13 +169,16 @@ int main(int argc, char** argv) {
         engine_options.prefill_a8            = options.prefill_a8;
         engine_options.prefill_cublas        = options.prefill_cublas;
         engine_options.prefill_cublas_projections = options.prefill_cublas_projections;
+        engine_options.expert_residency      = options.expert_residency;
+        engine_options.expert_cache_bytes    = options.expert_cache_bytes;
+        engine_options.hybrid_experts        = options.hybrid_experts;
 
         ninfer::bench::BenchEnvironment env;
         env.artifact_path            = options.artifact_path;
         env.artifact_file_size_bytes = ninfer::bench::file_size_or_zero(options.artifact_path);
         env.max_context              = max_context;
         env.rope_yarn_factor         = options.rope_yarn_factor;
-        env.prefill_chunk            = options.prefill_chunk;
+        env.expert_residency         = options.expert_residency;
         env.fast_prefill_kernel      = options.fast_prefill_kernel;
         env.kv_cache                 = options.kv_cache;
         env.speculative              = options.speculative;
@@ -189,6 +199,7 @@ int main(int argc, char** argv) {
         fill_cuda_environment(env, options.device);
         env.load   = engine.load_summary();
         env.memory = engine.memory_summary();
+        env.prefill_chunk = engine.options().prefill_chunk;
 
         prime_decode_graph(engine, env, corpus);
 
@@ -224,6 +235,7 @@ int main(int argc, char** argv) {
             results.push_back(std::move(result));
         }
 
+        env.experts = engine.runtime_stats().experts;
         std::string report;
         switch (options.output) {
         case ninfer::bench::OutputFormat::Table:

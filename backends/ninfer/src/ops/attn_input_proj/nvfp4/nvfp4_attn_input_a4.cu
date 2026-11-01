@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "ops/common/blackwell_routes.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan_unified.h"
 
 #include "core/device.h"
@@ -42,6 +43,7 @@ void launch_gemm(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tenso
 void nvfp4_attn_input_a4_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                                 Tensor& k, Tensor& v, Nvfp4A4Workspace workspace,
                                 cudaStream_t stream) {
+    require_nvfp4_a4_card();
     const std::int32_t tokens = x.ne[1];
     const auto layout =
         uses_tma(tokens) ? (tokens < 1024 ? Nvfp4ScaleLayout::Tiled128 : Nvfp4ScaleLayout::Tiled256)

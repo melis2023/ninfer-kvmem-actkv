@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "ninfer/request.h"
 #include "runtime/contract/resources.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/context_cache/context_portfolio_value.h"

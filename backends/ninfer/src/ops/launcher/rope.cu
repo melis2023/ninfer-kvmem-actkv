@@ -182,25 +182,41 @@ bool launch_fixed_single_dispatch(const Tensor& positions, int rotary_dim, float
     return false;
 }
 
-RopeYarnKernelTable yarn_table(int rotary_dim, float theta, const RopeYarn& yarn) {
-    constexpr double kPi  = 3.14159265358979323846;
-    const double dim      = rotary_dim;
-    const double log_base = std::log(static_cast<double>(theta));
-    const auto correction = [&](double rotations) {
-        return dim * std::log(yarn.native_context / (rotations * 2.0 * kPi)) / (2.0 * log_base);
+} // namespace
+
+// YaRN over the schedule theta^(-2i/dim), the first `pairs` pairs, into `inverse_frequency`
+// (Hugging Face's `yarn` with beta_fast=32 and beta_slow=1: the correction range is where a
+// wavelength fits between 32 times and once into the native window, rounded outward, and the
+// interpolated frequency blends in linearly across it by pair index); returns the attention
+// factor cos and sin carry. A factor of one leaves the schedule unscaled.
+static float yarn_schedule(int dim, int pairs, float theta, const RopeYarn& yarn,
+                           float* inverse_frequency) {
+    constexpr double kPi    = 3.14159265358979323846;
+    const double dimension  = dim;
+    const double log_base   = std::log(static_cast<double>(theta));
+    const auto correction   = [&](double rotations) {
+        return dimension * std::log(yarn.native_context / (rotations * 2.0 * kPi)) /
+               (2.0 * log_base);
     };
     const double lo = std::max(std::floor(correction(32.0)), 0.0);
-    double hi       = std::min(std::ceil(correction(1.0)), dim - 1.0);
+    double hi       = std::min(std::ceil(correction(1.0)), dimension - 1.0);
     if (hi == lo) { hi += 0.001; }
     const bool scaled = yarn.factor > 1.0F;
-    RopeYarnKernelTable table{};
-    for (int pair = 0; pair < rotary_dim / 2; ++pair) {
-        const double frequency = std::pow(static_cast<double>(theta), -2.0 * pair / dim);
+    for (int pair = 0; pair < pairs; ++pair) {
+        const double frequency = std::pow(static_cast<double>(theta), -2.0 * pair / dimension);
         const double ramp      = scaled ? std::clamp((pair - lo) / (hi - lo), 0.0, 1.0) : 0.0;
-        table.inverse_frequency[pair] =
+        inverse_frequency[pair] =
             static_cast<float>(frequency * ((1.0 - ramp) + ramp / (scaled ? yarn.factor : 1.0F)));
     }
-    table.attention_factor  = scaled ? static_cast<float>(0.1 * std::log(yarn.factor) + 1.0) : 1.0F;
+    return scaled ? static_cast<float>(0.1 * std::log(yarn.factor) + 1.0) : 1.0F;
+}
+
+namespace {
+
+RopeYarnKernelTable yarn_table(int rotary_dim, float theta, const RopeYarn& yarn) {
+    RopeYarnKernelTable table{};
+    table.attention_factor =
+        yarn_schedule(rotary_dim, rotary_dim / 2, theta, yarn, table.inverse_frequency);
     const bool interpolated = yarn.interpolation_factor > 1.0F;
     table.interpolation_threshold = interpolated ? static_cast<float>(yarn.interpolation_threshold)
                                                  : std::numeric_limits<float>::max();
@@ -286,3 +302,22 @@ void rope_single_launch(const Tensor& positions, int rotary_dim, float theta, co
 }
 
 } // namespace ninfer::ops::detail
+
+namespace ninfer::ops {
+
+RopeYarnFrequencies rope_yarn_frequencies(int dim, int pairs, float theta, const RopeYarn& yarn) {
+    if (dim < 2 || dim % 2 != 0 || pairs < 1 || pairs > dim / 2 || pairs > 128 ||
+        !std::isfinite(theta) || !(theta > 0.0F) || !std::isfinite(yarn.factor) ||
+        yarn.factor < 1.0F || yarn.native_context == 0 || yarn.interpolation_factor > 1.0F) {
+        throw std::invalid_argument("rope_yarn_frequencies: needs an even dim with 1..dim/2 pairs "
+                                    "(at most 128), a positive theta and a YaRN factor of at "
+                                    "least one over a native window, without position "
+                                    "interpolation");
+    }
+    RopeYarnFrequencies out;
+    out.pairs            = pairs;
+    out.attention_factor = detail::yarn_schedule(dim, pairs, theta, yarn, out.inverse_frequency);
+    return out;
+}
+
+} // namespace ninfer::ops

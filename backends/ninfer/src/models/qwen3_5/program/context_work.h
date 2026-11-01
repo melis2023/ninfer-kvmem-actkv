@@ -36,6 +36,10 @@ runtime::PrefillWork rebuild_work_at_frontier(const PreparedPromptData& prompt,
                                               std::span<const CaptureGroup> captures,
                                               std::span<const std::uint32_t> rewrite_frontiers);
 
+// The prefill units a branched read's branches take at most (nothing without branches).
+std::uint64_t branch_service_work(const std::vector<runtime::ReadBranch>* branches,
+                                  std::uint32_t prefill_chunk) noexcept;
+
 std::optional<qwen3_5::TargetKVRequirement>
 retained_requirement_after_drops(const qwen3_5::ContinuationSummary& summary,
                                  std::span<const runtime::CheckpointRef> dropped) noexcept;

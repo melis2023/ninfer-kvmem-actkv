@@ -113,15 +113,67 @@ MoeLaunch moe_launcher(GgmlType type) {
     throw std::invalid_argument("gguf moe product: unsupported block type");
 }
 
+template <class Args>
+using DecodeLaunch = void (*)(const Args&, int, cudaStream_t);
+
+template <class Fn, template <ggml_type> class Pick>
+Fn decode_launcher(GgmlType type) {
+    switch (type) {
+    case GgmlType::Q8_0: return Pick<GGML_TYPE_Q8_0>::launch;
+    case GgmlType::Q4_0: return Pick<GGML_TYPE_Q4_0>::launch;
+    case GgmlType::Q5_0: return Pick<GGML_TYPE_Q5_0>::launch;
+    case GgmlType::Q2_0: return Pick<GGML_TYPE_Q2_0>::launch;
+    case GgmlType::Q2_K: return Pick<GGML_TYPE_Q2_K>::launch;
+    case GgmlType::Q3_K: return Pick<GGML_TYPE_Q3_K>::launch;
+    case GgmlType::Q4_K: return Pick<GGML_TYPE_Q4_K>::launch;
+    case GgmlType::Q5_K: return Pick<GGML_TYPE_Q5_K>::launch;
+    case GgmlType::Q6_K: return Pick<GGML_TYPE_Q6_K>::launch;
+    case GgmlType::IQ2_XXS: return Pick<GGML_TYPE_IQ2_XXS>::launch;
+    case GgmlType::IQ2_XS: return Pick<GGML_TYPE_IQ2_XS>::launch;
+    case GgmlType::IQ2_S: return Pick<GGML_TYPE_IQ2_S>::launch;
+    case GgmlType::IQ3_XXS: return Pick<GGML_TYPE_IQ3_XXS>::launch;
+    case GgmlType::IQ3_S: return Pick<GGML_TYPE_IQ3_S>::launch;
+    case GgmlType::IQ1_S: return Pick<GGML_TYPE_IQ1_S>::launch;
+    case GgmlType::IQ1_M: return Pick<GGML_TYPE_IQ1_M>::launch;
+    case GgmlType::IQ4_NL: return Pick<GGML_TYPE_IQ4_NL>::launch;
+    case GgmlType::IQ4_XS: return Pick<GGML_TYPE_IQ4_XS>::launch;
+    }
+    throw std::invalid_argument("gguf moe decode: unsupported block type");
+}
+
+template <ggml_type type>
+struct PickUp {
+    static constexpr auto launch = &moe_decode_up_launch<type>;
+};
+template <ggml_type type>
+struct PickDown {
+    static constexpr auto launch = &moe_decode_down_launch<type>;
+};
+template <ggml_type type>
+struct PickPrep {
+    static constexpr auto launch = &moe_decode_prep_launch<type>;
+};
+
 // One block: the pairs of each expert counted, scanned into bounds, then placed. The experts with
-// pairs are listed in ascending order.
+// pairs are listed in ascending order, and so are the column tiles of each tile width that hold
+// any pair (MoeRouting::tiles).
 constexpr int kSortThreads = 1024;
+static_assert(sizeof(kMatrixColumnTiles) / sizeof(int) == kMoeTileWidths &&
+                  kMatrixColumnTiles[0] == 16 && kMatrixColumnTiles[1] == 32 &&
+                  kMatrixColumnTiles[2] == 64 && kMatrixColumnTiles[3] == 128,
+              "MoeRouting lists tiles of width 16 << w");
+
+int moe_tile_capacity(int experts, int pairs) {
+    return (pairs + kMatrixColumnTiles[0] - 1) / kMatrixColumnTiles[0] + std::min(experts, pairs);
+}
 
 __launch_bounds__(kSortThreads) __global__
     void moe_sort_kernel(const std::int32_t* __restrict__ ids, int pairs, int experts,
                          std::int32_t* __restrict__ bounds, std::int32_t* __restrict__ sorted,
                          std::int32_t* __restrict__ active,
-                         std::int32_t* __restrict__ active_count) {
+                         std::int32_t* __restrict__ active_count,
+                         std::int32_t* __restrict__ tile_count, std::int32_t* __restrict__ tiles,
+                         int tile_capacity) {
     extern __shared__ int shared[];
     int* count  = shared;
     int* cursor = shared + experts;
@@ -156,6 +208,23 @@ __launch_bounds__(kSortThreads) __global__
     if (threadIdx.x == kSortThreads - 1) {
         bounds[experts] = run;
         *active_count   = listed_total;
+    }
+    // Each width's tiles: a scan over the runs of how many tiles their experts' pairs fill.
+#pragma unroll 1
+    for (int w = 0; w < kMoeTileWidths; ++w) {
+        const int width = 16 << w;
+        int filled      = 0;
+        for (int e = first; e < min(first + per, experts); ++e) {
+            filled += (count[e] + width - 1) / width;
+        }
+        int at = 0, total = 0;
+        __syncthreads();
+        Scan(scan).ExclusiveSum(filled, at, total);
+        std::int32_t* list = tiles + std::int64_t(w) * tile_capacity;
+        for (int e = first; e < min(first + per, experts); ++e) {
+            for (int tile = 0; tile * width < count[e]; ++tile) { list[at++] = e | tile << 16; }
+        }
+        if (threadIdx.x == kSortThreads - 1) { tile_count[w] = total; }
     }
     __syncthreads();
     for (int p = threadIdx.x; p < pairs; p += blockDim.x) {
@@ -304,8 +373,14 @@ cublasHandle_t blas_handle() {
     if (device < 0 || device >= int(handles.size())) {
         throw std::invalid_argument("gguf: device ordinal out of range");
     }
+    // The first use can be inside a CUDA graph capture (a verify graph wide enough for the cuBLAS
+    // route); relaxed capture mode lets cublasCreate allocate without invalidating it.
     std::call_once(once[device], [&] {
-        if (cublasCreate(&handles[device]) != CUBLAS_STATUS_SUCCESS) {
+        cudaStreamCaptureMode mode = cudaStreamCaptureModeRelaxed;
+        check(cudaThreadExchangeStreamCaptureMode(&mode), "capture mode");
+        const cublasStatus_t created = cublasCreate(&handles[device]);
+        check(cudaThreadExchangeStreamCaptureMode(&mode), "capture mode");
+        if (created != CUBLAS_STATUS_SUCCESS) {
             throw std::runtime_error("gguf: cublasCreate failed");
         }
     });
@@ -408,6 +483,13 @@ void launch_dequantize(const void* weight, std::int64_t row_bytes, int k,
         rows <= 0) {
         throw std::invalid_argument("gguf dequantize: K must be whole blocks of the type");
     }
+    // The slice decoders write whole 16-byte groups; this kernel stays for the rest.
+    if constexpr (kSliceDequantize<type>) {
+        if (out_row_stride % 8 == 0 && reinterpret_cast<std::uintptr_t>(out) % 16 == 0) {
+            slice_dequantize<type>(weight, row_bytes, k, row_ids, rows, out, out_row_stride, stream);
+            return;
+        }
+    }
     dequantize_rows_kernel<type, threads, dst_t>
         <<<dim3((k + QK_K - 1) / QK_K, rows, 1), threads, 0, stream>>>(
             static_cast<const char*>(weight), row_bytes, row_ids, out, out_row_stride, k);
@@ -481,6 +563,10 @@ bool has_matrix_kernel(GgmlType type) { return type != GgmlType::IQ1_M; }
 
 int multiprocessor_count() { return detail::device_facts().sm_count; }
 
+std::size_t vector_activation_scales_offset(int k, int columns) {
+    return detail::vec_scales_offset(k, columns);
+}
+
 std::size_t vector_activation_bytes(int k, int columns) {
     return detail::vec_scales_offset(k, columns) + std::size_t(columns) * (k / QK8_1) * sizeof(half2);
 }
@@ -508,7 +594,8 @@ void vector_product(GgmlType type, const void* weight, std::int64_t row_bytes, i
         throw std::invalid_argument("gguf vector product: invalid output");
     }
     const detail::VecStore store{out.bf16,     out.f32,  out.column_stride,
-                                 out.epilogue, out.gate, out.gate_column_stride};
+                                 out.epilogue, out.gate, out.gate_column_stride,
+                                 static_cast<int>(out.activation)};
     detail::vector_launch(type)(
         detail::vector_args(weight, row_bytes, rows, k, activation, columns, store), columns,
         false, stream);
@@ -516,15 +603,20 @@ void vector_product(GgmlType type, const void* weight, std::int64_t row_bytes, i
 
 void vector_swiglu(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
                    const void* activation, int columns, __nv_bfloat16* out,
-                   std::int64_t out_column_stride, cudaStream_t stream) {
-    const detail::VecStore store{out, nullptr, out_column_stride, Epilogue::Store, nullptr, 0};
+                   std::int64_t out_column_stride, cudaStream_t stream,
+                   GateActivation gate_activation) {
+    const detail::VecStore store{out,     nullptr, out_column_stride,
+                                 Epilogue::Store, nullptr, 0,
+                                 static_cast<int>(gate_activation)};
     detail::vector_launch(type)(
         detail::vector_args(weight, row_bytes, rows, k, activation, columns, store), columns,
         true, stream);
 }
 
 std::size_t moe_routing_bytes(int experts, int pairs) {
-    return (std::size_t(experts) + 1 + std::size_t(pairs) + std::size_t(experts) + 1) *
+    return (std::size_t(experts) + 1 + std::size_t(pairs) + std::size_t(experts) + 1 +
+            detail::kMoeTileWidths +
+            std::size_t(detail::kMoeTileWidths) * detail::moe_tile_capacity(experts, pairs)) *
                sizeof(std::int32_t) +
            256;
 }
@@ -539,10 +631,13 @@ MoeRouting moe_sort_routes(const std::int32_t* ids, int pairs, int experts, void
     std::int32_t* sorted       = bounds + experts + 1;
     std::int32_t* active       = sorted + pairs;
     std::int32_t* active_count = active + experts;
+    std::int32_t* tile_count   = active_count + 1;
+    std::int32_t* tiles        = tile_count + detail::kMoeTileWidths;
+    const int capacity         = detail::moe_tile_capacity(experts, pairs);
     detail::moe_sort_kernel<<<1, detail::kSortThreads, 2 * experts * sizeof(int), stream>>>(
-        ids, pairs, experts, bounds, sorted, active, active_count);
+        ids, pairs, experts, bounds, sorted, active, active_count, tile_count, tiles, capacity);
     detail::check(cudaGetLastError(), "moe routing launch");
-    return MoeRouting{bounds, sorted, active, active_count};
+    return MoeRouting{bounds, sorted, active, active_count, tile_count, tiles, capacity};
 }
 
 namespace {
@@ -589,23 +684,65 @@ void moe_vector_product(GgmlType type, const MoeTable& table, const MoeRouting& 
     args.out_bf16 = out.bf16;
     args.out_f32  = out.f32;
     args.weighted = out.weighted;
-    args.weights  = out.weights;
-    args.gate     = out.gate;
+    args.weights    = out.weights;
+    args.gate       = out.gate;
+    args.activation = static_cast<int>(out.activation);
     detail::moe_launcher(type)(args, max_active, chunk, false, stream);
 }
 
 void moe_vector_swiglu(GgmlType type, const MoeTable& gate, const MoeTable& up,
                        const MoeRouting& routing, int max_active, int column_group,
                        const void* activation, int columns, __nv_bfloat16* out, int chunk,
-                       cudaStream_t stream) {
+                       cudaStream_t stream, GateActivation gate_activation) {
     if (out == nullptr) { throw std::invalid_argument("gguf moe swiglu: invalid output"); }
-    auto args     = moe_args(gate, &up, routing, column_group, 1, activation, columns);
-    args.out_bf16 = out;
+    auto args       = moe_args(gate, &up, routing, column_group, 1, activation, columns);
+    args.out_bf16   = out;
+    args.activation = static_cast<int>(gate_activation);
     detail::moe_launcher(type)(args, max_active, chunk, true, stream);
 }
 
+void moe_decode_up(GgmlType type, const MoeDecodeUpArgs& args, int chunk, cudaStream_t stream) {
+    if (args.m == nullptr || args.gate == nullptr || args.up == nullptr || args.middle == nullptr) {
+        throw std::invalid_argument("gguf moe decode: invalid up arguments");
+    }
+    detail::decode_launcher<detail::DecodeLaunch<MoeDecodeUpArgs>, detail::PickUp>(type)(args, chunk,
+                                                                                      stream);
+}
+
+void moe_decode_down(GgmlType type, const MoeDecodeDownArgs& args, int chunk, cudaStream_t stream) {
+    if (args.table_a == nullptr || args.middle == nullptr || args.weights == nullptr ||
+        args.fixed == nullptr || (args.y != nullptr && args.counter == nullptr) ||
+        (args.ids_b != nullptr && args.table_b == nullptr)) {
+        throw std::invalid_argument("gguf moe decode: invalid down arguments");
+    }
+    detail::decode_launcher<detail::DecodeLaunch<MoeDecodeDownArgs>, detail::PickDown>(type)(
+        args, chunk, stream);
+}
+
+void moe_decode_prep(GgmlType type, const MoeDecodePrepArgs& args, cudaStream_t stream) {
+    if (args.m == nullptr || args.ids == nullptr || args.ds == nullptr || args.qsum == nullptr) {
+        throw std::invalid_argument("gguf moe decode: invalid preparation arguments");
+    }
+    detail::decode_launcher<void (*)(const MoeDecodePrepArgs&, cudaStream_t), detail::PickPrep>(
+        type)(args, stream);
+}
+
+bool moe_decode_transposed(GgmlType type) {
+    // Decoder<type>::kTransposed of ggml_bridge_vec.cuh.
+    return type == GgmlType::Q2_0;
+}
+
+
 int matrix_activation_layout(GgmlType type) {
     return static_cast<int>(mmq_get_q8_1_ds_layout(detail::to_ggml(type)));
+}
+
+bool matrix_activation_f16_sums(GgmlType type) {
+    return mmq_get_q8_1_ds_layout(detail::to_ggml(type)) == MMQ_Q8_1_DS_LAYOUT_DS4;
+}
+
+bool vector_activation_f16_sums(GgmlType type) {
+    return type == GgmlType::Q4_K || type == GgmlType::Q5_K || type == GgmlType::IQ1_S;
 }
 
 std::size_t matrix_activation_bytes(int k, int columns) {
@@ -667,10 +804,21 @@ std::size_t moe_matrix_activation_bytes(int k, int pairs) {
     return matrix_activation_bytes(moe_padded_k(k), pairs);
 }
 
+int matrix_padded_k(int k) { return moe_padded_k(k); }
+
+void quantize_matrix_activation_padded(GgmlType type, const __nv_bfloat16* x, int k, int columns,
+                                       const std::int32_t* input_columns, void* out,
+                                       cudaStream_t stream) {
+    if (k <= 0 || k % 32 != 0 || columns <= 0) {
+        throw std::invalid_argument("gguf padded matrix activation: K must be whole 32-value blocks");
+    }
+    quantize_matrix(type, x, k, moe_padded_k(k), columns, input_columns, nullptr, 1, out, stream);
+}
+
 void quantize_moe_matrix_activation(GgmlType type, const __nv_bfloat16* x, int k,
                                     const MoeRouting& routing, int pairs, int column_group,
                                     void* out, cudaStream_t stream) {
-    if (routing.sorted == nullptr || column_group <= 0 || k <= 0 || k % 128 != 0 || pairs <= 0) {
+    if (routing.sorted == nullptr || column_group <= 0 || k <= 0 || k % 32 != 0 || pairs <= 0) {
         throw std::invalid_argument("gguf moe matrix activation: invalid routing or K");
     }
     quantize_matrix(type, x, k, moe_padded_k(k), pairs, nullptr, routing.sorted, column_group, out,
@@ -706,12 +854,53 @@ std::size_t matrix_fixup_bytes(GgmlType type, int rows, int columns) {
 
 void matrix_product(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
                     const void* activation, int columns, float* out,
-                    std::int64_t out_column_stride, void* fixup, cudaStream_t stream) {
+                    std::int64_t out_column_stride, void* fixup, cudaStream_t stream, bool tail) {
 #define NINFER_GGUF_MATRIX_CASE(NAME)                                                              \
     case GgmlType::NAME:                                                                           \
         detail::matrix_product_impl<GGML_TYPE_##NAME>(weight, row_bytes, rows, k, activation,      \
                                                       columns, out, out_column_stride, fixup,      \
-                                                      stream);                                     \
+                                                      stream, tail);                               \
+        return
+    switch (type) {
+        NINFER_GGUF_MATRIX_CASE(Q8_0);
+        NINFER_GGUF_MATRIX_CASE(Q4_0);
+        NINFER_GGUF_MATRIX_CASE(Q5_0);
+        NINFER_GGUF_MATRIX_CASE(Q2_0);
+        NINFER_GGUF_MATRIX_CASE(Q2_K);
+        NINFER_GGUF_MATRIX_CASE(Q3_K);
+        NINFER_GGUF_MATRIX_CASE(Q4_K);
+        NINFER_GGUF_MATRIX_CASE(Q5_K);
+        NINFER_GGUF_MATRIX_CASE(Q6_K);
+        NINFER_GGUF_MATRIX_CASE(IQ2_XXS);
+        NINFER_GGUF_MATRIX_CASE(IQ2_XS);
+        NINFER_GGUF_MATRIX_CASE(IQ2_S);
+        NINFER_GGUF_MATRIX_CASE(IQ3_XXS);
+        NINFER_GGUF_MATRIX_CASE(IQ3_S);
+        NINFER_GGUF_MATRIX_CASE(IQ1_S);
+        NINFER_GGUF_MATRIX_CASE(IQ4_NL);
+        NINFER_GGUF_MATRIX_CASE(IQ4_XS);
+    case GgmlType::IQ1_M:
+        break;
+    }
+#undef NINFER_GGUF_MATRIX_CASE
+    throw std::invalid_argument("gguf matrix product: no integer kernel for this block type");
+}
+
+void matrix_product_bf16(GgmlType type, const void* weight, std::int64_t row_bytes, int rows, int k,
+                         const void* activation, int columns, __nv_bfloat16* out,
+                         std::int64_t out_column_stride, float* partial, void* fixup,
+                         cudaStream_t stream, bool accumulate, bool tail) {
+#define NINFER_GGUF_MATRIX_CASE(NAME)                                                              \
+    case GgmlType::NAME:                                                                           \
+        if (accumulate) {                                                                         \
+            detail::matrix_product_impl<GGML_TYPE_##NAME, __nv_bfloat16, true>(                     \
+                weight, row_bytes, rows, k, activation, columns, out, out_column_stride,           \
+                fixup, stream, tail, partial);                                                     \
+        } else {                                                                                  \
+            detail::matrix_product_impl<GGML_TYPE_##NAME, __nv_bfloat16, false>(                    \
+                weight, row_bytes, rows, k, activation, columns, out, out_column_stride,           \
+                fixup, stream, tail, partial);                                                     \
+        }                                                                                         \
         return
     switch (type) {
         NINFER_GGUF_MATRIX_CASE(Q8_0);
@@ -768,17 +957,18 @@ bool moe_matrix_supported(GgmlType type, int rows, int k, bool tail) {
 }
 
 void moe_matrix_product(GgmlType type, const MoeTable& table, const MoeRouting& routing,
-                        int max_active, int pairs, int max_columns, bool tail,
-                        const void* activation, float* out, cudaStream_t stream) {
-    if (table.experts == nullptr || routing.bounds == nullptr || activation == nullptr ||
-        out == nullptr) {
+                        int max_active, int pairs, bool tail, const void* activation, float* out,
+                        cudaStream_t stream) {
+    if (table.experts == nullptr || routing.bounds == nullptr || routing.tiles == nullptr ||
+        activation == nullptr || out == nullptr) {
         throw std::invalid_argument("gguf moe matrix product: invalid tables or routing");
     }
 #define NINFER_GGUF_MOE_MATRIX_CASE(NAME)                                                          \
     case GgmlType::NAME:                                                                           \
-        detail::moe_matrix_product_impl<GGML_TYPE_##NAME>(                                         \
-            table.experts, table.row_bytes, table.rows, table.k, routing, max_active, pairs,       \
-            max_columns, tail, activation, out, stream);                                           \
+        detail::moe_matrix_product_impl<GGML_TYPE_##NAME>(table.experts, table.row_bytes,          \
+                                                          table.rows, table.k, routing,            \
+                                                          max_active, pairs, tail, activation,     \
+                                                          out, stream);                            \
         return
     switch (type) {
         NINFER_GGUF_MOE_MATRIX_CASE(Q8_0);
@@ -813,7 +1003,8 @@ void store_plane(const float* in, std::int64_t in_column_stride, int rows, int c
         throw std::invalid_argument("gguf store plane: invalid output");
     }
     const detail::VecStore store{out.bf16,     out.f32,  out.column_stride,
-                                 out.epilogue, out.gate, out.gate_column_stride};
+                                 out.epilogue, out.gate, out.gate_column_stride,
+                                 static_cast<int>(out.activation)};
     detail::store_plane_kernel<<<dim3((rows + 255) / 256, columns, 1), 256, 0, stream>>>(
         in, in_column_stride, rows, store);
     detail::check(cudaGetLastError(), "store plane launch");
@@ -867,6 +1058,13 @@ void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, 
 
 void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
                      const std::int32_t* row_ids, int rows, float* out,
+                     std::int64_t out_row_stride, cudaStream_t stream) {
+    detail::dispatch_dequantize(type, weight, row_bytes, k, row_ids, rows, out, out_row_stride,
+                                stream);
+}
+
+void dequantize_rows(GgmlType type, const void* weight, std::int64_t row_bytes, int k,
+                     const std::int32_t* row_ids, int rows, __half* out,
                      std::int64_t out_row_stride, cudaStream_t stream) {
     detail::dispatch_dequantize(type, weight, row_bytes, k, row_ids, rows, out, out_row_stride,
                                 stream);

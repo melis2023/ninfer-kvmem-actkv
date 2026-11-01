@@ -87,6 +87,28 @@ int run_cancellation_case() {
     return failures;
 }
 
+int run_fp32(std::int32_t rows, std::int32_t columns) {
+    const auto count = std::size_t(rows) * columns;
+    std::vector<float> x(count), y(count);
+    fill_uniform(x, 4101, -8.0F, 8.0F);
+    fill_uniform(y, 4102, -8.0F, 8.0F);
+    for (std::size_t i = 0; i < count; i += 13) { y[i] = -x[i]; }
+    const auto expected = residual_add_oracle(y, x);
+    GuardedDeviceBuffer dx(count * sizeof(float)), dy(count * sizeof(float));
+    dx.copy_from_host(x.data(), count * sizeof(float));
+    dy.copy_from_host(y.data(), count * sizeof(float));
+    Tensor xt(dx.data(), DType::FP32, {rows, columns});
+    const Tensor yt(dy.data(), DType::FP32, {rows, columns});
+    ops::residual_add(yt, xt, nullptr);
+    cuda_synchronize();
+    const auto actual = from_device<float>(dx.data(), count);
+    int failures = verify_pointwise("residual_add FP32", std::vector<double>(actual.begin(), actual.end()),
+                                    expected, {/*absolute*/ 0.0, /*relative*/ 6e-8});
+    failures += verify_exact("residual_add FP32 input unchanged", from_device<float>(dy.data(), count), y);
+    failures += dx.verify_guards("residual_add FP32 x") + dy.verify_guards("residual_add FP32 y");
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -102,6 +124,9 @@ int main() {
     failures += run_case("residual_add [2048,48]", 2048, 48, 202u);
     failures += run_case("residual_add [1152,128]", 1152, 128, 301u);
     failures += run_cancellation_case();
+    failures += run_fp32(2560, 1);
+    failures += run_fp32(2560, 16);
+    failures += run_fp32(17, 3);
     std::cout << (failures ? "FAIL" : "OK") << " residual_add\n";
     return failures ? 1 : 0;
 }

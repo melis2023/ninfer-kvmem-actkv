@@ -15,39 +15,41 @@
 namespace ninfer::ops::detail::sm70 {
 namespace {
 
-// plane [t][2 * count]: gate rows then up rows of one slab.
-__global__ void swiglu_epilogue_kernel(const float* __restrict__ plane, std::int32_t count,
-                                       std::int32_t tokens, std::int32_t row0, std::int32_t rows,
-                                       RowFactor gate_factor, std::int32_t gate_first,
-                                       RowFactor up_factor, std::int32_t up_first,
-                                       __nv_bfloat16* __restrict__ out) {
+// plane [t][2 * count]: gate rows then up rows of one slab (weights likewise).
+__global__ void swiglu_epilogue_kernel(const float* __restrict__ plane,
+                                       const __half* __restrict__ weights, Saturation saturation,
+                                       std::int32_t count, std::int32_t tokens, std::int32_t row0,
+                                       std::int32_t rows, RowFactor gate_factor,
+                                       std::int32_t gate_first, RowFactor up_factor,
+                                       std::int32_t up_first, __nv_bfloat16* __restrict__ out) {
     const std::int32_t r = static_cast<std::int32_t>(blockIdx.x * blockDim.x + threadIdx.x);
     if (r >= count) { return; }
     const float gate_scale = gate_factor(gate_first + row0 + r);
     const float up_scale   = up_factor(up_first + row0 + r);
     for (std::int32_t t = static_cast<std::int32_t>(blockIdx.y); t < tokens;
          t += static_cast<std::int32_t>(gridDim.y)) {
-        const float* column = plane + static_cast<std::size_t>(t) * (2 * count);
+        const float gate = saturated_product(plane, weights, saturation, 2 * count, r, t);
+        const float up   = saturated_product(plane, weights, saturation, 2 * count, count + r, t);
         out[static_cast<std::size_t>(t) * rows + row0 + r] =
-            __float2bfloat16_rn(silu(column[r] * gate_scale) * (column[count + r] * up_scale));
+            __float2bfloat16_rn(silu(gate * gate_scale) * (up * up_scale));
     }
 }
 
 std::int32_t pass_columns(std::int32_t tokens) { return std::min(tokens, kWideColumns); }
 
-// body(x16, first, count) for each pass over the call's columns: one over the FP16 plane prepare()
-// converted, or one per kWideColumns columns converted here.
+// body(x16, saturation, first, count) for each pass over the call's columns: one over the FP16
+// plane prepare() converted, or one per kWideColumns columns converted here.
 template <class Body>
 void by_pass(const Activation& x, cudaStream_t stream, Body&& body) {
     if (x.data != nullptr) {
-        body(x.data, 0, x.tokens);
+        body(x.data, Saturation{x.bf16, beyond_columns(x.data, x.k, x.tokens), x.k}, 0, x.tokens);
         return;
     }
     for (std::int32_t first = 0; first < x.tokens; first += kWideColumns) {
         const std::int32_t count = std::min(kWideColumns, x.tokens - first);
-        convert_activation(x.bf16 + static_cast<std::size_t>(first) * x.k, x.k, count, x.pass,
-                           stream);
-        body(x.pass, first, count);
+        const __nv_bfloat16* bf16 = x.bf16 + static_cast<std::size_t>(first) * x.k;
+        convert_activation(bf16, x.k, count, x.pass, stream);
+        body(x.pass, Saturation{bf16, beyond_columns(x.pass, x.k, count), x.k}, first, count);
     }
 }
 
@@ -74,11 +76,12 @@ Activation prepare(const Tensor& x, std::int32_t max_rows, WorkspaceArena& works
     auto* f16 = static_cast<__half*>(workspace.alloc_bytes(activation_bytes(out.k, columns)).data);
     out.scratch = workspace.alloc_bytes(slab_bytes(max_rows, out.k, columns)).data;
     const auto* bf16 = static_cast<const __nv_bfloat16*>(x.data);
+    // The BF16 plane stays the source of what the FP16 one saturates (Saturation).
+    out.bf16 = bf16;
     if (columns == out.tokens) {
         convert_activation(bf16, out.k, out.tokens, f16, stream);
         out.data = f16;
     } else {
-        out.bf16 = bf16;
         out.pass = f16;
     }
     return out;
@@ -93,15 +96,18 @@ void project(const Activation& x, const Weight& w, std::span<const Destination> 
     const auto dequantize = [&](std::int32_t row0, std::int32_t count, __half* dst) {
         dequantize_rows(w, row0, count, dst, stream);
     };
-    by_pass(x, stream, [&](const __half* x16, std::int32_t first, std::int32_t columns) {
-        DestinationEpilogue epilogue;
-        for (Destination d : destinations) {
-            d.data += static_cast<std::size_t>(first) * d.leading;
-            epilogue.set[epilogue.count++] = d;
-        }
-        epilogue.factor = row_factor(w);
-        product(x16, columns, w.n, w.k, dequantize, epilogue, x.scratch, stream);
-    });
+    by_pass(x, stream,
+            [&](const __half* x16, const Saturation& saturation, std::int32_t first,
+                std::int32_t columns) {
+                DestinationEpilogue epilogue;
+                for (Destination d : destinations) {
+                    d.data += static_cast<std::size_t>(first) * d.leading;
+                    epilogue.set[epilogue.count++] = d;
+                }
+                epilogue.factor = row_factor(w);
+                product(x16, saturation, columns, w.n, w.k, dequantize, epilogue, x.scratch,
+                        stream);
+            });
 }
 
 void swiglu(const Activation& x, const Weight& gate, const Weight* up, Tensor& out,
@@ -122,7 +128,8 @@ void swiglu(const Activation& x, const Weight& gate, const Weight* up, Tensor& o
     const Weight& up_weight     = joined ? gate : *up;
     const std::int32_t up_first = joined ? rows : 0;
     constexpr int kThreads      = 256;
-    by_pass(x, stream, [&](const __half* x16, std::int32_t first, std::int32_t columns) {
+    by_pass(x, stream, [&](const __half* x16, const Saturation& saturation, std::int32_t first,
+                           std::int32_t columns) {
         auto* destination =
             static_cast<__nv_bfloat16*>(out.data) + static_cast<std::size_t>(first) * rows;
         for (std::int32_t row0 = 0; row0 < rows; row0 += slab) {
@@ -134,8 +141,8 @@ void swiglu(const Activation& x, const Weight& gate, const Weight* up, Tensor& o
             const dim3 grid(static_cast<unsigned>((count + kThreads - 1) / kThreads),
                             static_cast<unsigned>(std::min<std::int32_t>(columns, 65535)));
             swiglu_epilogue_kernel<<<grid, kThreads, 0, stream>>>(
-                plane, count, columns, row0, rows, row_factor(gate), 0, row_factor(up_weight),
-                up_first, destination);
+                plane, weights, saturation, count, columns, row0, rows, row_factor(gate), 0,
+                row_factor(up_weight), up_first, destination);
             CUDA_CHECK(cudaGetLastError());
         }
     });

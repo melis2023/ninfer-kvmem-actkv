@@ -4,6 +4,7 @@
 #include "core/arena.h"
 #include "core/tensor.h"
 #include "ninfer/ops/sparse_moe.h"
+#include "ops/sparse_moe/candidate.h"
 
 #include <cuda_runtime.h>
 
@@ -38,6 +39,7 @@ struct SparseMoePrefillPlan {
     // Whether the route stages its operands in NVFP4. The staging buffers are the profile's own,
     // so the flag has to reach the allocation and not only the launch.
     bool nvfp4 = false;
+    SparseMoeCandidate candidate = SparseMoeCandidate::Automatic;
 };
 
 struct SparseMoePrefillWorkspace {
@@ -157,9 +159,14 @@ allocate_sparse_moe_prefill_workspace(Arena& arena, std::int32_t capacity_tokens
 
 [[nodiscard]] bool sparse_moe_uses_prefill(std::int32_t tokens, QType routed_gate_up,
                                            QType routed_down) noexcept;
+[[nodiscard]] std::int32_t sparse_moe_prefill_min_tokens(QType routed_gate_up,
+                                                        QType routed_down) noexcept;
+[[nodiscard]] SparseMoeCandidate sparse_moe_prefill_tile_candidate(
+    std::int32_t slice_tokens, QType gate, QType down, SparseMoeCandidate requested);
 [[nodiscard]] std::size_t sparse_moe_prefill_workspace_bytes(std::int32_t max_tokens, bool nvfp4);
 [[nodiscard]] SparseMoePrefillPlan
-resolve_sparse_moe_prefill_plan(std::int32_t tokens, QType routed_gate_up, QType routed_down);
+resolve_sparse_moe_prefill_plan(std::int32_t tokens, QType routed_gate_up, QType routed_down,
+                               SparseMoeCandidate candidate = SparseMoeCandidate::Automatic);
 
 void sparse_moe_prefill_launch(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoePrefillPlan& plan,

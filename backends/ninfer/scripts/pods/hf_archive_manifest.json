@@ -1,0 +1,37 @@
+{
+  "root": "/workspace/ninfer-work",
+  "models": [
+    {
+      "artifact": "models/flash-next-q2_0-mtp.ninfer",
+      "repo": "WaveCut/Qwen3.8-Flash-Next-GGUF-Q2_0-MTP-NInfer-exp-20261008",
+      "qualification": "Public Engine functional checks and 32K/128K needle checks passed on two RTX 3090 GPUs with int8 KV. The artifact includes the IQ4_NL n-gram table and shared-Q8_0 MTP block.",
+      "limitations": "Full-model quality and throughput qualification remain incomplete. Plain/MTP and batch token differences were observed; exact equality across those configurations is not the numerical contract. Fixed-mode repetition is required."
+    },
+    {
+      "artifact": "models/flash-next-native-q2-mtp.ninfer",
+      "repo": "WaveCut/Qwen3.8-Flash-Next-native-Q2-MTP-NInfer-exp-20261008",
+      "qualification": "73,872 projection imports passed exact code/scale and BF16-cast checks; native GPU and scalar/AVX2/AVX-512 VNNI CPU Ops passed independent FP64 oracles. Public Engine fixed-mode repetition, graphs, cancellation and 32K/128K checks passed. Host experts with DMA=1 on RTX 3090 matched every resident BF16 logit word on two RTX 3090s at 32 teacher-forced positions after 128/2112-token prefixes. On RTX 3090 / EPYC 7302P / CUDA 13.1, 219 input and 64 output tokens, int8 KV and 4 GiB expert cache: median decode 31.38 tok/s with MTP K=4 versus 23.98 plain, three requests each; K=4 peak RSS 35.19 GiB on a 256 GB host. The final two-3090 IQ4-table scoring baseline has PPL 5.04508077 on 391,000 targets, 18 windows, six domains, BF16 KV and 32K context.",
+      "limitations": "CPU mixing below DMA=1 is experimental: relative logit L2 reached 0.604 despite matching top-1, and decode was 3.11-5.26 tok/s. A physical 64 GB host and Windows were not tested. Earlier comparable A6000 native-versus-GGUF scoring showed PPL +0.2594%, worst window +4.2972% and one scoring pair +14.83% time. Native A16 wide routes remain 50.9-120.3% slower than optimized GGUF; A8 ranges from 28.3% faster to 33.7% slower. Later two-3090 PPL uses another source snapshot and device configuration, so it does not attribute the change to an optimization. Plain/MTP, batch and cross-host post-EOS outputs can differ; fixed-mode repeats are exact. The table is external, and a representative embedded hot profile is not supplied.",
+      "ngram_companion": {
+        "repo": "WaveCut/Qwen3.8-Flash-Next-GGUF-Q2_0-MTP-NInfer-exp-20261008",
+        "file": "flash-next-q2_0-mtp.ninfer"
+      }
+    },
+    {
+      "artifact": "models/flash-next-native-q2-layers-3-5.ninfer",
+      "repo": "WaveCut/Qwen3.8-Flash-Next-native-Q2-layers-3-5-NInfer-exp-20261008",
+      "qualification": "The converter preserved original source layers 3 and 4, with local indices 0 and 1. All 3,125 selected bindings, physical weight bytes, activation uses and frontend resources matched the qualified full native-Q2 artifact. The public Engine passed 32/700-token inputs, 16 generated tokens and exact fixed-mode repeats on RTX A6000 with CUDA 13.1. No n-gram rows were read, and unused table options were refused.",
+      "limitations": "Debug-only two-layer slice, not a complete model or a production candidate. It contains no PLE layer or n-gram table. Shortened-stack output is not the full model's intermediate forward result; full-model quality cannot be inferred from this artifact."
+    },
+    {
+      "artifact": "models/flash-next-native-q2-layers-1-4.ninfer",
+      "repo": "WaveCut/Qwen3.8-Flash-Next-native-Q2-layers-1-4-NInfer-exp-20261008",
+      "qualification": "The converter preserved source layers 1, 2 and 3, with local indices 0, 1 and 2 and PLE at local layer 0. All 4,691 selected bindings, physical weight bytes, activation uses, frontend resources and the table descriptor matched the qualified full native-Q2 artifact. The public Engine passed 32/700-token inputs, 16 generated tokens and exact fixed-mode repeats on RTX A6000 with CUDA 13.1. It read n-gram rows from the standalone IQ4 table and refused a missing companion.",
+      "limitations": "Debug-only three-layer slice, not a complete model or a production candidate. Shortened-stack output is not the full model's intermediate forward result. Full-model quality cannot be inferred from this artifact. The n-gram table is external.",
+      "ngram_companion": {
+        "repo": "WaveCut/Qwen3.8-Flash-Next-ngram-table-NInfer-v3",
+        "file": "Qwen3.8-Flash-Next-ngram-table-IQ4_NL-ninfer-v3.ninfer"
+      }
+    }
+  ]
+}

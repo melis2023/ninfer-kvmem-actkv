@@ -44,8 +44,9 @@ int verify_equal(const std::string& label, const std::vector<std::uint16_t>& lhs
 }
 
 int run_case(std::int32_t value_heads, std::int32_t width, std::int32_t batch,
-             std::vector<std::int32_t> valid_columns, std::uint32_t seed) {
-    constexpr std::int32_t kQkHeads = 16;
+             std::vector<std::int32_t> valid_columns, std::uint32_t seed,
+             std::int32_t qk_heads = 16) {
+    const std::int32_t kQkHeads = qk_heads;
     const bool dense                = valid_columns.empty();
     if (dense) { valid_columns.assign(static_cast<std::size_t>(batch), width); }
     const std::int32_t columns       = width * batch;
@@ -332,6 +333,9 @@ int main() {
         failures += run_case(48, width, 8, valid, 1760U + width);
     }
     failures += run_case(48, 5, 3, {5, 3, 1}, 1791U);
+    // A 27B layer's share on each of two and four tensor-parallel ranks.
+    failures += run_case(24, 6, 4, {6, 2, 5, 1}, 1793U, 8);
+    failures += run_case(12, 16, 2, {16, 9}, 1795U, 4);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gated_delta_net_replay_record\n";
     return failures == 0 ? 0 : 1;
 }

@@ -50,7 +50,9 @@ int cancellation_conformance() {
         const auto weight = packed.device_weight(dw.data());
         Tensor input(dx.data(), DType::BF16, {k, t});
         Tensor output(dr.data(), DType::BF16, {n, t});
-        WorkspaceArena workspace(256);
+        // Q8 LinearAdd holds no workspace except sm_70's wide route (ops/linear/sm70).
+        WorkspaceArena workspace(std::max<std::size_t>(
+            256, ops::linear_add_workspace_capacity_bytes(QType::Q8_G32_FP16, n, k, t, t)));
         ops::linear_add(input, weight, output, workspace, nullptr);
         test::cuda_check(cudaDeviceSynchronize(), "synchronize cancellation LinearAdd");
         dr.copy_to_host(residual.data(), dr.bytes());

@@ -1,14 +1,23 @@
+#include "ops/linear/t5/t5_project.h"
+
 #include "core/weight.h"
+#include "core/weight_view.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/linear.h"
 #include "ops/linear/gguf/gguf_linear.h"
+#include "ops/linear/sm70/sm70_dequantize.h"
+#include "ops/linear/sm70/sm70_gemm.h"
+#include "ops/linear/sm70/sm70_integer.h"
+#include "ops/linear/sm70/sm70_project.h"
 #include "ops/linear/t2/t2_a8.h"
 #include "ops/linear/t2/t2_weight_view.h"
 
+#include "ops/linear_swiglu/q4cublas/cublas_prefill_gate.h"
 #include "ops/linear_swiglu/q4cublas/w4_cublas_prefill.h"
 #include "ops/attn_input_proj/bf16/bf16_attn_input_plan.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
+#include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan_unified.h"
 #include "ops/attn_input_proj/q4_q5/q4_q5_attn_input_plan.h"
 #include "ops/attn_input_proj/q8/q8_attn_input_plan.h"
 #include "ops/linear/fp8/fp8_config.h"
@@ -16,10 +25,12 @@
 #include "ops/linear/nvfp4/nvfp4_config.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
-#include <array>
 #include <cstdint>
+#include <initializer_list>
 #include <vector>
 #include <stdexcept>
 #include <string>
@@ -42,11 +53,16 @@ void require_matrix(const Tensor& tensor, std::int32_t rows, std::int32_t cols, 
 void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, const char* label) {
     const bool no_high   = weight.qhigh == nullptr && weight.high_plane_bytes == 0;
     const bool q4_planes = qtype != QType::Q4_G64_FP16 || no_high;
-    const bool t2_planes = qtype != QType::T2_G128_FP16 || no_high;
+    const bool ternary = is_ternary(qtype);
+    const bool t2_planes = !ternary ||
+        (weight.qtype != QType::PTQ1_G128_FP16 ? no_high
+         : (weight.qhigh != nullptr && weight.high_plane_bytes != 0));
     const bool q5_planes =
         qtype != QType::Q5_G64_FP16 || (weight.qhigh != nullptr && weight.high_plane_bytes != 0);
-    const std::int32_t group = qtype == QType::T2_G128_FP16 ? 128 : 64;
-    if (weight.qtype != qtype || weight.layout != QuantLayout::RowSplit ||
+    const std::int32_t group = ternary ? 128 : 64;
+    // The panel layout is RowSplit's bytes permuted (sm_70 loads, read by its routes).
+    if ((weight.qtype != qtype && !(ternary && is_ternary(weight.qtype))) ||
+        !is_row_split(weight.layout) ||
         weight.scale_dtype != DType::FP16 ||
         weight.group_size != static_cast<std::uint32_t>(group) || weight.group != group ||
         !t2_planes || weight.ndim != 2 || weight.n != rows || weight.k != 5120 ||
@@ -94,6 +110,9 @@ void validate_policy(LinearPolicy policy) {
     // below, where no such route is registered for their qtypes.
     case LinearPolicy::AllowA8Int:
     case LinearPolicy::AllowA8IntDecode:
+    // The NVFP4 int8-grouped route is a single-parent concern; its resolvers decide what this Op
+    // admits for it.
+    case LinearPolicy::AllowNvfp4Int8:
     // The cuBLAS prefill route is registered only for linear_swiglu and linear_add. Everywhere else
     // this policy means exactly what AllowA8Int means, and is accepted rather than rejected so that
     // one engine-wide setting does not have to be threaded per Op.
@@ -109,11 +128,63 @@ LinearPolicy without_integer(LinearPolicy policy) {
     return allows_a8_int(policy) ? LinearPolicy::A16Only : policy;
 }
 
+__nv_bfloat16* plane(Tensor& t) { return static_cast<__nv_bfloat16*>(t.data); }
+
+// sm_70: one preparation of x (an FP16 conversion, or the integer route's quantization where the
+// policy admits it for both parents), then each parent's rows into the planes they belong to.
+void sm70_split(const Tensor& x, const Weight& first, std::initializer_list<Tensor*> first_planes,
+                const Weight* second, std::initializer_list<Tensor*> second_planes,
+                LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream) {
+    auto scope = workspace.scope();
+    const bool integer =
+        detail::sm70::integer_takes(first, x.ne[1], policy) &&
+        (second == nullptr || detail::sm70::integer_takes(*second, x.ne[1], policy));
+    const auto activation = detail::sm70::prepare_for(x, std::max(first.n, second ? second->n : 0),
+                                                      workspace, stream, integer);
+    const auto destinations = [](std::initializer_list<Tensor*> planes) {
+        std::vector<detail::sm70::Destination> out;
+        std::int32_t row = 0;
+        for (Tensor* t : planes) {
+            out.push_back({plane(*t), t->ne[0], 0, row, t->ne[0], false});
+            row += t->ne[0];
+        }
+        return out;
+    };
+    detail::sm70::project_for(activation, first, destinations(first_planes), stream);
+    if (second != nullptr) {
+        detail::sm70::project_for(activation, *second, destinations(second_planes), stream);
+    }
+}
+
+// sm_70 without a workspace: up to the small-T route's direct widths, each parent row range into
+// its plane straight from the BF16 activations. False where the width needs a workspace.
+bool sm70_direct_split(const Tensor& x, const Weight& weight, std::initializer_list<Tensor*> planes,
+                       cudaStream_t stream) {
+    if (!detail::sm70::direct_tokens(x.ne[1]) || !detail::sm70::covers(weight, x.ne[1])) {
+        return false;
+    }
+    std::vector<detail::sm70::Destination> destinations;
+    std::int32_t row = 0;
+    for (Tensor* t : planes) {
+        destinations.push_back({plane(*t), t->ne[0], 0, row, t->ne[0], false});
+        row += t->ne[0];
+    }
+    detail::sm70::project_for(detail::sm70::prepare_direct(x), weight, destinations, stream);
+    return true;
+}
+
 void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                             Tensor& k, Tensor& v, LinearPolicy policy, WorkspaceArena* workspace,
                             cudaStream_t stream) {
     validate_policy(policy);
     policy = without_integer(policy);
+    // The parent's rows are [query; key; gate; value].
+    if (policy != LinearPolicy::AllowNvfp4Int8 && workspace != nullptr &&
+        detail::sm70::covers(weight, x.ne[1]) && weight.n == 2 * q.ne[0] + 2 * k.ne[0] &&
+        gate.ne[0] == q.ne[0] && v.ne[0] == k.ne[0]) {
+        sm70_split(x, weight, {&q, &k, &gate, &v}, nullptr, {}, policy, *workspace, stream);
+        return;
+    }
     if (weight.qtype == QType::BF16) {
         constexpr std::int32_t kHidden = 5120;
         constexpr std::int32_t kQRows  = 6144;
@@ -183,19 +254,17 @@ void dispatch_single_parent(const Tensor& x, const Weight& weight, Tensor& q, Te
     require_matrix(k, kKvRows, cols, "k");
     require_matrix(v, kKvRows, cols, "v");
     require_q8_rowsplit(weight, kRows, kHidden, "query/key/gate/value weight");
+    if (sm70_direct_split(x, weight, {&q, &k, &gate, &v}, stream)) { return; }
     detail::q8_attn_input_dispatch(x, weight, q, gate, k, v, stream);
 }
 
 } // namespace
 
-std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
-                                                     std::int32_t input_rows, LinearPolicy policy,
-                                                     std::int32_t min_tokens,
-                                                     std::int32_t max_tokens) {
-    validate_policy(policy);
-    if (min_tokens <= 0 || max_tokens < min_tokens) {
-        throw std::invalid_argument("attn_input_proj workspace: invalid token interval");
-    }
+namespace {
+
+std::size_t single_parent_route_bytes(QType parent_qtype, std::int32_t parent_rows,
+                                      std::int32_t input_rows, LinearPolicy policy,
+                                      std::int32_t min_tokens, std::int32_t max_tokens) {
 
     switch (parent_qtype) {
     case QType::BF16:
@@ -235,6 +304,26 @@ std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::in
     throw std::invalid_argument("attn_input_proj workspace: unsupported parent qtype");
 }
 
+
+} // namespace
+
+std::size_t attn_input_proj_workspace_capacity_bytes(QType parent_qtype, std::int32_t parent_rows,
+                                                     std::int32_t input_rows, LinearPolicy policy,
+                                                     std::int32_t min_tokens,
+                                                     std::int32_t max_tokens) {
+    validate_policy(policy);
+    if (min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("attn_input_proj workspace: invalid token interval");
+    }
+    const auto routes = [&](std::int32_t lo, std::int32_t hi) {
+        return single_parent_route_bytes(parent_qtype, parent_rows, input_rows, policy, lo, hi);
+    };
+    // The NVFP4 int8 family keeps its own workspace on every tier.
+    if (policy == LinearPolicy::AllowNvfp4Int8) { return routes(min_tokens, max_tokens); }
+    return detail::sm70::capacity(parent_qtype, parent_rows, input_rows, min_tokens, max_tokens,
+                                  without_integer(policy), routes);
+}
+
 namespace {
 
 // Shape checks both split overloads owe their callers.
@@ -260,9 +349,10 @@ void require_split_profile(const Tensor& x, const Weight& query_key_weight,
 bool t2_pair_project(const Tensor& x, const Weight& query_key_weight,
                      const Weight& gate_value_weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
                      LinearPolicy policy, WorkspaceArena* workspace, cudaStream_t stream) {
-    const bool qk = query_key_weight.qtype == QType::T2_G128_FP16;
-    if (qk != (gate_value_weight.qtype == QType::T2_G128_FP16)) {
-        throw std::invalid_argument("attn_input_proj: the two parents must share the T2 format");
+    const bool qk = is_ternary(query_key_weight.qtype);
+    if (qk != is_ternary(gate_value_weight.qtype) ||
+        (qk && query_key_weight.qtype != gate_value_weight.qtype)) {
+        throw std::invalid_argument("attn_input_proj: the two ternary parents must share one format");
     }
     if (!qk) { return false; }
     constexpr std::int32_t kQRows  = 6144;
@@ -275,12 +365,25 @@ bool t2_pair_project(const Tensor& x, const Weight& query_key_weight,
     require_matrix(v, kKvRows, cols, "v");
     require_rowsplit(query_key_weight, QType::T2_G128_FP16, kQRows + kKvRows, "query/key weight");
     require_rowsplit(gate_value_weight, QType::T2_G128_FP16, kQRows + kKvRows, "gate/value weight");
+    if (query_key_weight.qtype == QType::T5_G128_FP16) {
+        Tensor* first[]{&q, &k};
+        Tensor* second[]{&gate, &v};
+        detail::t5_project(x, query_key_weight, first, false, policy, workspace, stream);
+        detail::t5_project(x, gate_value_weight, second, false, policy, workspace, stream);
+        return true;
+    }
+    if (workspace != nullptr && detail::sm70::covers(query_key_weight, cols) &&
+        detail::sm70::covers(gate_value_weight, cols)) {
+        sm70_split(x, query_key_weight, {&q, &k}, &gate_value_weight, {&gate, &v}, policy,
+                   *workspace, stream);
+        return true;
+    }
     if (workspace != nullptr && detail::t2_a8_admits(policy) &&
         detail::t2_a8_supported(query_key_weight, cols) &&
         detail::t2_a8_supported(gate_value_weight, cols)) {
         // One quantisation of x and one pass over each parent, split into its two destinations.
         auto scope             = workspace->scope();
-        const auto activations = detail::t2_a8_quantize(x, *workspace, stream);
+        const auto activations = detail::t2_a8_quantize(x, *workspace, stream, query_key_weight.qtype == QType::PTQ1_G128_FP16);
         detail::t2_a8_project_split_pair(activations, {query_key_weight, q, 0, kQRows, k, 0},
                                          {gate_value_weight, gate, 0, kQRows, v, 0}, stream);
         return true;
@@ -310,10 +413,17 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
         return;
     }
     require_split_profile(x, query_key_weight, gate_value_weight, q, gate, k, v);
+    if (detail::sm70::covers(query_key_weight, x.ne[1]) &&
+        detail::sm70::covers(gate_value_weight, x.ne[1])) {
+        sm70_split(x, query_key_weight, {&q, &k}, &gate_value_weight, {&gate, &v}, policy,
+                   workspace, stream);
+        return;
+    }
     // Both parents split into a query/gate half and a key/value half, and both read the same
     // activations, so the cuBLAS route materialises each parent once and shares one quantisation
     // across all four destinations.
-    if (allows_cublas_prefill(policy) && x.ne[1] >= kCublasPrefillMinTokens) {
+    if (allows_cublas_prefill(policy) &&
+        detail::cublas_prefill_takes(detail::kCublasAttnInput, x.ne[1])) {
         const std::int32_t q_rows  = q.ne[0];
         const std::int32_t kv_rows = k.ne[0];
         const detail::CublasProjectionDestination qk_dests[] = {
@@ -337,15 +447,13 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
                                       stream);
 }
 
-std::size_t attn_input_proj_split_workspace_capacity_bytes(
-    QType query_key_qtype, std::int32_t query_key_rows, QType gate_value_qtype,
-    std::int32_t gate_value_rows, std::int32_t input_rows, LinearPolicy policy,
-    std::int32_t min_tokens, std::int32_t max_tokens) {
-    validate_policy(policy);
-    if (min_tokens <= 0 || max_tokens < min_tokens) {
-        throw std::invalid_argument("attn_input_proj workspace: invalid token interval");
-    }
-    if (query_key_qtype == QType::T2_G128_FP16 || gate_value_qtype == QType::T2_G128_FP16) {
+namespace {
+
+std::size_t split_route_bytes(QType query_key_qtype, std::int32_t query_key_rows,
+                              QType gate_value_qtype, std::int32_t gate_value_rows,
+                              std::int32_t input_rows, LinearPolicy policy, std::int32_t min_tokens,
+                              std::int32_t max_tokens) {
+    if (is_ternary(query_key_qtype) || is_ternary(gate_value_qtype)) {
         if (query_key_qtype != gate_value_qtype || query_key_rows != 7168 ||
             gate_value_rows != 7168 || input_rows != 5120) {
             throw std::invalid_argument("attn_input_proj workspace: unregistered T2 pair");
@@ -353,7 +461,7 @@ std::size_t attn_input_proj_split_workspace_capacity_bytes(
         std::size_t bytes = 0;
         for (const std::int32_t rows : {6144, 1024}) {
             bytes = std::max(bytes,
-                             linear_workspace_capacity_bytes(QType::T2_G128_FP16, rows, input_rows,
+                             linear_workspace_capacity_bytes(query_key_qtype, rows, input_rows,
                                                              policy, min_tokens, max_tokens));
         }
         return bytes;
@@ -364,12 +472,40 @@ std::size_t attn_input_proj_split_workspace_capacity_bytes(
     if (!allows_a8_int(policy) || !registered) { return 0; }
     const std::size_t a8 = detail::q4_q5_attn_input_a8_workspace_capacity_bytes(min_tokens,
                                                                                 max_tokens);
-    if (allows_cublas_prefill(policy) && max_tokens >= kCublasPrefillMinTokens) {
-        return std::max(a8, detail::w4_cublas_projection_workspace_capacity_bytes(
-                                std::max(query_key_rows, gate_value_rows), input_rows,
-                                std::max(min_tokens, kCublasPrefillMinTokens), max_tokens));
+    const std::int32_t first =
+        allows_cublas_prefill(policy)
+            ? detail::cublas_prefill_first_width(detail::kCublasAttnInput, min_tokens, max_tokens)
+            : 0;
+    if (first != 0) {
+        return std::max(
+            a8, detail::w4_cublas_projection_workspace_capacity_bytes(
+                    std::max(query_key_rows, gate_value_rows), input_rows, first, max_tokens));
     }
     return a8;
+}
+
+} // namespace
+
+std::size_t
+attn_input_proj_split_workspace_capacity_bytes(QType query_key_qtype, std::int32_t query_key_rows,
+                                               QType gate_value_qtype, std::int32_t gate_value_rows,
+                                               std::int32_t input_rows, LinearPolicy policy,
+                                               std::int32_t min_tokens, std::int32_t max_tokens) {
+    validate_policy(policy);
+    if (min_tokens <= 0 || max_tokens < min_tokens) {
+        throw std::invalid_argument("attn_input_proj workspace: invalid token interval");
+    }
+    const auto routes = [&](std::int32_t lo, std::int32_t hi) {
+        return split_route_bytes(query_key_qtype, query_key_rows, gate_value_qtype, gate_value_rows,
+                                 input_rows, policy, lo, hi);
+    };
+    // Both parents take the sm_70 routes or neither does.
+    if (!detail::sm70::covered_format(query_key_qtype, input_rows) ||
+        !detail::sm70::covered_format(gate_value_qtype, input_rows)) {
+        return routes(min_tokens, max_tokens);
+    }
+    return detail::sm70::capacity(query_key_qtype, std::max(query_key_rows, gate_value_rows),
+                                  input_rows, min_tokens, max_tokens, policy, routes);
 }
 
 void attn_input_proj(const Tensor& x, const Weight& query_key_weight,
@@ -439,6 +575,42 @@ void attn_input_proj_fused_rmsnorm_nvfp4(const Tensor& residual, const Tensor& n
                                                   gate, k, v, workspace, stream);
 }
 
+bool attn_input_proj_fused_rmsnorm_int8_eligible(const Weight& weight, LinearPolicy policy,
+                                                 std::int32_t tokens) {
+    // The chain answer comes from the plan that owns the device-profile key, so a caller that
+    // skips its standalone rmsnorm here cannot disagree with the route the projection then takes.
+    return detail::nvfp4_attn_input_int8_fused_norm_eligible(policy, tokens) &&
+           weight.qtype == QType::NVFP4 && weight.layout == QuantLayout::BlockScaleK16M128x4 &&
+           weight.n == 14336 && weight.k == 5120;
+}
+
+void attn_input_proj_fused_rmsnorm_int8(const Tensor& residual, const Tensor& norm_weight,
+                                        float eps, const Weight& projection_weight, Tensor& q,
+                                        Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,
+                                        WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::int32_t tokens = residual.ne[1];
+    if (!attn_input_proj_fused_rmsnorm_int8_eligible(projection_weight, policy, tokens)) {
+        throw std::invalid_argument("fused int8 attn_input_proj: unsupported route");
+    }
+    if (!(eps > 0.0F) || !std::isfinite(eps)) {
+        throw std::invalid_argument("fused int8 attn_input_proj: eps must be positive and finite");
+    }
+    require_matrix(residual, 5120, tokens, "residual");
+    if (norm_weight.dtype != DType::BF16 || norm_weight.ne[0] != 5120 || norm_weight.ne[1] != 1 ||
+        norm_weight.ne[2] != 1 || norm_weight.ne[3] != 1 || !norm_weight.is_contiguous() ||
+        !aligned_to(norm_weight.data, 16)) {
+        throw std::invalid_argument("fused int8 attn_input_proj: invalid norm weight");
+    }
+    require_matrix(q, 6144, tokens, "q");
+    require_matrix(gate, 6144, tokens, "gate");
+    require_matrix(k, 1024, tokens, "k");
+    require_matrix(v, 1024, tokens, "v");
+    detail::validate_nvfp4_weight(projection_weight, "fused int8 attn_input_proj");
+    detail::unified::nvfp4_attn_input_int8_fused_norm_launch(
+        residual, norm_weight, eps, projection_weight, q, gate, k, v, workspace,
+        detail::Nvfp4Int8Mainloop::Grouped, stream);
+}
+
 void attn_input_proj(const Tensor& x, const Weight& query_key_gate_value_weight, Tensor& q,
                      Tensor& gate, Tensor& k, Tensor& v, cudaStream_t stream) {
     dispatch_single_parent(x, query_key_gate_value_weight, q, gate, k, v, LinearPolicy::A16Only,
@@ -461,7 +633,7 @@ void attn_input_proj(const Tensor& x, const Weight& query_key_value_weight, Tens
     require_matrix(k, kKvRows, cols, "k");
     require_matrix(v, kKvRows, cols, "v");
     require_q8_rowsplit(query_key_value_weight, kRows, hidden, "query/key/value weight");
-
+    if (sm70_direct_split(x, query_key_value_weight, {&q, &k, &v}, stream)) { return; }
     detail::q8_attn_input_dispatch(x, query_key_value_weight, q, k, v, stream);
 }
 

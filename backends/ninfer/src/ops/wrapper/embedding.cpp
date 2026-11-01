@@ -4,6 +4,7 @@
 #include "ops/common/math.h"
 #include "ops/linear/gguf/gguf_linear.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/t5/t5_project.h"
 #include "ops/launcher/embed_gather.h" // detail::embed_gather_*_launch
 #include "core/weight_view.h"
 
@@ -247,6 +248,13 @@ void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t
         return;
     }
     switch (table.qtype) {
+    case QType::T5_G128_FP16:
+        detail::validate_t5_weight(table, "embedding");
+        if (table.k != out.ne[0]) { throw std::invalid_argument("embedding: T5 table d must match out"); }
+        if (is_empty_T(ids, out)) { return; }
+        require_non_empty_tensors(ids, out);
+        detail::t5_embedding(ids, table, Tensor{}, out, stream);
+        break;
     case QType::BF16: {
         require_dense_metadata(table, out);
         if (is_empty_T(ids, out)) { return; }

@@ -27,6 +27,7 @@ GenerationOutcome outcome(int prompt, std::uint32_t cache_hit, int completion, d
     GenerationOutcome result;
     result.prompt_tokens                   = prompt;
     result.completion_tokens               = completion;
+    result.metrics.computed_prefill_tokens = prompt > cache_hit ? prompt - cache_hit : 0;
     result.metrics.prefix_cache_hit_tokens = cache_hit;
     result.metrics.ttft_seconds            = ttft;
     result.metrics.prefill_seconds         = prefill_seconds;
@@ -38,6 +39,19 @@ GenerationOutcome outcome(int prompt, std::uint32_t cache_hit, int completion, d
 
 int main() {
     int failures = 0;
+
+    GenerationOutcome cancelled = outcome(6400, 4224, 0, 0.0, 2.0, 0.0);
+    cancelled.finish_reason = ninfer::FinishReason::Cancelled;
+    cancelled.metrics.computed_prefill_tokens = 1920;
+    const auto partial = make_console_request_sample(cancelled);
+    failures += check(partial.prompt_tokens == 6400 && partial.cache_hit_tokens == 4224 &&
+                          partial.computed_prefill_tokens == 1920 && partial.decode_tokens == 0,
+                      "console accounting includes unexecuted cancelled suffix");
+    GenerationOutcome queued;
+    queued.prompt_tokens = 6400;
+    queued.finish_reason = ninfer::FinishReason::Cancelled;
+    failures += check(make_console_request_sample(queued).computed_prefill_tokens == 0,
+                      "cancelled queued request must report zero computed tokens");
 
     // Engine speculative totals include n-gram rounds; the model drafter gets only the remainder.
     GenerationOutcome mixed                     = outcome(1000, 600, 101, 0.25, 0.2, 2.0);

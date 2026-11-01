@@ -2,6 +2,7 @@
 #include "ops/linear_topk/linear_topk_launch.h"
 
 #include "core/device.h"
+#include "ops/common/device_limits.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/score_id_order.cuh"
@@ -58,7 +59,9 @@ __device__ __forceinline__ int swizzle_128(int row, int column) {
 
 template <int TileColumns, int kBlockK = 128>
 __global__
-__launch_bounds__(M64Schedule<TileColumns, kBlockK>::kThreads, 2) void fp8_m64_linear_topk_kernel(
+__launch_bounds__(M64Schedule<TileColumns, kBlockK>::kThreads,
+                  resident_ctas_bound(M64Schedule<TileColumns, kBlockK>::kThreads, 2)) void
+fp8_m64_linear_topk_kernel(
     const __nv_bfloat16* __restrict__ hidden, const std::uint8_t* __restrict__ weight_codes,
     const __nv_bfloat16* __restrict__ row_scales, std::int32_t valid_rows,
     std::uint64_t* __restrict__ partial_keys, std::int32_t producer_groups, std::int32_t columns) {

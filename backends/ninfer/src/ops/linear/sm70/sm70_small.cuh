@@ -466,12 +466,14 @@ union SmallShared {
 
 // Stages chunk `chunk` (Chunk values) of the direct BF16 columns [col0, col0 + cols) in P8 FP16:
 // lane l converts values 8g + p and 8g + p + 4 (g = l / 4 + 8 m, p = l % 4) of every column.
+// Returns, in every lane, whether the chunk holds a value beyond FP16.
 template <int Chunk>
-__device__ __forceinline__ void stage_direct(const std::uint16_t* __restrict__ x, std::int32_t k,
+__device__ __forceinline__ bool stage_direct(const std::uint16_t* __restrict__ x, std::int32_t k,
                                              std::int32_t col0, std::int32_t cols, int chunk,
                                              __half* stage) {
     const int lane = static_cast<int>(threadIdx.x) & 31;
     const int p    = lane & 3;
+    bool beyond    = false;
     for (int c = 0; c < cols; ++c) {
         const std::uint16_t* column = x + static_cast<std::int64_t>(col0 + c) * k + chunk * Chunk;
 #pragma unroll
@@ -480,22 +482,110 @@ __device__ __forceinline__ void stage_direct(const std::uint16_t* __restrict__ x
             const std::uint16_t* src = column + 8 * g + p;
             const unsigned word =
                 static_cast<unsigned>(__ldg(src)) | (static_cast<unsigned>(__ldg(src + 4)) << 16);
+            beyond |= bf16x2_beyond_f16(word);
             *reinterpret_cast<unsigned*>(stage + c * kStageColumn<Chunk> + 8 * g + 2 * p) =
                 bf16x2_to_f16x2(word);
+        }
+    }
+    return __any_sync(0xffffffffu, beyond);
+}
+
+// Whether chunk `chunk` of any of the tile's live columns holds a value beyond FP16, from the
+// prepared plane's flags (one per 64 values), in every lane.
+template <int Chunk, int Tiles>
+__device__ __forceinline__ bool flagged_chunk(const std::uint8_t* __restrict__ beyond,
+                                              std::int32_t k, std::int32_t col0,
+                                              const bool (&live)[Tiles], int column, int chunk) {
+    const std::int32_t chunks = k / kSmallChunk;
+    bool any                  = false;
+#pragma unroll
+    for (int j = 0; j < Tiles; ++j) {
+        if (!live[j]) { continue; }
+        const std::uint8_t* flags =
+            beyond + static_cast<std::int64_t>(col0 + 8 * j + column) * chunks + chunk * (Chunk / 64);
+#pragma unroll
+        for (int s = 0; s < Chunk / 64; ++s) { any |= __ldg(flags + s) != 0; }
+    }
+    return __any_sync(0xffffffffu, any);
+}
+
+// Adds to the tile what saturating the chunk's activations to FP16 took from its products: each lane
+// forms its own row times the excess (saturated_excess) of every live column in FP32, scaled by its
+// own group scales as the fast path scales its groups, and the sums move by shuffles into the
+// accumulator layout (row (lane & 1) + (i & 2) + 4h of the lane's quad pair, column (i & 4) +
+// (lane & 2) + (i & 1)). xb is the BF16 plane [T][k] in natural order.
+template <class Decoder, int Tiles>
+__device__ __forceinline__ void add_saturated(const Decoder& dec,
+                                              const typename Decoder::Raw& raw,
+                                              const std::uint16_t* __restrict__ xb, std::int32_t k,
+                                              std::int32_t col0, std::int32_t cols, int chunk,
+                                              float (&acc)[Tiles][8]) {
+    constexpr int Chunk  = Decoder::kChunk;
+    constexpr int Groups = Chunk / 8;
+    constexpr int Span   = Decoder::kScaleGroups != 0 ? Decoder::kScaleGroups : 1;
+    const int lane       = static_cast<int>(threadIdx.x) & 31;
+    const int source     = (lane & 0x1c) | (lane & 1);
+#pragma unroll
+    for (int j = 0; j < Tiles; ++j) {
+#pragma unroll
+        for (int cc = 0; cc < 8; ++cc) {
+            const std::int32_t c = 8 * j + cc;
+            float sum            = 0.0f;
+            if (c < cols) {
+                const uint4* column = reinterpret_cast<const uint4*>(
+                    xb + static_cast<std::int64_t>(col0 + c) * k + chunk * Chunk);
+                float part = 0.0f;
+#pragma unroll 1
+                for (int g = 0; g < Groups; ++g) {
+                    // a[p] holds weights p and p + 4 of the group, v its natural pairs.
+                    Fragments a;
+                    dec.decode(raw, g, a);
+                    const uint4 v           = __ldg(column + g);
+                    const unsigned words[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+                    for (int pr = 0; pr < 4; ++pr) {
+                        const float2 w = __half22float2(bits_half2(a[pr]));
+                        const unsigned lo_word = words[pr / 2];
+                        const unsigned hi_word = words[2 + pr / 2];
+                        const float lo = __uint_as_float(pr % 2 == 0 ? lo_word << 16
+                                                                     : lo_word & 0xffff0000u);
+                        const float hi = __uint_as_float(pr % 2 == 0 ? hi_word << 16
+                                                                     : hi_word & 0xffff0000u);
+                        part = fmaf(w.x, saturated_excess(lo), part);
+                        part = fmaf(w.y, saturated_excess(hi), part);
+                    }
+                    if (g % Span == Span - 1) {
+                        if constexpr (Decoder::kScaleGroups != 0) {
+                            sum = fmaf(part, dec.scale(raw, g / Span), sum);
+                        } else {
+                            sum += part;
+                        }
+                        part = 0.0f;
+                    }
+                }
+            }
+            const float row_a = __shfl_sync(0xffffffffu, sum, source);
+            const float row_b = __shfl_sync(0xffffffffu, sum, source | 2);
+            if ((lane & 2) == (cc & 2)) {
+                acc[j][cc & 5] += row_a;
+                acc[j][(cc & 5) | 2] += row_b;
+            }
         }
     }
 }
 
 // Rows [row0, row0 + 32) of the tile; the lane's row is row0 + 8 q + (lane % 4) + 4 h. Columns
-// [col0, col0 + cols) of x: a prepared P8 FP16 plane [T][k], or (Direct, cols <= 8) the caller's
-// BF16 plane, staged per chunk. `first` decodes tile rows below `split`, `second` the rest (the
-// gate and up halves of a SwiGLU tile; one decoder when both are the same). The sum over the CTA's
-// warps is left in shared.partial[0].
+// [col0, col0 + cols) of x: a prepared P8 FP16 plane [T][k] with its chunk flags `beyond`, or
+// (Direct, cols <= 8) the caller's BF16 plane, staged per chunk. xb is the BF16 plane (x itself when
+// Direct): a chunk with a value beyond FP16 adds what saturation took (add_saturated). `first`
+// decodes tile rows below `split`, `second` the rest (the gate and up halves of a SwiGLU tile; one
+// decoder when both are the same). The sum over the CTA's warps is left in shared.partial[0].
 template <class Decoder, int Tiles, bool Direct, int Warps>
 __device__ __forceinline__ void
 small_tile(const Decoder& first, const Decoder& second, std::int32_t first_row0,
            std::int32_t second_row0, int split, std::int32_t first_rows, std::int32_t second_rows,
-           const std::uint16_t* __restrict__ x, std::int32_t k, std::int32_t col0,
+           const std::uint16_t* __restrict__ x, const std::uint16_t* __restrict__ xb,
+           const std::uint8_t* __restrict__ beyond, std::int32_t k, std::int32_t col0,
            std::int32_t cols, SmallShared<Tiles, Decoder::kChunk, Warps>& shared) {
     static_assert(!Direct || Tiles == 1);
     constexpr int U      = Decoder::kUnroll;
@@ -544,10 +634,13 @@ small_tile(const Decoder& first, const Decoder& second, std::int32_t first_row0,
         for (int u = 0; u < U; ++u) {
             const int chunk = first_chunk + u;
             if (chunk >= chunks) { break; }
+            bool saturated = false;
             if constexpr (Direct) {
                 __syncwarp();
-                stage_direct<Chunk>(x, k, col0, cols, chunk, stage);
+                saturated = stage_direct<Chunk>(x, k, col0, cols, chunk, stage);
                 __syncwarp();
+            } else {
+                saturated = flagged_chunk<Chunk>(beyond, k, col0, live, column, chunk);
             }
             float part[Tiles][8];
 #pragma unroll
@@ -598,6 +691,7 @@ small_tile(const Decoder& first, const Decoder& second, std::int32_t first_row0,
                     }
                 }
             }
+            if (saturated) { add_saturated(dec, raw[u], xb, k, col0, cols, chunk, acc); }
         }
     }
     __syncthreads(); // every warp is done with its stage before the partial tiles overwrite them

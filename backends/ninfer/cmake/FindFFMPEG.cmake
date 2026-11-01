@@ -21,8 +21,7 @@ if(NOT DEFINED ENV{VCPKG_ROOT} OR NOT DEFINED ENV{VCPKG_TARGET_TRIPLET})
   return()
 endif()
 
-cmake_path(SET FFMPEG_VCPKG_TREE NORMALIZE "$ENV{VCPKG_ROOT}")
-cmake_path(APPEND FFMPEG_VCPKG_TREE "installed" "$ENV{VCPKG_TARGET_TRIPLET}")
+set(FFMPEG_VCPKG_TREE "$ENV{VCPKG_ROOT}/installed/$ENV{VCPKG_TARGET_TRIPLET}")
 
 set(_ffmpeg_needed avformat avcodec avutil swscale)
 set(_ffmpeg_libs_found TRUE)

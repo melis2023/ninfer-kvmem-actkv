@@ -2,6 +2,8 @@
 #include "ninfer/ops/sparse_moe.h"
 
 #include "core/nvtx.h"
+#include "ops/common/device_tier.h"
+#include "ops/sparse_moe/laboratory.h"
 #include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/sparse_moe/decode/sparse_moe_decode.h"
 #include "ops/sparse_moe/prefill/sparse_moe_prefill.h"
@@ -208,14 +210,9 @@ std::size_t sparse_moe_workspace_capacity_bytes(QType routed_gate_up, QType rout
     }
     (void)detail::resolve_sparse_moe_decode_plan(routed_gate_up, routed_down);
 
-    const bool q8_profile =
-        routed_gate_up == QType::Q8_G32_FP16 && routed_down == QType::Q8_G32_FP16;
     const bool nvfp4_profile = routed_gate_up == QType::NVFP4 && routed_down == QType::NVFP4;
-    const std::int32_t prefill_first = q8_profile      ? detail::kSparseMoePrefillQ8Q8Min
-                                       : nvfp4_profile ? detail::kSparseMoePrefillNvfp4Min
-                                       : routed_down == QType::Q5_G64_FP16
-                                           ? detail::kSparseMoePrefillQ4Q5Min
-                                           : detail::kSparseMoePrefillQ4Q6Min;
+    const std::int32_t prefill_first =
+        detail::sparse_moe_prefill_min_tokens(routed_gate_up, routed_down);
 
     std::size_t required = 0;
     if (min_tokens == 1) { required = detail::sparse_moe_decode_workspace_bytes(); }
@@ -239,14 +236,31 @@ std::size_t sparse_moe_workspace_capacity_bytes(QType routed_gate_up, QType rout
     return required;
 }
 
-void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
-                Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream) {
-    sparse_moe(x, weights, epilogue, destination, SparseMoeHints{}, workspace, stream);
+std::size_t detail::sparse_moe_candidate_workspace_bytes(QType gate, QType down,
+                                                         std::int32_t tokens,
+                                                         SparseMoeCandidate candidate) {
+    if (!sparse_moe_candidate_supports_tokens(candidate, tokens)) {
+        throw std::invalid_argument("sparse_moe: candidate does not support token extent");
+    }
+    switch (candidate) {
+    case SparseMoeCandidate::Automatic:
+        return sparse_moe_workspace_capacity_bytes(gate, down, tokens, tokens);
+    case SparseMoeCandidate::Decode:
+        return resolve_sparse_moe_decode_plan(gate, down).workspace_bytes;
+    case SparseMoeCandidate::SmallT:
+        return resolve_sparse_moe_small_t_plan(tokens, gate, down).workspace_bytes;
+    case SparseMoeCandidate::Prefill:
+    case SparseMoeCandidate::PrefillNarrow:
+    case SparseMoeCandidate::PrefillWide:
+        return resolve_sparse_moe_prefill_plan(tokens, gate, down, candidate).workspace_bytes;
+    }
+    throw std::invalid_argument("sparse_moe: invalid candidate");
 }
 
-void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
-                Tensor& destination, const SparseMoeHints& hints, WorkspaceArena& workspace,
-                cudaStream_t stream) {
+static void sparse_moe_impl(const Tensor& x, const SparseMoeWeights& weights,
+                            SparseMoeEpilogue epilogue, Tensor& destination,
+                            const SparseMoeHints& hints, detail::SparseMoeCandidate candidate,
+                            WorkspaceArena& workspace, cudaStream_t stream) {
     if (epilogue != SparseMoeEpilogue::AddResidual) {
         throw std::invalid_argument("sparse_moe: unsupported epilogue");
     }
@@ -261,17 +275,25 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     ranges.push_back(address_range(destination.data, destination.bytes(), "destination"));
     validate_weights(weights, ranges);
 
-    const bool use_small_t = detail::sparse_moe_uses_small_t(tokens);
-    const bool use_prefill = detail::sparse_moe_uses_prefill(tokens, weights.routed_gate_up.qtype,
-                                                             weights.routed_down.qtype);
-#if defined(NINFER_SM8X_COMPAT) && !defined(NINFER_SM120_NVFP4)
-    // The NVFP4 prefill route is W4A4 on the Blackwell FP4 tensor cores. Decode and the small-token
-    // route are CUDA-core dot products and run here; a prefill-sized call has no route on sm_8x.
-    if (use_prefill && nvfp4_profile(weights)) {
-        throw std::invalid_argument(
-            "sparse_moe: NVFP4 expert banks prefill only on an sm_120a build");
+    using Candidate = detail::SparseMoeCandidate;
+    const bool automatic = candidate == Candidate::Automatic;
+    if (!detail::sparse_moe_candidate_supports_tokens(candidate, tokens)) {
+        throw std::invalid_argument("sparse_moe: candidate does not support token extent");
     }
-#endif
+    const bool use_small_t = candidate == Candidate::SmallT ||
+                             (automatic && detail::sparse_moe_uses_small_t(tokens));
+    const bool use_prefill = candidate == Candidate::Prefill ||
+                             candidate == Candidate::PrefillNarrow ||
+                             candidate == Candidate::PrefillWide ||
+                             (automatic && detail::sparse_moe_uses_prefill(
+                                 tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype));
+    // The NVFP4 prefill route is W4A4 on the Blackwell FP4 tensor cores. Decode and the small-token
+    // route are CUDA-core dot products and run on every card; a prefill-sized call has no route on
+    // a card that does not run the 120a code.
+    if (use_prefill && nvfp4_profile(weights) && !current_device_blackwell()) {
+        throw std::invalid_argument(
+            "sparse_moe: NVFP4 expert banks prefill only on a card running sm_120a code");
+    }
     nvtx::ScopedRange moe_range(use_prefill   ? nvtx::Name::SparseMoePrefill
                                 : use_small_t ? nvtx::Name::SparseMoeSmallT
                                               : nvtx::Name::SparseMoeDecode,
@@ -279,7 +301,7 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     std::size_t required = 0;
     if (use_prefill) {
         required = detail::resolve_sparse_moe_prefill_plan(tokens, weights.routed_gate_up.qtype,
-                                                           weights.routed_down.qtype)
+                                                           weights.routed_down.qtype, candidate)
                        .workspace_bytes;
     } else if (use_small_t) {
         required = detail::resolve_sparse_moe_small_t_plan(tokens, weights.routed_gate_up.qtype,
@@ -300,7 +322,7 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
     auto scope = workspace.scope();
     if (use_prefill) {
         const detail::SparseMoePrefillPlan plan = detail::resolve_sparse_moe_prefill_plan(
-            tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype);
+            tokens, weights.routed_gate_up.qtype, weights.routed_down.qtype, candidate);
         const detail::SparseMoePrefillWorkspace views =
             detail::allocate_sparse_moe_prefill_workspace(workspace, plan.slice_tokens, plan.nvfp4);
         detail::sparse_moe_prefill_launch(x, weights, destination, plan, views, stream);
@@ -325,6 +347,26 @@ void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilo
         detail::sparse_moe_decode_launch(x_column, weights, destination_column, plan, views,
                                          stream);
     }
+}
+
+void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
+                Tensor& destination, WorkspaceArena& workspace, cudaStream_t stream) {
+    sparse_moe_impl(x, weights, epilogue, destination, {}, detail::SparseMoeCandidate::Automatic,
+                    workspace, stream);
+}
+
+void sparse_moe(const Tensor& x, const SparseMoeWeights& weights, SparseMoeEpilogue epilogue,
+                Tensor& destination, const SparseMoeHints& hints, WorkspaceArena& workspace,
+                cudaStream_t stream) {
+    sparse_moe_impl(x, weights, epilogue, destination, hints, detail::SparseMoeCandidate::Automatic,
+                    workspace, stream);
+}
+
+void detail::sparse_moe_candidate(const Tensor& x, const SparseMoeWeights& weights,
+                                 SparseMoeEpilogue epilogue, Tensor& destination,
+                                 SparseMoeCandidate candidate, WorkspaceArena& workspace,
+                                 cudaStream_t stream) {
+    sparse_moe_impl(x, weights, epilogue, destination, {}, candidate, workspace, stream);
 }
 
 } // namespace ninfer::ops

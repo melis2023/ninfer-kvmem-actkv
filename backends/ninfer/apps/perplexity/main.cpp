@@ -7,6 +7,9 @@
 #include "product/logging/logging.h"
 #include "product/logging/pretty_format.h"
 #include "product/logging/startup_log.h"
+#include "product/kv_resident_options.h"
+#include "product/ngram_table_options.h"
+#include "product/hybrid_expert_options.h"
 #include "product/rope_yarn_options.h"
 
 #include <nlohmann/json.hpp>
@@ -56,7 +59,9 @@ struct Options {
     std::vector<int> devices;
     ninfer::ExpertResidency expert_residency = ninfer::ExpertResidency::Device;
     std::optional<std::uint64_t> expert_cache_bytes;
+    ninfer::HybridExpertOptions hybrid_experts;
     ninfer::NgramTableOptions ngram_table;
+    std::optional<std::uint32_t> kv_resident;
 #if defined(NINFER_SM8X_COMPAT)
     // FP8 E4M3 KV attention has no SM86 implementation, so the upstream default would fail at
     // engine construction on this fork. INT8 group-64 is the qualified quantized profile here.
@@ -80,6 +85,10 @@ struct Options {
     bool prefill_cublas                 = false;
     bool prefill_cublas_projections     = true;
     bool fast_prefill_kernel            = false;
+    // NVFP4 W4A8 (int8 tensor cores): the family needs the model layer's admission flag, the same
+    // one the CLI exposes. Without it scoring silently runs the A16 route, which is a different
+    // numerical path and cannot answer a route-quality question.
+    bool nvfp4_w4a8_int                 = false;
     ninfer::product::LogLevel log_level = ninfer::product::LogLevel::Info;
 };
 
@@ -88,7 +97,13 @@ std::string usage_text() {
            "(--corpus <manifest.json> [--quick] | --text <utf8-file>)\n"
            "       [--context N] [--stride N | --disjoint] [--device N | --devices A,B,...]\n"
            "       [--expert-residency device|host|disk] [--expert-cache-mib N|auto]\n"
-           "       [--ngram-table PATH] [--ngram-ram] [--no-ngram-table]   (Qwen3.8-Flash-Next)\n"
+           "       [--expert-dma-share F] [--expert-cpu-threads N] [--expert-cache-adaptive]\n"
+           "       [--expert-misses staged|mapped] [--expert-tail-skip N]\n"
+           "       [--expert-prefill-buffers 1|2]\n"
+           "       [--ngram-table PATH] [--ngram-residency disk|ram|ram-hot] [--ngram-lock]\n"
+           "       [--ngram-io buffered|direct|mmap] [--ngram-io-depth N] [--ngram-ram-mib N]\n"
+           "       [--ngram-hot-profile PATH] [--no-ngram-table]\n"
+           "       [--kv-resident N|all|auto]   (Qwen3.8-Flash-Next)\n"
            "       [--kv-dtype bf16|int8|fp8|rk8v4|rk4v4|rk4v4-e8|rk2v4-e8|nvfp4|k8v4] [--output "
            "<directory>]\n"
            "       [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
@@ -100,6 +115,8 @@ std::string usage_text() {
            "       (--no-prefill-a8 is the opposite: scoring runs the prefill phase, so this is\n"
            "        how the integer prefill routes' perplexity cost is measured)\n"
            "       [--prefill-cublas [--no-prefill-cublas-projections]] [--fast-prefill-kernel]\n"
+           "       [--nvfp4-w4a8-int]   (NVFP4 weights on the int8 tensor cores; --linear-routes\n"
+           "        is the NINFER_LINEAR_ROUTES env, legacy=own MMQ, unified=grouped mainloop)\n"
            "       (--prefill-cublas scores through the cuBLAS prefill route, which is how its\n"
            "        perplexity cost is measured; the projections flag keeps the attention and GDN\n"
            "        input projections off it)\n"
@@ -151,6 +168,8 @@ Options parse_options(int argc, char** argv) {
             out.device = parse_integer<int>(value("--device"), "device");
         } else if (option == "--fast-prefill-kernel") {
             out.fast_prefill_kernel = true;
+        } else if (option == "--nvfp4-w4a8-int") {
+            out.nvfp4_w4a8_int = true;
         } else if (option == "--kv-dtype") {
             const std::string_view dtype = value("--kv-dtype");
             if (dtype == "bf16") {
@@ -217,12 +236,12 @@ Options parse_options(int argc, char** argv) {
                 out.expert_cache_bytes =
                     std::uint64_t(parse_integer<std::uint32_t>(mib, "expert-cache-mib")) << 20;
             }
-        } else if (option == "--ngram-table") {
-            out.ngram_table.path = value("--ngram-table");
-        } else if (option == "--ngram-ram") {
-            out.ngram_table.ram = true;
-        } else if (option == "--no-ngram-table") {
-            out.ngram_table.disabled = true;
+        } else if (ninfer::product::parse_hybrid_expert_option(
+                       option, out.hybrid_experts, [&] { return value(option.data()); })) {
+        } else if (ninfer::product::parse_ngram_table_option(
+                       option, out.ngram_table, [&] { return value(option.data()); })) {
+        } else if (ninfer::product::parse_kv_resident_option(
+                       option, out.kv_resident, [&] { return value(option.data()); })) {
         } else if (option == "--rope-yarn") {
             out.rope_yarn = true;
         } else if (option == "--rope-yarn-factor") {
@@ -361,7 +380,9 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.devices                       = options.devices;
     engine_options.expert_residency              = options.expert_residency;
     engine_options.expert_cache_bytes            = options.expert_cache_bytes;
+    engine_options.hybrid_experts                = options.hybrid_experts;
     engine_options.ngram_table                   = options.ngram_table;
+    engine_options.kv_resident_positions         = options.kv_resident;
     engine_options.max_context      = options.context;
     engine_options.kv_cache         = options.kv;
     engine_options.lm_head_q4       = options.lm_head_q4;
@@ -379,6 +400,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.prefill_cublas   = options.prefill_cublas;
     engine_options.prefill_cublas_projections = options.prefill_cublas_projections;
     engine_options.fast_prefill_kernel        = options.fast_prefill_kernel;
+    engine_options.nvfp4_w4a8_int             = options.nvfp4_w4a8_int;
     engine_options.startup_observer = startup_log.observer();
     engine_options.diagnostic_observer        = ninfer::product::engine_diagnostic_observer(logger);
     ninfer::Engine engine(std::move(engine_options));

@@ -44,7 +44,10 @@ def convert(
         )
     chosen_device = torch.device(device)
     if chosen_device.type == "cuda" and not torch.cuda.is_available():
-        raise ValueError("CUDA conversion requested but CUDA is unavailable")
+        raise ValueError(
+            "CUDA conversion requested but CUDA is unavailable; "
+            "convert on the CPU with --device cpu"
+        )
     start = time.perf_counter()
     prepared = recipe.prepare(device=str(chosen_device), rows_per_chunk=rows_per_chunk)
     preparation_seconds = time.perf_counter() - start

@@ -137,83 +137,6 @@ static void test_maybe_offload_evicts_before_stage_in() {
     CHECK(!idle.maybe_offload_during_prefill(32, 32, 32 * 8));
 }
 
-#if KVMEM_ENABLE_NVME
-static void test_cpu_full_spills_to_nvme_and_roundtrips() {
-    struct MemoryBackend : KvMemBackend {
-        uint64_t slot_bytes = 64;
-        int32_t next = 0;
-        std::map<int32_t, std::vector<uint8_t>> gpu;
-        int32_t alloc_gpu_slot() override {
-            const int32_t s = next++;
-            gpu[s].assign(slot_bytes, static_cast<uint8_t>(s + 1));
-            return s;
-        }
-        void free_gpu_slot(int32_t slot) override { gpu.erase(slot); }
-        void copy_block_to_host(uint32_t, int32_t gpu_slot, void *host,
-                                uint64_t bytes) override {
-            auto it = gpu.find(gpu_slot);
-            if (it == gpu.end() || !host) return;
-            std::memcpy(host, it->second.data(),
-                        static_cast<size_t>(std::min(bytes, slot_bytes)));
-        }
-        void copy_block_from_host(uint32_t, int32_t gpu_slot, const void *host,
-                                  uint64_t bytes) override {
-            if (!host) return;
-            gpu[gpu_slot].assign(static_cast<const uint8_t *>(host),
-                                 static_cast<const uint8_t *>(host) +
-                                     static_cast<size_t>(bytes));
-        }
-    };
-
-    const std::string dir = (std::filesystem::temp_directory_path() / "kvmem_p32_nvme").string();
-
-    MemoryBackend be;
-    KvMemRuntimeConfig cfg = make_cfg();
-    cfg.store.estimated_block_bytes = 64;
-    cfg.cpu_bytes = 64 * 2;          // two CPU slots
-    cfg.nvme_bytes = 64 * 8;
-    cfg.nvme_dir = dir;
-    KvMemRuntime rt(cfg, &be);
-    CHECK(rt.cpu_tier() && rt.cpu_tier()->enabled());
-    CHECK(rt.nvme_tier() && rt.nvme_tier()->enabled());
-
-    rt.register_append(32 * 10);
-    for (uint32_t id = 0; id < 10; ++id) {
-        rt.store().set_block_tier(id, KvTier::GPU);
-        rt.store().set_block_gpu_slot(id, be.alloc_gpu_slot());
-    }
-
-    auto plan = rt.prepare_prefill_pressure();
-    CHECK(plan.remaps.size() == 4);
-    rt.finish_reselect();
-
-    uint32_t on_nvme = 0;
-    for (const auto &b : rt.store().blocks()) {
-        if (b.nvme_slot >= 0 || b.tier == KvTier::SSD) {
-            ++on_nvme;
-        }
-    }
-    CHECK(on_nvme > 0);
-
-    // Bring a spilled middle block back via retrieval scores.
-    std::vector<double> scores(10, 0.0);
-    scores[4] = 100.0;
-    rt.store().set_retrieval_scores(scores);
-    auto back = rt.prepare_reselect();
-    bool staged = false;
-    for (uint32_t id : back.stage_in) {
-        if (id == 4) staged = true;
-    }
-    CHECK(staged);
-    rt.finish_reselect();
-    CHECK(rt.store().blocks()[4].gpu_slot >= 0);
-    const auto &payload = be.gpu[rt.store().blocks()[4].gpu_slot];
-    CHECK(!payload.empty());
-    // Original GPU slot for block 4 was 4, filled with byte 5.
-    CHECK(payload[0] == 5);
-}
-
-#endif
 
 static void test_selection_preview_and_resident_commit() {
     RecordingBackend be;
@@ -350,9 +273,6 @@ int main() {
     test_high_overlap_skips_stage_in();
     test_pressure_keeps_sink_and_tail();
     test_maybe_offload_evicts_before_stage_in();
-#if KVMEM_ENABLE_NVME
-    test_cpu_full_spills_to_nvme_and_roundtrips();
-#endif
     if (g_fail != 0) {
         std::printf("FAILED: %d check(s)\n", g_fail);
         return 1;

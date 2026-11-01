@@ -306,8 +306,8 @@ void ProgramImpl::prepare_graphs() {
                 ordinary_host_ingress->tokens[row] = 0;
                 ordinary_host_ingress->cache_positions[row] =
                     checked_i32(frontier, "graph representative ordinary position");
-                ordinary_host_ingress->logical_frontiers[row] =
-                    checked_i32(frontier, "graph representative ordinary RNG frontier");
+                ordinary_host_ingress->sample_positions[row] =
+                    checked_i32(frontier + 1U, "graph representative ordinary sample position");
                 ordinary_host_ingress->rope_positions[row] =
                     checked_i32(frontier, "graph representative ordinary RoPE position");
                 ordinary_host_ingress->text_kv_table_rows[row] = static_cast<std::int32_t>(row);
@@ -330,7 +330,7 @@ void ProgramImpl::prepare_graphs() {
                                         stage_runtime.get(),
                                         rope_yarn,
                                         fast_prefill_kernel,
-                                        mtp_attention_window,
+                                        mtp_attention_window, experts.get(),
                                         memory_candidate_statistics ? &*memory_candidate_statistics : nullptr};
     };
 
@@ -489,10 +489,8 @@ void ProgramImpl::prepare_graphs() {
             // batch>1 copy round also runs the drafter so rows without a copy keep their neural
             // proposal.
             const std::uint32_t family_window = copy ? ngram_draft_window : draft_window;
-            // KVMem sizes the device window to B+R, so DFlash profiles stay on that window and
-            // are validated against it, exactly like the ordinary and MTP families. Each captured
-            // profile uses its own frontier range as the envelope so the captured graph is
-            // identical to the envelope the runtime selects for that profile.
+            // Profiles and target KV use the compact device window. The cyclic draft attention
+            // still receives the logical capacity in its captured envelope.
             const std::uint32_t dflash_capacity =
                 kvmem_window_tokens ? kvmem_window_tokens : capacity;
             DecodeGraphFamily& family         = copy ? ngram_graphs : dflash_graphs;
@@ -550,73 +548,6 @@ void ProgramImpl::prepare_graphs() {
                 }
             }
         }
-
-        // P0-2: a bypassed request runs draftless rounds that skip the neural drafter and verify
-        // the anchor alone at width two. They are captured as their own family for the same reason
-        // the copy rounds are: a different width installs a different executable in the same
-        // topology slot, so mixing them with the neural family would make the two widths evict
-        // each other's graphs on every alternation.
-        {
-            const std::uint32_t family_window = 1U;
-            const std::uint32_t dflash_capacity =
-                kvmem_window_tokens ? kvmem_window_tokens : capacity;
-            const std::uint32_t batch_limit = max_concurrency;
-            const auto batch_one_profiles =
-                dflash_graph_profiles(speculative_backend, dflash_capacity, family_window, 1);
-            validate_graph_profiles(batch_one_profiles, dflash_capacity - 1, "DFlash draftless");
-            execution::DFlashBatchContext draftless_state{
-                execution_core(),
-                decoder->text_kv,
-                *dflash,
-                *io.dflash_decode,
-                *dflash_host_ingress,
-                *dflash_host_egress,
-                state_images->continuation_hidden_store()};
-            draftless_state.ngram                  = false;
-            draftless_state.neural_proposal_drafts = 0U;
-            const GraphExecutionProfile code_warm = batch_one_profiles.front();
-            const ops::CausalAttentionExecutionEnvelope code_warm_target{
-                1,
-                static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                    dflash_capacity,
-                    static_cast<std::uint64_t>(code_warm.max) + family_window + 1ULL))};
-            prepare_representative(code_warm.min, 1, family_window);
-            device.synchronize();
-            execution::dflash_decode_batch(draftless_state, 1, family_window,
-                                           dflash_envelopes(code_warm.min, code_warm.max, capacity),
-                                           code_warm_target, nullptr);
-            device.synchronize();
-
-            draftless_graphs.profiles.reserve(batch_one_profiles.size() * batch_limit);
-            for (std::uint32_t batch_size = 1; batch_size <= batch_limit; ++batch_size) {
-                const auto planned_profiles =
-                    batch_size == 1
-                        ? batch_one_profiles
-                        : dflash_graph_profiles(speculative_backend, dflash_capacity,
-                                                family_window, batch_size);
-                validate_graph_profiles(planned_profiles, dflash_capacity - 1, "DFlash draftless");
-                for (const GraphExecutionProfile planned : planned_profiles) {
-                    draftless_graphs.profiles.emplace_back();
-                    DecodeGraphProfile& profile    = draftless_graphs.profiles.back();
-                    profile.batch_size             = batch_size;
-                    profile.min_execution_frontier = planned.min;
-                    profile.max_execution_frontier = planned.max;
-                    // Like a copy round, a draftless round selects by its own width.
-                    profile.verify_window = family_window;
-                    profile.topology_class =
-                        planned.topology_class * max_concurrency + (batch_size - 1U);
-                    const ops::CausalAttentionExecutionEnvelope target_envelope{
-                        1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                               dflash_capacity,
-                               static_cast<std::uint64_t>(planned.max) + family_window + 1ULL))};
-
-                    execution::capture_dflash_decode_batch(
-                        draftless_state, static_cast<std::int32_t>(batch_size), family_window,
-                        dflash_envelopes(planned.min, planned.max, capacity), target_envelope,
-                        profile.definition);
-                }
-            }
-        }
     }
 
     const auto prepare_profile = [&](const DecodeGraphProfile& profile) {
@@ -631,9 +562,6 @@ void ProgramImpl::prepare_graphs() {
     }
     if (is_masked_draft_backend(speculative_backend)) {
         instantiate_graph_family(dflash_graphs, "DFlash", device, prepare_profile);
-    }
-    if (!draftless_graphs.profiles.empty()) {
-        instantiate_graph_family(draftless_graphs, "DFlash draftless", device, prepare_profile);
     }
     if (!ngram_graphs.profiles.empty()) {
         instantiate_graph_family(ngram_graphs, "ngram", device, prepare_profile);

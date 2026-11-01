@@ -70,7 +70,9 @@ def _round_e4m3fn_rne(values: np.ndarray) -> np.ndarray:
     return words
 
 
-def _quantize_host_rows(host: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _quantize_host_rows(
+    host: np.ndarray, scale_dtype: torch.dtype = torch.bfloat16
+) -> tuple[np.ndarray, np.ndarray]:
     if host.dtype != np.float32 or host.ndim != 2:
         raise TypeError("FP8 quantization rows must be a rank-two binary32 array")
     if not np.isfinite(host).all():
@@ -80,11 +82,17 @@ def _quantize_host_rows(host: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     zero_rows = max_abs == np.float32(0.0)
     with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
         raw_scale = (max_abs.astype(np.float64) / float(_E4M3FN_MAX)).astype(np.float32)
-    scale_words = _bf16_rne_words(raw_scale)
-    underflow = (scale_words == 0) & ~zero_rows
-    scale_words[underflow] = _BF16_MIN_SUBNORMAL_WORD
-
-    scale32 = _bf16_words_to_float32(scale_words)
+    if scale_dtype == torch.bfloat16:
+        scale_words = _bf16_rne_words(raw_scale)
+        scale_words[(scale_words == 0) & ~zero_rows] = _BF16_MIN_SUBNORMAL_WORD
+        scale32 = _bf16_words_to_float32(scale_words)
+    elif scale_dtype == torch.float16:
+        with np.errstate(over="ignore"):
+            scale_words = raw_scale.astype(np.float16).view(np.uint16)
+        scale_words[(scale_words == 0) & ~zero_rows] = np.uint16(1)
+        scale32 = scale_words.view(np.float16).astype(np.float32)
+    else:
+        raise ValueError("FP8 row scales must be BF16 or FP16")
     invalid_scale = (~zero_rows) & (
         ~np.isfinite(scale32) | (scale32 <= np.float32(0.0))
     )
@@ -102,20 +110,25 @@ def _quantize_host_rows(host: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     if not np.isfinite(normalized[~zero_rows]).all():
         raise ValueError("FP8 quantization normalization produced a non-finite value")
     bounded = np.clip(normalized, -_E4M3FN_MAX, _E4M3FN_MAX)
-    codes = _round_e4m3fn_rne(bounded)
+    codes = (
+        torch.from_numpy(bounded).to(torch.float8_e4m3fn).view(torch.uint8).numpy()
+        if scale_dtype == torch.float16 else _round_e4m3fn_rne(bounded)
+    )
     codes[zero_rows] = 0
     return codes, scale_words
 
 
-def quantize_bf16_rows(weight: torch.Tensor) -> RowScaledFp8Words:
-    """Quantize BF16 ``[N,K]`` values to E4M3FN codes and BF16 row scales."""
+def quantize_bf16_rows(
+    weight: torch.Tensor, *, scale_dtype: torch.dtype = torch.bfloat16
+) -> RowScaledFp8Words:
+    """Quantize BF16 ``[N,K]`` values to E4M3FN codes and BF16 or FP16 row scales."""
 
     if weight.dtype != torch.bfloat16 or weight.dim() != 2:
         raise TypeError("FP8 quantization source must be a rank-two BF16 tensor")
     if any(dim <= 0 for dim in weight.shape):
         raise ValueError("FP8 quantization source dimensions must be positive")
     host = weight.detach().to(device="cpu", dtype=torch.float32).numpy()
-    code_words, scale_words = _quantize_host_rows(host)
+    code_words, scale_words = _quantize_host_rows(host, scale_dtype)
     codes = torch.from_numpy(code_words.copy())
     signed_scales = torch.from_numpy(scale_words.view(np.int16).copy())
-    return RowScaledFp8Words(codes, signed_scales.view(torch.bfloat16))
+    return RowScaledFp8Words(codes, signed_scales.view(scale_dtype))

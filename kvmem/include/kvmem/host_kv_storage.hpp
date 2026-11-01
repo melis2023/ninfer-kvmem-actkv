@@ -69,6 +69,10 @@ public:
     explicit operator bool() const noexcept { return !empty(); }
     HostKvLease lease() const;
     HostKvSource source() const;
+    // Share sealed bytes across owners without pinning their RAM tier. The first
+    // write by either owner detaches; quota is charged once until then.
+    HostKvRecord fork() const;
+    const void * storage_identity() const noexcept { return allocation_.get(); }
     // Owner-only query: a mutable buffer cannot be relocated. The owner must
     // serialize this check with sealing and writable borrows.
     bool mutable_resident() const noexcept;
@@ -126,6 +130,8 @@ public:
     // Leased/mutable records remain resident. Failure preserves their valid bytes.
     void trim(uint64_t resident_target);
 private:
+    friend class HostKvRecord;
+    explicit HostKvStorage(std::shared_ptr<detail::HostKvAccount> account);
     std::shared_ptr<detail::HostKvAccount> account_;
 };
 } // namespace kvmem

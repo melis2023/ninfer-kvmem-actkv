@@ -19,13 +19,17 @@ class DirectFormat:
 
 @dataclass(frozen=True, slots=True)
 class QuantFormat:
-    """Signed grouped codes with one binary16 multiplier per group."""
+    """Grouped integer values with one binary16 multiplier per group.
+
+    Q2's stored code is the integer value plus one; other formats use two's complement.
+    """
 
     name: str
     bits: int
     group_size: int
     qmin: int
     qmax: int
+    code_bias: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,9 +42,10 @@ class Nvfp4Format:
 
 @dataclass(frozen=True, slots=True)
 class Fp8RowFormat:
-    """E4M3FN weights with one BF16 multiplier per logical row."""
+    """E4M3FN weights with one 16-bit multiplier per logical row."""
 
     name: str
+    scale_dtype: str = "bf16"
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +71,7 @@ BF16 = DirectFormat("bf16", 2)
 FP32 = DirectFormat("fp32", 4)
 INT32 = DirectFormat("int32", 4)
 
+Q2_G64_FP16 = QuantFormat("q2_g64_fp16", 2, 64, -1, 2, code_bias=1)
 Q4_G64_FP16 = QuantFormat("q4_g64_fp16", 4, 64, -8, 7)
 Q5_G64_FP16 = QuantFormat("q5_g64_fp16", 5, 64, -16, 15)
 Q6_G64_FP16 = QuantFormat("q6_g64_fp16", 6, 64, -32, 31)
@@ -73,8 +79,12 @@ Q8_G32_FP16 = QuantFormat("q8_g32_fp16", 8, 32, -127, 127)
 # Ternary: two-bit two's-complement codes over {-1, 0, +1} (0b10 is outside the language),
 # one binary16 multiplier per 128 columns; the native form of ternary checkpoints.
 T2_G128_FP16 = QuantFormat("t2_g128_fp16", 2, 128, -1, 1)
+# bits describes the logical ternary code domain; PTQ1 uses its own base-3 codec.
+PTQ1_G128_FP16 = QuantFormat("ptq1_g128_fp16", 2, 128, -1, 1)
+T5_G128_FP16 = QuantFormat("t5_g128_fp16", 2, 128, -1, 1)
 NVFP4 = Nvfp4Format("nvfp4", 16)
 FP8_E4M3FN_ROW_BF16 = Fp8RowFormat("fp8_e4m3fn_row_bf16")
+FP8_E4M3FN_ROW_FP16 = Fp8RowFormat("fp8_e4m3fn_row_fp16", "fp16")
 
 # ggml block types (ggml-common.h), kept byte for byte.
 GGUF_Q2_K = GgufFormat("gguf_q2_k", 10, 256, 84)
@@ -102,11 +112,13 @@ DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP32, INT3
 QUANT_FORMATS = MappingProxyType(
     {
         item.name: item
-        for item in (Q4_G64_FP16, Q5_G64_FP16, Q6_G64_FP16, Q8_G32_FP16, T2_G128_FP16)
+        for item in (Q2_G64_FP16, Q4_G64_FP16, Q5_G64_FP16, Q6_G64_FP16, Q8_G32_FP16, T2_G128_FP16, PTQ1_G128_FP16, T5_G128_FP16)
     }
 )
 NVFP4_FORMATS = MappingProxyType({NVFP4.name: NVFP4})
-FP8_ROW_FORMATS = MappingProxyType({FP8_E4M3FN_ROW_BF16.name: FP8_E4M3FN_ROW_BF16})
+FP8_ROW_FORMATS = MappingProxyType(
+    {item.name: item for item in (FP8_E4M3FN_ROW_BF16, FP8_E4M3FN_ROW_FP16)}
+)
 GGUF_FORMATS = MappingProxyType(
     {
         item.name: item
@@ -218,12 +230,14 @@ __all__ = [
     "BF16",
     "FP32",
     "INT32",
+    "Q2_G64_FP16",
     "Q4_G64_FP16",
     "Q5_G64_FP16",
     "Q6_G64_FP16",
     "Q8_G32_FP16",
     "NVFP4",
     "FP8_E4M3FN_ROW_BF16",
+    "FP8_E4M3FN_ROW_FP16",
     "DIRECT_FORMATS",
     "QUANT_FORMATS",
     "NVFP4_FORMATS",

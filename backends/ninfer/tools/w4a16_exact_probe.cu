@@ -59,7 +59,7 @@
 //
 // So the A8 path is permitted ten times the A16 error and A4 forty times, and the constants are
 // named for what they are. The A4 route also runs against dedicated artifacts --
-// model-cards/Qwen3.8-27B-nvfp4-NInfer, Qwen3.6-27B-nvfp4-NInfer -- whose weights are built for
+// neroued/Qwen3.8-27B-nvfp4-NInfer, Qwen3.6-27B-nvfp4-NInfer -- whose weights are built for
 // 4-bit activation execution rather than being groupwise-int reinterpreted.
 //
 // That means the sm_120a speed advantage is not a free gap the sm_86 fork is missing. It is partly

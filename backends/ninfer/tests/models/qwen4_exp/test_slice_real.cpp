@@ -171,14 +171,10 @@ void hc_read(Context& c, const std::string& prefix, Tensor& mixed, Tensor* injec
     Device up(c.ckpt.bytes(prefix + "input_mix_weight_up.weight"));
     std::unique_ptr<Device> inject_rows;
     Tensor t_norm(norm.buffer.p, DType::BF16, {kWidth});
-    Tensor t_down(down.buffer.p, DType::BF16, {kWidth, kLowrank});
-    Tensor t_up(up.buffer.p, DType::BF16, {kLowrank, kWidth});
-    Tensor t_inject;
-    ops::HyperConnectionWeights weights{&t_norm, &t_down, &t_up, nullptr};
+    ops::HyperConnectionWeights weights{&t_norm, {down.buffer.p}, {up.buffer.p}, {}};
     if (inject) {
         inject_rows = std::make_unique<Device>(c.ckpt.bytes(prefix + "block_inject_weight.weight"));
-        t_inject = Tensor(inject_rows->buffer.p, DType::BF16, {kWidth, kHC});
-        weights.inject = &t_inject;
+        weights.inject = {inject_rows->buffer.p};
     }
     WorkspaceArena workspace(ops::hyper_connection_read_workspace_bytes(kHC, kH, kLowrank, c.tokens));
     ops::hyper_connection_read(c.stack, weights, kEps, workspace, mixed, inject, c.device.stream);
@@ -331,9 +327,10 @@ void qsa(Context& c, int layer, const Tensor& a, Tensor& y) {
     Tensor t_pooled(pooled.buffer.p, DType::FP32, {128, capacity}), t_tail(tail.buffer.p, DType::FP32, {128, 3}),
         t_selected(selected.buffer.p, DType::I32, {512, T}), t_counts(counts.buffer.p, DType::I32, {T});
     const ops::QsaIndexerWeights iw{&t_iqn, &t_ikn};
-    ops::qsa_indexer_append(t_index, c.positions, iw, kEps, t_pooled, t_tail, c.device.stream);
+    ops::qsa_indexer_append(t_index, c.positions, iw, kEps, ops::RopeYarn{}, t_pooled, t_tail, c.device.stream);
     WorkspaceArena sws(ops::qsa_indexer_select_workspace_bytes(T, capacity));
-    ops::qsa_indexer_select(t_index, c.positions, iw, kEps, t_pooled, sws, t_selected, t_counts, c.device.stream);
+    ops::qsa_indexer_select(t_index, c.positions, iw, kEps, ops::RopeYarn{}, t_pooled, sws, t_selected, t_counts,
+                            c.device.stream);
     Device attn(static_cast<std::size_t>(6144) * T * 2);
     Tensor t_attn(attn.buffer.p, DType::BF16, {256, 24, T});
     WorkspaceArena attention_ws(ops::sparse_softmax_attention_workspace_bytes(T));

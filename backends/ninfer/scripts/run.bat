@@ -17,8 +17,8 @@ rem
 rem Every measurement behind these defaults, the memory model, and the reasoning for each flag are
 rem in docs\maintainer\launcher-profiles.md. What follows is what you need to run it.
 rem
-rem QWEN3.8-27B, `tuned`: two flag sets, each measured (docs\performance.md, "Recommended
-rem configurations"), chosen with NINFER_SPEC. The default is the fast one.
+rem QWEN3.8-27B, `tuned`: two flag sets, each measured (docs\maintainer\launcher-profiles.md),
+rem chosen with NINFER_SPEC. The default is the fast one.
 rem
 rem   NINFER_SPEC=dflash2 (default): fastest at one stream, 172,032 tokens of context
 rem

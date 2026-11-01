@@ -78,15 +78,21 @@ kv_cache_nvfp4_quantize_group16(const float* source) {
     return result;
 }
 
-// Two E2M1 codes per byte as halves, using the 8-entry E2M1 table and the sign bit.
+// Two E2M1 codes (the low byte of `codes`, low nibble first) as FP16 by integer operations: every
+// E2M1 magnitude is an FP16 with a zero low byte, so a byte permute looks the high bytes up and
+// the sign bits are moved in. This is for targets without a hardware E2M1 conversion.
 __device__ __forceinline__ __half2 kv_cache_e2m1x2_to_half2(unsigned codes) {
     const unsigned select = ((codes & 0x7u) << 4) | ((codes & 0x70u) << 8);
     const unsigned bits   = __byte_perm(0x3E3C3800u, 0x46444240u, select) | ((codes & 0x8u) << 12) |
                             ((codes & 0x80u) << 24);
     return *reinterpret_cast<const __half2*>(&bits);
 }
+
 __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_f16x8(const std::uint8_t* codes,
                                                              std::uint8_t scale_code) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    // Blackwell keeps its native packed conversions; the software expansion below
+    // avoids outlined conversions on pre-Blackwell devices.
     // Every finite E2M1 value times a legal nonnegative E4M3 cache scale is exactly representable
     // in FP16 (at most four product fraction bits and magnitude <= 2688). Half2 multiplication is
     // therefore the exact FP16 expansion boundary, not an additional approximation.
@@ -106,6 +112,37 @@ __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_f16x8(const std::uint8_t*
     }
     return make_int4(static_cast<int>(half_bits[0]), static_cast<int>(half_bits[1]),
                      static_cast<int>(half_bits[2]), static_cast<int>(half_bits[3]));
+
+#else
+    // Every finite E2M1 value times a legal nonnegative E4M3 cache scale is exactly representable
+    // in FP16 (at most four product fraction bits and magnitude <= 2688). Half2 multiplication is
+    // therefore the exact FP16 expansion boundary, not an additional approximation.
+    //
+    // Neither operand goes through the vendor conversions. On sm_86/sm_89 ptxas outlines
+    // __nv_fp4x2_e2m1 and __nv_fp8_e4m3 into calls carrying BSSY/BSYNC and a divide fixup, and
+    // this path is issue-bound on them: the nvfp4 prompt-attention kernel held 88 CALL.REL where
+    // its bf16 counterpart holds 3. kv_cache_e2m1x2_to_half2 above is the expansion the sm70 path
+    // already runs; the scale comes from the ue4m3 table the weight codec reads, whose entries are
+    // exactly half the vendor value, so doubling it is exact.
+    //
+    // Bit-exactness: an E2M1 magnitude is an FP16 with a zero low byte, so the permuted pattern is
+    // the same value the vendor conversion returns, and both scale routes land on the same
+    // representable half. The one input the two disagree on is a 0x7F scale byte, which the
+    // quantizer cannot emit (it converts a value clamped into [2^-9, 448] with __NV_SATFINITE).
+    const float scale_f  = detail::kNvfp4E4M3ScaleA16[scale_code] * 2.0F;
+    const __half2 scale2 = __float2half2_rn(scale_f);
+    const std::uint32_t packed = load_vec<std::uint32_t>(codes);
+    const std::uint8_t* bytes  = reinterpret_cast<const std::uint8_t*>(&packed);
+    unsigned half_bits[4];
+#pragma unroll
+    for (int pair = 0; pair < 4; ++pair) {
+        const __half2 value = __hmul2(kv_cache_e2m1x2_to_half2(bytes[pair]), scale2);
+        half_bits[pair]     = *reinterpret_cast<const unsigned*>(&value);
+    }
+    return make_int4(static_cast<int>(half_bits[0]), static_cast<int>(half_bits[1]),
+                     static_cast<int>(half_bits[2]), static_cast<int>(half_bits[3]));
+
+#endif
 }
 
 // BF16 counterpart of kv_cache_nvfp4_dequant_f16x8, for QK MMA operands on hardware with no FP4
@@ -113,6 +150,9 @@ __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_f16x8(const std::uint8_t*
 // Q's storage) instead of FP16.
 __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_bf16x8(const std::uint8_t* codes,
                                                               std::uint8_t scale_code) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    // Blackwell keeps its native packed conversions; the software expansion below
+    // avoids outlined conversions on pre-Blackwell devices.
     const std::uint32_t packed = load_vec<std::uint32_t>(codes);
     const std::uint8_t* bytes  = reinterpret_cast<const std::uint8_t*>(&packed);
     __nv_fp8_e4m3 encoded_scale;
@@ -130,6 +170,26 @@ __device__ __forceinline__ int4 kv_cache_nvfp4_dequant_bf16x8(const std::uint8_t
     }
     return make_int4(static_cast<int>(bf16_bits[0]), static_cast<int>(bf16_bits[1]),
                      static_cast<int>(bf16_bits[2]), static_cast<int>(bf16_bits[3]));
+
+#else
+    // Same two substitutions as the FP16 form above, and the same reasoning: the E2M1 half2 the
+    // sm70 path builds carries the exact value, so widening it to FP32 and multiplying by the
+    // table-derived scale reproduces the vendor expression bit for bit.
+    const float scale_f        = detail::kNvfp4E4M3ScaleA16[scale_code] * 2.0F;
+    const std::uint32_t packed = load_vec<std::uint32_t>(codes);
+    const std::uint8_t* bytes  = reinterpret_cast<const std::uint8_t*>(&packed);
+    unsigned bf16_bits[4];
+#pragma unroll
+    for (int pair = 0; pair < 4; ++pair) {
+        const float2 decoded = __half22float2(kv_cache_e2m1x2_to_half2(bytes[pair]));
+        const __nv_bfloat162 value =
+            __floats2bfloat162_rn(decoded.x * scale_f, decoded.y * scale_f);
+        bf16_bits[pair] = *reinterpret_cast<const unsigned*>(&value);
+    }
+    return make_int4(static_cast<int>(bf16_bits[0]), static_cast<int>(bf16_bits[1]),
+                     static_cast<int>(bf16_bits[2]), static_cast<int>(bf16_bits[3]));
+
+#endif
 }
 
 struct KVCacheNvfp4DequantizedF16x16 {
@@ -139,6 +199,9 @@ struct KVCacheNvfp4DequantizedF16x16 {
 
 __device__ __forceinline__ KVCacheNvfp4DequantizedF16x16
 kv_cache_nvfp4_dequant_f16x16(const std::uint8_t* codes, std::uint8_t scale_code) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    // Blackwell keeps its native packed conversions; the software expansion below
+    // avoids outlined conversions on pre-Blackwell devices.
     const int2 packed         = load_vec<int2>(codes);
     const std::uint8_t* bytes = reinterpret_cast<const std::uint8_t*>(&packed);
     __nv_fp8_e4m3 encoded_scale;
@@ -159,6 +222,26 @@ kv_cache_nvfp4_dequant_f16x16(const std::uint8_t* codes, std::uint8_t scale_code
         make_int4(static_cast<int>(half_bits[4]), static_cast<int>(half_bits[5]),
                   static_cast<int>(half_bits[6]), static_cast<int>(half_bits[7])),
     };
+
+#else
+    const float scale_f  = detail::kNvfp4E4M3ScaleA16[scale_code] * 2.0F;
+    const __half2 scale2 = __float2half2_rn(scale_f);
+    const int2 packed         = load_vec<int2>(codes);
+    const std::uint8_t* bytes = reinterpret_cast<const std::uint8_t*>(&packed);
+    unsigned half_bits[8];
+#pragma unroll
+    for (int pair = 0; pair < 8; ++pair) {
+        const __half2 value = __hmul2(kv_cache_e2m1x2_to_half2(bytes[pair]), scale2);
+        half_bits[pair]     = *reinterpret_cast<const unsigned*>(&value);
+    }
+    return {
+        make_int4(static_cast<int>(half_bits[0]), static_cast<int>(half_bits[1]),
+                  static_cast<int>(half_bits[2]), static_cast<int>(half_bits[3])),
+        make_int4(static_cast<int>(half_bits[4]), static_cast<int>(half_bits[5]),
+                  static_cast<int>(half_bits[6]), static_cast<int>(half_bits[7])),
+    };
+
+#endif
 }
 
 } // namespace ninfer::ops

@@ -252,14 +252,9 @@ void ProgramImpl::retire_continuation_slot(std::uint32_t index) noexcept {
     sequence.text_kv_valid           = 0;
     sequence.mtp_kv_valid            = 0;
     sequence.dflash_context_frontier = 0;
-    sequence.dflash_pending_base     = 0;
-    sequence.dflash_pending_valid    = false;
-    // A recycled slot starts with an empty draft ring. Without clearing the floor a stale value
-    // from a longer previous request masks every ring row of the next (shorter) one, so the
-    // draft silently reads nothing and acceptance collapses to ~0.
-    sequence.dflash_context_floor    = 0;
-    sequence.dflash_state_slot       = -1;
+    sequence.dflash_context_floor = 0;
     sequence.mtp_draft_count         = 0;
+    sequence.mtp_drafts_pending      = false;
     sequence.tail_hidden_valid       = false;
     sequence.endpoint_valid          = false;
     sequence.rewrite_checkpoint      = {};
@@ -979,9 +974,60 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle sequence,
         // Engine owns resource settlement. Keep the sequence capability valid
         // until it can abort this request outside any peer's open transaction.
         throw;
+    } catch (const runtime::RequestResourceError&) {
+        // Deferred CPU Vision loading can fail before this unit executes. Like a storage
+        // failure, it is request-local: preserve ownership for the Engine's ordered abort.
+        throw;
     } catch (...) {
         const Clock::time_point cleanup_started = Clock::now();
         clear_execution_failure_lanes(std::span<const std::uint32_t>(&lane, 1));
+        if (failed_timing != nullptr) {
+            failed_timing->post_host_ns += elapsed_ns(cleanup_started);
+        }
+        throw;
+    }
+}
+
+std::optional<PrefillBatchUnit>
+ProgramImpl::prefill_batch_unit(SequenceHandle sequence) const noexcept {
+    if (pending_transaction_ || !valid_sequence(sequence)) { return std::nullopt; }
+    try {
+        return prefill_batch_unit(ContractAccess::lane(sequence).value);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+std::uint32_t ProgramImpl::pending_branch_tokens(SequenceHandle sequence) const noexcept {
+    if (!valid_sequence(sequence)) { return 0; }
+    const RequestControl& request = requests[ContractAccess::lane(sequence).value];
+    if (request.branches == nullptr || !request.prefill) { return 0; }
+    std::uint32_t tokens = 0;
+    for (std::size_t branch = request.prefill->next_branch; branch < request.branches->size();
+         ++branch) {
+        tokens += static_cast<std::uint32_t>((*request.branches)[branch].tokens.size());
+    }
+    return tokens;
+}
+
+runtime::ExecutionTiming ProgramImpl::prefill_batch(std::span<const SequenceHandle> sequences,
+                                                    runtime::ExecutionTiming* failed_timing) {
+    if (pending_transaction_ || sequences.empty() || sequences.size() > max_concurrency) {
+        throw std::logic_error("batched prefill membership is invalid");
+    }
+    std::array<std::uint32_t, kMaximumConcurrency> lanes{};
+    for (std::size_t row = 0; row < sequences.size(); ++row) {
+        if (!valid_sequence(sequences[row])) {
+            throw std::logic_error("prefill sequence capability is invalid");
+        }
+        lanes[row] = ContractAccess::lane(sequences[row]).value;
+    }
+    const std::span<const std::uint32_t> members(lanes.data(), sequences.size());
+    try {
+        return advance_prefill_batch(members, failed_timing);
+    } catch (...) {
+        const Clock::time_point cleanup_started = Clock::now();
+        clear_execution_failure_lanes(members);
         if (failed_timing != nullptr) {
             failed_timing->post_host_ns += elapsed_ns(cleanup_started);
         }
@@ -1166,48 +1212,6 @@ bool ProgramImpl::state_exclusive_to_sequence(const SequenceState& sequence,
            owned_checkpoint_references(sequence, state);
 }
 
-void ProgramImpl::clamp_masked_draft_floor(SequenceState& sequence) noexcept {
-    if (sequence.dflash_context_floor > sequence.dflash_context_frontier) {
-        sequence.dflash_context_floor = sequence.dflash_context_frontier;
-    }
-}
-
-std::uint32_t ProgramImpl::masked_draft_ring_capacity() const noexcept {
-    if (!is_masked_draft_backend(speculative_backend)) { return 0U; }
-    const auto& draft = parameters.model.config().draft;
-    return draft ? draft->sliding_window.value_or(0U) : 0U;
-}
-
-void ProgramImpl::sync_masked_draft_frontier(SequenceState& sequence) {
-    if (speculative_backend != SpeculativeBackend::DFlash2 || !io.dflash_decode || !dflash) {
-        return;
-    }
-    // pending_features is the last decode round's target hidden. A prefill checkpoint owns its
-    // features in prefill_features, so only close a decode-round gap here. If the sequence is
-    // still prefilling, or the two frontiers disagree, leave the checkpoint validation to reject
-    // the capture instead of appending the wrong feature rows.
-    if (requests[sequence.lane].prefill.has_value() ||
-        sequence.execution_frontier != sequence.text_kv_valid || sequence.state.fork_pending) {
-        return;
-    }
-    const std::uint32_t frontier = sequence.text_kv_valid;
-    if (frontier <= sequence.dflash_context_frontier) { return; }
-    const std::uint32_t gap = frontier - sequence.dflash_context_frontier;
-    const std::uint32_t widest = widest_verify_window() + 1U;
-    if (gap > widest) {
-        throw std::logic_error("masked-draft checkpoint gap exceeds the last round's features");
-    }
-    const std::array<std::uint32_t, 1> lanes{sequence.lane};
-    const std::array<std::uint32_t, 1> starts{sequence.dflash_context_frontier};
-    const std::array<std::uint32_t, 1> counts{gap};
-    enqueue_dflash_context_append(lanes, starts, counts);
-    device.synchronize();
-    sequence.dflash_context_frontier = frontier;
-    if (kvmem_options.verify_transfers) {
-        std::fprintf(stderr, "KVMEM_DFLASH_SYNC frontier=%u gap=%u\n", frontier, gap);
-    }
-}
-
 void ProgramImpl::refresh_state_views(SequenceState& sequence) {
     sequence.tail_hidden               = {};
     sequence.rewrite_checkpoint_hidden = {};
@@ -1224,10 +1228,6 @@ void ProgramImpl::refresh_state_views(SequenceState& sequence) {
         sequence.rewrite_checkpoint_hidden = state_images->continuation_hidden_slot(
             state_store->physical_slot(*sequence.rewrite_state));
     }
-    // Every frontier transition passes through here (request admission, prefix reuse,
-    // materialization, checkpoint restore, prefill chunk binds), and several of them rewrite the
-    // frontier without touching the floor.
-    clamp_masked_draft_floor(sequence);
 }
 
 void ProgramImpl::reserve_state_entitlement(SequenceState& sequence, std::uint32_t slots) {
@@ -1505,44 +1505,6 @@ std::uint32_t ProgramImpl::backend_kv_valid(const SequenceState& sequence) const
         return sequence.dflash_context_frontier;
     }
     return 0;
-}
-
-void ProgramImpl::set_backend_kv_valid(SequenceState& sequence, std::uint32_t frontier) noexcept {
-    if (speculative_backend == SpeculativeBackend::Mtp) {
-        sequence.mtp_kv_valid = frontier;
-        return;
-    }
-    if (speculative_backend == SpeculativeBackend::DFlash) {
-        sequence.dflash_context_frontier = frontier;
-        sequence.dflash_pending_base     = frontier;
-        sequence.dflash_pending_valid    = false;
-    }
-}
-
-std::uint32_t ProgramImpl::kvmem_backend_frontier(const SequenceState& sequence) const noexcept {
-    if (speculative_backend == SpeculativeBackend::Mtp) { return sequence.mtp_kv_valid; }
-    // Both masked draft backends maintain dflash_context_frontier (see commit.cpp, which
-    // repairs a lagging masked-draft frontier by appending the gap). backend_kv_valid()
-    // narrows this to DFlash on purpose; the KVMem window needs the real value for DFlash2.
-    if (speculative_backend == SpeculativeBackend::DFlash ||
-        speculative_backend == SpeculativeBackend::DFlash2) {
-        return sequence.dflash_context_frontier;
-    }
-    return 0;
-}
-
-void ProgramImpl::kvmem_set_backend_frontier(SequenceState& sequence,
-                                             std::uint32_t frontier) noexcept {
-    if (speculative_backend == SpeculativeBackend::Mtp) {
-        sequence.mtp_kv_valid = frontier;
-        return;
-    }
-    if (speculative_backend == SpeculativeBackend::DFlash ||
-        speculative_backend == SpeculativeBackend::DFlash2) {
-        sequence.dflash_context_frontier = frontier;
-        sequence.dflash_pending_base     = frontier;
-        sequence.dflash_pending_valid    = false;
-    }
 }
 
 void ProgramImpl::resize_sequence_kv_entitlement(SequenceState& sequence, std::uint32_t text_pages,
@@ -1933,10 +1895,7 @@ void ProgramImpl::ordered_reset(SequenceState& sequence) {
     sequence.text_kv_valid           = 0;
     sequence.mtp_kv_valid            = 0;
     sequence.dflash_context_frontier = 0;
-    sequence.dflash_pending_base     = 0;
-    sequence.dflash_pending_valid    = false;
-    sequence.dflash_context_floor    = 0;
-    sequence.dflash_state_slot       = -1;
+    sequence.dflash_context_floor = 0;
 }
 
 

@@ -34,6 +34,146 @@ int check(bool condition, const char* message) {
 
 int run_tests() {
     int failures = 0;
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--vision-cpu"}).cpu_vision_idle_seconds == 300,
+                      "CPU Vision CLI default idle timeout is not five minutes");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--vision-cpu", "--cpu-vision-idle-seconds", "0"}).cpu_vision_idle_seconds == 0,
+                      "CPU Vision CLI cannot disable idle eviction");
+    failures += check(rejects([] { (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--cpu-vision-idle-seconds", "-1"}); }),
+                      "CLI accepted a negative CPU Vision idle timeout");
+
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--gpu-clock-floor",
+                             "1500"}).gpu_clock_floor_mhz == 1500 &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x"})
+                                  .gpu_clock_floor_mhz == 0,
+                      "--gpu-clock-floor was not parsed, or is not off by default");
+    for (const char* value : {"0", "5001", "fast"}) {
+        failures += check(rejects([&] {
+                              (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                           "--gpu-clock-floor", value});
+                          }),
+                          "--gpu-clock-floor accepted 0, 5001 or a word");
+    }
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x"})
+                          .speculative.draft_min_p == 0, "draft confidence must be opt-in");
+    for (const auto* floor : {"0", "0.3", "1"}) {
+        failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "mtp",
+                                "--draft-tokens", "4", "--draft-min-p", floor})
+                              .speculative.draft_min_p == std::stof(floor),
+                          "CLI did not preserve draft confidence");
+    }
+    for (const auto* floor : {"-0.1", "1.1", "nan", "inf", "0.3x"}) {
+        failures += check(rejects([&] {
+            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "mtp",
+                         "--draft-tokens", "4", "--draft-min-p", floor});
+        }), "CLI accepted invalid draft confidence");
+    }
+    for (const auto* backend : {"dflash", "dflash2"}) {
+        failures += check(rejects([&] {
+            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", backend,
+                         "--draft-tokens", "4", "--draft-min-p", "0.3"});
+        }), "CLI accepted draft confidence outside MTP");
+    }
+    failures += check(rejects([] {
+        (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--draft-min-p", "0.3"});
+    }), "CLI accepted draft confidence without MTP");
+    {
+        // Without --spec the Engine chooses; --spec none and every backend are explicit.
+        const auto unset = parse({"ninfer-cli", "model.ninfer", "--prompt", "x"}).speculative;
+        const auto none  = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "none"}).speculative;
+        const auto mtp   = parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--spec", "mtp",
+                                  "--draft-tokens", "4"}).speculative;
+        failures += check(unset.automatic && unset.backend == ninfer::SpeculativeBackend::None &&
+                              !none.automatic && none.backend == ninfer::SpeculativeBackend::None &&
+                              !mtp.automatic && mtp.backend == ninfer::SpeculativeBackend::Mtp,
+                          "CLI did not leave the backend to the Engine only without --spec");
+    }
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                             "--expert-residency", "host"}).hybrid_experts.dma_share.has_value() == false,
+                      "CLI must default the expert DMA share to automatic");
+    {
+        // --kv-resident: unset (auto) leaves the choice to the Engine, all keeps every position.
+        const auto resident = [&](std::vector<std::string> tail) {
+            std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt", "x"};
+            args.insert(args.end(), tail.begin(), tail.end());
+            return parse(args).kv_resident_positions;
+        };
+        failures += check(!resident({}) && resident({"--kv-resident", "4096"}) == 4096U &&
+                              resident({"--kv-resident", "all"}) == 0U &&
+                              !resident({"--kv-resident", "4096", "--kv-resident", "auto"}),
+                          "CLI did not preserve --kv-resident");
+        for (const auto* value : {"0", "-1", "12x", "", "All"}) {
+            failures += check(rejects([&] { (void)resident({"--kv-resident", value}); }),
+                              "CLI accepted an invalid --kv-resident");
+        }
+    }
+    for (const auto* share : {"0", "0.25", "1"}) {
+        const auto hybrid = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+            "--expert-residency", "host", "--expert-dma-share", share,
+            "--expert-cpu-threads", "8", "--expert-cache-adaptive",
+            "--expert-profile", "routes.json", "--expert-profile-out", "recorded.json"});
+        failures += check(hybrid.hybrid_experts.dma_share == std::stof(share) &&
+            hybrid.hybrid_experts.cpu_threads == 8 && hybrid.hybrid_experts.adaptive_cache &&
+            hybrid.hybrid_experts.routing_profile == "routes.json" &&
+            hybrid.hybrid_experts.record_profile == "recorded.json",
+            "CLI did not preserve the native hybrid configuration");
+    }
+    {
+        const auto automatic = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+            "--expert-residency", "host", "--expert-dma-share", "auto"});
+        const auto fixed_after = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+            "--expert-dma-share", "auto", "--expert-dma-share", "0.5"});
+        failures += check(!automatic.hybrid_experts.dma_share &&
+                              fixed_after.hybrid_experts.dma_share == 0.5F,
+                          "CLI did not preserve an automatic hybrid DMA share");
+    }
+    for (const auto* share : {"-0.1", "1.1", "nan", "inf", "0.5x", "Auto"}) {
+        failures += check(rejects([&] {
+            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-dma-share", share});
+        }), "CLI accepted an invalid hybrid DMA share");
+    }
+    for (const auto* threads : {"0", "257", "-1", "1.5"}) {
+        failures += check(rejects([&] {
+            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-cpu-threads", threads});
+        }), "CLI accepted an invalid hybrid CPU worker count");
+    }
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-residency",
+                             "host"}).hybrid_experts.tail_skip_rank == 0 &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                 "--expert-residency", "host", "--expert-tail-skip", "7"})
+                                  .hybrid_experts.tail_skip_rank == 7,
+                      "CLI did not keep every miss by default or preserve the tail skip");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "x"})
+                              .hybrid_experts.prefill_buffers == 0 &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                 "--expert-prefill-buffers", "1"})
+                                  .hybrid_experts.prefill_buffers == 1 &&
+                          parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                 "--expert-prefill-buffers", "2"})
+                                  .hybrid_experts.prefill_buffers == 2,
+                      "CLI did not leave the prefill expert buffers automatic by default or "
+                      "preserve one or two");
+    for (const auto* count : {"0", "3", "two"}) {
+        failures += check(rejects([&] {
+            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-prefill-buffers",
+                         count});
+        }), "CLI accepted an invalid prefill expert buffer count");
+    }
+    for (const auto* rank : {"0", "10", "-1", "7x"}) {
+        failures += check(rejects([&] {
+            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--expert-tail-skip", rank});
+        }), "CLI accepted an invalid expert tail skip");
+    }
+    for (const auto* budget : {"0", "32", "4096"}) {
+        const auto disk = parse({"ninfer-cli", "model.ninfer", "--prompt", "x",
+                                 "--ngram-residency", "disk", "--ngram-ram-mib", budget});
+        failures += check(disk.ngram_table.ram_budget_bytes == (std::stoull(budget) << 20U),
+                          "CLI did not preserve the disk row-cache budget");
+    }
+    for (const auto* budget : {"-1", "1.5", "1073741825"}) {
+        failures += check(rejects([&] {
+            (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "x", "--ngram-ram-mib", budget});
+        }), "CLI accepted an invalid row-cache budget");
+    }
     const auto memory_defaults = parse({"ninfer-cli", "model.ninfer", "--prompt", "x"});
     failures += check(memory_defaults.cuda_memory_policy == ninfer::CudaMemoryPolicy::DriverDefault &&
                           memory_defaults.cuda_vram_reserve_bytes == 0 &&
@@ -214,6 +354,27 @@ int run_tests() {
                "--reasoning-effort", "medium"});
     failures += check(with_effort.thinking_budget == 8 && with_effort.reasoning_effort,
                       "thinking budget did not coexist with reasoning effort");
+    failures += check(
+        configured.reasoning_loop == ninfer::ReasoningLoopAction::Off &&
+            parse(
+                {"ninfer-cli", "model.ninfer", "--prompt", "hello", "--reasoning-loop", "conclude"})
+                    .reasoning_loop == ninfer::ReasoningLoopAction::Conclude &&
+            parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--reasoning-loop", "stop"})
+                    .reasoning_loop == ninfer::ReasoningLoopAction::Stop,
+        "--reasoning-loop did not select its action (or was not off by default)");
+    failures +=
+        check(ninfer::cli::usage_text("ninfer-cli").find("--reasoning-loop") != std::string::npos,
+              "CLI help omits --reasoning-loop");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--reasoning-loop", "on"});
+                      }),
+                      "--reasoning-loop on was accepted");
+    failures += check(rejects([] {
+                          (void)parse({"ninfer-cli", "model.ninfer", "--prompt", "hello",
+                                       "--reasoning-loop", "stop", "--no-thinking"});
+                      }),
+                      "--reasoning-loop was accepted with --no-thinking");
     const ninfer::cli::Options dflash_vision =
         parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--vision", "--spec", "dflash",
                "--draft-tokens", "7"});
@@ -275,7 +436,9 @@ int run_tests() {
                                         "--embedding-q4",
                                         "--embedding-q6",
                                         "--frequency-penalty",
+                                        "--full-draft-head",
                                         "--gdn-state-fp16",
+                                        "--gpu-clock-floor",
                                         "--greedy",
                                         "--json",
                                         "--json-schema",
@@ -410,6 +573,23 @@ int run_tests() {
                                        "--devices", "0,0", "--stage-layers", "0,64"});
                       }),
                       "a stage with no layers was accepted");
+    failures += check(parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices", "0,1",
+                             "--tensor-parallel"})
+                          .tensor_parallel,
+                      "--tensor-parallel did not reach the options");
+    failures += check(!parse({"ninfer-cli", "model.ninfer", "--prompt", "hello", "--devices", "0,1"})
+                           .tensor_parallel,
+                      "tensor parallelism is not off by default");
+    for (const std::vector<std::string>& devices :
+         {std::vector<std::string>{}, std::vector<std::string>{"--devices", "1"}}) {
+        failures += check(rejects([&] {
+                              std::vector<std::string> args{"ninfer-cli", "model.ninfer", "--prompt",
+                                                            "hello", "--tensor-parallel"};
+                              args.insert(args.end(), devices.begin(), devices.end());
+                              (void)parse(args);
+                          }),
+                          "--tensor-parallel without several devices was accepted");
+    }
     failures += check(parse({"ninfer", "model.ninfer", "--prompt", "x", "--spec", "mtp",
                              "--draft-tokens", "3", "--mtp-attention-window", "2048"})
                               .speculative.mtp_attention_window == 2048,

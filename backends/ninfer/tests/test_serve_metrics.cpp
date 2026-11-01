@@ -50,6 +50,13 @@ int main() {
     sample.stats.waiting_requests              = 2;
     sample.stats.reused_prompt_tokens          = 700;
     sample.stats.engine_recoveries             = 1;
+    sample.stats.root_selections               = 3;
+    sample.stats.private_endpoint_selections   = 9;
+    sample.stats.pressure_checkpoints_dropped  = 4;
+    sample.stats.main_kv_h2d_bytes             = 1 << 20;
+    sample.stats.host_state_occupied_slots     = 6;
+    sample.stats.waiting_expired_requests      = 2;
+    sample.stats.cancelled_prefills_salvaged   = 1;
 
     ServeMetrics metrics;
     GenerationOutcome outcome;
@@ -99,6 +106,23 @@ int main() {
                           values.at("ninfer:reused_prompt_tokens_total") == 700.0 &&
                           values.at("ninfer:engine_recoveries_total") == 1.0,
                       "ninfer series accumulate reuse, speculation and recoveries");
+    const auto at = [&](const char* series) { return values.at(series); };
+    failures += check(at("ninfer:context_selections_total{source=\"root\"}") == 3.0 &&
+                          at("ninfer:context_selections_total"
+                             "{source=\"private_endpoint\"}") == 9.0 &&
+                          at("ninfer:context_pressure_events_total"
+                             "{event=\"checkpoint_dropped\"}") == 4.0 &&
+                          at("ninfer:context_transfer_bytes_total"
+                             "{object=\"main_kv\",direction=\"h2d\"}") == 1048576.0 &&
+                          at("ninfer:context_occupancy{pool=\"host_state_slots\"}") == 6.0 &&
+                          body.find("# TYPE ninfer:context_selections_total counter") !=
+                              std::string::npos &&
+                          body.find("# TYPE ninfer:context_occupancy gauge") != std::string::npos,
+                      "context-cache selections, pressure, transfers and occupancy are exported");
+    failures += check(at("ninfer:waiting_expired_requests_total") == 2.0 &&
+                          at("ninfer:waiting_cancelled_requests_total") == 0.0 &&
+                          at("ninfer:cancelled_prefills_salvaged_total") == 1.0,
+                      "abandoned and cancelled requests are counted");
 
     const auto empty = samples(ServeMetrics{}.render(LoadCapacity{}, LoadSample{}));
     failures += check(empty.at("llamacpp:predicted_tokens_seconds") == 0.0 &&

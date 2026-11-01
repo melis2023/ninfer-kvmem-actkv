@@ -26,8 +26,8 @@
 //   build-ninja\bench\ninfer_q4_q5_gdn_input_schedule_bench.exe --spread
 //
 // Use --spread when a margin looks close: it prints min..p95 beside the median, and a boundary is
-// only decidable if the margin clears the spread. See TODO section 3 on cold-flush margins -- they
-// overstate wins, so confirm anything narrow with a profile of the real workload.
+// only decidable if the margin clears the spread. Cold-flush margins overstate wins, so confirm
+// anything narrow with a profile of the real workload.
 
 #include "core/device.h"
 #include "ninfer_bench_common.h"

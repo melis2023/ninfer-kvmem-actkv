@@ -8,10 +8,17 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace ninfer::serve {
 
 [[noreturn]] void bad_request(std::string message, std::string param = {}, std::string code = {});
+
+// Refuses an image detail outside auto, low and high (`field`, under request parameter `param`)
+// with image_detail_not_supported, unless the server reads such values as auto
+// (--lenient-image-detail).
+void settle_image_details(std::vector<ChatTurn>& turns, const RequestLimits& limits,
+                          const std::string& param, const std::string& field);
 
 std::optional<int> optional_int(const RequestJson& object, const char* key);
 std::optional<double> optional_number(const RequestJson& object, const char* key);

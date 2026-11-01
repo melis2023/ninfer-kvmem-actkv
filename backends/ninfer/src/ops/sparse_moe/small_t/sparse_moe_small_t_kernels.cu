@@ -1,4 +1,5 @@
 #include "ops/sparse_moe/small_t/sparse_moe_small_t.h"
+#include "ops/sparse_moe/streamed.h"
 
 #include "core/device.h"
 #include "core/pdl.cuh"
@@ -286,6 +287,26 @@ void dispatch_tokens(std::int32_t tokens, Launch&& launch) {
 }
 
 } // namespace
+
+void sparse_moe_stream_route(const Tensor& x, const Weight& router,
+                              const SparseMoeSmallTWorkspace& workspace, cudaStream_t stream) {
+    if (x.ne[1] < 1 || x.ne[1] > kSparseMoeSmallTMax) {
+        throw std::invalid_argument("streamed SparseMoe routes one to 46 columns per call");
+    }
+    if (x.ne[1] == 1) {
+        sparse_moe_stream_decode_route(x, router, workspace, stream);
+        return;
+    }
+    dispatch_tokens(x.ne[1], [&]<int Tokens>() {
+        launch_s1<Tokens>(static_cast<const __nv_bfloat16*>(x.data),
+                          static_cast<const __nv_bfloat16*>(router.qdata),
+                          static_cast<float*>(workspace.scratch.data), stream);
+    });
+    launch_s2(static_cast<const float*>(workspace.scratch.data),
+              static_cast<int*>(workspace.token_ids.data),
+              static_cast<float*>(workspace.token_alpha.data),
+              static_cast<float*>(workspace.shared_scale.data), x.ne[1], stream);
+}
 
 void sparse_moe_small_t_launch(const Tensor& x, const SparseMoeWeights& weights,
                                Tensor& destination, const SparseMoeSmallTPlan& plan,

@@ -809,6 +809,25 @@ as well as evicted pages. Its preparation therefore accounts for those additiona
 records in H; current completed records are reused. `verify_transfers` additionally checks
 native payload and recurrent-state bytes and is disabled for ordinary product execution.
 
+RAM-only execution owns one bounded CPU preparation worker when H is nonzero.
+An admitted request with a Host payload reservation prepares missing records for its
+next prompt chunk before the current GPU chunk. The next safe boundary joins and
+publishes those records before use. Existing RAM records keep their original owner
+borrows and writes; lookahead neither adds copy-on-write capacity nor changes zero
+initialization or H accounting. Cancellation waits for an already-started preparation
+to drain. Requests with no Host reservation keep their original path. RAM bulk
+transfers and decode/control scheduling remain synchronous, with the same GPU
+executor, workspace and Graphs; this worker performs only Host preparation.
+RAM record preparation is capped at the request's admitted history pages. A speculative
+device mapping can extend beyond the output limit; those extra positions do not consume
+Host history capacity, including when active requests exactly fill H.
+
+Admission's service projection counts worker-visible prefill steps on KVMem's
+canonical chunk grid, including resumed suffixes and query replay. The final
+prompt chunk leaves room in R for the initial MTP proposal and may require an
+extra step. Reserve that allowance across the whole suffix, including captures
+inside its final chunk; storage waits consume no compute service units.
+
 Durable KVMem records use ordinary pageable RAM. Program owns one reusable pinned transfer
 buffer, bounded by B+R native page payload bytes, rather than registering every history page
 with CUDA. Spill synchronizes into that buffer before copying bytes to the archive; restore
@@ -907,8 +926,8 @@ and prefills from the beginning. Named histories use Engine publication order, i
 high-water mark for active updates, so an older late finish cannot replace a newer update.
 A request with `update_session_index=false` does not consume or replace its named retained source.
 Cancellation may retain the earlier trusted checkpoint,
-never the partially generated endpoint. Optional cold snapshots extend named text histories
-across process restarts; they do not enable cross-backend state transport. The generic
+never the partially generated endpoint. These histories are process-local, including when
+their records spill to SSD; restarting an Engine or process does not import them. The generic
 MemoryBackend descriptor does not advertise a portable checkpoint codec.
 
 MTP native records contain both Main and MTP packed planes. They transfer only when their

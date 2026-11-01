@@ -658,7 +658,7 @@ void integer_prepare(const Tensor& x, WorkspaceArena& workspace, cudaStream_t st
         x.ne[3] != 1 || tokens < 1 || tokens > kIntegerMaxTokens || k % kT2Group != 0) {
         throw std::invalid_argument("sm70 integer route: x must be a contiguous BF16 [K, T<=8]");
     }
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     const auto groups = static_cast<std::size_t>(k / kGroup) * tokens;
     auto* codes =
         static_cast<std::int8_t*>(workspace.alloc_bytes(static_cast<std::size_t>(k) * tokens).data);
@@ -690,7 +690,7 @@ void integer_project(const Activation& x, const Weight& w,
     if (destinations.empty() || destinations.size() > kMaxDestinations) {
         throw std::invalid_argument("sm70 integer route: unsupported destinations");
     }
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     DestinationEpilogue epilogue;
     for (const Destination& d : destinations) { epilogue.set[epilogue.count++] = d; }
     epilogue.factor = row_factor(w);
@@ -723,7 +723,7 @@ void integer_swiglu(const Activation& x, const Weight& gate, const Weight* up, T
         (joined ? gate.n != 2 * rows : (gate.n != rows || up->n != rows))) {
         throw std::invalid_argument("sm70 integer swiglu: unsupported weights or output");
     }
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     const dim3 grid(static_cast<unsigned>((rows / 4 + kPanels - 1) / kPanels));
     with_cols(x.tokens, [&]<int Cols>() {
         if constexpr (Cols > kPanelMaxTokens) {

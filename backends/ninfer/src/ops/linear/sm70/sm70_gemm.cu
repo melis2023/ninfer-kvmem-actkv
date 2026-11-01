@@ -5,6 +5,7 @@
 #include <cublas_v2.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -48,22 +49,39 @@ __device__ __forceinline__ float saturate_f16(float value) {
     return fminf(fmaxf(value, -65504.0f), 65504.0f);
 }
 
+// Flags the column of value i (of columns k wide) when the value is beyond FP16.
+__device__ __forceinline__ void flag_beyond(std::uint32_t* columns, std::int64_t i, std::int32_t k,
+                                            unsigned word, int half) {
+    const unsigned bits = half == 0 ? word << 16 : word & 0xffff0000u;
+    if (bf16x2_beyond_f16(bits)) { atomicOr(columns + i / k, 1u); }
+}
+
 // Eight values per thread: one 16-byte BF16 load, one 16-byte FP16 store.
 __global__ void convert_activation_kernel(const uint4* __restrict__ x, uint4* __restrict__ out,
-                                          std::int64_t vectors) {
+                                          std::int64_t vectors, std::int32_t k,
+                                          std::uint32_t* __restrict__ columns) {
     const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= vectors) { return; }
     const uint4 in = x[i];
     out[i]         = make_uint4(bf16x2_to_f16x2(in.x), bf16x2_to_f16x2(in.y), bf16x2_to_f16x2(in.z),
                                 bf16x2_to_f16x2(in.w));
+    if (bf16x2_beyond_f16(in.x) || bf16x2_beyond_f16(in.y) || bf16x2_beyond_f16(in.z) ||
+        bf16x2_beyond_f16(in.w)) {
+        // Eight values may straddle two columns where k is not a multiple of eight.
+        const unsigned words[4] = {in.x, in.y, in.z, in.w};
+        for (int e = 0; e < 8; ++e) { flag_beyond(columns, i * 8 + e, k, words[e / 2], e % 2); }
+    }
 }
 
 __global__ void convert_activation_tail_kernel(const __nv_bfloat16* __restrict__ x,
                                                __half* __restrict__ out, std::int64_t first,
-                                               std::int64_t count) {
+                                               std::int64_t count, std::int32_t k,
+                                               std::uint32_t* __restrict__ columns) {
     const std::int64_t i = first + static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (i >= count) { return; }
     out[i] = __float2half_rn(saturate_f16(__bfloat162float(x[i])));
+    flag_beyond(columns, i, k, static_cast<unsigned>(reinterpret_cast<const std::uint16_t*>(x)[i]),
+                0);
 }
 
 } // namespace
@@ -86,7 +104,14 @@ std::int32_t slab_rows(std::int32_t rows, std::int32_t k) {
 
 std::size_t activation_bytes(std::int32_t k, std::int32_t tokens) {
     return round256(static_cast<std::size_t>(k) * static_cast<std::size_t>(tokens) *
-                    sizeof(__half));
+                    sizeof(__half)) +
+           round256(static_cast<std::size_t>(tokens) * sizeof(std::uint32_t));
+}
+
+const std::uint32_t* beyond_columns(const __half* plane, std::int32_t k, std::int32_t tokens) {
+    return reinterpret_cast<const std::uint32_t*>(
+        reinterpret_cast<const std::byte*>(plane) +
+        round256(static_cast<std::size_t>(k) * static_cast<std::size_t>(tokens) * sizeof(__half)));
 }
 
 std::size_t slab_bytes(std::int32_t rows, std::int32_t k, std::int32_t tokens) {
@@ -102,17 +127,21 @@ void convert_activation(const __nv_bfloat16* x, std::int32_t k, std::int32_t tok
     const bool aligned         = (reinterpret_cast<std::uintptr_t>(x) % 16) == 0 &&
                                  (reinterpret_cast<std::uintptr_t>(out) % 16) == 0;
     const std::int64_t vectors = aligned ? count / 8 : 0;
+    auto* columns = const_cast<std::uint32_t*>(beyond_columns(out, k, tokens));
+    CUDA_CHECK(cudaMemsetAsync(columns, 0, static_cast<std::size_t>(tokens) * sizeof(std::uint32_t),
+                               stream));
     if (vectors > 0) {
         convert_activation_kernel<<<static_cast<unsigned>((vectors + kThreads - 1) / kThreads),
                                     kThreads, 0, stream>>>(reinterpret_cast<const uint4*>(x),
-                                                           reinterpret_cast<uint4*>(out), vectors);
+                                                           reinterpret_cast<uint4*>(out), vectors,
+                                                           k, columns);
         CUDA_CHECK(cudaGetLastError());
     }
     const std::int64_t first = vectors * 8;
     if (first < count) {
         convert_activation_tail_kernel<<<static_cast<unsigned>((count - first + kThreads - 1) /
                                                                kThreads),
-                                         kThreads, 0, stream>>>(x, out, first, count);
+                                         kThreads, 0, stream>>>(x, out, first, count, k, columns);
         CUDA_CHECK(cudaGetLastError());
     }
 }

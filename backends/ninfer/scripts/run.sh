@@ -16,8 +16,8 @@
 # Every measurement behind these defaults, the memory model, and the reasoning for each flag are
 # in docs/maintainer/launcher-profiles.md. What follows is what you need to run it.
 #
-# QWEN3.8-27B, `tuned`: two flag sets, each measured (docs/performance.md, "Recommended
-# configurations"), chosen with NINFER_SPEC. The default is the fast one.
+# QWEN3.8-27B, `tuned`: two flag sets, each measured (docs/maintainer/launcher-profiles.md),
+# chosen with NINFER_SPEC. The default is the fast one.
 #
 #   NINFER_SPEC=dflash2 (default): fastest at one stream, the full 262,144-token context headless
 #

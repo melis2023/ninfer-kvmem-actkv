@@ -1,4 +1,5 @@
 #include "models/qwen3_5/execution/vision_cpu.h"
+#include "runtime/contract/execution.h"
 #include "models/qwen3_5/load/vision_cpu.h"
 #include "ops/quantized_weight.h"
 
@@ -330,7 +331,8 @@ void test_encoder_matches_reference() {
     check(exec::encode_vision_on_cpu(w, patches, ct, 2, &cancelled).empty(),
           "a cancelled encode returned embeddings");
 
-    auto shared             = std::make_shared<const CpuVisionWeights>(w);
+    auto shared = std::make_shared<ninfer::models::qwen3_5::CpuVisionCache>(
+        [w] { return std::make_shared<const CpuVisionWeights>(w); }, std::chrono::milliseconds(0));
     auto payload            = std::make_shared<ninfer::models::qwen3_5::PreparedMediaPayload>();
     payload->patches        = std::make_unique<std::uint16_t[]>(patches.size());
     payload->patch_elements = patches.size();
@@ -349,6 +351,22 @@ void test_encoder_matches_reference() {
         // Destroying a session with an item in flight cancels and joins it.
         exec::CpuVisionSession session(shared);
         session.submit_item(payload, ct);
+    }
+    {
+        unsigned calls = 0;
+        auto retry = std::make_shared<ninfer::models::qwen3_5::CpuVisionCache>([&] {
+            if (++calls == 1) throw std::runtime_error("injected CPU Vision read failure");
+            return std::make_shared<const CpuVisionWeights>(w);
+        }, std::chrono::milliseconds(0));
+        exec::CpuVisionSession session(retry);
+        bool failed = false;
+        try { (void)session.encode_item(payload, ct); }
+        catch (const ninfer::runtime::RequestResourceError&) { failed = true; }
+        check(failed && retry->summary().bytes == 0, "failed image load published weights");
+        const auto recovered = session.encode_item(payload, ct);
+        check(recovered.size() == single.size() * 2 &&
+                  std::memcmp(recovered.data(), single.data(), recovered.size()) == 0,
+              "image encode did not recover from a failed weight load");
     }
     VisionItemControl mismatched = ct;
     mismatched.patch_count       = ct.patch_count - 4;

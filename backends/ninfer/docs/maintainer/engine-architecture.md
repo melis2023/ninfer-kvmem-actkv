@@ -24,7 +24,7 @@ Generation purpose 的 NInfer Engine 固定运行：
 - 一张 GPU，或 Linux 上按层切成最多八个 pipeline stage 的多张 GPU（见第 8 节）；
 - 一个常驻模型实例；
 - 启动时确定的 `max_concurrency=1..8`；
-- 一个有界 FIFO 等待队列；
+- 一个有界 FIFO 等待队列（等待中的单 token 读取请求之间按剩余工作量交换位置，见 5.2）；
 - 不抢占已经激活的请求；
 - 每个 decode round 将全部 decode-ready 请求组成一个紧凑批次。
 
@@ -80,6 +80,12 @@ flowchart LR
 [数值格式](tensor-formats.md)和[存储布局](storage-layouts.md)。
 
 ---
+
+CPU Vision 的 Host 权重驻留由 Qwen Model 拥有：启动只验证绑定和格式，实际编码的 CPU worker
+取得不可变权重读租约时才读取并解码；多个编码器共享一次加载。最后一个租约释放后开始空闲计时，
+独立的 Host 回收线程在超时后释放权重，即使没有后续请求也会运行。该线程不调用 CUDA、不修改
+Program 或请求状态；活动租约阻止卸载，失败加载不发布部分权重。模型卸载停止并等待回收线程，
+已有租约独立拥有不可变数据直到最后一个读者释放。编码结果只保留 embedding，不继续持有权重。
 
 ## 2. 四个执行边界
 
@@ -369,6 +375,10 @@ Session key 只是查找提示，不拥有 continuation。每个请求进入 Eng
 Scheduler 先确定唯一可尝试的 waiting request，ResourceManager 再为它选择缓存与资源终态。
 资源条件不能反向改变 FIFO 所有权。
 
+每次 admission 尝试前，Scheduler 按 PrefillOnly（arXiv 2505.07203）的规则重排等待中的单 token
+请求（决策读取）：它们只在彼此占有的队列位置之间交换，按 prompt token 数（含分支）减去已等待时间
+折算的 token 数（每秒 4096）升序，长读取不会被饿死；其他请求位置不变；存在 protected head 时不重排。
+
 FIFO head 暂时受 active incumbents 阻塞时，Scheduler 记录 protected head 和必须结束的 donor set。
 后续请求只有在 Program 证明以下条件时才能 backfill：
 
@@ -382,13 +392,28 @@ FIFO head 暂时受 active incumbents 阻塞时，Scheduler 记录 protected hea
 
 Scheduler 保证：
 
-- staged prefill 按 lane 持有；prefill unit 每次 worker boundary 只推进一个 lane 的一个
-  chunk，lane 在其 staged prefill 完成、settle 或 cancel 时从集合中清除。默认情况下 staged
-  prefill 期间不进行 admission，因此同时最多一个 staged-prefill request；启用
-  `concurrent_prefill`（`--concurrent-prefill`）后，由于 prefill 不持有 resource transaction，
-  admission 可以在其它 request prefill 期间进行（仍受 open global topology transition 与 decode
-  连续性的门控），多个 request 可以同时处于 staged-prefill 状态；
-- 已有 decode work 不会被连续 prefill 饿死；
+- staged prefill 按 lane 持有；prefill unit 每次 worker boundary 推进一个 lane 的一个
+  chunk（剩余 prompt 最短的可运行 lane；被跳过 `kPrefillMaxSkip` 次的 lane 优先）。若该 chunk
+  是 prompt 的最后一段且可共享（`Program::prefill_batch_unit`：纯文本、段内无 capture、exact
+  tap 或 drafter 工作；带 grammar 的 request 以其 lane 采样记录中的首个 mask 采样自己的行），
+  其它 staged lane 同样可共享的最后一段在合计不超过
+  `prefill_chunk` 时并入同一次 pass（`Program::prefill_batch`），随后各 lane 按 lane 顺序各自
+  完成 prefill step。分支读取（`Engine::submit_branches`）的 step 总以这种 pass 运行，但 pass
+  只含它自己的 segment（前缀的最后一段与分支块），不并入其它 lane，因此它的答案不取决于同时
+  运行的其它请求。lane 在其 staged prefill 完成、settle 或 cancel 时从集合中清除。默认情况下
+  staged prefill 期间不进行 admission，除非每个 staged prefill 都只剩可共享的最后一段：此时新
+  request 被接纳并可加入同一次 pass。启用 `concurrent_prefill`（`--concurrent-prefill`）后，由于
+  prefill 不持有 resource transaction，admission 可以在其它 request prefill 期间进行（仍受 open
+  global topology transition 与 decode 连续性的门控），多个 request 可以同时处于 staged-prefill
+  状态。admission 门打开时，一个 boundary 接纳所有能立即进入空闲 lane 的等待 request，使同时
+  到达的短 request 共享一次 prefill pass。`Engine::submit_group` 在一次 queue lock 下按序入队
+  一组 request（先为整组预留容量，任一成员出错则整组都不入队），worker 因此在同一 boundary
+  看到整组，而不是先启动第一个、其余在它的 pass 期间才到达（serve 的 decision read 与 rerank
+  window 即如此提交）；
+- 已有 decode work 不会被连续 prefill 饿死：只要有 decode work，每个 prefill unit 之前先运行
+  `decode_rounds_per_prefill` 个 decode（或 control）unit（按该 unit 的 token 数相对一个 chunk
+  成比例，至少一个；`0` 为 `prefill_chunk / 64`，`1` 为严格交替），短 prompt 因此一轮之后即可
+  prefill；
 - decode round 包含所有且仅包含当前 decode-ready requests；
 - batch 使用精确 `B`，不以 inactive lane padding 到 `max_concurrency`。
 
@@ -552,8 +577,11 @@ Worker 捕获的 host 侧异常（CUDA 错误直接终止进程，不会到达�
 物理状态，二者都必须先等待已发出的工作），再尝试恢复而不是永久锁存：执行同样的 Program cleanup 与
 ResourceManager 清空，以错误完成 active lanes 与 materializing request，保留尚未触及物理状态的 FIFO
 队列。只有 cleanup 后 Program 没有打开的 transaction、`physical_usage()` 的 Device/Host State 与 KV
-占用全部为零时才继续服务；否则，或第三次连续失败（其间没有未取消的请求发布成功结果）时，才锁存为
-Engine-wide failure，`is_available()` 此后为 false。
+占用全部为零时才继续服务；否则，或连续八次恢复之后的下一次失败时，才锁存为 Engine-wide failure，
+`is_available()` 此后为 false。连续指其间没有 work unit（control batch、prefill step、decode round）
+完成，且相邻两次失败相隔不到 30 秒（`runtime/engine/worker_recovery.h` 的 `RecoveryStreak`）：每次恢复
+都经过验证，相隔更久的失败不是该上限要阻止的紧密循环，例如一个客户端反复重发同一个在 admission 时
+耗尽内存的请求。
 恢复清空整个 context cache 而不是把不变量错误解释成 cache miss；启动时 pinned 的 prompt graft 随之
 释放，因此在确认物理占用为零之后按启动时的同一路径重新注入并登记为 external shared prefix，失败则锁存；`RuntimeStats::engine_recoveries`
 计数每次恢复。修复后的缺陷不再能从公开 API 触发，因此 `runtime/engine/worker_fault.h` 提供验证
@@ -580,7 +608,7 @@ live KV 与 State 的 lane；未启用时每个 prefill unit 只多一次 relaxe
   可承载页数的最小值。产物为许多 Use 只存一份的 auxiliary（输入列 gather、Hadamard 符号向量）只物化在
   rank 0；Model 为每个读取它的其他 rank 保留一份副本（`AuxiliaryReplicas`，两个模型族共用），Use 读取
   权重所在设备上的那一份，因此没有 P2P 的设备之间也不会跨卡访存。设计与限制见
-  [pipeline-parallel-plan.md](pipeline-parallel-plan.md)。
+  [pipeline-stages.md](pipeline-stages.md)。
 
 容量查询消费与执行同源的逐层参数和 Use。Allocation scope 同时用于布局计算与实际执行；
 顺序互斥的 scratch 取峰值，跨阶段仍活跃的数据计入完整存活期。Vision handoff 保留至 Text
@@ -638,8 +666,12 @@ checkpoint catalog。
 
 这些路径用于定位当前 authority，不把文件拆分固化为外部接口。
 
-`include/ninfer/engine.h` 与 `include/ninfer/types.h` 是 in-tree application 使用的 opaque Engine
-interface 和 owning host values；NInfer 当前不安装或导出 C++ SDK。`include/ninfer/ops/` 是
+`include/ninfer/engine.h` 是 in-tree application 使用的 opaque Engine interface；owning host values
+按领域分布在 `include/ninfer/` 的头文件中：`base.h`、`model_enums.h`、`kv_cache_storage.h`、
+`startup.h`、`engine_options.h`、`request.h` 与 `observability/{execution,resources,snapshot}.h`。
+`types_fwd.h` 声明其中全部 struct、class 与 enum；只按引用、指针使用类型或不使用 enumerator 的头文件包含
+它而非定义头文件。`types.h` 汇总这些头文件，只有 `engine.h` 包含它；其他代码包含定义所用类型的头文件。NInfer 当前不
+安装或导出 C++ SDK。`include/ninfer/ops/` 是
 repository-internal semantic Op contracts。`.ninfer` 是唯一 C++ 产品 artifact，不通过扩展名检测、
 兼容 shim 或第二套产品入口加载其他格式。CLI、server 和 inference benchmark 只通过公共 Engine
 推理；converter 不提供 Python model-inference route。
@@ -681,12 +713,23 @@ commits forced thinking-control tokens through the matcher; the injected closure
 grammar in the reasoning phase. Framing and grammar state have identical rollback/commit ownership.
 
 Program reserves vocabulary bitsets in its planned persistent device arena and owns pinned host
-staging. Ordinary/prefill sampling uses the current mask. MTP supplies each current draft prefix
-to a forked matcher before launch. DFlash/DFlash2 must first generate device drafts: their graph
-captures D2H draft transfer, a CUDA host function that fills all reachable prefix masks, H2D mask
-transfer, then target verification. The host function calls no CUDA API; it captures exceptions
-for rethrow after stream synchronization and before any token can be published. All node addresses
-belong to Program and outlive graph replay.
+staging. Prefill sampling uses the mask installed with the request. An ordinary or MTP round
+starts each structured lane's mask job (a fork of its grammar; MTP supplies the round's draft
+prefixes, whose columns fill in parallel) on host threads before launch; a non-blocking upload
+stream collects the jobs in a host function, uploads their columns and records an event, and the
+round's graph waits on that event (an external event node) just before it samples, so the masks
+compute while the forward pass runs. DFlash/DFlash2 must first generate device drafts: their graph
+captures D2H draft transfer and a host function that starts the lanes' jobs from them, then target
+verification, then a host function that collects the jobs and the H2D mask transfer before the
+acceptance. Host functions call no CUDA API; they capture exceptions for rethrow after stream
+synchronization and before any token can be published. All node addresses belong to Program and
+outlive graph replay. Mask duration never clips the speculative extent. Draft availability,
+the configured speculative policy, output budget and context capacity still bound it. Slow masks
+can hold the speculative round at sampling. For ordinary decoding, the Engine asks
+`Program::structured_readiness` for every decode-ready lane before a round; its job starts at
+the committed ledger frontier, and the lane sits out rounds until that job is ready. The ordinary
+round adopts the finished job. A failed or over-budget ordinary readiness job ends its request
+with an explicit error.
 
 Draft frames are compact at each round's actual proposal width, which may be narrower than the
 maximum ngram/copy window. D2H staging must preserve the fixed host-row pitch used by the grammar

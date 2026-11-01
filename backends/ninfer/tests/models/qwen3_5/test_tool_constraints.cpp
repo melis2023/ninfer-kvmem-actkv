@@ -6,6 +6,7 @@
 #include "serve/openai_responses.h"
 #include "serve/anthropic_messages.h"
 #include "serve/translate.h"
+#include "serve/structured_output.h"
 #endif
 #include <nlohmann/json.hpp>
 #include <iostream>
@@ -29,6 +30,15 @@ int main() try {
         R"({"type":"function","function":{"name":"alpha","parameters":{"type":"object","properties":{"s":{"type":"string"},"n":{"type":"integer"}}}}})",
         R"({"type":"function","function":{"name":"beta","parameters":{"type":"object","properties":{}}}})"};
     auto base = fi::build_tool_call_output_contract(declarations, true);
+    ToolChoice basic; basic.constraints = ToolConstraintMode::Basic;
+    require(!fi::select_tool_call_contract(base, {})->constrained,
+            "default auto retains native parsing without a generation grammar");
+    ToolChoice free_none; free_none.mode = ToolChoiceMode::None;
+    require(!fi::select_tool_call_contract(base, free_none),
+            "default none neither constrains generation nor decodes tool calls");
+    const auto forced = fi::build_tool_call_output_contract(declarations, true, "beta");
+    require(fi::select_tool_call_contract(forced, {})->constrained,
+            "a prompt with a forced opener retains constraints under the default auto mode");
     const std::string call = "<tool_call>\n<function=beta>\n</function>\n</tool_call>";
     auto compile = [&](ToolChoice choice, StructuredOutputOptions body = {}, std::string close = "") {
         auto contract = fi::select_tool_call_contract(base, choice);
@@ -48,8 +58,8 @@ int main() try {
     require(!accepts(required, ""), "required blocks EOS before a tool call");
     require(!accepts(required, "text"), "required must block text and early EOS");
     require(!accepts(required, "<tool_call>\n<function=unknown>"), "declared names only");
-    require(accepts({}, "prefix " + call), "auto permits text before first call");
-    require(!accepts({}, call + "garbage"), "terminal call sequence forbids trailing text");
+    require(accepts(basic, "prefix " + call), "basic auto permits text before first call");
+    require(!accepts(basic, call + "garbage"), "basic terminal call sequence forbids trailing text");
     required.allowed_names = std::vector<std::string>{"alpha"};
     require(!accepts(required, call), "allowed subset enforced");
     required.allowed_names = std::vector<std::string>{"beta"};
@@ -60,20 +70,35 @@ int main() try {
     require(!accepts(allowed_auto, call), "auto also blocks tools outside allowed subset");
     required.allowed_names.reset(); required.parallel = false;
     require(!accepts(required, call + "\n" + call), "parallel=false enforced in generation");
-    ToolChoice none; none.mode = ToolChoiceMode::None;
+    ToolChoice none = basic; none.mode = ToolChoiceMode::None;
     require(accepts(none, "normal answer"), "none admits text");
     require(!accepts(none, call), "none blocks tool marker");
     require(accepts(required, "reasoning</think>\n\n" + call, true, {}, "</think>"), "required with thinking");
     StructuredOutputOptions json{StructuredOutputKind::JsonSchema,
         R"({"type":"object","properties":{"ok":{"const":true}},"required":["ok"],"additionalProperties":false})", true};
-    require(accepts({}, "{\"ok\":true}", true, json), "JSON body composed with auto tools");
-    require(accepts({}, call, true, json), "JSON body tool alternative");
+    require(accepts(basic, "{\"ok\":true}", true, json), "JSON body composed with basic auto tools");
+    require(accepts(basic, call, true, json), "JSON body tool alternative");
     require(!accepts(required, "{\"ok\":true}", true, json), "required overrides JSON body alternative");
     require(accepts(none, "{\"ok\":true}", true, json), "none retains JSON body constraint");
+    for (const auto kind : {StructuredOutputKind::Regex, StructuredOutputKind::Choice,
+                            StructuredOutputKind::Grammar}) {
+        StructuredOutputOptions body;
+        body.kind = kind;
+        if (kind == StructuredOutputKind::Regex) body.grammar = "(yes|no)";
+        else if (kind == StructuredOutputKind::Grammar) body.grammar = "root ::= \"yes\" | \"no\"";
+        else body.choices = {"yes", "no"};
+        require(accepts(basic, "yes", true, body), "text format composes with tool alternatives");
+        require(!accepts(basic, "maybe", true, body), "text format rejects undeclared final content");
+        require(accepts(basic, call, true, body), "text format retains a declared tool alternative");
+        require(accepts(none, "no", true, body) && !accepts(none, call, true, body),
+                "none retains the text format and excludes tool calls");
+        require(!accepts(required, "yes", true, body) && accepts(required, call, true, body),
+                "required takes precedence over a final text format");
+    }
     StructuredOutputOptions unique{StructuredOutputKind::JsonSchema,
         R"({"type":"array","items":{"type":"string"},"uniqueItems":true})",false};
-    require(accepts({}, "[\"a\",\"b\"]",true,unique), "composed final JSON keeps uniqueItems validator");
-    require(!accepts({}, "[\"a\",\"a\"]",true,unique), "composed final JSON blocks duplicate strings");
+    require(accepts(basic, "[\"a\",\"b\"]",true,unique), "composed final JSON keeps uniqueItems validator");
+    require(!accepts(basic, "[\"a\",\"a\"]",true,unique), "composed final JSON blocks duplicate strings");
     auto transaction = compile(required);
     std::vector<std::uint32_t> before(9), after(9), speculative(27);
     transaction->fill_masks(before, {});
@@ -120,9 +145,46 @@ int main() try {
     require(arguments["s"]=="  abc  " && arguments["n"]==3 && arguments["o"]["ok"]==true, "strict codecs preserve exact argument values");
     fi::ToolCallOutputDecoder truncated(typed,128); (void)truncated.feed(strict_call.substr(0, strict_call.size()-1));
     require(truncated.finish().tool_calls.empty(), "truncated call never repaired or invented");
-    auto parallel = fi::select_tool_call_contract(base, {});
+    auto parallel = fi::select_tool_call_contract(base, basic);
     fi::ToolCallOutputDecoder partial(parallel,128); (void)partial.feed(call+"\n<tool_call>\n<function=alpha>\n");
     require(partial.finish().tool_calls.size()==1, "keep completed call before truncated second call");
+    const std::vector<std::string> non_strict_defs = {
+        R"({"function":{"name":"normalize","parameters":{"type":"object","properties":{"enabled":{"type":"boolean"},"count":{"type":"integer"}}}}})"};
+    const auto non_strict = fi::select_tool_call_contract(
+        fi::build_tool_call_output_contract(non_strict_defs, true), basic);
+    for (const std::string empty_value : {std::string("\n"), std::string("\n\n")}) {
+        const auto value = "<tool_call>\n<function=normalize>\n<parameter=enabled>" + empty_value +
+            "</parameter>\n<parameter=count>\nmany\n</parameter>\n</function>\n</tool_call>";
+        auto grammar = compiler.compile_model(fi::tool_grammar(*non_strict, {}), {}, "");
+        grammar->accept(bytes(value));
+        grammar->accept({&end, 1});
+        fi::ToolCallOutputDecoder normalized(non_strict, 128);
+        require(normalized.feed(value).empty(), "non-strict markup withheld from content");
+        const auto result = normalized.finish();
+        require(result.tool_calls.size() == 1 &&
+                    Json::parse(result.tool_calls[0].arguments_json) == Json{{"count", "many"}},
+                "empty non-strict parameter must not consume the following parameter");
+        require(result.diagnostics.marker_seen && result.diagnostics.structured_call_count == 1 &&
+                    result.diagnostics.empty_arguments_omitted == 1 &&
+                    result.diagnostics.schema_mismatch_arguments == 1,
+                "non-strict normalization diagnostics must describe the published call");
+    }
+    const std::vector<std::string> raw_def = {
+        R"({"function":{"name":"raw","strict":true,"parameters":{"type":"object","properties":{"s":{"type":"string"}},"required":["s"],"additionalProperties":false}}})"};
+    const auto raw_contract = fi::select_tool_call_contract(
+        fi::build_tool_call_output_contract(raw_def, true), required);
+    const std::string raw_value = "</parameter>\n<parameter=literal>";
+    const std::string raw_call = "<tool_call>\n<function=raw>\n<parameter=s>\n" + raw_value +
+        "\n</parameter>\n</function>\n</tool_call>";
+    auto raw_grammar = compiler.compile_model(fi::tool_grammar(*raw_contract, {}), {}, "");
+    raw_grammar->accept(bytes(raw_call));
+    raw_grammar->accept({&end, 1});
+    fi::ToolCallOutputDecoder raw_decoder(raw_contract, 128);
+    (void)raw_decoder.feed(raw_call);
+    const auto raw_result = raw_decoder.finish();
+    require(raw_result.tool_calls.size() == 1 &&
+                Json::parse(raw_result.tool_calls[0].arguments_json)["s"] == raw_value,
+            "strict raw strings must retain literal markup without compact-empty recovery");
     ToolChoice automatic; automatic.constraints = ToolConstraintMode::Automatic;
     require(!fi::select_tool_call_contract(base, automatic)->constrained, "auto opt-out retains free decoder");
     require(fi::select_tool_call_contract(fi::build_tool_call_output_contract(strict_def,true), automatic)->constrained, "strict remains mandatory under auto opt-out");
@@ -133,6 +195,7 @@ int main() try {
                {"tools",Json::array({Json::parse(declarations[0]),Json::parse(declarations[1])})}, {"tool_choice","required"}};
     auto cr=parse_chat_completion_request(chat,limits).generation;
     require(cr.tool_choice.mode==ToolChoiceMode::Required && cr.tools.size()==2, "Chat required preserves declarations");
+    require(cr.tool_choice.constraints==ToolConstraintMode::Automatic, "Chat defaults to auto tool constraints");
     chat["tool_choice"]={{"type","allowed_tools"},{"allowed_tools",{{"mode","required"},{"tools",Json::array({{{"type","function"},{"name","beta"}}})}}}};
     cr=parse_chat_completion_request(chat,limits).generation;
     require(cr.tools.size()==2 && cr.tool_choice.allowed_names->size()==1, "Chat allowed selection keeps prompt declarations");
@@ -147,10 +210,17 @@ int main() try {
     Json responses={{"model","test"},{"input","hi"},{"tools",Json::array({{{"type","function"},{"name","typed"},{"strict",true},{"parameters",Json::parse(strict_def[0])["function"]["parameters"]}}})},{"tool_choice","required"},{"tool_constraints","basic"}};
     auto rr=parse_openai_responses_create_request(responses,limits);
     require(rr.prompt.generation.tools[0].strict && rr.prompt.generation.tool_choice.mode==ToolChoiceMode::Required, "Responses strict and required transport");
+    require(!drop_unavailable_constraints(rr.prompt.generation, false, false),
+            "strict tools remain enforced without the final-response-format server flag");
+    responses.erase("tool_constraints");
+    rr=parse_openai_responses_create_request(responses,limits);
+    require(rr.prompt.generation.tool_choice.constraints==ToolConstraintMode::Automatic,
+            "Responses defaults to auto tool constraints");
     Json anth={{"model","test"},{"max_tokens",128},{"messages",Json::array({{{"role","user"},{"content","hi"}}})},
                {"tools",Json::array({{{"name","alpha"},{"input_schema",Json::object()}},{{"name","beta"},{"input_schema",Json::object()}}})},{"tool_choice",{{"type","any"}}}};
     auto ar=parse_anthropic_messages_request(anth,limits).generation;
     require(ar.tool_choice.mode==ToolChoiceMode::Required && ar.tools.size()==2, "Anthropic any over multiple tools");
+    require(ar.tool_choice.constraints==ToolConstraintMode::Automatic, "Anthropic defaults to auto tool constraints");
     anth["tool_choice"]={{"type","tool"},{"name","beta"}};
     ar=parse_anthropic_messages_request(anth,limits).generation;
     options=to_request_options(ar,server,resolve_prompt_semantics(ar,server),true);

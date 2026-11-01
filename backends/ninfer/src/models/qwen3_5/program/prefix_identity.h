@@ -24,6 +24,7 @@ public:
     void truncate(std::size_t tokens);
 
     [[nodiscard]] std::size_t size() const noexcept { return token_types_.size(); }
+    [[nodiscard]] std::size_t allocated_bytes() const noexcept;
 
     [[nodiscard]] bool matches(const PreparedPromptData& prompt, std::size_t count) const;
     [[nodiscard]] bool equals(const ResidentPrefixIdentity& other) const;

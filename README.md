@@ -11,6 +11,55 @@ QQ 交流群：**1040777853**。本项目仅供研究学习，稳定使用请前
 
 **所有修补、测速与召回数据汇总在 [docs/CHANGELOG.md](docs/CHANGELOG.md)。**
 
+## 更新日志（2026-11-02）
+
+### 1. DFlash2 草稿 KV 精度同步
+
+DFlash2 的 draft ring 之前硬编码 BF16，与 target 的 `--kv-dtype` 无关。
+新增 `--draft-kv-dtype`：
+
+```text
+bf16   默认，保持旧行为
+int8   draft ring 用 int8 G64，与 target 的 int8 KV 对齐
+```
+
+实现：
+
+```text
+CyclicKVCache 支持 KvCacheStorage + scale planes + BF16 shadow
+D128 int8 append kernel：量化写入 int8，同时写量化后的 BF16 shadow
+sliding_window_attention 直接读 shadow，不再每步解量化
+StateImage 同步 scales/shadow，restore 后重建 shadow
+```
+
+原理：
+
+```text
+draft 的 q 与 target 的 p 精度一致时，接受率上升
+BF16 draft  54.2%
+int8 draft  70.0%
+64K decode  72.8 -> 87.4 tok/s
+greedy 输出与 BF16 完全一致
+
+128K（prompt 163,048，int8 KV，budget 32k，ngram off）
+
+| draft | decode | 接受率 | prefill |
+|---|---|---|---|
+| 4 | 72.7 tok/s | 54.2% (13/24) | 333.3 |
+| 5 | 67.7 tok/s | 44.8% (13/29) | 329.4 |
+| 7 | 47.3 tok/s | 26.7% (12/45) | 333.1 |
+```
+
+### 2. Query replay 崩溃修复
+
+```text
+KVMem query replay has no complete exclusive checkpoint
+```
+
+原因：tool 续接恢复 fork 后的 StateImage 时，QueryReplay checkpoint 已不可用。
+
+修复：`rewind_memory_query` 在 checkpoint 缺失、StateImage 非独占或 fork 未 settle 时返回 false，回退普通 prefill，不再 500。
+
 ## 更新日志（2026-10-31）
 
 ### 1. DFlash2 同步

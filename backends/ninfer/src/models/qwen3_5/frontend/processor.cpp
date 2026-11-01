@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <iomanip>
 #include <iterator>
 #include <limits>
@@ -48,6 +49,11 @@ constexpr std::string_view kImagePad              = "<|image_pad|>";
 constexpr std::string_view kVideoPad              = "<|video_pad|>";
 constexpr std::string_view kVisionStart           = "<|vision_start|>";
 constexpr std::string_view kVisionEnd             = "<|vision_end|>";
+
+// Gemma 4: an image's soft tokens between <|image> and <image|>; a video frame's after its
+// mm:ss time, between the same two.
+constexpr std::string_view kGemmaBoi = "<|image>";
+constexpr std::string_view kGemmaEoi = "<image|>";
 
 struct Size {
     int h = 0;
@@ -269,7 +275,7 @@ void append_patch(const std::vector<const media::decode::Image*>& frames, int gr
     cursor += local;
 }
 
-void add_budget(PreprocessStats& stats, const VisionItem& item);
+void add_budget(PreprocessStats& stats, const VisionItem& item, const ProcessorOptions& options);
 void enforce_media_item_resource_limits(const PreprocessStats& stats);
 void enforce_media_resource_limits(const PreprocessStats& stats, const ProcessorOptions& options);
 
@@ -282,7 +288,7 @@ public:
 
     void claim(const VisionItem& item) {
         std::lock_guard lock(mutex_);
-        add_budget(stats_, item);
+        add_budget(stats_, item, options_);
         enforce_media_resource_limits(stats_, options_);
     }
 
@@ -304,7 +310,7 @@ Prepared prepare_image(std::span<const std::uint8_t> bytes, const ProcessorOptio
     out.item.modality = Modality::Image;
     out.item.grid     = {1, gh, gw};
     PreprocessStats item_stats;
-    add_budget(item_stats, out.item);
+    add_budget(item_stats, out.item, options);
     enforce_media_item_resource_limits(item_stats);
     request_budget.claim(out.item);
     const std::size_t elements = static_cast<std::size_t>(gh) * gw * kPatchFeatures;
@@ -359,7 +365,7 @@ Prepared prepare_video(std::span<const std::uint8_t> bytes, const ProcessorOptio
     out.item.modality = Modality::Video;
     out.item.grid     = {gt, gh, gw};
     PreprocessStats item_stats;
-    add_budget(item_stats, out.item);
+    add_budget(item_stats, out.item, options);
     enforce_media_item_resource_limits(item_stats);
     request_budget.claim(out.item);
     const std::size_t elements = static_cast<std::size_t>(gt) * gh * gw * kPatchFeatures;
@@ -386,6 +392,187 @@ Prepared prepare_video(std::span<const std::uint8_t> bytes, const ProcessorOptio
     }
     if (cursor != elements) { throw std::logic_error("Vision patch writer left a short payload"); }
     return out;
+}
+
+// ---- Gemma 4 -----------------------------------------------------------------------------------
+
+// transformers' get_aspect_ratio_preserving_size: the largest size, aspect kept, whose sides are
+// multiples of pooling * patch and whose patches fit max_patches (a small image grows to it).
+Size gemma_size(int height, int width, std::uint64_t max_patches, int patch, int pooling) {
+    if (height <= 0 || width <= 0 || max_patches == 0) {
+        throw std::invalid_argument("invalid Gemma media resize configuration");
+    }
+    const double target_px = static_cast<double>(max_patches) * patch * patch;
+    const double factor    = std::sqrt(target_px / (static_cast<double>(height) * width));
+    const int side         = pooling * patch;
+    int h = static_cast<int>(std::floor(factor * height / side)) * side;
+    int w = static_cast<int>(std::floor(factor * width / side)) * side;
+    if (h == 0 && w == 0) {
+        throw ProcessorError(ProcessorErrorKind::InvalidMedia,
+                             "Gemma media resizes to a 0 x 0 picture");
+    }
+    const int max_side = static_cast<int>(max_patches / std::uint64_t(pooling * pooling)) * side;
+    if (h == 0) {
+        h = side;
+        w = std::min(static_cast<int>(std::floor(static_cast<double>(width) / height)) * side,
+                     max_side);
+    } else if (w == 0) {
+        w = side;
+        h = std::min(static_cast<int>(std::floor(static_cast<double>(height) / width)) * side,
+                     max_side);
+    }
+    if (static_cast<double>(h) * w > target_px) {
+        throw ProcessorError(ProcessorErrorKind::InvalidMedia,
+                             "Gemma media resize exceeds its patch budget");
+    }
+    return {h, w};
+}
+
+// The soft-token budget of one media part: a video frame's, or an image's by its detail (low the
+// smallest, high the server's bound, auto the release's default), never above the bound.
+std::uint32_t gemma_part_budget(const ChatPart& part, const GemmaMediaOptions& g) {
+    std::uint64_t wanted = g.image_tokens;
+    if (part.kind == ChatPartKind::Video) {
+        wanted = g.video_tokens;
+    } else if (part.media.image_detail == ImageDetail::Low) {
+        wanted = kGemmaSoftTokenBudgets.front();
+    } else if (part.media.image_detail == ImageDetail::High) {
+        wanted = g.max_tokens;
+    }
+    return gemma_budget_at_most(std::min<std::uint64_t>(wanted, g.max_tokens));
+}
+
+std::uint64_t gemma_max_patches(std::uint32_t budget, const GemmaMediaOptions& g) {
+    return std::uint64_t(budget) * std::uint64_t(g.pooling) * std::uint64_t(g.pooling);
+}
+
+// One patch (channel, y, x) of `frame` at patch (grid_y, grid_x), as 2 p / 255 - 1 in BF16.
+void append_gemma_patch(const media::decode::Image& frame, int patch, int grid_y, int grid_x,
+                        std::span<std::uint16_t> out, std::size_t& cursor) {
+    const std::size_t features = std::size_t(3) * patch * patch;
+    if (cursor > out.size() || out.size() - cursor < features) {
+        throw std::logic_error("Vision patch writer exceeded its allocation");
+    }
+    const auto& lut            = normalization_lut();
+    std::uint16_t* destination = out.data() + cursor;
+    std::size_t local          = 0;
+    for (int channel = 0; channel < 3; ++channel) {
+        for (int y = 0; y < patch; ++y) {
+            const std::uint8_t* source =
+                frame.rgb.data() +
+                (static_cast<std::size_t>(grid_y * patch + y) * frame.width + grid_x * patch) * 3 +
+                channel;
+            for (int x = 0; x < patch; ++x) {
+                destination[local++] = lut[source[static_cast<std::size_t>(x) * 3]];
+            }
+        }
+    }
+    cursor += local;
+}
+
+// One frame's patches, row by row of the patch grid.
+void append_gemma_frame(const media::decode::Image& frame, int patch, int gh, int gw,
+                        std::span<std::uint16_t> out, std::size_t& cursor,
+                        const PreparationControl& control) {
+    for (int y = 0; y < gh; ++y) {
+        check_preparation_control(control);
+        for (int x = 0; x < gw; ++x) { append_gemma_patch(frame, patch, y, x, out, cursor); }
+    }
+}
+
+Prepared prepare_gemma_image(std::span<const std::uint8_t> bytes, std::uint32_t budget,
+                             const ProcessorOptions& options, const media::decode::Policy& policy,
+                             MediaPreprocessCache& cache, ConcurrentMediaBudget& request_budget,
+                             const PreparationControl& control) {
+    const GemmaMediaOptions& g = *options.gemma;
+    media::decode::Image image = media::decode::decode_image(bytes, policy);
+    const Size size =
+        gemma_size(image.height, image.width, gemma_max_patches(budget, g), g.patch, g.pooling);
+    const int gh = size.h / g.patch;
+    const int gw = size.w / g.patch;
+    Prepared out;
+    out.item.modality = Modality::Image;
+    out.item.grid     = {1, gh, gw};
+    PreprocessStats item_stats;
+    add_budget(item_stats, out.item, options);
+    enforce_media_item_resource_limits(item_stats);
+    request_budget.claim(out.item);
+    const std::size_t elements = static_cast<std::size_t>(gh) * gw * 3 * g.patch * g.patch;
+    out.payload                = cache.allocate_payload(elements, control);
+    resize_bicubic(image, size, control);
+    std::size_t cursor = 0;
+    append_gemma_frame(image, g.patch, gh, gw, out.payload->mutable_span(), cursor, control);
+    if (cursor != elements) { throw std::logic_error("Vision patch writer left a short payload"); }
+    return out;
+}
+
+std::vector<double> gemma_timestamps(std::span<const int> indices, double fps) {
+    std::vector<double> out;
+    out.reserve(indices.size());
+    for (const int index : indices) { out.push_back(static_cast<double>(index) / fps); }
+    return out;
+}
+
+Prepared prepare_gemma_video(std::span<const std::uint8_t> bytes, std::uint32_t budget,
+                             const ProcessorOptions& options, const media::decode::Policy& policy,
+                             MediaPreprocessCache& cache, ConcurrentMediaBudget& request_budget,
+                             const PreparationControl& control) {
+    const GemmaMediaOptions& g = *options.gemma;
+    media::decode::Video video = media::decode::decode_video(
+        bytes, policy, 1.0, 1, g.frames, media::decode::FrameSpacing::Floor);
+    const Size size =
+        gemma_size(video.height, video.width, gemma_max_patches(budget, g), g.patch, g.pooling);
+    const int gt = static_cast<int>(video.frames.size());
+    const int gh = size.h / g.patch;
+    const int gw = size.w / g.patch;
+    Prepared out;
+    out.item.modality = Modality::Video;
+    out.item.grid     = {gt, gh, gw};
+    PreprocessStats item_stats;
+    add_budget(item_stats, out.item, options);
+    enforce_media_item_resource_limits(item_stats);
+    request_budget.claim(out.item);
+    const std::size_t elements =
+        static_cast<std::size_t>(gt) * gh * gw * 3 * g.patch * g.patch;
+    out.payload = cache.allocate_payload(elements, control);
+    std::size_t cursor = 0;
+    for (media::decode::Image& frame : video.frames) {
+        resize_bicubic(frame, size, control);
+        append_gemma_frame(frame, g.patch, gh, gw, out.payload->mutable_span(), cursor, control);
+    }
+    if (cursor != elements) { throw std::logic_error("Vision patch writer left a short payload"); }
+    out.item.timestamps = gemma_timestamps(video.indices, video.fps);
+    return out;
+}
+
+VisionItem inspect_gemma_item(const ChatPart& part, const ProcessorOptions& options,
+                              const media::decode::Policy& policy) {
+    const GemmaMediaOptions& g  = *options.gemma;
+    const std::uint32_t budget  = gemma_part_budget(part, g);
+    const std::uint64_t patches = gemma_max_patches(budget, g);
+    VisionItem item;
+    if (part.kind == ChatPartKind::Image) {
+        const media::decode::ImageInfo image = media::decode::inspect_image(part.media.bytes, policy);
+        const Size size = gemma_size(image.height, image.width, patches, g.patch, g.pooling);
+        item.modality   = Modality::Image;
+        item.grid       = {1, size.h / g.patch, size.w / g.patch};
+        return item;
+    }
+    const media::decode::VideoInfo video = media::decode::inspect_video(
+        part.media.bytes, policy, 1.0, 1, g.frames, media::decode::FrameSpacing::Floor);
+    const Size size = gemma_size(video.height, video.width, patches, g.patch, g.pooling);
+    item.modality   = Modality::Video;
+    item.grid       = {video.sampled_frames, size.h / g.patch, size.w / g.patch};
+    item.timestamps = gemma_timestamps(video.indices, video.fps);
+    return item;
+}
+
+// mm:ss, as the release's processor prints a frame's time.
+std::string gemma_time(double seconds) {
+    const auto whole = static_cast<long long>(std::floor(seconds));
+    char text[32];
+    std::snprintf(text, sizeof(text), "%02lld:%02lld", whole / 60, whole % 60);
+    return text;
 }
 
 std::vector<ChatPart*> media_parts(std::vector<ChatMessage>& messages) {
@@ -439,6 +626,37 @@ VisionItem inspect_image_item(std::span<const std::uint8_t> bytes, const Process
     return item;
 }
 
+// A low-detail image's bound: the area of a 512 x 512 picture.
+constexpr std::uint64_t kLowDetailMergedTokens = 256;
+
+// The options one media part is counted and prepared with: a low-detail image is bounded further.
+ProcessorOptions part_options(const ChatPart& part, const ProcessorOptions& options) {
+    ProcessorOptions out = options;
+    if (part.kind == ChatPartKind::Image && part.media.image_detail == ImageDetail::Low) {
+        bound_merged_tokens(out, kLowDetailMergedTokens);
+    }
+    return out;
+}
+
+// The identity of a part's prepared media: its bytes' digest, kept apart for a low-detail image,
+// whose Vision tokens differ from the same bytes seen at full detail.
+Sha256Digest part_digest(const ChatPart& part, const Sha256Digest& bytes_digest,
+                         const ProcessorOptions& options) {
+    if (options.gemma) {
+        // Gemma 4's soft tokens depend on the budget the part is seen at.
+        std::string keyed =
+            "ninfer gemma budget " + std::to_string(gemma_part_budget(part, *options.gemma)) + "\n";
+        keyed.append(reinterpret_cast<const char*>(bytes_digest.data()), bytes_digest.size());
+        return sha256(std::string_view(keyed));
+    }
+    if (part.kind != ChatPartKind::Image || part.media.image_detail != ImageDetail::Low) {
+        return bytes_digest;
+    }
+    std::string keyed = "ninfer image detail low\n";
+    keyed.append(reinterpret_cast<const char*>(bytes_digest.data()), bytes_digest.size());
+    return sha256(std::string_view(keyed));
+}
+
 void enforce_image_resize_policy(const ChatPart& part, const ProcessorOptions& options,
                                  const media::decode::Policy& policy) {
     if (part.kind != ChatPartKind::Image ||
@@ -446,6 +664,17 @@ void enforce_image_resize_policy(const ChatPart& part, const ProcessorOptions& o
         return;
     }
     const media::decode::ImageInfo image = media::decode::inspect_image(part.media.bytes, policy);
+    if (options.gemma) {
+        const GemmaMediaOptions& g = *options.gemma;
+        const double budget_px     = static_cast<double>(gemma_max_patches(
+                                     gemma_part_budget(part, g), g)) * g.patch * g.patch;
+        if (static_cast<double>(image.height) * image.width > budget_px) {
+            throw ProcessorError(ProcessorErrorKind::InvalidMedia,
+                                 "image exceeds its Vision budget and oversized_image is set to "
+                                 "'error'");
+        }
+        return;
+    }
     const int aligned_h = round_even(static_cast<double>(image.height) / kFactor) * kFactor;
     const int aligned_w = round_even(static_cast<double>(image.width) / kFactor) * kFactor;
     const std::uint64_t area =
@@ -513,6 +742,31 @@ void append_placeholder(std::string& out, const VisionItem& item, std::size_t it
     }
 }
 
+void append_gemma_placeholder(std::string& out, const VisionItem& item, std::size_t item_index,
+                              int pooling, std::vector<MediaTokenRunByteSpec>& runs) {
+    const std::uint64_t frame_tokens =
+        static_cast<std::uint64_t>(item.grid.h / pooling) * (item.grid.w / pooling);
+    if (item.modality == Modality::Image) {
+        out += kGemmaBoi;
+        append_media_token_run(out, kGemmaMediaPads.image, frame_tokens, Modality::Image,
+                               item_index, 0, runs);
+        out += kGemmaEoi;
+        return;
+    }
+    if (item.timestamps.size() != static_cast<std::size_t>(item.grid.t)) {
+        throw std::logic_error("video timestamp count does not match grid");
+    }
+    for (std::size_t frame = 0; frame < item.timestamps.size(); ++frame) {
+        if (frame != 0) { out += ' '; }
+        out += gemma_time(item.timestamps[frame]);
+        out += ' ';
+        out += kGemmaBoi;
+        append_media_token_run(out, kGemmaMediaPads.video, frame_tokens, Modality::Video,
+                               item_index, frame, runs);
+        out += kGemmaEoi;
+    }
+}
+
 struct PlaceholderExpansion {
     std::size_t source_begin = 0;
     std::size_t source_end   = 0;
@@ -538,7 +792,9 @@ std::size_t map_expanded_boundary(std::size_t boundary, std::size_t source_size,
     return completed.rendered_end + boundary - completed.source_end;
 }
 
-RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<VisionItem>& items) {
+RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<VisionItem>& items,
+                                 const ProcessorOptions& options) {
+    const MediaPads pads = options.gemma ? kGemmaMediaPads : kQwenMediaPads;
     if (!rendered.media_token_runs.empty()) {
         throw std::logic_error("rendered chat media placeholders were already expanded");
     }
@@ -557,14 +813,19 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
         if (placeholder.item_index != index || placeholder.modality != item.modality) {
             throw std::invalid_argument("chat media order does not match rendered placeholders");
         }
-        const std::string_view needle = item.modality == Modality::Image ? kImagePad : kVideoPad;
+        const std::string_view needle = item.modality == Modality::Image ? pads.image : pads.video;
         if (placeholder.bytes.begin < source_cursor || placeholder.bytes.end > source.size() ||
             placeholder.bytes.end - placeholder.bytes.begin != needle.size() ||
             source.compare(placeholder.bytes.begin, needle.size(), needle) != 0) {
             throw std::logic_error("rendered media placeholder metadata does not match its text");
         }
         expanded.append(source, source_cursor, placeholder.bytes.begin - source_cursor);
-        append_placeholder(expanded, item, index, rendered.media_token_runs);
+        if (options.gemma) {
+            append_gemma_placeholder(expanded, item, index, options.gemma->pooling,
+                                     rendered.media_token_runs);
+        } else {
+            append_placeholder(expanded, item, index, rendered.media_token_runs);
+        }
         const std::size_t source_end = placeholder.bytes.end;
         expansions.push_back(PlaceholderExpansion{.source_begin = placeholder.bytes.begin,
                                                   .source_end   = source_end,
@@ -590,6 +851,10 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
         rendered.tools_region->begin = map_boundary(rendered.tools_region->begin, "tools");
         rendered.tools_region->end   = map_boundary(rendered.tools_region->end, "tools");
     }
+    if (rendered.action_region) {
+        rendered.action_region->begin = map_boundary(rendered.action_region->begin, "action");
+        rendered.action_region->end   = map_boundary(rendered.action_region->end, "action");
+    }
     for (auto& span : rendered.literal_spans) {
         span.begin = map_boundary(span.begin, "literal span");
         span.end   = map_boundary(span.end, "literal span");
@@ -612,13 +877,16 @@ RenderedChat expand_placeholders(RenderedChat rendered, const std::vector<Vision
     return rendered;
 }
 
-void add_budget(PreprocessStats& stats, const VisionItem& item) {
+void add_budget(PreprocessStats& stats, const VisionItem& item, const ProcessorOptions& options) {
     const std::uint64_t spatial =
         checked_mul(static_cast<std::uint64_t>(item.grid.h), item.grid.w, "vision spatial grid");
     const std::uint64_t patches =
         checked_mul(static_cast<std::uint64_t>(item.grid.t), spatial, "vision raw patches");
+    const std::uint64_t per_token =
+        options.gemma ? std::uint64_t(options.gemma->pooling) * options.gemma->pooling
+                      : std::uint64_t(kMerge * kMerge);
     stats.raw_patches += patches;
-    stats.vision_tokens += patches / (kMerge * kMerge);
+    stats.vision_tokens += patches / per_token;
     stats.attention_pairs += checked_mul(static_cast<std::uint64_t>(item.grid.t),
                                          checked_mul(spatial, spatial, "vision attention pairs"),
                                          "vision attention pairs");
@@ -721,6 +989,60 @@ void assign_positions(ProcessedInput& output,
     output.rope_delta = maximum + 1 - static_cast<std::int32_t>(length);
 }
 
+// Gemma 4's positions are the token indices on every axis; media runs set the token types and the
+// items' spans.
+void assign_gemma_positions(ProcessedInput& output,
+                            std::span<const EncodedChat::MediaTokenRun> media_runs, int pooling) {
+    const std::size_t length = output.input_ids.size();
+    output.positions.assign(length * 3, 0);
+    output.token_types.assign(length, 0);
+    for (int axis = 0; axis < 3; ++axis) {
+        for (std::size_t index = 0; index < length; ++index) {
+            output.positions[static_cast<std::size_t>(axis) * length + index] =
+                static_cast<std::int32_t>(index);
+        }
+    }
+    std::vector<std::size_t> next_frame(output.vision_items.size(), 0);
+    std::size_t cursor = 0;
+    for (const EncodedChat::MediaTokenRun& run : media_runs) {
+        if (run.tokens.begin < cursor || run.tokens.begin > length || run.tokens.count == 0 ||
+            run.tokens.count > length - run.tokens.begin) {
+            throw std::logic_error("encoded media token runs are not ordered disjoint spans");
+        }
+        if (run.item_index >= output.vision_items.size()) {
+            throw std::logic_error("encoded media token run references no Vision item");
+        }
+        VisionItem& item = output.vision_items[run.item_index];
+        if (item.modality != run.modality || run.frame_index != next_frame[run.item_index]) {
+            throw std::logic_error("encoded media token run identity is inconsistent");
+        }
+        const std::size_t expected_frames = item.modality == Modality::Image ? 1 : item.grid.t;
+        if (run.frame_index >= expected_frames) {
+            throw std::logic_error("encoded media token run exceeds its temporal grid");
+        }
+        ++next_frame[run.item_index];
+        const std::size_t expected =
+            static_cast<std::size_t>(item.grid.h / pooling) * (item.grid.w / pooling);
+        if (run.tokens.count != expected) {
+            throw std::invalid_argument("vision placeholder run does not match media grid");
+        }
+        item.token_spans.push_back(run.tokens);
+        const std::size_t end = run.tokens.begin + run.tokens.count;
+        std::fill(output.token_types.begin() + static_cast<std::ptrdiff_t>(run.tokens.begin),
+                  output.token_types.begin() + static_cast<std::ptrdiff_t>(end),
+                  static_cast<std::uint8_t>(run.modality));
+        cursor = end;
+    }
+    for (std::size_t index = 0; index < output.vision_items.size(); ++index) {
+        const VisionItem& item     = output.vision_items[index];
+        const std::size_t expected = item.modality == Modality::Image ? 1 : item.grid.t;
+        if (next_frame[index] != expected || item.token_spans.size() != expected) {
+            throw std::invalid_argument("media grid count does not match placeholder runs");
+        }
+    }
+    output.rope_delta = 0;
+}
+
 int media_token_id(const Tokenizer& tokenizer, std::string_view text) {
     const std::vector<int> ids = tokenizer.encode(text);
     if (ids.size() != 1) {
@@ -748,8 +1070,21 @@ std::span<const std::int32_t> ProcessedInput::position_axis(int axis) const {
         static_cast<std::size_t>(axis) * input_ids.size(), input_ids.size());
 }
 
+std::uint32_t gemma_budget_at_most(std::uint64_t bound) {
+    std::uint32_t out = 0;
+    for (const std::uint32_t budget : kGemmaSoftTokenBudgets) {
+        if (budget <= bound) { out = budget; }
+    }
+    if (out == 0) {
+        throw std::invalid_argument("a Gemma 4 media budget is at least " +
+                                    std::to_string(kGemmaSoftTokenBudgets.front()) +
+                                    " soft tokens");
+    }
+    return out;
+}
+
 EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat& rendered,
-                                 std::size_t maximum_tokens) {
+                                 std::size_t maximum_tokens, MediaPads pads) {
     if (!rendered.media_placeholders.empty()) {
         throw std::logic_error("rendered chat contains unexpanded media placeholders");
     }
@@ -775,38 +1110,54 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         byte_boundaries.push_back(run.bytes.end);
     }
 
-    std::optional<std::pair<std::size_t, std::size_t>> first_user_boundaries;
-    std::optional<std::pair<std::size_t, std::size_t>> tools_boundaries;
-    std::optional<std::pair<std::size_t, std::size_t>> memory_boundaries;
-    const auto push_span = [&](const std::optional<text::ByteSpan>& span,
-                               std::optional<std::pair<std::size_t, std::size_t>>& indices) {
-        if (!span) { return; }
-        indices = {byte_boundaries.size(), byte_boundaries.size() + 1};
-        byte_boundaries.push_back(span->begin);
-        byte_boundaries.push_back(span->end);
-    };
-    push_span(rendered.first_user_region, first_user_boundaries);
-    push_span(rendered.tools_region, tools_boundaries);
-    push_span(rendered.memory_query, memory_boundaries);
+    if (rendered.memory_query) {
+        byte_boundaries.push_back(rendered.memory_query->begin);
+        byte_boundaries.push_back(rendered.memory_query->end);
+    }
+    if (rendered.first_user_region) {
+        byte_boundaries.push_back(rendered.first_user_region->begin);
+        byte_boundaries.push_back(rendered.first_user_region->end);
+    }
+    if (rendered.tools_region) {
+        byte_boundaries.push_back(rendered.tools_region->begin);
+        byte_boundaries.push_back(rendered.tools_region->end);
+    }
+    if (rendered.action_region) {
+        byte_boundaries.push_back(rendered.action_region->begin);
+        byte_boundaries.push_back(rendered.action_region->end);
+    }
     BoundaryEncodedText tokenized = tokenizer.encode_with_boundaries(
         rendered.text, byte_boundaries, EncodeOptions{.max_tokens = maximum_tokens},
         rendered.literal_spans);
     encoded.input_ids = std::move(tokenized.input_ids);
     if (encoded.input_ids.size() == maximum_tokens) { return encoded; }
-    const auto token_span = [&](const std::optional<std::pair<std::size_t, std::size_t>>& indices)
+    const auto encoded_span = [&](std::size_t begin_index, std::size_t end_index)
         -> std::optional<TokenSpan> {
-        if (!indices) { return std::nullopt; }
-        const auto& begin = tokenized.boundaries.at(indices->first);
-        const auto& end   = tokenized.boundaries.at(indices->second);
+        const auto& begin = tokenized.boundaries.at(begin_index);
+        const auto& end = tokenized.boundaries.at(end_index);
         if (!begin.exact_frontier || !end.exact_frontier ||
             *begin.exact_frontier >= *end.exact_frontier) {
             return std::nullopt;
         }
         return TokenSpan{*begin.exact_frontier, *end.exact_frontier - *begin.exact_frontier};
     };
-    encoded.first_user_region = token_span(first_user_boundaries);
-    encoded.tools_region      = token_span(tools_boundaries);
-    encoded.memory_query      = token_span(memory_boundaries);
+    std::size_t boundary_cursor = tokenized.boundaries.size();
+    if (rendered.action_region) {
+        boundary_cursor -= 2;
+        encoded.action_region = encoded_span(boundary_cursor, boundary_cursor + 1);
+    }
+    if (rendered.tools_region) {
+        boundary_cursor -= 2;
+        encoded.tools_region = encoded_span(boundary_cursor, boundary_cursor + 1);
+    }
+    if (rendered.first_user_region) {
+        boundary_cursor -= 2;
+        encoded.first_user_region = encoded_span(boundary_cursor, boundary_cursor + 1);
+    }
+    if (rendered.memory_query) {
+        boundary_cursor -= 2;
+        encoded.memory_query = encoded_span(boundary_cursor, boundary_cursor + 1);
+    }
     std::size_t boundary_index = 0;
     const auto to_frontier     = [](std::size_t frontier, std::string_view kind) {
         if (frontier > std::numeric_limits<std::uint32_t>::max()) {
@@ -866,7 +1217,7 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
         const std::size_t token_begin = *begin.exact_frontier;
         const std::size_t token_end   = *end.exact_frontier;
         const int expected_token =
-            media_token_id(tokenizer, run.modality == Modality::Image ? kImagePad : kVideoPad);
+            media_token_id(tokenizer, run.modality == Modality::Image ? pads.image : pads.video);
         if (!std::all_of(encoded.input_ids.begin() + static_cast<std::ptrdiff_t>(token_begin),
                          encoded.input_ids.begin() + static_cast<std::ptrdiff_t>(token_end),
                          [expected_token](int token) { return token == expected_token; })) {
@@ -879,9 +1230,10 @@ EncodedChat encode_rendered_chat(const Tokenizer& tokenizer, const RenderedChat&
             .frame_index = run.frame_index,
         });
     }
+    if (rendered.memory_query) { boundary_index += 2; }
     if (rendered.first_user_region) { boundary_index += 2; }
     if (rendered.tools_region) { boundary_index += 2; }
-    if (rendered.memory_query) { boundary_index += 2; }
+    if (rendered.action_region) { boundary_index += 2; }
     if (boundary_index != tokenized.boundaries.size()) {
         throw std::logic_error("rendered token boundary result count changed during encoding");
     }
@@ -903,6 +1255,13 @@ Processor::Processor(const Tokenizer& tokenizer, const CompiledChatTemplate& cha
         throw std::invalid_argument("processor budgets must be positive");
     }
     if (!media_cache_) { throw std::invalid_argument("processor media cache must not be null"); }
+    if (options_.gemma) {
+        for (const std::string_view token :
+             {kGemmaMediaPads.image, kGemmaMediaPads.video, kGemmaBoi, kGemmaEoi}) {
+            (void)media_token_id(tokenizer_, token);
+        }
+        return;
+    }
     (void)media_token_id(tokenizer_, kImagePad);
     (void)media_token_id(tokenizer_, kVideoPad);
 }
@@ -929,20 +1288,25 @@ std::size_t Processor::count_tokens(std::vector<ChatMessage> messages,
     try {
         for (const ChatPart* part : parts) {
             check_preparation_control(control);
-            enforce_image_resize_policy(*part, options_, policy);
-            VisionItem item = part->kind == ChatPartKind::Image
-                                  ? inspect_image_item(part->media.bytes, options_, policy)
-                                  : inspect_video_item(part->media.bytes, options_, policy);
+            const ProcessorOptions options = part_options(*part, options_);
+            enforce_image_resize_policy(*part, options, policy);
+            VisionItem item = options_.gemma ? inspect_gemma_item(*part, options_, policy)
+                              : part->kind == ChatPartKind::Image
+                                  ? inspect_image_item(part->media.bytes, options, policy)
+                                  : inspect_video_item(part->media.bytes, options, policy);
             PreprocessStats item_stats;
-            add_budget(item_stats, item);
+            add_budget(item_stats, item, options_);
             enforce_media_item_resource_limits(item_stats);
-            add_budget(stats, item);
+            add_budget(stats, item, options_);
             enforce_media_resource_limits(stats, options_);
             items.push_back(std::move(item));
         }
     } catch (const media::decode::Error& error) { throw_decode_error(error); }
-    rendered                = expand_placeholders(std::move(rendered), items);
-    const std::size_t count = encode_rendered_chat(tokenizer_, rendered).input_ids.size();
+    rendered = expand_placeholders(std::move(rendered), items, options_);
+    const std::size_t count =
+        encode_rendered_chat(tokenizer_, rendered, std::numeric_limits<std::size_t>::max(),
+                             options_.gemma ? kGemmaMediaPads : kQwenMediaPads)
+            .input_ids.size();
     check_preparation_control(control, "tokenization");
     return count;
 }
@@ -1008,7 +1372,9 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         .checkpoint = [&worker_control] { check_preparation_control(worker_control); },
     };
     try {
-        for (const ChatPart* part : parts) { enforce_image_resize_policy(*part, options_, policy); }
+        for (const ChatPart* part : parts) {
+            enforce_image_resize_policy(*part, part_options(*part, options_), policy);
+        }
     } catch (const media::decode::Error& error) { throw_decode_error(error); }
     ProcessedInput output;
     std::vector<VisionItem> items;
@@ -1026,8 +1392,10 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     for (ChatPart* part : parts) {
         try {
             check_preparation_control(control);
-            const auto digest =
-                sha256(part->media.bytes, [&control] { check_preparation_control(control); });
+            const auto digest = part_digest(
+                *part,
+                sha256(part->media.bytes, [&control] { check_preparation_control(control); }),
+                options_);
             const ChatPartKind kind = part->kind;
             const MediaCacheKey key{
                 .digest   = digest,
@@ -1035,13 +1403,25 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
             };
             PendingMedia pending = media_cache_->begin_prepare(
                 key, worker_control,
-                [this, part, kind, digest, &policy, &request_budget, &worker_control]() {
-                    Prepared built =
-                        kind == ChatPartKind::Image
-                            ? prepare_image(part->media.bytes, options_, policy, *media_cache_,
-                                            request_budget, worker_control)
-                            : prepare_video(part->media.bytes, options_, policy, *media_cache_,
-                                            request_budget, worker_control);
+                [this, part, kind, digest, options = part_options(*part, options_), &policy,
+                 &request_budget, &worker_control]() {
+                    Prepared built;
+                    if (options.gemma) {
+                        const std::uint32_t budget = gemma_part_budget(*part, *options.gemma);
+                        built = kind == ChatPartKind::Image
+                                    ? prepare_gemma_image(part->media.bytes, budget, options,
+                                                          policy, *media_cache_, request_budget,
+                                                          worker_control)
+                                    : prepare_gemma_video(part->media.bytes, budget, options,
+                                                          policy, *media_cache_, request_budget,
+                                                          worker_control);
+                    } else {
+                        built = kind == ChatPartKind::Image
+                                    ? prepare_image(part->media.bytes, options, policy,
+                                                    *media_cache_, request_budget, worker_control)
+                                    : prepare_video(part->media.bytes, options, policy,
+                                                    *media_cache_, request_budget, worker_control);
+                    }
                     built.item.content_digest = digest;
                     return PreparedMedia{std::move(built.item), std::move(built.payload)};
                 });
@@ -1054,6 +1434,9 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     }
     MediaCacheRequestStats cache_stats;
     std::size_t patch_cursor = 0;
+    const std::size_t patch_features =
+        options_.gemma ? std::size_t(3) * options_.gemma->patch * options_.gemma->patch
+                       : std::size_t(kPatchFeatures);
     for (PendingMedia& pending : pending_items) {
         PreparedMedia media;
         try {
@@ -1071,7 +1454,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
             continue;
         }
         if (preparation_error) { continue; }
-        if (!media.payload || media.payload->patch_elements % kPatchFeatures != 0) {
+        if (!media.payload || media.payload->patch_elements % patch_features != 0) {
             preparation_error = std::make_exception_ptr(
                 std::logic_error("preprocessed patch buffer is not row aligned"));
             stop_preparation.store(true, std::memory_order_relaxed);
@@ -1079,13 +1462,13 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
         }
         VisionItem item  = media.item;
         item.patch_begin = patch_cursor;
-        item.patch_count = media.payload->patch_elements / kPatchFeatures;
+        item.patch_count = media.payload->patch_elements / patch_features;
         patch_cursor += item.patch_count;
         try {
             PreprocessStats item_stats;
-            add_budget(item_stats, item);
+            add_budget(item_stats, item, options_);
             enforce_media_item_resource_limits(item_stats);
-            add_budget(stats, item);
+            add_budget(stats, item, options_);
             enforce_media_resource_limits(stats, options_);
         } catch (...) {
             preparation_error = std::current_exception();
@@ -1110,9 +1493,10 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     request_permit.reset();
 
     check_preparation_control(control);
-    rendered                    = expand_placeholders(std::move(rendered), items);
+    rendered                    = expand_placeholders(std::move(rendered), items, options_);
     const auto tokenize_started = Clock::now();
-    EncodedChat encoded         = encode_rendered_chat(tokenizer_, rendered, encode_limit);
+    EncodedChat encoded         = encode_rendered_chat(
+        tokenizer_, rendered, encode_limit, options_.gemma ? kGemmaMediaPads : kQwenMediaPads);
     stats.tokenize_seconds +=
         std::chrono::duration<double>(Clock::now() - tokenize_started).count();
     check_preparation_control(control, "tokenization");
@@ -1128,6 +1512,7 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     output.memory_query                = encoded.memory_query;
     output.first_user_region           = encoded.first_user_region;
     output.tools_region                = encoded.tools_region;
+    output.action_region               = encoded.action_region;
     output.message_boundaries          = std::move(encoded.message_boundaries);
     output.cache_boundaries            = std::move(encoded.cache_boundaries);
     stats.prompt_tokens                = output.input_ids.size();
@@ -1141,7 +1526,11 @@ ProcessedInput Processor::process(std::vector<ChatMessage> messages,
     stats.media_preprocess_seconds      = media_preprocess_seconds;
     stats.media_preprocess_work_seconds = cache_stats.build_seconds;
     output.vision_items                 = std::move(items);
-    assign_positions(output, encoded.media_token_runs);
+    if (options_.gemma) {
+        assign_gemma_positions(output, encoded.media_token_runs, options_.gemma->pooling);
+    } else {
+        assign_positions(output, encoded.media_token_runs);
+    }
     check_preparation_control(control);
     output.stats = stats;
     return output;

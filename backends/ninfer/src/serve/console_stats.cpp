@@ -122,7 +122,7 @@ ConsoleRequestSample make_console_request_sample(const GenerationOutcome& outcom
         .ttft_seconds            = metrics.ttft_seconds,
         .prompt_tokens           = prompt_tokens,
         .cache_hit_tokens        = cache_hit_tokens,
-        .computed_prefill_tokens = saturating_sub(prompt_tokens, cache_hit_tokens),
+        .computed_prefill_tokens = metrics.computed_prefill_tokens,
         .prefill_seconds         = metrics.prefill_seconds,
         // The first output token comes from prefill; the decode rate covers the rest, as the
         // request-done record does.

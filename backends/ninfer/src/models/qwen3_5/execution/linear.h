@@ -8,6 +8,12 @@
 
 namespace ninfer::models::qwen3_5::execution {
 
+// Whether a proposal head's projection can store FP32 logits. Its top-1 then ranks the unrounded
+// scores, so two candidates BF16 would round to one value are told apart.
+[[nodiscard]] inline bool fp32_proposal_logits(const LinearParameters& head) {
+    return head.weight.qtype == QType::BF16 || is_gguf(head.weight.qtype);
+}
+
 inline void project(const Tensor& input, const LinearParameters& p, Tensor& output,
                     WorkspaceArena& workspace, cudaStream_t stream,
                     InputBasis basis = InputBasis::Primal) {

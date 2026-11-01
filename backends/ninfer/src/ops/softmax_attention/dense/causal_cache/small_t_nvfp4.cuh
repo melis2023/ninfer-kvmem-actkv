@@ -25,7 +25,7 @@ __device__ __forceinline__ int causal_small_t_nvfp4_code_swz(int row, int logica
 }
 
 template <typename Geometry, int TokenTile, int WarpsPerCta, int MinBlocksPerSm, int KeyBlock,
-          bool DynamicArena, bool MultiBatch, bool Masked, typename CacheInput>
+          bool DynamicArena, bool MultiBatch, bool Masked, typename CacheInput, bool TuringShapes>
 __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     void causal_attention_small_t_nvfp4_tiled_kernel(
         const __nv_bfloat16* q, CacheInput input, const std::int32_t* positions,
@@ -35,6 +35,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         std::int32_t table_stride, std::int32_t full_width, std::int32_t column_begin,
         std::int32_t logical_capacity, float attention_scale, float* partial_acc, float* partial_m,
         float* partial_l) {
+    if constexpr (!shape_set_in_image(TuringShapes)) { return; } // not this image's set
+    // A Volta card runs its own kernel (small_t_sm70.cuh): a build of several architectures
+    // compiles this kernel empty in the Volta image.
+#if !defined(NINFER_SM70_DEVICE)
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
@@ -49,7 +53,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     constexpr int ProducerWarps        = RowTiles;
     constexpr int VWorkerWarps         = Wc - ProducerWarps;
     constexpr int VWorkerThreads       = VWorkerWarps * 32;
-    constexpr bool CompactKVStage      = RowTiles <= 2;
+    constexpr bool CompactKVStage =
+        RowTiles <= 2 || kCausalSmallTCompactKV<RowTiles, Bc, 5 * Bc * D, TuringShapes>;
     constexpr int ConsumerWarpsPerTile = Wc / RowTiles;
     constexpr int PVNtPerWarp          = D / (ConsumerWarpsPerTile * 8);
     constexpr int PVKs                 = Bc / 16;
@@ -149,7 +154,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         return;
     }
 
-    const int window = last_pos + 1;
+    const int live_end = last_pos + 1;
+    const int window   = causal_small_t_tile_window(first_pos, TokenTile, logical_capacity);
     const int active_split_count =
         causal_small_t_quantized_active_splits<Geometry>(window, split_count, TokenTile);
     if (split >= active_split_count) return;
@@ -173,6 +179,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         write_neutral();
         return;
     }
+    // Keys at or past the live end are beyond every live column: none is loaded.
+    const int load_end = split_end < live_end ? split_end : live_end;
+
     const int first_tile = (split_start / Bc) * Bc;
     const int key_blocks = div_up(split_end - first_tile, Bc);
     const int first_page = first_tile >> kPagedKVPageShift;
@@ -295,7 +304,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int key = tile_k0 + key_l;
             auto* k_dst   = k_scale_s + key_l * kKVCacheNvfp4Groups;
             auto* v_dst   = v_scale_s + key_l * kKVCacheNvfp4Groups;
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < load_end) {
                 const std::int64_t scale_offset = kv_cache_nvfp4_scale_index<Geometry>(
                     physical_page, kv_head, 0, key & kPagedKVPageMask);
                 cp_async<16>(k_dst, cache_k_scale + scale_offset);
@@ -314,7 +323,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int physical_byte = causal_small_t_nvfp4_code_swz(key_l, dc * 16);
             std::uint8_t* k_dst     = &k_nvfp4[key_l * CodeRowBytes + physical_byte];
             std::uint8_t* v_dst     = &v_nvfp4[key_l * CodeRowBytes + d / 2];
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < load_end) {
                 const std::int64_t code_offset = kv_cache_nvfp4_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
                 cp_async<16, Cache::cg>(k_dst, &cache_k[code_offset]);
@@ -341,7 +350,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int dc    = chunk - key_l * (D / 16);
             const int d     = dc * 16;
             const int key   = k0 + key_l;
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < load_end) {
                 const auto represented = kv_cache_nvfp4_dequant_f16x16(
                     &k_nvfp4[key_l * CodeRowBytes + causal_small_t_nvfp4_code_swz(key_l, d / 2)],
                     k_scale_s[key_l * kKVCacheNvfp4Groups + d / kKVCacheNvfp4Group]);
@@ -469,7 +478,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int dc    = chunk - key_l * (D / 16);
                 const int d     = dc * 16;
                 const int key   = k0 + key_l;
-                if (key >= split_start && key < split_end) {
+                if (key >= split_start && key < load_end) {
                     const auto represented = kv_cache_nvfp4_dequant_f16x16(
                         &v_nvfp4[key_l * CodeRowBytes + d / 2],
                         v_scale_s[key_l * kKVCacheNvfp4Groups + d / kKVCacheNvfp4Group]);
@@ -496,7 +505,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int dc    = chunk - key_l * (D / 16);
                 const int d     = dc * 16;
                 const int key   = k0 + key_l;
-                if (key >= split_start && key < split_end) {
+                if (key >= split_start && key < load_end) {
                     const auto represented = kv_cache_nvfp4_dequant_f16x16(
                         &v_nvfp4[key_l * CodeRowBytes + d / 2],
                         v_scale_s[key_l * kKVCacheNvfp4Groups + d / kKVCacheNvfp4Group]);
@@ -603,6 +612,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             *reinterpret_cast<float2*>(&partial_acc[dst]) = make_float2(acc[n][2], acc[n][3]);
         }
     }
+#endif
 }
 
 template <typename Geometry, bool MultiBatch, bool Masked, bool Offset>
@@ -610,7 +620,7 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_nvfp4_reduce_out
     const float* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
-    std::int32_t split_count, __nv_bfloat16* out) {
+    std::int32_t visible_capacity, std::int32_t split_count, __nv_bfloat16* out) {
     const int q_head      = static_cast<int>(blockIdx.x);
     const int flat_column = static_cast<int>(blockIdx.y);
     int batch             = 0;
@@ -626,7 +636,7 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_nvfp4_reduce_out
     }
     if constexpr (Offset) positions += column_begin;
     if constexpr (MultiBatch) positions += static_cast<std::int64_t>(batch) * full_width;
-    const int window  = positions[tokens - 1] + 1;
+    const int window  = causal_small_t_tile_window(positions[0], tokens, visible_capacity);
     int output_column = token;
     if constexpr (Offset) output_column += column_begin;
     if constexpr (MultiBatch) output_column += batch * full_width;
@@ -653,13 +663,8 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_nvfp4_reduce_out
     const float head_l = causal_merge_split_statistics<Geometry>(
         partial_m, partial_l, q_head, token, tokens, active_splits, weights, warp_sums, scalars);
 
-    float numerator = 0.0F;
-    for (int split = 0; split < active_splits; ++split) {
-        if (weights[split] != 0.0f)
-            numerator +=
-                partial_acc[causal_partial_acc_index<Geometry>(q_head, tid, token, split, tokens)] *
-                weights[split];
-    }
+    const float numerator = causal_weighted_split_sum<Geometry>(partial_acc, weights, q_head, tid,
+                                                                token, tokens, active_splits);
     normalized[tid] = head_l > 0.0F ? numerator / head_l : 0.0F;
     __syncthreads();
 

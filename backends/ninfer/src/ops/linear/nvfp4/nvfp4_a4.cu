@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "ops/common/blackwell_routes.h"
 #include "ops/linear/nvfp4/nvfp4_a4_plan.h"
 
 #include "core/device.h"
@@ -69,6 +70,7 @@ void launch_quantize_exact(const Tensor& x, const Weight& weight, Nvfp4A4Workspa
 void launch_nvfp4_a4_quantize(const Tensor& x, const Weight& weight, Nvfp4A4Workspace workspace,
                               Nvfp4ScaleLayout layout, cudaStream_t stream,
                               bool reciprocal_quotient) {
+    require_nvfp4_a4_card();
     if (workspace.codes == nullptr || workspace.scales == nullptr) {
         throw std::invalid_argument("nvfp4 A4 requires caller workspace");
     }

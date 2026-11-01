@@ -18,7 +18,7 @@
 #
 #   .\scripts\build.ps1                  configure + build into build-ninja
 #   .\scripts\build.ps1 -Test            ... then run the test suite
-#   .\scripts\build.ps1 -Package         ... then build the release archive for VERSION
+#   .\scripts\build.ps1 -Package         ... then build the release archive for this source commit
 #   .\scripts\build.ps1 -Benchmarks      ... include bench\ (implied by -Package)
 #   .\scripts\build.ps1 -Clean           delete the build directory first
 #   .\scripts\build.ps1 -Target ninfer-serve
@@ -30,7 +30,7 @@ param(
     [switch]$Benchmarks,
     [string]$Target,
     [string]$BuildDir,
-    [ValidateSet('80', '86', '89')][string]$Arch = '86'
+    [ValidateSet('75', '80', '86', '89')][string]$Arch = '86'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -99,9 +99,10 @@ Push-Location $RepoRoot
 try {
     # Quote the -D arguments: PowerShell does not reliably expand a variable inside a bare token
     # that begins with "-D", and cmake then sees the literal "$Arch".
+    $RuntimeOption = if ($Package) { 'ON' } else { 'OFF' }
     $BenchmarksOption = if ($BuildBenchmarks) { 'ON' } else { 'OFF' }
     cmake -S . -B $BuildDir -G Ninja '-DCMAKE_BUILD_TYPE=Release' "-DCMAKE_CUDA_ARCHITECTURES=$Arch" `
-          "-DNINFER_BUILD_BENCHMARKS=$BenchmarksOption"
+          "-DNINFER_BUILD_BENCHMARKS=$BenchmarksOption" "-DNINFER_SHARED_RUNTIME=$RuntimeOption"
     if ($LASTEXITCODE -ne 0) { throw "configure failed ($LASTEXITCODE)" }
 
     $buildArgs = @('--build', $BuildDir)

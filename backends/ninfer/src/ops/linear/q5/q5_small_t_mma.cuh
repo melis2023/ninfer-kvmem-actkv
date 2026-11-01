@@ -13,6 +13,8 @@
 // in a permuted k order (see the kernel); each warp folds its group's fp16 scale into an fp32
 // accumulator, and the eight K partials are reduced through shared memory at the end.
 
+#include "ops/common/device_limits.h"
+#include "ops/common/math.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/small_t_layout.cuh"
@@ -89,6 +91,31 @@ __device__ __forceinline__ void q5_small_t_decode_eight(unsigned word, unsigned 
     }
 }
 
+#if defined(NINFER_SM75_FORMS)
+// q5_small_t_decode_eight as FP16 pairs, for Turing's FP16 MMA: v in the mantissa of FP16 1024.0
+// less 1040, the same codes, formed by native FP16 arithmetic where Turing has no BF16 arithmetic.
+__device__ __forceinline__ void q5_small_t_decode_eight_f16(unsigned word, unsigned high,
+                                                            unsigned (&out)[4]) {
+    const unsigned kMagic = 0x64006400u; // fp16 1024.0 in both halves
+    const unsigned kBias  = 0x64106410u; // fp16 1040.0 in both halves
+    const unsigned lo     = word & 0x0f0f0f0fu;
+    const unsigned hi     = (word >> 4) & 0x0f0f0f0fu;
+    unsigned even         = __byte_perm(lo, hi, 0x5140);
+    unsigned odd          = __byte_perm(lo, hi, 0x7362);
+    const unsigned inv    = ~high;
+    even |= (((inv & 0xfu) * 0x00204081u) & 0x01010101u) << 4;
+    odd |= ((((inv >> 4) & 0xfu) * 0x00204081u) & 0x01010101u) << 4;
+    const unsigned biased[4] = {
+        __byte_perm(even, kMagic, 0x7150), __byte_perm(even, kMagic, 0x7372),
+        __byte_perm(odd, kMagic, 0x7150), __byte_perm(odd, kMagic, 0x7372)};
+#    pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const __half2 value = __hsub2(half2_from_bits(biased[j]), half2_from_bits(kBias));
+        out[j]              = *reinterpret_cast<const unsigned*>(&value);
+    }
+}
+#endif
+
 // Rows: output rows. K: reduction length, a multiple of the slab (64 * KWarps). XCols: activation
 // columns staged (4, 8, 16 or 32), covered by max(1, XCols / 8) eight-column MMA tiles; the B
 // fragments of columns at or past `columns` are zero. Stages: depth of the cp.async ring (1..3).
@@ -106,7 +133,9 @@ __device__ __forceinline__ void q5_small_t_decode_eight(unsigned word, unsigned 
 // natural slot order needs a byte load, a decode and an ldmatrix per fragment.
 template <int Rows, int K, int XCols, int Stages, class Epilogue, int KWarps = 8,
           int TilesPerWarp = 1>
-__launch_bounds__(256, (KWarps < 8 || XCols >= 32 ? 2 : (XCols >= 16 || Stages == 2 ? 4 : 6)))
+__launch_bounds__(256, resident_ctas_bound(256, KWarps < 8 || XCols >= 32
+                                                         ? 2
+                                                         : (XCols >= 16 || Stages == 2 ? 4 : 6)))
     __global__ void q5_small_t_mma_kernel(const __nv_bfloat16* __restrict__ x,
                                           const std::uint8_t* __restrict__ codes,
                                           const std::uint8_t* __restrict__ high_bits,
@@ -213,22 +242,68 @@ __launch_bounds__(256, (KWarps < 8 || XCols >= 32 ? 2 : (XCols >= 16 || Stages =
 #pragma unroll
         for (int half = 0; half < 2; ++half) {
             // Four code bytes and one high byte per row cover steps ks = 2*half and 2*half + 1.
-            unsigned a_top[kTpw][4], a_bot[kTpw][4];
-#pragma unroll
+#if defined(NINFER_SM75_DEVICE)
+            // Turing: the codes decode to FP16 natively, and a tile whose activations are all FP16
+            // values runs FP16 MMA on the operands mma_bf16 would form, in its order, so the bits
+            // are the same; another tile runs mma_bf16 (q4_ksplit_mma.cuh does the same).
+            unsigned h_top[kTpw][4], h_bot[kTpw][4];
+#    pragma unroll
             for (int t = 0; t < kTpw; ++t) {
-                q5_small_t_decode_eight(half == 0 ? top[t].x : top[t].y,
-                                        (top_high[t] >> (8 * half)) & 0xffu, a_top[t]);
-                q5_small_t_decode_eight(half == 0 ? bot[t].x : bot[t].y,
-                                        (bot_high[t] >> (8 * half)) & 0xffu, a_bot[t]);
+                q5_small_t_decode_eight_f16(half == 0 ? top[t].x : top[t].y,
+                                            (top_high[t] >> (8 * half)) & 0xffu, h_top[t]);
+                q5_small_t_decode_eight_f16(half == 0 ? bot[t].x : bot[t].y,
+                                            (bot_high[t] >> (8 * half)) & 0xffu, h_bot[t]);
             }
-#pragma unroll
+#    pragma unroll
             for (int nt = 0; nt < kNt; ++nt) {
                 const int col = nt * 8 + gid;
                 uint4 b       = make_uint4(0u, 0u, 0u, 0u);
                 if (col < columns) {
                     b = load_vec<uint4>(&stage.activations[k_split][col][16 * lid + 8 * half]);
                 }
-#pragma unroll
+                uint4 h;
+                if (sm75::bf16_fragments_as_f16(b, h)) {
+#    pragma unroll
+                    for (int t = 0; t < kTpw; ++t) {
+                        float(&g)[4] = group_acc[t][nt];
+                        mma_f16(g[0], g[1], g[2], g[3], h_top[t][0], h_bot[t][0], h_top[t][1],
+                                h_bot[t][1], h.x, h.y);
+                        mma_f16(g[0], g[1], g[2], g[3], h_top[t][2], h_bot[t][2], h_top[t][3],
+                                h_bot[t][3], h.z, h.w);
+                    }
+                } else {
+#    pragma unroll
+                    for (int t = 0; t < kTpw; ++t) {
+                        unsigned a_top[4], a_bot[4];
+                        q5_small_t_decode_eight(half == 0 ? top[t].x : top[t].y,
+                                                (top_high[t] >> (8 * half)) & 0xffu, a_top);
+                        q5_small_t_decode_eight(half == 0 ? bot[t].x : bot[t].y,
+                                                (bot_high[t] >> (8 * half)) & 0xffu, a_bot);
+                        float(&g)[4] = group_acc[t][nt];
+                        mma_bf16(g[0], g[1], g[2], g[3], a_top[0], a_bot[0], a_top[1], a_bot[1],
+                                 b.x, b.y);
+                        mma_bf16(g[0], g[1], g[2], g[3], a_top[2], a_bot[2], a_top[3], a_bot[3],
+                                 b.z, b.w);
+                    }
+                }
+            }
+#else
+            unsigned a_top[kTpw][4], a_bot[kTpw][4];
+#    pragma unroll
+            for (int t = 0; t < kTpw; ++t) {
+                q5_small_t_decode_eight(half == 0 ? top[t].x : top[t].y,
+                                        (top_high[t] >> (8 * half)) & 0xffu, a_top[t]);
+                q5_small_t_decode_eight(half == 0 ? bot[t].x : bot[t].y,
+                                        (bot_high[t] >> (8 * half)) & 0xffu, a_bot[t]);
+            }
+#    pragma unroll
+            for (int nt = 0; nt < kNt; ++nt) {
+                const int col = nt * 8 + gid;
+                uint4 b       = make_uint4(0u, 0u, 0u, 0u);
+                if (col < columns) {
+                    b = load_vec<uint4>(&stage.activations[k_split][col][16 * lid + 8 * half]);
+                }
+#    pragma unroll
                 for (int t = 0; t < kTpw; ++t) {
                     float(&g)[4] = group_acc[t][nt];
                     mma_bf16(g[0], g[1], g[2], g[3], a_top[t][0], a_bot[t][0], a_top[t][1],
@@ -237,6 +312,7 @@ __launch_bounds__(256, (KWarps < 8 || XCols >= 32 ? 2 : (XCols >= 16 || Stages =
                              a_bot[t][3], b.z, b.w);
                 }
             }
+#endif
         }
 
 #pragma unroll

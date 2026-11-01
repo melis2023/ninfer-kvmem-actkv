@@ -22,6 +22,11 @@ std::string prefill_signature(const Model& model) {
                {"num_hidden_layers", t.num_hidden_layers},
                {"rms_norm_eps", t.rms_norm_eps},
                {"layer_types", t.layer_types}};
+    // Explicit NVFP4 weight modes alter represented activations. Bind cached state and
+    // measured prefill costs to that choice; leave the default signature unchanged.
+    if (model.options().nvfp4_w4a16 || model.options().nvfp4_w4a8_int) {
+        facts["nvfp4_weight_compute"] = model.options().nvfp4_w4a16 ? "a16" : "a8-int";
+    }
     if (t.attention) {
         const auto& a      = *t.attention;
         facts["attention"] = {a.num_attention_heads, a.num_key_value_heads, a.head_dim};
@@ -47,6 +52,13 @@ std::string prefill_signature(const Model& model) {
         facts["vision"] = {
             v.depth,      v.hidden_size,         v.intermediate_size,  v.num_heads,
             v.patch_size, v.temporal_patch_size, v.spatial_merge_size, v.num_position_embeddings};
+    }
+    if (!model.expert_sources().layers.empty()) {
+        facts["expert_execution"] = {"native-streamed-grouped", model.options().expert_residency};
+        auto& sources = facts["streamed_expert_formats"] = Json::array();
+        for (const auto& layer : model.expert_sources().layers) {
+            sources.push_back({layer.gate_up.format, layer.down.format});
+        }
     }
     std::vector<const BoundWeight*> weights;
     // PrefillWork prices primary Text/Vision reconstruction. The coefficients were measured

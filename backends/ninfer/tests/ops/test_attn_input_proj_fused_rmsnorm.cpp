@@ -59,8 +59,11 @@ int run_case(const Weight& weight, int tokens, bool measure) {
     const std::size_t capacity = ops::attn_input_proj_workspace_capacity_bytes(
         QType::NVFP4, kParentRows, kHidden, ops::LinearPolicy::AllowA4, tokens, tokens);
     // The A16 route (T<4) uses no workspace; the one-byte floor keeps the arena
-    // constructible while still rejecting any genuine plane allocation.
-    const std::size_t floored = capacity == 0 ? 1 : capacity;
+    // constructible while still rejecting any genuine plane allocation. The quantizer comparison
+    // below allocates W4A4 planes, which an Op capacity without that route (sm_70) leaves out.
+    const std::size_t planes =
+        tokens >= 4 ? ops::detail::nvfp4_w4a4_workspace_capacity_bytes(tokens, kHidden) : 0;
+    const std::size_t floored = std::max<std::size_t>({capacity, planes, 1});
     DeviceArena reference_workspace(floored);
     DeviceArena fused_workspace(floored);
     int failures = 0;

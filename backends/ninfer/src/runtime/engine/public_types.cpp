@@ -1,7 +1,9 @@
-#include "ninfer/types.h"
+#include "ninfer/engine_options.h"
+#include "ninfer/request.h"
 
 #include <atomic>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <utility>
 

@@ -81,9 +81,14 @@ void launch_exact(const Tensor& x, const Weight& weight, Tensor& out, cudaStream
                                                   ? Nvfp4SimtActivationAccess::SharedPhase
                                                   : Nvfp4SimtActivationAccess::TokenPacked;
     static constexpr int kWarpsPerCta       = ActiveTokens >= 13 ? 16 : (ActiveTokens >= 5 ? 4 : 8);
+    // Five blocks per SM for the 256-thread instances: at MinBlocksPerSm 1 ptxas settles on 82
+    // registers, which fits two blocks and leaves the launch latency-bound. A 48-register budget
+    // lifts active warps from 32.5% to ~62%. The 128-thread instances never bind on registers and
+    // the 512-thread instance would spill at 42, so both stay at one block per SM.
+    static constexpr int kMinBlocksPerSm = ActiveTokens <= 4 ? 5 : 1;
     using Schedule = Nvfp4SimtSchedule<kWarpsPerCta, 1, 2, 16, ActiveTokens, 1, kActivationAccess,
                                        Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 1,
-                                       Nvfp4SimtBlockOrder::RowsContiguous, 1>;
+                                       Nvfp4SimtBlockOrder::RowsContiguous, kMinBlocksPerSm>;
     static_assert((kIntermediate % Schedule::kWarpsPerCta) == 0);
     constexpr int kBlocks = kIntermediate / Schedule::kWarpsPerCta;
     const float inverse   = 1.0F / weight.weight_scale_divisor;

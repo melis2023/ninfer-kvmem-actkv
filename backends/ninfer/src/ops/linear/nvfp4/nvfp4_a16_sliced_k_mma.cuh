@@ -126,7 +126,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
             cp_commit();
         }
     }
-#pragma unroll
+    // Partially unrolled on purpose. A fully unrolled K/kBlockK loop (80 groups on the
+    // 5120-column shapes) makes ptxas emit 320 straight-line HMMA for the 32-row tiles, which is
+    // slower than a rolled loop: T=28..32 measured 854/871 us before this, 372/394 us at unroll 1
+    // and 178 us at T=8 needed some unrolling back. Four groups per iteration keeps the software
+    // pipeline while cutting the code 20x. Arithmetic untouched -- same groups, same order, same
+    // k-step unroll below.
+#pragma unroll 8
     for (int group_index = 0; group_index < kGroups; ++group_index) {
         const int stage = group_index % Schedule::kStages;
         if (group_index + Schedule::kStages - 1 < kGroups)
@@ -136,17 +142,22 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
         __syncthreads();
 #pragma unroll
         for (int k_step = 0; k_step < kTileK / 16; ++k_step) {
-            const int code_col   = k_step * 16 + lid * 2;
-            const auto load_pair = [&](int row, int col) {
+            const int code_col = k_step * 16 + lid * 2;
+            // Both column pairs of a k-step land inside the same 16-column scale group, so the
+            // group byte is read once per row rather than once per pair: four pairs share two
+            // bytes.
+            const int scale_col = (warp_k0 + code_col) / 16;
+            const auto scale_lo = scale_shared[stage][gid][scale_col];
+            const auto scale_hi = scale_shared[stage][gid + 8][scale_col];
+            const auto load_pair = [&](int row, int col, std::uint8_t scale) {
                 const int byte   = (warp_k0 + col) / 2;
                 const int offset = ((byte / 16) ^ (row & kCodeSwizzle)) * 16 + (byte & 15);
-                return nvfp4_scaled_pair_bf16(code_shared[stage][row][offset],
-                                              scale_shared[stage][row][(warp_k0 + col) / 16]);
+                return nvfp4_scaled_pair_bf16(code_shared[stage][row][offset], scale);
             };
-            const unsigned a0 = load_pair(gid, code_col);
-            const unsigned a1 = load_pair(gid + 8, code_col);
-            const unsigned a2 = load_pair(gid, code_col + 8);
-            const unsigned a3 = load_pair(gid + 8, code_col + 8);
+            const unsigned a0 = load_pair(gid, code_col, scale_lo);
+            const unsigned a1 = load_pair(gid + 8, code_col, scale_hi);
+            const unsigned a2 = load_pair(gid, code_col + 8, scale_lo);
+            const unsigned a3 = load_pair(gid + 8, code_col + 8, scale_hi);
 #pragma unroll
             for (int token_mma = 0; token_mma < kTokenMmas; ++token_mma) {
                 unsigned b0;

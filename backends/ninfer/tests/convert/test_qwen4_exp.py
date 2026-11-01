@@ -52,7 +52,16 @@ def test_mtp_config():
     assert mtp_config(_checkpoint()) == {
         "architectures": ["Qwen4ExpMTP"],
         "rope_theta": 10000000.0,
+        "num_experts": 512,
     }
+    # An expert-pruned model drafts with the full model's MTP block, whose GGUF names its count.
+    source = deepcopy(_checkpoint())
+    source["text_config"]["num_experts"] = 256
+    source["text_config"]["mtp"]["num_experts"] = 512
+    assert mtp_config(source)["num_experts"] == 512
+    source["text_config"]["mtp"]["num_experts"] = 8
+    with pytest.raises(ValueError, match="experts each token selects"):
+        mtp_config(source)
 
 
 def _tiny_config():
@@ -191,5 +200,72 @@ def test_build_model_adds_the_qwen3_5_vision_tower(tmp_path):
                                             "video_preprocessor_config.json"}
         assert model.parameters["vision/merger/fc2"].shape == (8, 64)
         assert model.parameters["vision/layers/1/attention/query"].shape == (16, 16)
-        with pytest.raises(ValueError, match="vision optional beside text"):
+        with pytest.raises(ValueError, match="vision and mtp optional beside text"):
             build_model(source, components=("ngram", "vision"))
+
+
+def test_build_model_adds_the_mtp_block(tmp_path):
+    from tools.convert.qwen4_exp import build_model
+    from tools.convert.sources.safetensors import SafetensorsSource
+
+    root = tmp_path / "source"
+    root.mkdir()
+    config = _tiny_config()
+    config["text_config"].update(mtp_num_hidden_layers=1, mtp_use_dedicated_embeddings=False,
+                                 mtp={"num_hidden_layers": 1, "hybrid": True,
+                                      "layer_types": ["full_attention"],
+                                      "rope_theta": 10000000, "num_experts": 5})
+    (root / "config.json").write_text(json.dumps(config))
+    from safetensors.torch import save_file
+
+    save_file({"model.language_model.layers.0.ple.conv1d.weight": torch.zeros(16, 1, 4)},
+              root / "model.safetensors")
+    for name, value in {
+        "tokenizer.json": {"model": {"vocab": {str(i): i for i in range(6)}}},
+        "tokenizer_config.json": {},
+        "generation_config.json": {},
+    }.items():
+        (root / name).write_text(json.dumps(value))
+    (root / "chat_template.jinja").write_text("{{ messages }}")
+    with SafetensorsSource(root) as source:
+        model = build_model(source, components=("text", "mtp"))
+        assert model.components["mtp"] == {
+            "config": {"architectures": ["Qwen4ExpMTP"], "rope_theta": 10000000.0,
+                       "num_experts": 5},
+            "target": "text",
+        }
+        names = set(model.parameters)
+        # The input norms and projections, one sparse-attention layer with its own MoE (five
+        # experts here, three in the text layers) and a final mixer without inject rows.
+        assert model.parameters["mtp/hidden_norm"].shape == (16,)
+        assert model.parameters["mtp/embedding_norm"].shape == (8,)
+        assert model.parameters["mtp/fc_hidden"].shape == (8, 8)
+        assert model.parameters["mtp/fc_embedding"].inputs == ("mtp/embedding_normalized",)
+        assert {"mtp/layer/attn_hc/inject", "mtp/layer/mlp_hc/up", "mtp/layer/attention/gate",
+                "mtp/layer/indexer/key", "mtp/layer/moe/experts/4/down",
+                "mtp/layer/moe/shared/down", "mtp/final_mixer/norm"} <= names
+        assert "mtp/final_mixer/inject" not in names
+        assert "text/layers/1/moe/experts/3/down" not in names
+        assert model.parameters["mtp/layer/moe/router"].shape == (5, 8)
+        assert not any(n.startswith("mtp/layer/gdn/") or n.startswith("mtp/layer/ple/")
+                       for n in names)
+        # The head serves the MTP block's final mixer too.
+        assert model.parameters["text/output_head"].inputs == ("text/final_hidden",
+                                                               "mtp/final_hidden")
+
+    # A range-fetched companion supplies actual MTP bytes; the base has no MTP weights.
+    companion = tmp_path / "mtp"
+    companion.mkdir()
+    (companion / "config.json").write_text(json.dumps(config))
+    hidden = torch.arange(64, dtype=torch.bfloat16).reshape(8, 8)
+    norm = torch.arange(8, dtype=torch.bfloat16)
+    save_file({"mtp.fc_hidden.weight": hidden, "mtp.pre_fc_norm_embedding.weight": norm},
+              companion / "model.safetensors")
+    with SafetensorsSource(root) as source, SafetensorsSource(companion) as mtp:
+        model = build_model(source, components=("text", "mtp"), companions={"mtp": mtp})
+        assert torch.equal(model.parameters["mtp/fc_hidden"].source.rows(2, 5), hidden[2:5])
+        assert torch.equal(model.parameters["mtp/embedding_norm"].source.values(), norm)
+        assert model.components["mtp"]["config"]["num_experts"] == 5
+        mtp.config["text_config"]["hc_lowrank"] += 1
+        with pytest.raises(ValueError, match="MTP companion hc_lowrank"):
+            build_model(source, components=("text", "mtp"), companions={"mtp": mtp})

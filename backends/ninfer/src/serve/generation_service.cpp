@@ -1,7 +1,11 @@
 #include "serve/generation_service.h"
+#include "serve/openai_chat.h"
+#include "kvmem/monitor.hpp"
+#include "kvmem/monitor_rate.hpp"
 
 #include "product/media_acquire/acquire.h"
 #include "serve/console_log.h"
+#include "serve/structured_output.h"
 #include "serve/translate.h"
 
 #include <cuda_runtime_api.h>
@@ -104,6 +108,9 @@ using Clock = std::chrono::steady_clock;
 // several times that pass gets one.
 constexpr std::size_t kRawPromptAnchorMinimumTokens = 512;
 
+// The branched reads' records the memo keeps, about 1 KiB each.
+constexpr std::size_t kBranchMemoRecords = 8192;
+
 [[noreturn]] void throw_preparation_cancelled();
 
 [[noreturn]] void throw_media_error(const ninfer::product::media_acquire::Error& exception) {
@@ -201,6 +208,7 @@ ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point dead
     }
     media.bytes               = std::move(source_bytes);
     media.image_resize_policy = part.image_resize_policy;
+    media.image_detail        = part.image_detail;
     return media;
 }
 
@@ -233,21 +241,42 @@ void check_preparation_control(Clock::time_point deadline,
 
 class ServiceOutputSink final : public ninfer::OutputSink {
 public:
-    explicit ServiceOutputSink(const StreamSink& sink) : sink_(&sink) {}
+    explicit ServiceOutputSink(const StreamSink& sink, const PreparedRequest& prepared)
+        : sink_(&sink), monitor_(prepared.monitor_update), prompt_(prepared.prompt_tokens) {}
 
     void start(ninfer::GenerationStart start) override {
+        prompt_ = start.prompt.prompt_tokens;
+        cached_ = start.reused_prompt_tokens;
+        if (monitor_) monitor_({{"status", "reading"}, {"prompt_tokens", prompt_}, {"cached_tokens", cached_}});
         if (sink_->on_start) { sink_->on_start(start); }
     }
 
     void progress(ninfer::PromptProgress progress) override {
+        cached_ = progress.reused_prompt_tokens;
+        if (monitor_) monitor_({{"status", "reading"}, {"prompt_tokens", progress.total_prompt_tokens}, {"cached_tokens", cached_}});
+        if (monitor_) monitor_({{"prompt_processed_tokens", progress.processed_prompt_tokens},
+            {"prefill_elapsed_ms", progress.elapsed_ns / 1e6}});
         if (sink_->on_progress) { sink_->on_progress(progress); }
     }
 
     void timing(ninfer::GenerationTimingObservation timing) override {
+        const auto native = completion_timings_json(prompt_, cached_, timing);
+        nlohmann::json values{{"status", "generating"}, {"generated_tokens", timing.generated_tokens},
+            {"decode_tps", native.at("predicted_per_second")},
+            {"decode_tps_mean", native.at("predicted_per_second")},
+            {"prefill_tps", native.at("prompt_per_second")}, {"prefill_ms", native.at("prompt_ms")},
+            {"ttft_ms", native.at("prompt_ms")}, {"ttft_scope", "execution"},
+            {"decode_ms", native.at("predicted_ms")}, {"prompt_new_tokens", prompt_ - cached_}};
+        values.update(rate_.sample(timing.generated_tokens, timing.generation_elapsed_ns, kvmem::monitor::now_ms()));
+        if (monitor_) monitor_(values);
         if (sink_->on_timing) { sink_->on_timing(timing); }
     }
 
     void publish(ninfer::OutputDelta delta) override {
+        if (monitor_ && !delta.text.empty()) {
+            const auto phase = delta.channel == ninfer::OutputChannel::Reasoning ? "thinking" : "answering";
+            if (phase_ != phase) { phase_ = phase; monitor_({{"phase", phase}}); }
+        }
         if (delta.channel == ninfer::OutputChannel::Reasoning) {
             if (!delta.text.empty() && sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
             return;
@@ -258,6 +287,10 @@ public:
 
 private:
     const StreamSink* sink_ = nullptr;
+    std::function<void(const nlohmann::json&)> monitor_;
+    int prompt_ = 0, cached_ = 0;
+    kvmem::monitor_rate_window rate_;
+    std::string phase_;
 };
 
 } // namespace
@@ -267,8 +300,6 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.artifact_path            = options.artifact_path;
     engine_options.chat_template_path       = options.chat_template_path;
     engine_options.device                   = options.device;
-    engine_options.gpu_clock_floor_mhz      = options.gpu_clock_floor_mhz;
-    engine_options.invariant_attention      = options.invariant_attention;
     engine_options.max_context              = options.max_context;
     engine_options.kv_capacity              = options.kv_capacity;
     engine_options.kvmem                    = options.kvmem;
@@ -276,13 +307,16 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.max_pending_requests     = options.max_pending_requests;
     engine_options.pending_timeout_ms       = options.pending_timeout_ms;
     engine_options.prefill_chunk            = options.prefill_chunk;
+    engine_options.decode_rounds_per_prefill = options.decode_rounds_per_prefill;
     engine_options.fast_prefill_kernel      = options.fast_prefill_kernel;
     engine_options.kv_cache                 = options.kv_cache;
     engine_options.enable_vision            = options.enable_vision;
     engine_options.grafts                   = options.grafts;
     engine_options.vision_residency         = options.vision_residency;
+    engine_options.cpu_vision_idle_seconds   = options.cpu_vision_idle_seconds;
     engine_options.vision_max_merged_tokens = options.vision_max_merged_tokens;
     engine_options.use_cuda_graph           = options.use_cuda_graph;
+    engine_options.gpu_clock_floor_mhz      = options.gpu_clock_floor_mhz;
     engine_options.lm_head_q4               = options.lm_head_q4;
     engine_options.lm_head_q6               = options.lm_head_q6;
     engine_options.embedding_q4             = options.embedding_q4;
@@ -306,6 +340,8 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.suspend                  = options.suspend;
     engine_options.mlp_a8_decode            = options.mlp_a8_decode;
     engine_options.prefill_a8               = options.prefill_a8;
+    engine_options.nvfp4_w4a8_int           = options.nvfp4_w4a8_int;
+    engine_options.nvfp4_w4a16              = options.nvfp4_w4a16;
     engine_options.prefill_cublas           = options.prefill_cublas;
     engine_options.prefill_cublas_projections = options.prefill_cublas_projections;
     engine_options.speculative              = options.speculative;
@@ -313,9 +349,12 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.slot_auto_save.enabled   = options.auto_save_evicted;
     engine_options.devices                  = options.devices;
     engine_options.stage_layers             = options.stage_layers;
+    engine_options.tensor_parallel          = options.tensor_parallel;
     engine_options.expert_residency           = options.expert_residency;
     engine_options.ngram_table                = options.ngram_table;
+    engine_options.kv_resident_positions      = options.kv_resident_positions;
     engine_options.expert_cache_bytes         = options.expert_cache_bytes;
+    engine_options.hybrid_experts             = options.hybrid_experts;
     engine_options.context_cost.preset_path = options.context_cost_presets;
     engine_options.device_profile           = options.device_profile;
     engine_options.device_profile_path      = options.device_profile_path;
@@ -353,10 +392,19 @@ GenerationService::GenerationService(
     engine_options.diagnostic_observer   = std::move(diagnostic_observer);
     engine_options.slot_auto_save.listener = std::move(auto_save_listener);
     engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
+    // A request that says nothing about thinking gets its template's default. Qwen's templates
+    // think unless told not to; Gemma 4's chat template keeps thinking off unless enable_thinking
+    // asks for it, so without --no-thinking or a request flag a Gemma 4 server answers directly.
+    // Flint's template has no switch: thinking on, the default, leaves reasoning to the model, and
+    // thinking off closes an empty reasoning block, after which it answers at once.
+    if (!options_.enable_thinking && engine_->load_summary().architecture == "Gemma4ForCausalLM") {
+        options_.enable_thinking = false;
+    }
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
     count_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
+    branch_memo_ = std::make_shared<BranchMemo>(kBranchMemoRecords);
 }
 
 std::size_t GenerationService::admitted_requests() const {
@@ -405,36 +453,172 @@ PreparedRequest GenerationService::prepare(const GenerationRequest& request,
                                            ninfer::GenerationObservationOptions observation,
                                            std::function<bool()> is_cancelled,
                                            ContextCacheHints context_cache) const {
-    return prepare_impl(
+    std::vector<StagedRequest> one;
+    one.push_back(stage(request, consumer_mode, observation, std::move(is_cancelled),
+                        std::move(context_cache)));
+    return std::move(submit_group(std::move(one)).front());
+}
+
+StagedRequest GenerationService::stage(const GenerationRequest& request,
+                                       GenerationConsumerMode consumer_mode,
+                                       ninfer::GenerationObservationOptions observation,
+                                       std::function<bool()> is_cancelled,
+                                       ContextCacheHints context_cache) const {
+    if (consumer_mode == GenerationConsumerMode::Streaming) {
+        observation.live_timings = true;
+        observation.prompt_progress = true;
+    }
+    return stage_impl(
         request, consumer_mode, observation, std::move(is_cancelled), std::move(context_cache),
         options_.allow_prefix_reuse ? CacheParticipation::ReadWrite : CacheParticipation::Disabled,
         DeadlinePolicy::ClientPendingTimeout);
 }
 
-PreparedRequest GenerationService::prepare_impl(const GenerationRequest& incoming,
-                                                GenerationConsumerMode consumer_mode,
-                                                ninfer::GenerationObservationOptions observation,
-                                                std::function<bool()> is_cancelled,
-                                                ContextCacheHints context_cache,
-                                                CacheParticipation cache_participation,
-                                                DeadlinePolicy deadline_policy) const {
-    std::optional<GenerationRequest> unconstrained;
-    if (incoming.structured_output.kind != StructuredOutputKind::None &&
-        !options_.structured_output) {
-        if (!options_.unconstrained_response_format) {
-            ApiError error;
-            error.message =
-                "structured output requires the server to start with --structured-output";
-            error.param = "response_format";
-            error.code  = "response_format_not_supported";
-            throw ApiException(std::move(error));
-        }
-        unconstrained.emplace(incoming);
-        unconstrained->structured_output = {};
+std::vector<PreparedRequest>
+GenerationService::submit_group(std::vector<StagedRequest> staged) const {
+    std::vector<ninfer::GenerationSubmission> submissions;
+    submissions.reserve(staged.size());
+    for (StagedRequest& request : staged) { submissions.push_back(std::move(request.submission)); }
+    std::vector<ninfer::GenerationHandle> handles;
+    try {
+        handles = engine_->submit_group(std::move(submissions));
+    } catch (const ninfer::RequestError& exception) {
+        throw_request_error(exception);
+    } catch (const std::invalid_argument& exception) {
+        throw_invalid_input(exception, "invalid_prompt");
     }
+    std::vector<PreparedRequest> prepared;
+    prepared.reserve(staged.size());
+    for (std::size_t index = 0; index < staged.size(); ++index) {
+        PreparedRequest& request          = staged[index].prepared;
+        request.generation                = std::move(handles[index]);
+        request.sampling                  = request.generation.resolved_sampling();
+        request.effective_thinking_budget = request.generation.effective_thinking_budget();
+        prepared.push_back(std::move(request));
+    }
+    return prepared;
+}
+
+StagedRequest GenerationService::stage_read(const BranchRead& read,
+                                            ninfer::GenerationObservationOptions observation,
+                                            std::function<bool()> is_cancelled,
+                                            const ContextCacheHints& context_cache) const {
+    StagedRequest staged = stage(*read.request, GenerationConsumerMode::Aggregate, observation,
+                                 std::move(is_cancelled), context_cache);
+    if (!read.continuation.empty()) {
+        const std::span<const ninfer::TokenId> base = staged.submission.prompt.token_ids();
+        std::vector<ninfer::TokenId> tokens(base.begin(), base.end());
+        tokens.insert(tokens.end(), read.continuation.begin(), read.continuation.end());
+        staged.prepared.prompt_tokens = static_cast<int>(tokens.size());
+        try {
+            staged.submission.prompt = engine_->prepare_tokens(std::move(tokens), true, false,
+                                                               read.request->speculative_drafting);
+        } catch (const std::out_of_range& exception) {
+            throw_invalid_input(std::invalid_argument(exception.what()), "invalid_prompt");
+        }
+    }
+    staged.submission.options.execution.readout_tokens = read.readout;
+    return staged;
+}
+
+PreparedRequest GenerationService::submit_branches(std::span<const BranchRead> reads,
+                                                   ninfer::GenerationObservationOptions observation,
+                                                   std::function<bool()> is_cancelled,
+                                                   const ContextCacheHints& context_cache) const {
+    if (reads.empty()) { throw std::invalid_argument("submit_branches needs one read or more"); }
+    StagedRequest first = stage_read(BranchRead{.request = reads.front().request}, observation,
+                                     is_cancelled, context_cache);
+    ninfer::RequestOptions options = std::move(first.submission.options);
+    options.execution.readout_tokens.clear();
+    // The prompt of the request whose reads come next, without any read's continuation.
+    const GenerationRequest* base_request               = reads.front().request;
+    const std::span<const ninfer::TokenId> first_tokens = first.submission.prompt.token_ids();
+    std::vector<ninfer::TokenId> base_tokens(first_tokens.begin(), first_tokens.end());
+    const auto continued = [&](std::span<const ninfer::TokenId> continuation) {
+        std::vector<ninfer::TokenId> tokens = base_tokens;
+        tokens.insert(tokens.end(), continuation.begin(), continuation.end());
+        try {
+            // A branch's prompt only supplies its tokens: it drafts nothing.
+            return engine_->prepare_tokens(std::move(tokens), true, false, false);
+        } catch (const std::out_of_range& exception) {
+            throw_invalid_input(std::invalid_argument(exception.what()), "invalid_prompt");
+        }
+    };
+    std::vector<ninfer::GenerationBranch> branches;
+    branches.reserve(reads.size());
+    branches.push_back(ninfer::GenerationBranch{
+        .prompt = reads.front().continuation.empty() ? std::move(first.submission.prompt)
+                                                     : continued(reads.front().continuation),
+        .readout_tokens = reads.front().readout});
+    for (std::size_t index = 1; index < reads.size(); ++index) {
+        const BranchRead& read = reads[index];
+        if (read.request != base_request) {
+            StagedRequest next = stage(*read.request, GenerationConsumerMode::Aggregate,
+                                       observation, is_cancelled, context_cache);
+            const std::span<const ninfer::TokenId> tokens = next.submission.prompt.token_ids();
+            base_tokens.assign(tokens.begin(), tokens.end());
+            base_request = read.request;
+            if (read.continuation.empty()) {
+                branches.push_back(ninfer::GenerationBranch{
+                    .prompt = std::move(next.submission.prompt), .readout_tokens = read.readout});
+                continue;
+            }
+        }
+        branches.push_back(ninfer::GenerationBranch{.prompt         = continued(read.continuation),
+                                                    .readout_tokens = read.readout});
+    }
+    // The memo answers the reads it holds; the Engine runs the rest.
+    const std::optional<int> top_logprobs = reads.front().request->reported_top_logprobs();
+    HeldBranches held;
+    held.records.resize(reads.size());
+    std::vector<ninfer::GenerationBranch> pending;
+    pending.reserve(branches.size());
+    for (std::size_t index = 0; index < branches.size(); ++index) {
+        std::optional<BranchKey> key;
+        if (reads[index].memo && reads[index].request->cache_prompt) {
+            key = branch_key(branches[index].prompt.token_ids(), branches[index].readout_tokens,
+                             top_logprobs);
+            if (std::optional<ninfer::BranchResult> record = branch_memo_->find(*key)) {
+                held.records[index] = std::move(record);
+                continue;
+            }
+        }
+        held.run.push_back(key);
+        pending.push_back(std::move(branches[index]));
+    }
+    ninfer::GenerationHandle handle;
+    if (!pending.empty()) {
+        try {
+            handle = engine_->submit_branches(
+                std::move(pending), std::move(options), first.submission.consumer_mode,
+                first.submission.observation, first.submission.pending_deadline);
+        } catch (const ninfer::RequestError& exception) {
+            throw_request_error(exception);
+        } catch (const std::invalid_argument& exception) {
+            throw_invalid_input(exception, "invalid_prompt");
+        }
+    }
+    PreparedRequest prepared           = std::move(first.prepared);
+    prepared.generation                = std::move(handle);
+    prepared.sampling                  = prepared.generation.resolved_sampling();
+    prepared.effective_thinking_budget = prepared.generation.effective_thinking_budget();
+    prepared.held_branches             = std::move(held);
+    return prepared;
+}
+
+StagedRequest GenerationService::stage_impl(const GenerationRequest& incoming,
+                                            GenerationConsumerMode consumer_mode,
+                                            ninfer::GenerationObservationOptions observation,
+                                            std::function<bool()> is_cancelled,
+                                            ContextCacheHints context_cache,
+                                            CacheParticipation cache_participation,
+                                            DeadlinePolicy deadline_policy) const {
+    const std::optional<GenerationRequest> unconstrained = drop_unavailable_constraints(
+        incoming, options_.structured_output, options_.unconstrained_response_format);
     const GenerationRequest& request = unconstrained ? *unconstrained : incoming;
     if (!request.cache_prompt) { cache_participation = CacheParticipation::Disabled; }
-    PreparedRequest prepared;
+    StagedRequest staged;
+    PreparedRequest& prepared               = staged.prepared;
     const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request, options_);
     ninfer::RequestOptions request_options  = to_request_options(
         request, options_, semantics, cache_participation == CacheParticipation::ReadWrite);
@@ -477,7 +661,8 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& incomin
             const bool cached = cache_participation == CacheParticipation::ReadWrite;
             const bool anchor = cached && tokens.size() >= kRawPromptAnchorMinimumTokens;
             try {
-                prompt = engine_->prepare_tokens(std::move(tokens), cached, anchor);
+                prompt = engine_->prepare_tokens(std::move(tokens), cached, anchor,
+                                                 request.speculative_drafting);
             } catch (const std::out_of_range& exception) {
                 // A token id outside the vocabulary is the client's input, not a server fault.
                 invalid_prompt(exception.what());
@@ -538,19 +723,20 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& incomin
         prepared.preparation   = prompt.preparation_stats();
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();
-        prepared.generation = engine_->submit(std::move(prompt), std::move(request_options),
-                                              consumer_mode == GenerationConsumerMode::Streaming
-                                                  ? ninfer::OutputConsumerMode::Streaming
-                                                  : ninfer::OutputConsumerMode::Aggregate,
-                                              observation, prepared.lifetime->deadline);
-        prepared.sampling                  = prepared.generation.resolved_sampling();
-        prepared.effective_thinking_budget = prepared.generation.effective_thinking_budget();
+        staged.submission = ninfer::GenerationSubmission{
+            .prompt           = std::move(prompt),
+            .options          = std::move(request_options),
+            .consumer_mode    = consumer_mode == GenerationConsumerMode::Streaming
+                                    ? ninfer::OutputConsumerMode::Streaming
+                                    : ninfer::OutputConsumerMode::Aggregate,
+            .observation      = observation,
+            .pending_deadline = prepared.lifetime->deadline};
     } catch (const ApiException&) { throw; } catch (const ninfer::RequestError& exception) {
         throw_request_error(exception);
     } catch (const std::invalid_argument& exception) {
         throw_invalid_input(exception, "invalid_prompt");
     }
-    return prepared;
+    return staged;
 }
 
 int GenerationService::count_prompt_tokens(const GenerationRequest& request,
@@ -625,7 +811,7 @@ std::string GenerationService::render_prompt(const GenerationRequest& request,
 GenerationOutcome GenerationService::run(PreparedRequest& prepared, const StreamSink* sink,
                                          std::function<bool()> is_cancelled) {
     std::unique_ptr<ServiceOutputSink> output_sink;
-    if (sink != nullptr) { output_sink = std::make_unique<ServiceOutputSink>(*sink); }
+    if (sink != nullptr) { output_sink = std::make_unique<ServiceOutputSink>(*sink, prepared); }
     ninfer::OutputSink* public_sink = output_sink.get();
     ninfer::CancellationView cancellation;
     if (is_cancelled || (sink != nullptr && sink->is_cancelled)) {
@@ -635,15 +821,47 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         });
     }
 
+    if (prepared.held_branches && !prepared.generation) {
+        // The memo held every read: no Engine request ran, and none of the prompt was computed.
+        GenerationOutcome outcome;
+        outcome.prompt_tokens = prepared.prompt_tokens;
+        outcome.metrics.prefix_cache_hit_tokens =
+            static_cast<std::uint32_t>(prepared.prompt_tokens);
+        outcome.metrics.prepare_seconds = prepared.prepare_seconds;
+        outcome.metrics.total_seconds   = prepared.prepare_seconds;
+        for (std::optional<ninfer::BranchResult>& record : prepared.held_branches->records) {
+            outcome.branches.push_back(std::move(*record));
+        }
+        return outcome;
+    }
     ninfer::GenerationResult result;
     try {
         result = prepared.generation.wait(public_sink, cancellation);
     } catch (const ninfer::RequestError& exception) { throw_request_error(exception); }
+    if (prepared.held_branches && result.branches.size() == prepared.held_branches->run.size()) {
+        // The Engine's records in read order between the held ones, and into the memo.
+        HeldBranches& held                         = *prepared.held_branches;
+        std::vector<ninfer::BranchResult> computed = std::move(result.branches);
+        result.branches.clear();
+        result.branches.reserve(held.records.size());
+        std::size_t next = 0;
+        for (std::optional<ninfer::BranchResult>& record : held.records) {
+            if (record) {
+                result.branches.push_back(std::move(*record));
+                continue;
+            }
+            if (const std::optional<BranchKey>& key = held.run[next]) {
+                branch_memo_->keep(*key, computed[next]);
+            }
+            result.branches.push_back(std::move(computed[next++]));
+        }
+    }
     GenerationOutcome outcome;
     outcome.tokens              = result.generated_token_ids;
     outcome.text                = std::move(result.content);
     outcome.reasoning           = std::move(result.reasoning);
     outcome.content_logprobs    = std::move(result.content_logprobs);
+    outcome.branches            = std::move(result.branches);
     outcome.prompt_tokens       = static_cast<int>(result.prompt.prompt_tokens);
     outcome.completion_tokens   = static_cast<int>(result.generated_token_ids.size());
     outcome.reasoning_tokens    = static_cast<int>(result.reasoning_tokens);
@@ -671,6 +889,7 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
         prepared.prepare_seconds +
         std::max(0.0, result.timings.total_seconds - result.timings.prepare_seconds);
     outcome.metrics.engine_timing                = result.engine_timing;
+    outcome.metrics.computed_prefill_tokens      = result.computed_prompt_tokens;
     outcome.metrics.prefix_cache_hit_tokens      = result.reused_prompt_tokens;
     outcome.id_slot                              = result.slot;
     outcome.session_digest                       = result.session_digest;
@@ -719,9 +938,10 @@ void GenerationService::warmup() {
     turn.content.push_back(std::move(content));
     request.messages.push_back(std::move(turn));
     request.max_tokens = 4;
-    PreparedRequest prepared =
-        prepare_impl(request, GenerationConsumerMode::Aggregate, {}, {}, {},
-                     CacheParticipation::Disabled, DeadlinePolicy::UnboundedStartup);
+    std::vector<StagedRequest> staged;
+    staged.push_back(stage_impl(request, GenerationConsumerMode::Aggregate, {}, {}, {},
+                                CacheParticipation::Disabled, DeadlinePolicy::UnboundedStartup));
+    PreparedRequest prepared = std::move(submit_group(std::move(staged)).front());
     run(prepared, nullptr);
 }
 

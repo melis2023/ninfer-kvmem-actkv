@@ -9,6 +9,7 @@
 
 #include "serve/generation_service.h"
 #include "serve/load_report.h"
+#include "kvmem/speculative.hpp"
 
 #include <cstdint>
 #include <mutex>
@@ -28,9 +29,13 @@ public:
     void record_rejection();
 
     [[nodiscard]] std::string render(const LoadCapacity& capacity, const LoadSample& sample) const;
+    [[nodiscard]] kvmem::SpeculativeStatistics speculative_statistics() const {
+        const std::lock_guard lock(mutex_); return speculative_statistics_;
+    }
 
 private:
     mutable std::mutex mutex_;
+    kvmem::SpeculativeStatistics speculative_statistics_;
     std::uint64_t requests_total_                = 0;
     std::uint64_t requests_failed_total_         = 0;
     std::uint64_t requests_rejected_total_       = 0;

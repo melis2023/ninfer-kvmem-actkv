@@ -27,6 +27,15 @@
 namespace xgrammar {
 
 namespace {
+// NInfer: whether a wrapper string is whitespace only.
+bool IsWhitespaceText(const std::string& text) {
+  return std::all_of(text.begin(), text.end(), [](char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+  });
+}
+}  // namespace
+
+namespace {
 
 constexpr std::array<std::pair<TCodepoint, const char*>, 4> kCohereKeyEntities = {
     std::pair<TCodepoint, const char*>{'&', "&amp;"},
@@ -405,6 +414,8 @@ const std::string CohereXMLToolCallingConverter::kCohereAnyScalar = "cohere_any_
 const std::string CohereXMLToolCallingConverter::kCohereAnyList = "cohere_any_list";
 const std::unordered_map<JSONFormat, XMLToolCallingConverter::XMLWrapper>
     XMLToolCallingConverter::kKeyWrapperMap = {
+        // NInfer: the framing newlines of Qwen's chat template (<parameter=k>\nvalue\n</parameter>\n),
+        // which the model writes and its tool-call parser strips, so a raw string is exact.
         {JSONFormat::kQwenXML, {"<parameter=", ">", "\n", "\n</parameter>\n"}},
         {JSONFormat::kMiniMaxXML, {"<parameter name=\"", "\">", "", "</parameter>"}},
         {JSONFormat::kDeepSeekXML,
@@ -889,7 +900,11 @@ int32_t XMLToolCallingConverter::FormatProperty(
                        RuleRef(value_rule_id), ByteString(xml_wrapper_.parameter_suffix)});
     std::vector<int32_t> elements = {FormatPropertyKey(key, schema)};
     if (!xml_wrapper_.value_wrapper_prefix.empty()) {
-      elements.push_back(WhitespaceExpression());
+      // NInfer: a whitespace prefix is the value's framing; whitespace before it would reach a raw
+      // string's value.
+      if (!IsWhitespaceText(xml_wrapper_.value_wrapper_prefix)) {
+        elements.push_back(WhitespaceExpression());
+      }
       elements.push_back(ByteString(xml_wrapper_.value_wrapper_prefix));
     }
     // xml_string already accepts whitespace. Adding whitespace repetitions around it preserves the
@@ -932,7 +947,9 @@ int32_t XMLToolCallingConverter::FormatOtherProperty(
         XMLKeySuffix(json_format_ == JSONFormat::kKimiK3XML ? KimiK3TypeAttr(schema) : std::nullopt)
     };
     if (!xml_wrapper_.value_wrapper_prefix.empty()) {
-      elements.push_back(WhitespaceExpression());
+      if (!IsWhitespaceText(xml_wrapper_.value_wrapper_prefix)) {
+        elements.push_back(WhitespaceExpression());
+      }
       elements.push_back(ByteString(xml_wrapper_.value_wrapper_prefix));
     }
     if (value_rule_id == builder_.GetRuleId(kXMLString)) {

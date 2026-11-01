@@ -1,6 +1,7 @@
 #include "kvmem/raw_kv_store.hpp"
 #include "kvmem/rope.hpp"
-#include "kvmem/nvme_kv_tier.hpp"
+#include "kvmem/spill_io.hpp"
+#include <random>
 #include <filesystem>
 
 #include <algorithm>
@@ -11,10 +12,6 @@
 #include <cstring>
 #include <memory>
 #include <vector>
-#if KVMEM_ENABLE_NVME
-#include <csignal>
-#include <sys/resource.h>
-#endif
 
 #define CHECK(cond)                                                            \
     do {                                                                       \
@@ -117,8 +114,8 @@ static void test_sibling_stores_are_independent() {
     a->write_layer_k_gpu(0, 4, 0, pa.data());
     a->write_layer_v_gpu(0, 4, 0, pa.data());
     b->write_layer_k_gpu(0, 4, 0, pb.data());
-    a->wait_writes();
-    b->wait_writes();
+
+
     CHECK(a->has_k_gpu(0, 0, 4) && b->has_k_gpu(0, 0, 4));
     CHECK(a->has_v_gpu(0, 0, 4) && !b->has_v_gpu(0, 0, 4));
     CHECK(a->copy_k_gpu(0, 0, out.data(), 4));
@@ -161,7 +158,7 @@ static void test_store_bytes() {
         raw.write_layer_k_gpu(0, cfg.block_tokens, il, packed.data());
         raw.write_layer_v_gpu(0, cfg.block_tokens, il, packed.data());
     }
-    raw.wait_writes();
+
     // One whole block of packed K and V for every layer, and nothing else:
     // write_layer_k_gpu does not capture a mean sum.
     CHECK(raw.bytes_k() + raw.bytes_v() == block);
@@ -170,7 +167,7 @@ static void test_store_bytes() {
         raw.write_layer_k_gpu(cfg.block_tokens, cfg.block_tokens, il, packed.data());
         raw.write_layer_v_gpu(cfg.block_tokens, cfg.block_tokens, il, packed.data());
     }
-    raw.wait_writes();
+
     CHECK(raw.bytes_k() + raw.bytes_v() == 2 * block);
 
     // Dropping the second block returns the total to exactly the one-block
@@ -183,112 +180,15 @@ static void test_store_bytes() {
     // rather than pure packed KV.
     std::vector<float> mean(cfg.block_tokens * cfg.n_embd_k, 1.0f);
     raw.write_layer_mean_k(0, cfg.block_tokens, 0, mean.data());
-    raw.wait_writes();
+
     CHECK(raw.bytes_k() + raw.bytes_v() == block + size_t(cfg.n_embd_k) * sizeof(float));
 
     raw.clear();
     CHECK(raw.bytes_k() == 0 && raw.bytes_v() == 0);
 }
 
-#if KVMEM_ENABLE_NVME
-static kvmem::RawKvStoreConfig failure_config() {
-    kvmem::RawKvStoreConfig cfg;
-    cfg.n_layer = 1; cfg.n_embd_k = cfg.n_embd_v = 4;
-    cfg.block_tokens = 4; cfg.k_gpu_row_bytes = cfg.v_gpu_row_bytes = 8;
-    cfg.nvme_bytes = 64;
-    cfg.nvme_dir = (std::filesystem::temp_directory_path() /
-        ("kvmem-raw-failure-" + std::to_string(getpid()))).string();
-    return cfg;
-}
-
-static void test_capacity_failure() {
-    const auto cfg = failure_config();
-    // Exercise all three legacy writer sources, including inline writes.
-    for (bool sync : {false, true}) for (int kind = 0; kind < 3; ++kind) {
-        CHECK(setenv("KVMEM_HARVEST_SYNC", sync ? "1" : "0", 1) == 0);
-        kvmem::RawKvStore raw(cfg);
-        std::vector<uint8_t> packed(32), got(32);
-        std::vector<uint16_t> f16(16);
-        const auto write = [&](unsigned id) {
-            std::fill(packed.begin(), packed.end(), uint8_t(id + 1));
-            std::fill(f16.begin(), f16.end(), uint16_t(0x3c00 + id));
-            if (kind == 0) raw.write_layer_v_gpu(id * 4, 4, 0, packed.data());
-            else if (kind == 1) raw.write_layer_k_rows(id * 4, 4, 0, packed.data(), nullptr);
-            else raw.write_layer_tokens_f16(id * 4, 4, 0, nullptr, f16.data());
-        };
-        write(0); write(1);
-        bool rejected = false;
-        try { write(2); } catch (const std::runtime_error&) { rejected = true; }
-        CHECK(rejected);
-        raw.wait_writes();
-        CHECK(raw.nvme_bytes_written() == 64);
-        for (unsigned id = 0; id < 3; ++id) {
-            if (kind == 2) {
-                std::vector<float> values(16);
-                CHECK(raw.copy_v(id, 0, values.data()));
-                for (auto value : values) CHECK(value == 1.0f + float(id) / 1024.0f);
-            } else {
-                CHECK(kind == 0 ? raw.copy_v_gpu(id, 0, got.data(), 4)
-                                : raw.copy_k_rows(id, 0, got.data(), 4));
-                for (auto value : got) CHECK(value == id + 1);
-            }
-        }
-        raw.clear();
-        write(0); raw.wait_writes();
-        CHECK(raw.nvme_bytes_written() == 32);
-    }
-    CHECK(setenv("KVMEM_HARVEST_SYNC", "0", 1) == 0);
-    std::filesystem::remove(cfg.nvme_dir);
-}
-
-static void test_write_failure() {
-    const auto cfg = failure_config();
-    for (bool recover : {false, true}) {
-        kvmem::RawKvStore raw(cfg);
-        std::vector<uint8_t> packed(32, 17), got(32);
-        struct rlimit previous;
-        CHECK(getrlimit(RLIMIT_FSIZE, &previous) == 0);
-        const auto old_handler = std::signal(SIGXFSZ, SIG_IGN);
-        CHECK(old_handler != SIG_ERR);
-        auto limit = previous;
-        limit.rlim_cur = 0; // Deterministic pwrite failure after arena creation.
-        CHECK(setrlimit(RLIMIT_FSIZE, &limit) == 0);
-        bool failed = false;
-        try {
-            raw.write_layer_v_gpu(0, 4, 0, packed.data());
-            raw.wait_writes();
-        } catch (const std::runtime_error&) { failed = true; }
-        CHECK(setrlimit(RLIMIT_FSIZE, &previous) == 0);
-        CHECK(std::signal(SIGXFSZ, old_handler) != SIG_ERR);
-        CHECK(failed && raw.nvme_bytes_written() == 0);
-        CHECK(raw.has_v_gpu(0, 0, 4) && raw.copy_v_gpu(0, 0, got.data(), 4));
-        CHECK(got == packed);
-        bool repeated = false;
-        try { raw.wait_writes(); } catch (const std::runtime_error&) { repeated = true; }
-        CHECK(repeated);
-        if (recover) {
-            raw.clear();
-            raw.write_layer_v_gpu(0, 4, 0, packed.data());
-            raw.wait_writes();
-            CHECK(raw.nvme_bytes_written() == 32);
-            CHECK(raw.copy_v_gpu(0, 0, got.data(), 4) && got == packed);
-        } // The other case destroys a failed store without terminating or hanging.
-    }
-    std::filesystem::remove(cfg.nvme_dir);
-}
-#endif
 
 int main() {
-#if KVMEM_ENABLE_NVME
-    const char * previous_sync = std::getenv("KVMEM_HARVEST_SYNC");
-    const bool had_sync = previous_sync != nullptr;
-    const std::string saved_sync = previous_sync ? previous_sync : "";
-    test_capacity_failure();
-    test_write_failure();
-    if (had_sync) CHECK(setenv("KVMEM_HARVEST_SYNC", saved_sync.c_str(), 1) == 0);
-    else CHECK(unsetenv("KVMEM_HARVEST_SYNC") == 0);
-    std::puts("raw NVMe: capacity refusal, failed-write retention, drain and clear recovery passed");
-#endif
     test_sum_only(32);
     test_sum_only(128);
     test_sibling_stores_are_independent();
@@ -366,28 +266,6 @@ int main() {
     CHECK(raw_h.copy_k(0, 1, hgot.data()));
     CHECK(hgot[0] == 0.0f);
 
-#if KVMEM_ENABLE_NVME
-    kvmem::RawKvStoreConfig ncfg = cfg;
-    ncfg.nvme_dir = (std::filesystem::temp_directory_path() / "kvmem_raw_k_test").string();
-    ncfg.nvme_file = "raw.bin";
-    ncfg.nvme_bytes = 4ull * 1024ull * 1024ull;
-    kvmem::RawKvStore rawn(ncfg);
-    CHECK(rawn.nvme_enabled());
-    std::vector<float> kfull(16, 0.0f);
-    for (int i = 0; i < 16; ++i) {
-        kfull[i] = static_cast<float>(i);
-    }
-    rawn.write_layer_tokens(0, 4, 0, kfull.data(), nullptr);
-    CHECK(rawn.has_k(0, 0));
-    std::vector<float> nout(16, -1.0f);
-    CHECK(rawn.copy_k(0, 0, nout.data()));
-    CHECK(nout[0] == 0.0f);
-    CHECK(nout[15] == 15.0f);
-    std::vector<float> nmean(4, 0.0f);
-    rawn.mean_k(0, 0, nmean.data());
-    CHECK(std::fabs(nmean[0] - 6.0f) < 1e-2f); // (0+4+8+12)/4
-
-#endif
 
     // F16 write: 0x3c00 is 1.0 in IEEE half.
     kvmem::RawKvStore raw16(cfg);
@@ -478,25 +356,11 @@ int main() {
 
     kvmem::RawKvStoreConfig ngcfg = cfg;
     ngcfg.v_gpu_row_bytes = 6;
-    ngcfg.nvme_dir = (std::filesystem::temp_directory_path() / "kvmem_raw_vgpu_test").string();
-    ngcfg.nvme_file = "raw_vgpu.bin";
-    ngcfg.nvme_bytes = 4ull * 1024ull * 1024ull;
     std::vector<uint8_t> packed4(24);
     for (int i = 0; i < 24; ++i) {
         packed4[static_cast<size_t>(i)] = static_cast<uint8_t>(i + 1);
     }
     std::vector<uint8_t> gout4(24, 0);
-#if KVMEM_ENABLE_NVME
-    kvmem::RawKvStore rawgn(ngcfg);
-    CHECK(rawgn.nvme_enabled());
-    rawgn.write_layer_v_gpu(0, 4, 0, packed4.data());
-    CHECK(rawgn.has_v(0, 0));
-    CHECK(rawgn.copy_v_gpu(0, 0, gout4.data(), 4));
-    CHECK(gout4[0] == 1);
-    CHECK(gout4[23] == 24);
-    CHECK(!rawgn.copy_v(0, 0, no_f32.data()));
-
-#endif
 
     kvmem::RawKvStoreConfig kcfg = cfg;
     kcfg.k_row_bytes = 6;
@@ -512,44 +376,27 @@ int main() {
     rawk.mean_k(0, 0, mk.data());
     CHECK(std::fabs(mk[0] - 2.0f) < 1e-3f);
 
-#if KVMEM_ENABLE_NVME
-    kvmem::RawKvStoreConfig nkcfg = cfg;
-    nkcfg.k_row_bytes = 6;
-    nkcfg.nvme_dir = (std::filesystem::temp_directory_path() / "kvmem_raw_krow_test").string();
-    nkcfg.nvme_file = "raw_krow.bin";
-    nkcfg.nvme_bytes = 4ull * 1024ull * 1024ull;
-    kvmem::RawKvStore rawkn(nkcfg);
-    CHECK(rawkn.nvme_enabled());
-    std::vector<float> krowf(16, 0.0f);
-    for (int i = 0; i < 16; ++i) {
-        krowf[static_cast<size_t>(i)] = static_cast<float>(i);
-    }
-    rawkn.write_layer_k_rows(0, 4, 0, packed4.data(), krowf.data());
-    CHECK(rawkn.has_k(0, 0));
-    std::vector<uint8_t> kout4(24, 0);
-    CHECK(rawkn.copy_k_rows(0, 0, kout4.data(), 4));
-    CHECK(kout4[0] == 1);
-    CHECK(kout4[23] == 24);
-    CHECK(!rawkn.copy_k(0, 0, no_f32.data()));
-    std::vector<float> krowmean(4, 0.0f);
-    rawkn.mean_k(0, 0, krowmean.data());
-    CHECK(std::fabs(krowmean[0] - 6.0f) < 1e-3f);
-
-#endif
 
     // Replacing a suffix preserves prefix bytes and rejects stale packed rows,
     // even if the mean-K capture has already extended the logical block.
-    for (bool nvme : {false, true}) {
-        if (nvme && !KVMEM_ENABLE_NVME) continue;
+    for (bool ssd : {false, true}) {
         auto tail_cfg = ngcfg;
         tail_cfg.k_gpu_row_bytes = 6;
-        if (!nvme) tail_cfg.nvme_bytes = 0;
+        const auto root = std::filesystem::temp_directory_path() /
+            ("kvmem-tail-ssd-" + std::to_string(std::random_device{}()));
+        std::shared_ptr<kvmem::SpillFile> disk;
+        if (ssd) {
+            disk = std::make_shared<kvmem::SpillFile>(root, 4096);
+            tail_cfg.payload_storage = std::make_shared<kvmem::HostKvStorage>(128, disk);
+        }
+        {
         kvmem::RawKvStore tail_store(tail_cfg);
         tail_store.write_layer_mean_k(0, 2, 0, k.data());
         const auto checkpoint = tail_store.mean_checkpoint(2);
         tail_store.write_layer_mean_k(2, 2, 0, k2.data());
         tail_store.write_layer_k_gpu(0, 4, 0, packed4.data());
         tail_store.write_layer_v_gpu(0, 4, 0, packed4.data());
+        if (ssd) tail_cfg.payload_storage->trim(0);
         tail_store.truncate_to(2);
         tail_store.restore_mean_checkpoint(2, checkpoint);
         CHECK(tail_store.n_tokens(0) == 2);
@@ -577,6 +424,27 @@ int main() {
         CHECK(!tail_store.has_v_gpu(0, 0, 4));
         CHECK(tail_store.copy_k_gpu(0, 0, gout4.data(), 3));
         CHECK(tail_store.copy_v_gpu(0, 0, gout4.data(), 3));
+        }
+        if (ssd) {
+            CHECK(disk->stats().reads > 0 && disk->stats().written_bytes > 0);
+            tail_cfg.payload_storage.reset(); disk.reset();
+            CHECK(std::filesystem::is_empty(root)); std::filesystem::remove(root);
+        }
+    }
+    {
+        kvmem::RawKvStoreConfig cfg; cfg.n_layer=1; cfg.n_embd_k=2; cfg.block_tokens=4;
+        kvmem::RawKvStore parent(cfg);
+        const float prefix[]={1,2,3,4};
+        parent.write_layer_mean_k(0,2,0,prefix);
+        const auto checkpoint=parent.mean_checkpoint(2);
+        const float suffix[]={5,6,7,8};
+        parent.write_layer_mean_k(2,2,0,suffix);
+        auto child=parent.fork_mean_prefix(2);
+        child->truncate_to(2); child->restore_mean_checkpoint(2,checkpoint);
+        const float edited[]={9,10,11,12};
+        child->write_layer_mean_k(2,2,0,edited);
+        float a[2],b[2]; parent.mean_k(0,0,a); child->mean_k(0,0,b);
+        CHECK(a[0]==4 && a[1]==5 && b[0]==6 && b[1]==7);
     }
     return 0;
 }

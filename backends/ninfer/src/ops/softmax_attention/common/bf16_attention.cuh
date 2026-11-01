@@ -31,22 +31,18 @@
 
 namespace ninfer::ops {
 
-#if defined(NINFER_SM75)
-inline constexpr bool kAttentionPvHalfProbabilities = true;
-#else
-inline constexpr bool kAttentionPvHalfProbabilities = false;
-#endif
-
-// Two probabilities as the A operand of attention_pv_mma.
+// Two probabilities as the A operand of attention_pv_mma: FP16 in a Turing image, whose
+// attention_pv_mma multiplies FP16 probabilities, BF16 elsewhere. Both follow __CUDA_ARCH__, so
+// every image of a build of several architectures packs what it multiplies.
 __device__ __forceinline__ std::uint32_t pack_attention_p(float lo, float hi) {
-    if constexpr (kAttentionPvHalfProbabilities) {
-        return pack_f16x2(lo, hi);
-    } else {
-        return pack_bf16x2(lo, hi);
-    }
+#if defined(NINFER_SM75_DEVICE)
+    return pack_f16x2(lo, hi);
+#else
+    return pack_bf16x2(lo, hi);
+#endif
 }
 
-#if defined(NINFER_SM75)
+#if defined(NINFER_SM75_FORMS)
 namespace sm75 {
 
 // Both BF16 halves are below 2^16 in magnitude (a biased exponent of at most 142; zero and BF16
@@ -152,7 +148,7 @@ __device__ __forceinline__ bool copy_bf16x8_as_half(void* dst, const void* src) 
 __device__ __forceinline__ void attention_pv_mma(float& c0, float& c1, float& c2, float& c3,
                                                  unsigned p0, unsigned p1, unsigned p2, unsigned p3,
                                                  unsigned v0, unsigned v1) {
-#if defined(NINFER_SM75)
+#if defined(NINFER_SM75_DEVICE)
     mma_f16_bf16(c0, c1, c2, c3, p0, p1, p2, p3, v0, v1);
 #else
     mma_bf16(c0, c1, c2, c3, p0, p1, p2, p3, v0, v1);

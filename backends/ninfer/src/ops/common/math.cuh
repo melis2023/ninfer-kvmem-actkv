@@ -73,7 +73,15 @@ __device__ __forceinline__ std::uint32_t pack_bf16x2(float lo, float hi) {
     std::uint32_t out;
     const std::uint32_t lo_bits = __float_as_uint(lo);
     const std::uint32_t hi_bits = __float_as_uint(hi);
+#if defined(NINFER_PRE_SM80_DEVICE)
+    // cvt.rn.bf16x2.f32 is sm_80; the header's conversion rounds the same way in software.
+    (void)lo_bits;
+    (void)hi_bits;
+    const __nv_bfloat162 packed = __floats2bfloat162_rn(lo, hi);
+    out                         = load_vec<std::uint32_t>(&packed);
+#else
     asm volatile("cvt.rn.bf16x2.f32 %0, %1, %2;\n" : "=r"(out) : "r"(hi_bits), "r"(lo_bits));
+#endif
     return out;
 }
 

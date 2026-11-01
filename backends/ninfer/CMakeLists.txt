@@ -2,8 +2,11 @@ cmake_minimum_required(VERSION 3.28)
 
 # The current implementation supports Ampere sm_86 and early Ada sm_89, plus sm_80 (GA100, e.g.
 # CMP 170HX) as an unmeasured compatibility target: it shares the sm_86 instruction set the
-# kernels use, but none of its route tables have been swept. Set and validate the
-# architecture before CUDA compiler detection so CMake never injects a generic
+# kernels use, but none of its route tables have been swept. sm_70 (Tesla V100) builds the same
+# compatibility path with the Ampere warp primitives it lacks (cp.async, ldmatrix, the m16n8
+# mma.sync shapes) emulated in src/ops/common, and its own prefill and attention routes. Turing
+# sm_75 (TITAN RTX, RTX 20 series) runs the same mma.sync path through the Turing tier below. Set
+# and validate the architectures before CUDA compiler detection so CMake never injects a generic
 # host-toolchain default or accepts an unsupported target.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
   set(CMAKE_CUDA_ARCHITECTURES 86 CACHE STRING "CUDA architectures to build")
@@ -11,18 +14,55 @@ endif()
 # 120a is admitted locally as an unqualified target. Consumer Blackwell is Ada-like at the warp
 # level - mma.sync, ldmatrix and cp.async recompile natively, and there is no tcgen05 or tensor
 # memory at all - so the compatibility path below is what actually runs there.
-if(NOT CMAKE_CUDA_ARCHITECTURES MATCHES "^(70|75|80|86|89|120a)$")
-  message(FATAL_ERROR
-    "NInfer supports CMAKE_CUDA_ARCHITECTURES=70, 75, 80, 86, 89 or 120a; got "
+#
+# A build may also list several of them: one binary for cards of different architectures in one
+# process, such as a layer pipeline across a V100, a TITAN RTX and RTX 30 series cards. CUDA loads
+# on each card the image of the newest listed architecture it runs, every image selects its own
+# instructions by __CUDA_ARCH__, and the host sizes and routes each launch by the tier of the image
+# the card runs (src/ops/common/device_tier.h), so a card runs the kernels of its own build.
+set(_ninfer_architectures ${CMAKE_CUDA_ARCHITECTURES})
+list(REMOVE_DUPLICATES _ninfer_architectures)
+list(LENGTH _ninfer_architectures _ninfer_architecture_count)
+list(LENGTH CMAKE_CUDA_ARCHITECTURES _ninfer_listed_count)
+if(_ninfer_architecture_count EQUAL 0 OR NOT _ninfer_architecture_count EQUAL _ninfer_listed_count)
+  message(FATAL_ERROR "CMAKE_CUDA_ARCHITECTURES must list each architecture once; got "
     "'${CMAKE_CUDA_ARCHITECTURES}'")
+endif()
+foreach(_ninfer_architecture IN LISTS _ninfer_architectures)
+  if(NOT _ninfer_architecture MATCHES "^(70|75|80|86|89|120a)$")
+    message(FATAL_ERROR
+      "NInfer supports CMAKE_CUDA_ARCHITECTURES of 70, 75, 80, 86, 89 and 120a, alone or as a list; "
+      "got '${CMAKE_CUDA_ARCHITECTURES}'")
+  endif()
+endforeach()
+set(NINFER_ARCH_VOLTA OFF)
+set(NINFER_ARCH_TURING OFF)
+set(NINFER_ARCH_AMPERE OFF)
+set(NINFER_ARCH_BLACKWELL OFF)
+if("70" IN_LIST _ninfer_architectures)
+  set(NINFER_ARCH_VOLTA ON)
+endif()
+if("75" IN_LIST _ninfer_architectures)
+  set(NINFER_ARCH_TURING ON)
+endif()
+if("80" IN_LIST _ninfer_architectures OR "86" IN_LIST _ninfer_architectures OR
+   "89" IN_LIST _ninfer_architectures)
+  set(NINFER_ARCH_AMPERE ON)
+endif()
+if("120a" IN_LIST _ninfer_architectures)
+  set(NINFER_ARCH_BLACKWELL ON)
+endif()
+if(NINFER_ARCH_VOLTA AND NINFER_ARCH_BLACKWELL)
+  message(FATAL_ERROR
+    "70 and 120a need different CUDA releases (12.x and 13.1 or newer) and cannot share a build")
 endif()
 
 project(ninfer LANGUAGES C CXX CUDA)
 
-# CUDA 13 removed Volta from nvcc's offline targets, so a 70 build stays on the CUDA 12 branch.
-if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70" AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
+# CUDA 13 removed Volta from nvcc's offline targets, so a build with 70 stays on the CUDA 12 branch.
+if(NINFER_ARCH_VOLTA AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13.0)
   message(FATAL_ERROR
-    "A 70 build needs CUDA 12.x; CUDA ${CMAKE_CUDA_COMPILER_VERSION} no longer compiles sm_70")
+    "A build with 70 needs CUDA 12.x; CUDA ${CMAKE_CUDA_COMPILER_VERSION} no longer compiles sm_70")
 endif()
 
 # CUDA 12.8 and 12.9 miscompile sm_120a code. 12.8's ptxas reads a register under one predicate
@@ -31,10 +71,10 @@ endif()
 # test included. With 12.9 the NVFP4 small-T attention kernels still go wrong, with no change in
 # the sources: a wide verification's split reduce reads from a wild address, and two requests
 # decoded together over an NVFP4 KV cache draw from corrupt logits. CUDA 13.1 builds them correctly.
-if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a" AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1)
+if(NINFER_ARCH_BLACKWELL AND CMAKE_CUDA_COMPILER_VERSION VERSION_LESS 13.1)
   message(FATAL_ERROR
-    "A 120a build needs CUDA 13.1 or newer; CUDA ${CMAKE_CUDA_COMPILER_VERSION} miscompiles sm_120a "
-    "kernels")
+    "A build with 120a needs CUDA 13.1 or newer; CUDA ${CMAKE_CUDA_COMPILER_VERSION} miscompiles "
+    "sm_120a kernels")
 endif()
 
 # NINFER_SM8X_COMPAT gates every Ampere/early-Ada compatibility path. ninfer_ops also sets it
@@ -45,23 +85,33 @@ endif()
 # A 120a build gets the same path by default. Upstream's native routes would be available there,
 # but they are a separate, unqualified code path, while the compatibility one is the tested route
 # and is the only one that promotes T2G128 weights to the integer-activation prefill GEMM. Set
-# NINFER_SM120_NATIVE=ON to build the native routes instead.
+# NINFER_SM120_NATIVE=ON to build the native routes instead; a build of several architectures
+# always takes the compatibility path.
 option(NINFER_SM120_NATIVE
        "On a 120a build, compile upstream's native routes instead of the mma.sync path" OFF)
-if(CMAKE_CUDA_ARCHITECTURES MATCHES "^(70|75|80|86|89)$" OR NOT NINFER_SM120_NATIVE)
+if(NINFER_SM120_NATIVE AND NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+  message(FATAL_ERROR "NINFER_SM120_NATIVE requires CMAKE_CUDA_ARCHITECTURES=120a")
+endif()
+if(NOT NINFER_SM120_NATIVE)
   set(NINFER_COMPAT_PATH ON)
   add_compile_definitions(NINFER_SM8X_COMPAT=1)
 else()
   set(NINFER_COMPAT_PATH OFF)
 endif()
-# NINFER_SM70 marks a Volta build on the host side too (route selection, startup checks), where
-# __CUDA_ARCH__ is not defined.
-if(CMAKE_CUDA_ARCHITECTURES STREQUAL "70")
-  add_compile_definitions(NINFER_SM70=1)
+# The tiers this binary carries code for (src/ops/common/device_tier.h): Volta (70), Turing (75),
+# Ampere (80, 86, 89) and Blackwell (120a). Host code asks a device's tier at run time; device code
+# selects instructions by __CUDA_ARCH__ (NINFER_SM70_DEVICE, NINFER_SM75_DEVICE).
+if(NINFER_ARCH_VOLTA)
+  add_compile_definitions(NINFER_TIER_VOLTA=1)
 endif()
-# NINFER_SM75 is the Turing tier of that path, for host and device code alike.
-if(CMAKE_CUDA_ARCHITECTURES STREQUAL "75")
-  add_compile_definitions(NINFER_SM75=1)
+if(NINFER_ARCH_TURING)
+  add_compile_definitions(NINFER_TIER_TURING=1)
+endif()
+if(NINFER_ARCH_AMPERE)
+  add_compile_definitions(NINFER_TIER_AMPERE=1)
+endif()
+if(NINFER_ARCH_BLACKWELL)
+  add_compile_definitions(NINFER_TIER_BLACKWELL=1)
 endif()
 # Programmatic dependent launch lets a captured decode-graph kernel stage its weights while the
 # kernel before it finishes (src/core/pdl.cuh). It needs sm_90 or newer, so the compatibility path
@@ -82,12 +132,20 @@ if(NINFER_PDL)
   endif()
   add_compile_definitions(NINFER_PDL=1)
 endif()
-# Every 120a build keeps the FP8 A8 and NVFP4 W4A4 units, the compatibility path included: without
-# them an NVFP4 weight has no route wider than 16 columns, so an NVFP4 artifact could not start, and
-# FP8 weights prefill through their dequantizing A16 route. They are selected only by FP8 and NVFP4
-# weights, so every other format keeps the path chosen above.
-if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+# Every build with 120a keeps the FP8 A8 and NVFP4 W4A4 units, the compatibility path included:
+# without them an NVFP4 weight has no route wider than 16 columns, so an NVFP4 artifact could not
+# start, and FP8 weights prefill through their dequantizing A16 route. They are selected only by FP8
+# and NVFP4 weights, and only on a card that runs the 120a code (ops/common/device_tier.h), so every
+# other format and card keeps the path chosen above. In a build of several architectures the other
+# images compile their Blackwell-only instructions as traps that no launch reaches.
+if(NINFER_ARCH_BLACKWELL)
   add_compile_definitions(NINFER_SM120_NVFP4=1 NINFER_SM120_FP8=1)
+endif()
+
+# The device code of several architectures outgrows the 2 GiB that 32-bit PC-relative references
+# span when it sits between an executable's code and its writable data (cmake/large-fatbin.ld).
+if(_ninfer_architecture_count GREATER 1 AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_link_options("$<HOST_LINK:LINKER:-T,${PROJECT_SOURCE_DIR}/cmake/large-fatbin.ld>")
 endif()
 
 # --- Global settings ---------------------------------------------------------
@@ -108,12 +166,6 @@ option(NINFER_BF16_RESIDUAL_ADD
        "Add BF16 linear projections onto the residual in bf16 instead of fp32" OFF)
 if(NINFER_BF16_RESIDUAL_ADD)
   add_compile_definitions(NINFER_BF16_RESIDUAL_ADD=1)
-endif()
-# Windows only: device arenas from a D3D12 heap held resident, for --wddm-evictable-budget.
-option(NINFER_D3D12_RESIDENCY
-       "On Windows, offer --wddm-evictable-budget: D3D12-resident device arenas" OFF)
-if(WIN32 AND NINFER_D3D12_RESIDENCY)
-  add_compile_definitions(NINFER_D3D12_RESIDENCY=1)
 endif()
 # Windows only: disk-tier restores through Microsoft DirectStorage, for --disk-kv-directstorage.
 # dstorage.dll is delay-loaded, so a binary that never asks for DirectStorage runs without it.
@@ -145,6 +197,13 @@ if(NOT NINFER_NVCC_SPLIT_COMPILE STREQUAL "")
   add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:--split-compile=${NINFER_NVCC_SPLIT_COMPILE}>)
 endif()
 option(NINFER_PTXAS_VERBOSE "Print each kernel's registers and local-memory spills (-Xptxas=-v)" OFF)
+option(NINFER_CUDA_PRUNE_PTX
+       "Remove PTX from CUDA archives while retaining every configured machine-code image" OFF)
+option(NINFER_WINDOWS_KERNEL_DLL
+       "Link GGML CUDA kernels as a Windows DLL to keep multi-architecture executables below 2 GiB" OFF)
+if(NINFER_WINDOWS_KERNEL_DLL AND NOT WIN32)
+  message(FATAL_ERROR "NINFER_WINDOWS_KERNEL_DLL is only supported on Windows")
+endif()
 if(NINFER_PTXAS_VERBOSE)
   add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>)
 endif()
@@ -230,6 +289,17 @@ if(NINFER_BUILD_APPS OR BUILD_TESTING)
   set(NINFER_BUILD_PRODUCT_SUPPORT ON)
 endif()
 
+option(NINFER_SHARED_RUNTIME "Build portable launchers and a private CUDA runtime library" OFF)
+if(NINFER_SHARED_RUNTIME)
+  if(NOT NINFER_BUILD_APPS)
+    message(FATAL_ERROR "NINFER_SHARED_RUNTIME requires NINFER_BUILD_APPS")
+  endif()
+  if(NOT WIN32)
+    # Static component archives contribute to the shared runtime. CI uses the same policy.
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+  endif()
+endif()
+
 include(cmake/Dependencies.cmake)
 include(cmake/NinferTargets.cmake)
 
@@ -262,9 +332,23 @@ if(NOT EXISTS "${NINFER_KVMEM_SOURCE_DIR}/include/kvmem/memory_contract.hpp")
   message(FATAL_ERROR "Set NINFER_KVMEM_SOURCE_DIR to the portable KVMem core")
 endif()
 add_subdirectory("${NINFER_KVMEM_SOURCE_DIR}" "kvmem-core" EXCLUDE_FROM_ALL)
+kvmem_enable_cuda_recall(CUDART_TARGET ${NINFER_CUDART_TARGET})
+option(NINFER_KVMEM_QUERY_TEST_HOOKS "Enable deterministic native Query lifecycle test rendezvous and fingerprints" OFF)
 
 # --- Subdirectories ----------------------------------------------------------
 add_subdirectory(src)
+if(NINFER_KVMEM_QUERY_TEST_HOOKS)
+  if(NOT BUILD_TESTING)
+    message(FATAL_ERROR "NINFER_KVMEM_QUERY_TEST_HOOKS requires BUILD_TESTING")
+  endif()
+  set_property(SOURCE
+    src/models/qwen3_5/program/prefill.cpp
+    src/models/qwen3_5/program/storage/memory_statistics.cpp
+    src/models/qwen3_5/program/storage/kvmem_window.cpp
+    TARGET_DIRECTORY ninfer_model_runtime
+    APPEND PROPERTY COMPILE_DEFINITIONS NINFER_KVMEM_QUERY_TEST_HOOKS=1)
+endif()
+
 if(NINFER_BUILD_APPS)
   add_subdirectory(apps)
   add_subdirectory(tools)
@@ -275,4 +359,8 @@ if(BUILD_TESTING)
 endif()
 if(NINFER_BUILD_BENCHMARKS)
   add_subdirectory(bench)
+endif()
+
+if(NINFER_SHARED_RUNTIME)
+  ninfer_finalize_runtime()
 endif()

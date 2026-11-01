@@ -10,25 +10,30 @@
 #include "artifact/reader.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/ngram_table.h"
+#include "models/qwen4_exp/ngram_profile.h"
 #include "ninfer/ops/ngram_rows.h"
 
 #include <filesystem>
+#include <optional>
 
 namespace ninfer::models::qwen4_exp {
 
 struct NgramTableSource {
     NgramTableLayout layout;
     ops::NgramRowFormat format = ops::NgramRowFormat::Bf16;
+    std::optional<NgramProfile> hot_profile;
 };
 
 // Locates the table of the model artifact `reader` opened at `artifact`: the rows of the table
 // artifact at `table` when one is given, otherwise the model's own rows. Refuses a table whose
 // digest, format or constants differ from the model's, and a model that stores no rows when
-// `table` is empty.
+// `table` is empty. When requested, reads and validates the selected table artifact's
+// `ngram.resources.hot_profile`; absent profiles remain empty for the caller to report.
 [[nodiscard]] NgramTableSource ngram_table_source(const artifact::Reader& reader,
                                                   const std::filesystem::path& artifact,
                                                   const TextConfig& config,
-                                                  const std::filesystem::path& table = {});
+                                                  const std::filesystem::path& table = {},
+                                                  bool read_hot_profile = false);
 
 // True when the artifact holds an n-gram table and no model.
 [[nodiscard]] bool is_ngram_table_artifact(const artifact::Reader& reader);

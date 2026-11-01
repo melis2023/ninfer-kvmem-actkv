@@ -1,7 +1,13 @@
 #pragma once
 
 #include "core/device_snapshot.h"
-#include "ninfer/types.h"
+#include "ninfer/base.h"
+#include "ninfer/observability/execution.h"
+#include "ninfer/observability/resources.h"
+#include "ninfer/observability/snapshot.h"
+#include "ninfer/request.h"
+#include "ninfer/startup.h"
+#include "ninfer/types_fwd.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "models/qwen3_5/frontend/graft.h"
@@ -31,6 +37,7 @@ namespace ninfer::models::qwen3_5 {
 
 namespace execution {
 class Parameters;
+class NativeExpertRuntime;
 }
 
 namespace detail {
@@ -67,6 +74,13 @@ struct DeviceKVLeaseShortfall {
 struct DeviceKVPages {
     std::uint32_t main    = 0;
     std::uint32_t backend = 0;
+};
+
+// Whether a structured-output sequence can join the next decode round: not while the mask of its
+// next token is still computing, and never once that mask failed (`failure` says why).
+struct StructuredReadiness {
+    bool ready = true;
+    std::optional<std::string> failure;
 };
 
 enum class TextPhase {
@@ -855,6 +869,16 @@ struct PrefillProgress {
     runtime::ExecutionTiming timing;
     std::optional<PendingBatch> pending;
     std::optional<CaptureOffer> capture;
+    // A completed branched read: one record per branch, in branch order.
+    std::vector<runtime::RawTokenLogprob> branches;
+};
+
+// One sequence's share of a shared prefill pass (Program::prefill_batch_unit).
+struct PrefillBatchUnit {
+    std::uint32_t tokens   = 0;
+    std::uint32_t segments = 0;
+    // A branched read: its step runs as a shared pass even alone.
+    bool branched = false;
 };
 
 enum class CaptureStatePlacement : std::uint8_t {
@@ -1079,12 +1103,40 @@ public:
     // Replaces the sampling of an active sequence from its next round; the grammar mask and the
     // penalty counts carry over.
     void update_sampling(SequenceHandle sequence, const ResolvedSamplingParameters& sampling);
+    // With ordinary decoding, the next grammar mask computes ahead after the last commit; the
+    // Engine leaves that lane out of rounds until it is ready. Speculative rounds compute their
+    // masks alongside verification and do not change draft eligibility based on mask duration.
+    [[nodiscard]] StructuredReadiness structured_readiness(SequenceHandle sequence);
     // Blocks until the open context transaction's submitted Host transfer completes, so an idle
     // worker resumes the transaction as soon as it can progress. Returns false, without
     // waiting, when no transfer is in flight. A failed transfer surfaces at the next progress.
     [[nodiscard]] bool wait_context_transfer() noexcept;
     [[nodiscard]] PrefillProgress
     advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming* failed_timing = nullptr);
+    // The columns and segments a sequence's next prefill step adds to a pass shared with other
+    // sequences' last chunks; empty when its step must run alone (a media prompt, a capture or tap
+    // inside the rest of the prompt, drafter work, more than one chunk left, ...). A branched read
+    // (ResolvedExecutionOptions::branches) contributes the rest of its prompt and the branches
+    // that fit one pass after it, and its steps always run as such a pass, alone or shared.
+    [[nodiscard]] std::optional<PrefillBatchUnit>
+    prefill_batch_unit(SequenceHandle sequence) const noexcept;
+    // The most columns and segments one shared pass computes.
+    [[nodiscard]] std::uint32_t prefill_batch_capacity() const noexcept;
+    [[nodiscard]] std::uint32_t prefill_batch_segments() const noexcept;
+    // Whether a branched read (ResolvedExecutionOptions::branches) can run: its steps need the
+    // shared pass, which a staged Program does not have.
+    [[nodiscard]] bool runs_branched_reads() const noexcept;
+    // Branch tokens a branched read has left to compute.
+    [[nodiscard]] std::uint32_t pending_branch_tokens(SequenceHandle sequence) const noexcept;
+    // Runs each sequence's unit in one pass over the model: the rest of an ordinary prompt and its
+    // first token, or a branched read's prompt part and next branches; every sequence must be
+    // admitted by prefill_batch_unit, together within prefill_batch_capacity columns and
+    // kMaximumPrefillSegments segments. Each sequence's next advance_prefill then returns its step
+    // without device work, complete once its first token (all branches) is read. A failure
+    // releases every member's lane.
+    [[nodiscard]] runtime::ExecutionTiming
+    prefill_batch(std::span<const SequenceHandle> sequences,
+                  runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,
@@ -1133,12 +1185,6 @@ public:
            runtime::CommitObservation observation  = runtime::CommitObservation::AllRows,
            runtime::ExecutionTiming* failed_timing = nullptr);
     [[nodiscard]] DiscardResult abort_pending(PendingBatch&& pending) noexcept;
-    // L1 retention for KVMem histories: mark the generated [begin, thinking_end) span as
-    // thinking (soft-demoted) and [thinking_end, execution_frontier) as the response tail
-    // (pinned). Call immediately before finish(), while the lane is Finishable. No-op unless
-    // KvmemOptions::pin_answer is set and KVMem is enabled.
-    void retain_generated_spans(SequenceHandle sequence, std::uint32_t generated_begin,
-                                std::uint32_t thinking_end) noexcept;
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
     // The Device KV lease of an active sequence is extended on demand at a decode-round boundary.
@@ -1233,6 +1279,7 @@ public:
     [[nodiscard]] runtime::ProgramResourceRevision resource_revision() const noexcept;
     [[nodiscard]] PhysicalUsageSnapshot physical_usage() const noexcept;
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    [[nodiscard]] ExpertResidencyStats expert_residency_stats() const;
     // Largest output budget for a prompt of `prompt_tokens` whose admission entitlement (main KV and
     // any MTP/DFlash backend KV, draft window included) fits one lane's share of each pool, so that
     // every configured lane can hold such a request at once; clamped to the remaining context. Reads
@@ -1257,7 +1304,8 @@ private:
     std::unique_ptr<detail::ProgramImpl> impl_;
 
     friend std::unique_ptr<Program> create_program(const execution::Parameters&, SequencePlan&&,
-                                                   DeviceContext&, const StartupObserver&);
+                                                   DeviceContext&, const StartupObserver&,
+                                                   std::unique_ptr<execution::NativeExpertRuntime>);
 };
 
 namespace detail {
@@ -1416,6 +1464,11 @@ struct RuntimeContractAccess {
                                                     const EngineOptions& options,
                                                     std::uint32_t resident_main_pages = 0);
 
+// A temporary Program captures the configured graphs, then releases its arenas.
+// Allocation pressure returns no reading; execution errors must propagate.
+[[nodiscard]] std::optional<std::size_t> measure_cuda_graph_bytes(
+    const execution::Parameters&, DeviceContext&, const EngineOptions&);
+
 // Overlay Vision residency: sizes one encode window for these options, checks that the evictable
 // weight tail covers it and captures the weight pool's window mirror. Call once after load and
 // before sequence planning, so the pinned mirror is already charged when KV capacity resolves.
@@ -1424,17 +1477,12 @@ struct RuntimeContractAccess {
                                                  DeviceContext& device,
                                                  const EngineOptions& options);
 
-// Measures the CUDA Graph driver-state footprint with a minimal physical KV probe: the plan keeps
-// the full logical context so every graph profile is captured, but allocates only enough pages for
-// the configured lanes. The probe is destroyed before the caller plans final capacity. Returns
-// nullopt when graphs are disabled or the probe cannot be built; a successful probe may report 0
-// when WDDM clamps the free-memory delta, which the caller treats as "captured but unmeasured".
-[[nodiscard]] std::optional<std::size_t>
-measure_cuda_graph_bytes(const execution::Parameters& parameters, DeviceContext& device,
-                         const EngineOptions& options);
-
 [[nodiscard]] std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
                                                       SequencePlan&& plan, DeviceContext& device,
                                                       const StartupObserver& startup_observer);
+[[nodiscard]] std::unique_ptr<Program> create_program(const execution::Parameters& parameters,
+                                                      SequencePlan&& plan, DeviceContext& device,
+                                                      const StartupObserver& startup_observer,
+                                                      std::unique_ptr<execution::NativeExpertRuntime> experts);
 
 } // namespace ninfer::models::qwen3_5

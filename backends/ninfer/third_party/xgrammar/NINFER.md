@@ -29,7 +29,33 @@ CPU coverage includes test_unicode_scalar_output.cpp and the native_schema_probe
 
 Schema compatibility supplement: the text compiler distributes proven
 anyOf type/required intersections before XGrammar compilation. String-array
-uniqueness is enforced by request-owned incremental semantic masks, not by dropping
+uniqueness is enforced by request-owned incremental semantic masks (src/text/string_constraints.cpp), not by dropping
 the assertion from public JSON or by rewriting completed arrays. Object upper
 bounds use the existing vendored object generator. CPU equivalence, prefix
 reachability and committed/speculative-state regressions guard these contracts.
+
+Counted-repetition supplement (from upstream XGrammar after v0.2.7, generalized in Neroued/ninfer
+0a8530d44): a repetition whose unit is a deterministic, prefix-free byte language, followed by a
+byte that cannot start a unit, stays one counted repeat edge in a rule of its own
+(`RepetitionRangeExpanderImpl::TryCountedRepeat`), and the unit's FSM is normalized to a DFA. For
+every state of such a unit, `PopulateRepeatMasks` classifies the tokens by the repetitions they
+consume, including partial UTF-8 and escape states: tokens that stay inside go into cumulative
+bitsets (or sorted sparse lists) by count, tokens that leave on their last byte into an exit list,
+and both leave the mask's ordinary classes. The matcher reads the count from the repetition parent
+and accepts the fitting tokens without replaying them; tokens that cross into the parent's
+continuation keep the ordinary replay. The data is rebuilt on compilation and deserialization, not
+serialized; the serialization version is `v16-ninfer-repeat-masks`. A JSON string with
+`minLength`/`maxLength` compiles to `"\"" scalar{min,max} "\""` over one shared JSON-scalar unit.
+With Qwen3.5's 248,070-token vocabulary (Apple M-series, one thread) a schema with an `anyOf`
+string of `maxLength: 200` and one of `maxLength: 2800` compiles in 81 ms and 9.8 MB instead of
+24.8 s and 3.1 GB, and its masks inside the strings take 0.04 ms instead of 70-96 ms. Regression:
+tests/text/test_structured_output.cpp compares every mask inside bounded strings with token
+acceptance over a vocabulary of multi-scalar, partial and closing tokens.
+
+
+Qwen XML parameter supplement (cpp/json_schema_converter_ext.cc): the `qwen_xml_parameter` value
+wrapper carries the newlines of Qwen's chat template, `<parameter=NAME>\nVALUE\n</parameter>\n`,
+which the model writes and NInfer's tool-call parser strips, so a raw string value is exactly the
+argument. A whitespace-only wrapper prefix is not preceded by another whitespace run, which would
+otherwise reach a raw string's value. Strict tool arguments depend on it; coverage is in
+tests/test_tool_call_parser.cpp.

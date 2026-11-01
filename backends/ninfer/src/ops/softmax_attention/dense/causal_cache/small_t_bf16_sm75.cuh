@@ -1,13 +1,13 @@
 #pragma once
 
-// ninfer::ops - split-KV causal small-T attention, BF16 KV-cache partial kernel of a Turing (sm_75)
-// build. small_t_bf16.cuh holds the sm_80+ kernel; this one keeps its contract, split geometry and
-// partial layout. Turing has no BF16 MMA, so a CTA sweeps its split on FP16 MMA with Q, K and V as
-// their FP16 roundings (common/bf16_attention.cuh), and sweeps it again on the BF16 emulation, an
-// out-of-line function, only when a tile holds a value FP16 cannot hold: in the fast sweep's loop
-// body, the emulation's registers made it spill. The probabilities stay in registers (the QK
-// accumulator is the PV A fragment) and page IDs come from the block table, so the K and V tiles
-// are all of a CTA's shared memory: 32 KiB, two CTAs per SM.
+// ninfer::ops - split-KV causal small-T attention, BF16 KV-cache partial kernel of the Turing shape
+// set (ops/common/device_tier.h), included by small_t_bf16.cuh after the standard kernel; this one
+// keeps its contract, split geometry and partial layout. Turing has no BF16 MMA, so a CTA sweeps
+// its split on FP16 MMA with Q, K and V as their FP16 roundings (common/bf16_attention.cuh), and
+// sweeps it again on the BF16 emulation, an out-of-line function, only when a tile holds a value
+// FP16 cannot hold: in the fast sweep's loop body, the emulation's registers made it spill. The
+// probabilities stay in registers (the QK accumulator is the PV A fragment) and page IDs come from
+// the block table, so the K and V tiles are all of a CTA's shared memory: 32 KiB, two CTAs per SM.
 
 #include <cuda_bf16.h>
 #include <math_constants.h>
@@ -18,6 +18,9 @@
 #include <cstdint>
 
 namespace ninfer::ops {
+// Turing's forms (sm75_mma.cuh) exist in every image but sm_70's, which never runs this kernel and
+// compiles it empty.
+#if defined(NINFER_SM75_FORMS)
 namespace sm75_small_t_bf16 {
 
 inline constexpr int kBc = 32;
@@ -129,7 +132,7 @@ __device__ __forceinline__ bool sweep(const Split<CacheInput>& s, __nv_bfloat16*
                 const int key   = k0 + key_l;
                 k_raw[j]        = make_int4(0, 0, 0, 0);
                 v_raw[j]        = make_int4(0, 0, 0, 0);
-                if (key >= s.split_start && key < s.split_end) {
+                if (key >= s.split_start && key < s.load_end) {
                     const __nv_bfloat16* k_src = s.cache_k;
                     const __nv_bfloat16* v_src = s.cache_v;
                     std::int64_t off = causal_cache_index<Geometry>(physical_page, s.kv_head, d,
@@ -291,15 +294,18 @@ __device__ __noinline__ void sweep_exact(Split<CacheInput> s, __nv_bfloat16* qkv
 }
 
 } // namespace sm75_small_t_bf16
+#endif
 
 template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
           typename CacheInput>
-__launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf16_kernel(
+__launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf16_turing_kernel(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, __nv_bfloat16* cache_k,
     __nv_bfloat16* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
     float* partial_acc, float* partial_m, float* partial_l) {
+    if constexpr (!shape_set_in_image(true)) { return; } // not this image's set
+#if defined(NINFER_SM75_FORMS)
     static_assert(TokenTile >= 1 && TokenTile * Geometry::GroupSize <= 48);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
 
@@ -342,6 +348,7 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
             }
             sm75_small_t_bf16::sweep_exact<Geometry, Wc>(s, qkv_s);
         });
+#endif
 }
 
 } // namespace ninfer::ops

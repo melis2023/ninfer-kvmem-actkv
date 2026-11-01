@@ -60,8 +60,8 @@ struct SweepOptions {
     const char* title         = "schedules";
     // Print "median min..p95" per cell instead of the median alone. A route decision is only
     // meaningful if the margin between two schedules clears their own spread, and the median by
-    // itself cannot tell you that -- TODO section 5 has a band that stayed unresolved for exactly
-    // this reason, where the losing schedule's own samples ranged 19.6%.
+    // itself cannot tell you that: one band stayed unresolved for exactly this reason, where the
+    // losing schedule's own samples ranged 19.6%.
     bool spread               = false;
     // Optional: what the Op's own resolver picks at this width, and the public Op itself. Supply
     // both or neither.

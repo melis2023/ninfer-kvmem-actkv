@@ -15,48 +15,54 @@
 
 namespace ninfer::ops {
 
-template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
-          typename CacheInput>
-__launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf16_kernel(
+// One CTA's share of a BF16 small-T partial launch, as this file's kernel and a Turing build's
+// (small_t_bf16_sm75.cuh) take it: the inputs advanced to its column and batch row, and the keys
+// [split_start, split_end) of its split, in key_blocks tiles of Bc keys from first_tile. Keys at or
+// past load_end lie beyond the last live column: the sweep reads none of them.
+template <class CacheInput>
+struct CausalSmallTBf16Split {
+    const __nv_bfloat16* q;
+    CacheInput input;
+    const std::int32_t* pos;
+    const std::int32_t* block_table;
+    float* partial_acc;
+    float* partial_m;
+    float* partial_l;
+    int kv_head;
+    int split;
+    int tokens;
+    int row_count;
+    int valid_tokens;
+    int first_pos;
+    int split_start;
+    int split_end;
+    int load_end;
+    int first_tile;
+    int key_blocks;
+};
+
+// Runs `sweep` on the split this CTA covers, or writes the split's neutral partials when it has no
+// keys. With a cache-writing input, the CTA whose split owns a new token's position also writes its
+// K and V rows into the cache first; the sweep reads those rows from the input, so no split depends
+// on another split's write. The sweep is a continuation rather than a returned split: a split
+// returned past the early exits would merge every value with its unset form, and those merged
+// values stay in registers through the sweep (on sm_86 the kernel spilled twice as much).
+template <typename Geometry, int TokenTile, int Br, int Bc, int Threads, bool MultiBatch,
+          bool Masked, typename CacheInput, class Sweep>
+__device__ __forceinline__ void causal_small_t_bf16_split(
     const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, __nv_bfloat16* cache_k,
     __nv_bfloat16* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
-    std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
-    float* partial_acc, float* partial_m, float* partial_l) {
-    static_assert(TokenTile >= 1 && TokenTile * Geometry::GroupSize <= 48);
-    static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
-
-    constexpr int Wc      = WarpsPerCta;
-    constexpr int Br      = Wc * 16;
-    constexpr int Bc      = 32;
-    constexpr int D       = kCausalHeadDim;
-    constexpr int Threads = Wc * 32;
-    constexpr int QKNt    = Bc / 8;
-    constexpr int QKKs    = D / 16;
-    constexpr int PVNt    = D / 8;
-    constexpr int PVKs    = Bc / 16;
-    // A split stages up to 64 page IDs, enough for a 262,144-key window in this split
-    // geometry; a split that spans more pages reads the block table directly.
-    constexpr int PageIds       = 64;
-    constexpr float Log2E       = 1.4426950408889634074f;
+    std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity,
+    float* partial_acc, float* partial_m, float* partial_l, Sweep&& sweep) {
+    constexpr int D             = kCausalHeadDim;
     constexpr unsigned FullMask = 0xffffffffu;
-    constexpr int QkvRows       = 2 * Bc;
-
-    static_assert(QkvRows >= Br);
-
-    __shared__ __align__(16) __nv_bfloat16 qkv_s[QkvRows * D];
-    __shared__ __align__(16) __nv_bfloat16 p_s[Wc * 16 * Bc];
-    __shared__ std::int32_t physical_pages_s[PageIds];
-    __nv_bfloat16* k_s = qkv_s;
-    __nv_bfloat16* v_s = qkv_s + Bc * D;
 
     const int kv_head     = static_cast<int>(blockIdx.x);
     const int split       = static_cast<int>(blockIdx.y);
     const int batch       = MultiBatch ? static_cast<int>(blockIdx.z) : 0;
     const int split_count = static_cast<int>(gridDim.y);
     const int tid         = static_cast<int>(threadIdx.x);
-    const int warp        = tid >> 5;
-    const int lane        = tid & 31;
     int valid_tokens      = tokens;
     if constexpr (Masked) {
         const int remaining = valid_columns[batch] - column_begin;
@@ -122,7 +128,8 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
         return;
     }
 
-    const int window = last_pos + 1;
+    const int live_end = last_pos + 1;
+    const int window   = causal_small_t_tile_window(first_pos, tokens, logical_capacity);
     const int active_split_count =
         causal_small_t_active_splits<Geometry, false>(window, split_count, TokenTile);
     if (split >= active_split_count) { return; }
@@ -139,23 +146,8 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
         return;
     }
     const int first_tile = (split_start / Bc) * Bc;
-    const int key_blocks = div_up(split_end - first_tile, Bc);
-    const int first_page = first_tile >> kPagedKVPageShift;
-    const int page_count    = ((split_end - 1) >> kPagedKVPageShift) - first_page + 1;
-    const bool staged_pages = page_count <= PageIds;
-    if (staged_pages) {
-        for (int page = tid; page < page_count; page += Threads) {
-            physical_pages_s[page] = block_table[first_page + page];
-        }
-    }
-    const auto page_at = [&](int key) {
-        return staged_pages ? physical_pages_s[(key >> kPagedKVPageShift) - first_page]
-                            : block_table[key >> kPagedKVPageShift];
-    };
 
     if constexpr (CacheInput::writes_cache) {
-        // The owning split writes each new row. Current attention reads those rows directly from
-        // input below, so no split depends on another split's cache write.
         for (int chunk = tid; chunk < valid_tokens * (D / 8); chunk += Threads) {
             const int token = chunk / (D / 8);
             const int d     = (chunk - token * (D / 8)) * 8;
@@ -175,256 +167,349 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
         __syncthreads();
     }
 
-    for (int idx = tid; idx < Br * D; idx += Threads) {
-        const int row = idx / D;
-        const int d   = idx - row * D;
-        int q_head    = 0;
-        int token     = 0;
-        causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
-        __nv_bfloat16 value = __float2bfloat16(0.0f);
-        if (row < row_count && causal_valid_q_head<Geometry>(kv_head, q_head)) {
-            value = q[causal_q_index<Geometry>(q_head, d, token)];
-        }
-        qkv_s[row * D + causal_small_t_tc_swz(row, d)] = value;
-    }
-    __syncthreads();
+    sweep(CausalSmallTBf16Split<CacheInput>{q, input, pos, block_table, partial_acc, partial_m,
+                                            partial_l, kv_head, split, tokens, row_count,
+                                            valid_tokens, first_pos, split_start, split_end,
+                                            split_end < live_end ? split_end : live_end, first_tile,
+                                            div_up(split_end - first_tile, Bc)});
+}
 
-    const int gid = lane >> 2;
-    const int lid = lane & 3;
-
-    const int a_mat    = lane >> 3;
-    const int a_rin    = lane & 7;
-    const int a_rowoff = a_rin + ((a_mat & 1) << 3);
-    const int a_coloff = (a_mat >> 1) << 3;
-    const int b_rin    = lane & 7;
-    const int b_koff   = ((lane >> 3) & 1) << 3;
-
-    const int warp_row0 = warp * 16;
-    __nv_bfloat16* p_sw  = &p_s[warp * 16 * Bc];
-
-    unsigned af_q[QKKs][4];
-#pragma unroll
-    for (int k = 0; k < QKKs; ++k) {
-        const int arow = warp_row0 + a_rowoff;
-        const int acol = k * 16 + a_coloff;
-        ldmatrix_x4(af_q[k][0], af_q[k][1], af_q[k][2], af_q[k][3],
-                    smem_addr(&qkv_s[arow * D + causal_small_t_tc_swz(arow, acol)]));
-    }
-    __syncthreads();
-    int physical_page = page_at(first_tile);
-    float acc[PVNt][4];
-#pragma unroll
-    for (int n = 0; n < PVNt; ++n) {
-#pragma unroll
-        for (int i = 0; i < 4; ++i) { acc[n][i] = 0.0f; }
-    }
-    float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F, l0 = 0.0f, l1 = 0.0f;
-
-    for (int kb = 0; kb < key_blocks; ++kb) {
-        const int k0 = first_tile + kb * Bc;
-        if (kb != 0 && (k0 & kPagedKVPageMask) == 0) {
-            physical_page = page_at(k0);
-        }
-        // Stage the bf16 K/V key tile with one cp.async wave (16B/thread, high MLP).
-        // Current-step tokens come from k_new/v_new; tail slots are zeroed.
-#pragma unroll 1
-        for (int chunk = tid; chunk < Bc * (D / 8); chunk += Threads) {
-            const int key_l      = chunk / (D / 8);
-            const int d          = (chunk - key_l * (D / 8)) * 8;
-            const int key        = k0 + key_l;
-            __nv_bfloat16* k_dst = &k_s[key_l * D + causal_small_t_tc_swz(key_l, d)];
-            __nv_bfloat16* v_dst = &v_s[key_l * D + causal_small_t_tc_swz(key_l, d)];
-            if (key >= split_start && key < split_end) {
-                if constexpr (CacheInput::writes_cache) {
-                    const int new_token = key - first_pos;
-                    const bool from_new =
-                        new_token >= 0 && new_token < valid_tokens && key >= first_pos;
-                    if (from_new) {
-                        const std::int64_t off =
-                            kv_cache_int8_new_index<Geometry>(kv_head, d, new_token);
-                        ninfer::ops::cp_async<16>(k_dst, &input.k[off]);
-                        ninfer::ops::cp_async<16>(v_dst, &input.v[off]);
-                    } else {
-                        const std::int64_t off = causal_cache_index<Geometry>(
-                            physical_page, kv_head, d, key & kPagedKVPageMask);
-                        ninfer::ops::cp_async<16>(k_dst, &cache_k[off]);
-                        ninfer::ops::cp_async<16>(v_dst, &cache_v[off]);
-                    }
-                } else {
-                    const std::int64_t off = causal_cache_index<Geometry>(physical_page, kv_head, d,
-                                                                          key & kPagedKVPageMask);
-                    ninfer::ops::cp_async<16>(k_dst, &cache_k[off]);
-                    ninfer::ops::cp_async<16>(v_dst, &cache_v[off]);
-                }
-            } else {
-                store_vec(k_dst, make_int4(0, 0, 0, 0));
-                store_vec(v_dst, make_int4(0, 0, 0, 0));
-            }
-        }
-        ninfer::ops::cp_commit();
-        ninfer::ops::cp_wait<0>();
-        __syncthreads();
-
-        float score[QKNt][4];
-#pragma unroll
-        for (int nt = 0; nt < QKNt; ++nt) {
-            score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
-#pragma unroll
-            for (int k = 0; k < QKKs; ++k) {
-                unsigned bf[2];
-                const int brow = nt * 8 + b_rin;
-                const int bcol = k * 16 + b_koff;
-                ldmatrix_x2(bf[0], bf[1],
-                            smem_addr(&k_s[brow * D + causal_small_t_tc_swz(brow, bcol)]));
-                mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af_q[k][0],
-                         af_q[k][1], af_q[k][2], af_q[k][3], bf[0], bf[1]);
-            }
-        }
-
-        const int row0 = warp_row0 + gid;
-        const int row1 = row0 + 8;
-        int q_head0 = 0, token0 = 0, q_head1 = 0, token1 = 0;
-        causal_small_t_tc_row_to_qt<Geometry>(row0, tokens, kv_head, q_head0, token0);
-        causal_small_t_tc_row_to_qt<Geometry>(row1, tokens, kv_head, q_head1, token1);
-        const int qabs0 = (row0 < row_count) ? pos[token0] : -1;
-        const int qabs1 = (row1 < row_count) ? pos[token1] : -1;
-
-        float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
-#pragma unroll
-        for (int nt = 0; nt < QKNt; ++nt) {
-            const int col0 = nt * 8 + 2 * lid;
-            const int col1 = col0 + 1;
-            const int key0 = k0 + col0;
-            const int key1 = col1 + k0;
-            score[nt][0] =
-                (row0 < row_count && key0 >= split_start && key0 < split_end && key0 <= qabs0)
-                    ? score[nt][0] * scale
-                    : -CUDART_INF_F;
-            score[nt][1] =
-                (row0 < row_count && key1 >= split_start && key1 < split_end && key1 <= qabs0)
-                    ? score[nt][1] * scale
-                    : -CUDART_INF_F;
-            score[nt][2] =
-                (row1 < row_count && key0 >= split_start && key0 < split_end && key0 <= qabs1)
-                    ? score[nt][2] * scale
-                    : -CUDART_INF_F;
-            score[nt][3] =
-                (row1 < row_count && key1 >= split_start && key1 < split_end && key1 <= qabs1)
-                    ? score[nt][3] * scale
-                    : -CUDART_INF_F;
-            bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
-            bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
-        }
-        bm0 = warp_max<4>(bm0, FullMask);
-        bm1 = warp_max<4>(bm1, FullMask);
-
-        const float nm0    = fmaxf(m0, bm0);
-        const float nm1    = fmaxf(m1, bm1);
-        const float alpha0 = (m0 == -CUDART_INF_F) ? 0.0f : exp2_approx((m0 - nm0) * Log2E);
-        const float alpha1 = (m1 == -CUDART_INF_F) ? 0.0f : exp2_approx((m1 - nm1) * Log2E);
-
-        float bl0 = 0.0f, bl1 = 0.0f;
-#pragma unroll
-        for (int nt = 0; nt < QKNt; ++nt) {
-            const int col0  = nt * 8 + 2 * lid;
-            const int col1  = col0 + 1;
-            const float p00 = (nm0 > -CUDART_INF_F && score[nt][0] > -CUDART_INF_F)
-                                  ? exp2_approx((score[nt][0] - nm0) * Log2E)
-                                  : 0.0f;
-            const float p01 = (nm0 > -CUDART_INF_F && score[nt][1] > -CUDART_INF_F)
-                                  ? exp2_approx((score[nt][1] - nm0) * Log2E)
-                                  : 0.0f;
-            const float p10 = (nm1 > -CUDART_INF_F && score[nt][2] > -CUDART_INF_F)
-                                  ? exp2_approx((score[nt][2] - nm1) * Log2E)
-                                  : 0.0f;
-            const float p11 = (nm1 > -CUDART_INF_F && score[nt][3] > -CUDART_INF_F)
-                                  ? exp2_approx((score[nt][3] - nm1) * Log2E)
-                                  : 0.0f;
-            bl0 += p00 + p01;
-            bl1 += p10 + p11;
-            p_sw[gid * Bc + causal_small_t_tc_swz32(gid, col0)]           = __float2bfloat16(p00);
-            p_sw[gid * Bc + causal_small_t_tc_swz32(gid, col1)]           = __float2bfloat16(p01);
-            p_sw[(gid + 8) * Bc + causal_small_t_tc_swz32(gid + 8, col0)] = __float2bfloat16(p10);
-            p_sw[(gid + 8) * Bc + causal_small_t_tc_swz32(gid + 8, col1)] = __float2bfloat16(p11);
-        }
-        bl0 = warp_sum<4>(bl0, FullMask);
-        bl1 = warp_sum<4>(bl1, FullMask);
-
-        l0 = l0 * alpha0 + bl0;
-        l1 = l1 * alpha1 + bl1;
-        m0 = nm0;
-        m1 = nm1;
-#pragma unroll
-        for (int n = 0; n < PVNt; ++n) {
-            acc[n][0] *= alpha0;
-            acc[n][1] *= alpha0;
-            acc[n][2] *= alpha1;
-            acc[n][3] *= alpha1;
-        }
-        __syncwarp();
-
-#pragma unroll
-        for (int n = 0; n < PVNt; ++n) {
-#pragma unroll
-            for (int k = 0; k < PVKs; ++k) {
-                unsigned pf[4];
-                const int pcol = k * 16 + a_coloff;
-                ldmatrix_x4(
-                    pf[0], pf[1], pf[2], pf[3],
-                    smem_addr(&p_sw[a_rowoff * Bc + causal_small_t_tc_swz32(a_rowoff, pcol)]));
-                unsigned vf[2];
-                const int vrow = k * 16 + b_koff + b_rin;
-                const int vcol = n * 8;
-                ldmatrix_x2_t(vf[0], vf[1],
-                              smem_addr(&v_s[vrow * D + causal_small_t_tc_swz(vrow, vcol)]));
-                mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
-                         vf[0], vf[1]);
-            }
-        }
-        __syncthreads();
-    }
-
+// The split-local partials of the warp's rows: each row's running max and sum (by the quad's
+// first lane) and its FP32 accumulators.
+template <typename Geometry, class CacheInput, int PVNt>
+__device__ __forceinline__ void
+causal_small_t_bf16_store(const CausalSmallTBf16Split<CacheInput>& s, const float (&acc)[PVNt][4],
+                          float m0, float m1, float l0, float l1, int warp_row0, int lane) {
+    const int gid  = lane >> 2;
+    const int lid  = lane & 3;
+    const int row0 = warp_row0 + gid;
+    const int row1 = row0 + 8;
+    int q_head0 = 0, token0 = 0, q_head1 = 0, token1 = 0;
+    causal_small_t_tc_row_to_qt<Geometry>(row0, s.tokens, s.kv_head, q_head0, token0);
+    causal_small_t_tc_row_to_qt<Geometry>(row1, s.tokens, s.kv_head, q_head1, token1);
     if (lid == 0) {
-        const int row0 = warp_row0 + gid;
-        const int row1 = row0 + 8;
-        if (row0 < row_count) {
-            int q_head = 0;
-            int token  = 0;
-            causal_small_t_tc_row_to_qt<Geometry>(row0, tokens, kv_head, q_head, token);
-            partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] = m0;
-            partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] = l0;
+        if (row0 < s.row_count) {
+            const std::int64_t at =
+                causal_partial_stat_index<Geometry>(q_head0, token0, s.split, s.tokens);
+            s.partial_m[at] = m0;
+            s.partial_l[at] = l0;
         }
-        if (row1 < row_count) {
-            int q_head = 0;
-            int token  = 0;
-            causal_small_t_tc_row_to_qt<Geometry>(row1, tokens, kv_head, q_head, token);
-            partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] = m1;
-            partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] = l1;
+        if (row1 < s.row_count) {
+            const std::int64_t at =
+                causal_partial_stat_index<Geometry>(q_head1, token1, s.split, s.tokens);
+            s.partial_m[at] = m1;
+            s.partial_l[at] = l1;
         }
     }
-
 #pragma unroll
     for (int n = 0; n < PVNt; ++n) {
-        const int d0   = n * 8 + 2 * lid;
-        const int row0 = warp_row0 + gid;
-        const int row1 = row0 + 8;
-        if (row0 < row_count) {
-            int q_head = 0;
-            int token  = 0;
-            causal_small_t_tc_row_to_qt<Geometry>(row0, tokens, kv_head, q_head, token);
+        const int d0 = n * 8 + 2 * lid;
+        if (row0 < s.row_count) {
             const std::int64_t dst =
-                causal_partial_acc_index<Geometry>(q_head, d0, token, split, tokens);
-            *reinterpret_cast<float2*>(&partial_acc[dst]) = make_float2(acc[n][0], acc[n][1]);
+                causal_partial_acc_index<Geometry>(q_head0, d0, token0, s.split, s.tokens);
+            *reinterpret_cast<float2*>(&s.partial_acc[dst]) = make_float2(acc[n][0], acc[n][1]);
         }
-        if (row1 < row_count) {
-            int q_head = 0;
-            int token  = 0;
-            causal_small_t_tc_row_to_qt<Geometry>(row1, tokens, kv_head, q_head, token);
+        if (row1 < s.row_count) {
             const std::int64_t dst =
-                causal_partial_acc_index<Geometry>(q_head, d0, token, split, tokens);
-            *reinterpret_cast<float2*>(&partial_acc[dst]) = make_float2(acc[n][2], acc[n][3]);
+                causal_partial_acc_index<Geometry>(q_head1, d0, token1, s.split, s.tokens);
+            *reinterpret_cast<float2*>(&s.partial_acc[dst]) = make_float2(acc[n][2], acc[n][3]);
         }
     }
 }
 
 } // namespace ninfer::ops
+
+namespace ninfer::ops {
+
+template <typename Geometry, int TokenTile, int WarpsPerCta, bool MultiBatch, bool Masked,
+          typename CacheInput>
+__launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf16_kernel(
+    const __nv_bfloat16* q, CacheInput input, const std::int32_t* pos, __nv_bfloat16* cache_k,
+    __nv_bfloat16* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
+    const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
+    std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
+    float* partial_acc, float* partial_m, float* partial_l) {
+    if constexpr (!shape_set_in_image(false)) { return; } // not this image's set
+    // A Volta card runs its own kernel (small_t_sm70.cuh): a build of several architectures
+    // compiles this kernel empty in the Volta image.
+#if !defined(NINFER_SM70_DEVICE)
+    static_assert(TokenTile >= 1 && TokenTile * Geometry::GroupSize <= 48);
+    static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
+
+    constexpr int Wc      = WarpsPerCta;
+    constexpr int Br      = Wc * 16;
+    constexpr int Bc      = 32;
+    constexpr int D       = kCausalHeadDim;
+    constexpr int Threads = Wc * 32;
+    constexpr int QKNt    = Bc / 8;
+    constexpr int QKKs    = D / 16;
+    constexpr int PVNt    = D / 8;
+    constexpr int PVKs    = Bc / 16;
+    // A split stages up to 64 page IDs, enough for a 262,144-key window in this split
+    // geometry; a split that spans more pages reads the block table directly.
+    constexpr int PageIds       = 64;
+    constexpr float Log2E       = 1.4426950408889634074f;
+    constexpr unsigned FullMask = 0xffffffffu;
+    constexpr int QkvRows       = 2 * Bc;
+
+    static_assert(QkvRows >= Br);
+
+    __shared__ __align__(16) __nv_bfloat16 qkv_s[QkvRows * D];
+    __shared__ __align__(16) __nv_bfloat16 p_s[Wc * 16 * Bc];
+    __shared__ std::int32_t physical_pages_s[PageIds];
+    __nv_bfloat16* k_s = qkv_s;
+    __nv_bfloat16* v_s = qkv_s + Bc * D;
+
+    const int tid  = static_cast<int>(threadIdx.x);
+    const int warp = tid >> 5;
+    const int lane = tid & 31;
+    causal_small_t_bf16_split<Geometry, TokenTile, Br, Bc, Threads, MultiBatch, Masked>(
+        q, input, pos, cache_k, cache_v, block_tables, valid_columns, table_rows, table_stride,
+        tokens, full_width, column_begin, logical_capacity, partial_acc, partial_m, partial_l,
+        [&](const CausalSmallTBf16Split<CacheInput>& sp) {
+            const int kv_head               = sp.kv_head;
+            const int row_count             = sp.row_count;
+            const int valid_tokens          = sp.valid_tokens;
+            const int first_pos             = sp.first_pos;
+            const int split_start           = sp.split_start;
+            const int split_end             = sp.split_end;
+            const int load_end              = sp.load_end;
+            const int first_tile            = sp.first_tile;
+            const int key_blocks            = sp.key_blocks;
+            q                               = sp.q;
+            pos                             = sp.pos;
+            input                           = sp.input;
+            const std::int32_t* block_table = sp.block_table;
+            const int first_page            = first_tile >> kPagedKVPageShift;
+            const int page_count    = ((split_end - 1) >> kPagedKVPageShift) - first_page + 1;
+            const bool staged_pages = page_count <= PageIds;
+            if (staged_pages) {
+                for (int page = tid; page < page_count; page += Threads) {
+                    physical_pages_s[page] = block_table[first_page + page];
+                }
+            }
+            const auto page_at = [&](int key) {
+                return staged_pages ? physical_pages_s[(key >> kPagedKVPageShift) - first_page]
+                                    : block_table[key >> kPagedKVPageShift];
+            };
+
+            for (int idx = tid; idx < Br * D; idx += Threads) {
+                const int row = idx / D;
+                const int d   = idx - row * D;
+                int q_head    = 0;
+                int token     = 0;
+                causal_small_t_tc_row_to_qt<Geometry>(row, tokens, kv_head, q_head, token);
+                __nv_bfloat16 value = __float2bfloat16(0.0f);
+                if (row < row_count && causal_valid_q_head<Geometry>(kv_head, q_head)) {
+                    value = q[causal_q_index<Geometry>(q_head, d, token)];
+                }
+                qkv_s[row * D + causal_small_t_tc_swz(row, d)] = value;
+            }
+            __syncthreads();
+
+            const int gid = lane >> 2;
+            const int lid = lane & 3;
+
+            const int a_mat    = lane >> 3;
+            const int a_rin    = lane & 7;
+            const int a_rowoff = a_rin + ((a_mat & 1) << 3);
+            const int a_coloff = (a_mat >> 1) << 3;
+            const int b_rin    = lane & 7;
+            const int b_koff   = ((lane >> 3) & 1) << 3;
+
+            const int warp_row0 = warp * 16;
+            __nv_bfloat16* p_sw = &p_s[warp * 16 * Bc];
+
+            unsigned af_q[QKKs][4];
+#    pragma unroll
+            for (int k = 0; k < QKKs; ++k) {
+                const int arow = warp_row0 + a_rowoff;
+                const int acol = k * 16 + a_coloff;
+                ldmatrix_x4(af_q[k][0], af_q[k][1], af_q[k][2], af_q[k][3],
+                            smem_addr(&qkv_s[arow * D + causal_small_t_tc_swz(arow, acol)]));
+            }
+            __syncthreads();
+            int physical_page = page_at(first_tile);
+            float acc[PVNt][4];
+#    pragma unroll
+            for (int n = 0; n < PVNt; ++n) {
+#    pragma unroll
+                for (int i = 0; i < 4; ++i) { acc[n][i] = 0.0f; }
+            }
+            float m0 = -CUDART_INF_F, m1 = -CUDART_INF_F, l0 = 0.0f, l1 = 0.0f;
+
+            for (int kb = 0; kb < key_blocks; ++kb) {
+                const int k0 = first_tile + kb * Bc;
+                if (kb != 0 && (k0 & kPagedKVPageMask) == 0) { physical_page = page_at(k0); }
+            // Stage the bf16 K/V key tile with one cp.async wave (16B/thread, high MLP).
+            // Current-step tokens come from k_new/v_new; tail slots are zeroed.
+#    pragma unroll 1
+                for (int chunk = tid; chunk < Bc * (D / 8); chunk += Threads) {
+                    const int key_l      = chunk / (D / 8);
+                    const int d          = (chunk - key_l * (D / 8)) * 8;
+                    const int key        = k0 + key_l;
+                    __nv_bfloat16* k_dst = &k_s[key_l * D + causal_small_t_tc_swz(key_l, d)];
+                    __nv_bfloat16* v_dst = &v_s[key_l * D + causal_small_t_tc_swz(key_l, d)];
+                    if (key >= split_start && key < load_end) {
+                        if constexpr (CacheInput::writes_cache) {
+                            const int new_token = key - first_pos;
+                            const bool from_new =
+                                new_token >= 0 && new_token < valid_tokens && key >= first_pos;
+                            if (from_new) {
+                                const std::int64_t off =
+                                    kv_cache_int8_new_index<Geometry>(kv_head, d, new_token);
+                                ninfer::ops::cp_async<16>(k_dst, &input.k[off]);
+                                ninfer::ops::cp_async<16>(v_dst, &input.v[off]);
+                            } else {
+                                const std::int64_t off = causal_cache_index<Geometry>(
+                                    physical_page, kv_head, d, key & kPagedKVPageMask);
+                                ninfer::ops::cp_async<16>(k_dst, &cache_k[off]);
+                                ninfer::ops::cp_async<16>(v_dst, &cache_v[off]);
+                            }
+                        } else {
+                            const std::int64_t off = causal_cache_index<Geometry>(
+                                physical_page, kv_head, d, key & kPagedKVPageMask);
+                            ninfer::ops::cp_async<16>(k_dst, &cache_k[off]);
+                            ninfer::ops::cp_async<16>(v_dst, &cache_v[off]);
+                        }
+                    } else {
+                        store_vec(k_dst, make_int4(0, 0, 0, 0));
+                        store_vec(v_dst, make_int4(0, 0, 0, 0));
+                    }
+                }
+                ninfer::ops::cp_commit();
+                ninfer::ops::cp_wait<0>();
+                __syncthreads();
+
+                float score[QKNt][4];
+#    pragma unroll
+                for (int nt = 0; nt < QKNt; ++nt) {
+                    score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0f;
+#    pragma unroll
+                    for (int k = 0; k < QKKs; ++k) {
+                        unsigned bf[2];
+                        const int brow = nt * 8 + b_rin;
+                        const int bcol = k * 16 + b_koff;
+                        ldmatrix_x2(bf[0], bf[1],
+                                    smem_addr(&k_s[brow * D + causal_small_t_tc_swz(brow, bcol)]));
+                        mma_bf16(score[nt][0], score[nt][1], score[nt][2], score[nt][3], af_q[k][0],
+                                 af_q[k][1], af_q[k][2], af_q[k][3], bf[0], bf[1]);
+                    }
+                }
+
+                const int row0 = warp_row0 + gid;
+                const int row1 = row0 + 8;
+                int q_head0 = 0, token0 = 0, q_head1 = 0, token1 = 0;
+                causal_small_t_tc_row_to_qt<Geometry>(row0, tokens, kv_head, q_head0, token0);
+                causal_small_t_tc_row_to_qt<Geometry>(row1, tokens, kv_head, q_head1, token1);
+                const int qabs0 = (row0 < row_count) ? pos[token0] : -1;
+                const int qabs1 = (row1 < row_count) ? pos[token1] : -1;
+
+                float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
+#    pragma unroll
+                for (int nt = 0; nt < QKNt; ++nt) {
+                    const int col0 = nt * 8 + 2 * lid;
+                    const int col1 = col0 + 1;
+                    const int key0 = k0 + col0;
+                    const int key1 = col1 + k0;
+                    score[nt][0]   = (row0 < row_count && key0 >= split_start && key0 < split_end &&
+                                    key0 <= qabs0)
+                                         ? score[nt][0] * scale
+                                         : -CUDART_INF_F;
+                    score[nt][1]   = (row0 < row_count && key1 >= split_start && key1 < split_end &&
+                                    key1 <= qabs0)
+                                         ? score[nt][1] * scale
+                                         : -CUDART_INF_F;
+                    score[nt][2]   = (row1 < row_count && key0 >= split_start && key0 < split_end &&
+                                    key0 <= qabs1)
+                                         ? score[nt][2] * scale
+                                         : -CUDART_INF_F;
+                    score[nt][3]   = (row1 < row_count && key1 >= split_start && key1 < split_end &&
+                                    key1 <= qabs1)
+                                         ? score[nt][3] * scale
+                                         : -CUDART_INF_F;
+                    bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
+                    bm1            = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
+                }
+                bm0 = warp_max<4>(bm0, FullMask);
+                bm1 = warp_max<4>(bm1, FullMask);
+
+                const float nm0    = fmaxf(m0, bm0);
+                const float nm1    = fmaxf(m1, bm1);
+                const float alpha0 = (m0 == -CUDART_INF_F) ? 0.0f : exp2_approx((m0 - nm0) * Log2E);
+                const float alpha1 = (m1 == -CUDART_INF_F) ? 0.0f : exp2_approx((m1 - nm1) * Log2E);
+
+                float bl0 = 0.0f, bl1 = 0.0f;
+#    pragma unroll
+                for (int nt = 0; nt < QKNt; ++nt) {
+                    const int col0  = nt * 8 + 2 * lid;
+                    const int col1  = col0 + 1;
+                    const float p00 = (nm0 > -CUDART_INF_F && score[nt][0] > -CUDART_INF_F)
+                                          ? exp2_approx((score[nt][0] - nm0) * Log2E)
+                                          : 0.0f;
+                    const float p01 = (nm0 > -CUDART_INF_F && score[nt][1] > -CUDART_INF_F)
+                                          ? exp2_approx((score[nt][1] - nm0) * Log2E)
+                                          : 0.0f;
+                    const float p10 = (nm1 > -CUDART_INF_F && score[nt][2] > -CUDART_INF_F)
+                                          ? exp2_approx((score[nt][2] - nm1) * Log2E)
+                                          : 0.0f;
+                    const float p11 = (nm1 > -CUDART_INF_F && score[nt][3] > -CUDART_INF_F)
+                                          ? exp2_approx((score[nt][3] - nm1) * Log2E)
+                                          : 0.0f;
+                    bl0 += p00 + p01;
+                    bl1 += p10 + p11;
+                    p_sw[gid * Bc + causal_small_t_tc_swz32(gid, col0)] = __float2bfloat16(p00);
+                    p_sw[gid * Bc + causal_small_t_tc_swz32(gid, col1)] = __float2bfloat16(p01);
+                    p_sw[(gid + 8) * Bc + causal_small_t_tc_swz32(gid + 8, col0)] =
+                        __float2bfloat16(p10);
+                    p_sw[(gid + 8) * Bc + causal_small_t_tc_swz32(gid + 8, col1)] =
+                        __float2bfloat16(p11);
+                }
+                bl0 = warp_sum<4>(bl0, FullMask);
+                bl1 = warp_sum<4>(bl1, FullMask);
+
+                l0 = l0 * alpha0 + bl0;
+                l1 = l1 * alpha1 + bl1;
+                m0 = nm0;
+                m1 = nm1;
+#    pragma unroll
+                for (int n = 0; n < PVNt; ++n) {
+                    acc[n][0] *= alpha0;
+                    acc[n][1] *= alpha0;
+                    acc[n][2] *= alpha1;
+                    acc[n][3] *= alpha1;
+                }
+                __syncwarp();
+
+#    pragma unroll
+                for (int n = 0; n < PVNt; ++n) {
+#    pragma unroll
+                    for (int k = 0; k < PVKs; ++k) {
+                        unsigned pf[4];
+                        const int pcol = k * 16 + a_coloff;
+                        ldmatrix_x4(
+                            pf[0], pf[1], pf[2], pf[3],
+                            smem_addr(
+                                &p_sw[a_rowoff * Bc + causal_small_t_tc_swz32(a_rowoff, pcol)]));
+                        unsigned vf[2];
+                        const int vrow = k * 16 + b_koff + b_rin;
+                        const int vcol = n * 8;
+                        ldmatrix_x2_t(
+                            vf[0], vf[1],
+                            smem_addr(&v_s[vrow * D + causal_small_t_tc_swz(vrow, vcol)]));
+                        mma_bf16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2],
+                                 pf[3], vf[0], vf[1]);
+                    }
+                }
+                __syncthreads();
+            }
+
+            causal_small_t_bf16_store<Geometry>(sp, acc, m0, m1, l0, l1, warp_row0, lane);
+        });
+#endif
+}
+
+} // namespace ninfer::ops
+
+// The Turing shape set's kernel of the same contract (ops/common/device_tier.h).
+#include "ops/softmax_attention/dense/causal_cache/small_t_bf16_sm75.cuh"

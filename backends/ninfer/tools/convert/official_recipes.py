@@ -171,6 +171,79 @@ def qwen3_6_35b_a3b(model, recipe, sources):
         _assign(recipe, name, format)
 
 
+def _flash_next_expert_values(parameter):
+    """Keep fused HF expert banks from treating compressed codes as unscaled values."""
+    import torch
+
+    from .sources.logical import LogicalSource
+
+    source = parameter.source
+
+    def read(begin, end):
+        values = source.values(begin, end)
+        if values.dtype not in (torch.bfloat16, torch.float16, torch.float32, torch.float64):
+            raise ValueError(f"{source.label}: HF expert banks require decoded floating-point "
+                             "values; fused FP8 source scales are not supported yet")
+        return values
+
+    return LogicalSource(source.shape, source.label, read)
+
+
+def flash_next_mtp_formats(model, recipe):
+    """The HF MTP block: Q4 routed experts, BF16 dense and shared projections."""
+    formats = {}
+    for name, parameter in model.parameters.items():
+        if not name.startswith("mtp/"):
+            continue
+        format = Q4 if "/moe/experts/" in name else parameter.direct_format
+        source = _flash_next_expert_values(parameter) if format == Q4 else None
+        _assign(recipe, name, format, source=source)
+        if format == Q4:
+            recipe.assign(name, activation_policy="AllowA8")
+        formats[name] = format
+    return formats
+
+
+def qwen3_8_flash_next(model, recipe, sources):
+    """HF BF16/block-FP8 quality candidate: Q4 gate/up, Q5 down; no sensitive-layer mask.
+
+    Dense GDN/QSA and shared experts use Q8, embedding Q8 and head Q6. HC, router,
+    indexer, PLE, vision and small GDN gates retain their direct representation.
+    The table comes from sharded HF BF16 rows (written as FP8) or an IQ4_NL GGUF.
+    """
+    from .qwen4_exp_ngram import configure_ngram
+    from .sources.safetensors import SafetensorsSource
+
+    if "text" in model.components and model.config.get("architectures") != ["Qwen4ExpForCausalLM"]:
+        raise ValueError("qwen3_8_flash_next requires Qwen3.8-Flash-Next mathematics")
+    if "mtp" in model.components and "mtp" in sources and not isinstance(sources["mtp"], SafetensorsSource):
+        raise ValueError("qwen3_8_flash_next requires an HF safetensors MTP source; "
+                         "use qwen3_8_flash_next_gguf to import an MTP GGUF")
+    for name, parameter in model.parameters.items():
+        if not name.startswith("text/"):
+            continue
+        if name == "text/token_embedding":
+            _assign(recipe, name, Q8)
+        elif name == "text/output_head":
+            _assign(recipe, name, Q6)
+        elif parameter.projection:
+            if "/moe/experts/" in name:
+                format = Q5 if name.endswith("/down") else Q4
+                source = _flash_next_expert_values(parameter)
+            elif "/moe/shared/" in name or "/attention/" in name or (
+                "/gdn/" in name and not name.endswith(("/a_projection", "/b_projection"))
+            ):
+                format = Q8
+                source = None
+            else:
+                continue
+            _assign(recipe, name, format, source=source)
+            recipe.assign(name, activation_policy="AllowA8")
+    flash_next_mtp_formats(model, recipe)
+    if "ngram" in model.components:
+        configure_ngram(model, recipe, sources["ngram"])
+
+
 def qwen3_6_27b_nvfp4(model, recipe, sources):
     if "num_experts" in model.config:
         raise ValueError("this official recipe requires Qwen3.5 Dense mathematics")
@@ -383,6 +456,7 @@ def qwen3_6_35b_a3b_nvfp4(model, recipe, sources):
 
 
 RECIPES = {
+    "qwen3_8_flash_next": qwen3_8_flash_next,
     "qwen3_6_27b": qwen3_6_27b,
     "qwen3_6_27b_nvfp4": qwen3_6_27b_nvfp4,
     "qwen3_8_27b": qwen3_8_27b,

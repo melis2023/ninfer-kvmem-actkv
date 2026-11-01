@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "ops/common/blackwell_routes.h"
 #include "ops/attn_input_proj/fp8/fp8_attn_input_plan.h"
 
 #include "core/device.h"
@@ -32,12 +33,9 @@ void launch_mma(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor
     };
 
     if constexpr (Schedule::kSharedBytes > 48 * 1024) {
-        configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(
-                fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8IdentityEpilogue,
-                               Fp8AttentionInputOutput>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
-        });
+        raise_dynamic_shared_memory(fp8_mma_kernel<Geometry, Schedule, FullTokens,
+                                                   Fp8IdentityEpilogue, Fp8AttentionInputOutput>,
+                                    Schedule::kSharedBytes);
     }
     CUDA_CHECK(pdl::launch_consumer(
         {dim3(blocks), dim3(Schedule::kThreads), Schedule::kSharedBytes, stream},
@@ -60,6 +58,7 @@ void run(const Weight& weight, Tensor& q, Tensor& gate, Tensor& k, Tensor& v,
 
 void fp8_attn_input_a8_launch(const Tensor& x, const Weight& weight, Tensor& q, Tensor& gate,
                               Tensor& k, Tensor& v, Fp8A8Workspace workspace, cudaStream_t stream) {
+    require_fp8_a8_card();
     launch_fp8_a8_quantize(x, weight, workspace, stream);
     // This Op owns its tile choices; the generic Linear schedules do not describe four-output
     // projection's short-column cost. All variants share the same activation representation.

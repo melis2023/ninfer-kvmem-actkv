@@ -1,9 +1,9 @@
 #pragma once
 
 // llama.cpp's tensor-core flash attention (third_party/ggml-quants, fattn-mma-f16.cuh) behind plain
-// pointers: one sequence's queries against a masked F16 key/value cache, for head widths 256 (query
-// heads per key/value head a multiple of two) and 512 (eight). Gemma 4 runs its prompt attention
-// through it, and so does Qwen3.5's on sm_70, whose tensor cores take FP16 only.
+// pointers: one sequence's queries against a masked F16 key/value cache, for head widths 128 (query
+// heads per key/value head a multiple of eight), 256 (two) and 512 (eight), optionally with a
+// learned sink logit per query head. Gemma 4 and Flint run their prompt attention through it.
 
 #include <cuda_runtime.h>
 
@@ -13,9 +13,10 @@
 namespace ninfer::ops::gguf {
 
 struct FlashAttentionArgs {
-    int head_dim    = 0; // 256 or 512; K and V share it
+    int head_dim    = 0; // 128, 256 or 512; K and V share it
     int query_heads = 0;
-    int kv_heads    = 0; // query_heads / kv_heads: a multiple of 2 at width 256, 8 at width 512
+    // query_heads / kv_heads: a multiple of 8 at widths 128 and 512, of 2 at width 256.
+    int kv_heads    = 0;
     int tokens      = 0; // query rows
     // Q FP32: element (d, h, t) at q[t * q_token_stride + h * head_dim + d].
     const float* q              = nullptr;
@@ -32,6 +33,9 @@ struct FlashAttentionArgs {
     // FP32 [tokens][query_heads][head_dim].
     float* out  = nullptr;
     float scale = 1.0f;
+    // Optional FP32 [query_heads]: head h's sink logit joins each of its softmax denominators as
+    // exp(sinks[h] - max), a key without a value.
+    const float* sinks = nullptr;
     // Optional, device [ceil(tokens / flash_attention_tile_rows(head_dim))]: per tile of query
     // rows, a multiple of 256 at or past which every slot is masked for every row of the tile. The
     // launch skips those slots.

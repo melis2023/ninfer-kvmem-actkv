@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "ops/common/blackwell_routes.h"
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_plan.h"
 
 #include "core/device.h"
@@ -65,6 +66,7 @@ void launch_problem(const Weight& weight, Tensor& residual, Nvfp4W4a4Workspace w
 
 void nvfp4_linear_add_w4a4_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                                   Nvfp4W4a4Workspace workspace, cudaStream_t stream) {
+    require_nvfp4_a4_card();
     const std::int32_t tokens = x.ne[1];
     launch_nvfp4_w4a4_quantize(
         x, weight, workspace,

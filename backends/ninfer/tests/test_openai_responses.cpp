@@ -4,6 +4,7 @@
 
 #include "serve/generation_service.h"
 #include "serve/openai_responses.h"
+#include "serve/structured_output.h"
 #include "serve/translate.h"
 
 #include <nlohmann/json.hpp>
@@ -213,7 +214,7 @@ int test_budgets_and_nonsemantic_hints() {
                   {"prompt_cache_retention", "24h"},
                   {"prompt_cache_options",
                    Json{{"mode", "explicit"}, {"ttl", "30m"}, {"future_hint", true}}},
-                  {"safety_identifier", "local-user"},
+                  {"safety_identifier", std::string(128, 'x')},
                   {"service_tier", "auto"},
                   {"stream_options", Json{{"include_obfuscation", false}}},
                   {"text", Json{{"format", Json{{"type", "text"}}}, {"verbosity", "medium"}}},
@@ -224,6 +225,14 @@ int test_budgets_and_nonsemantic_hints() {
         parse_openai_responses_create_request(hints, limits());
     failures += check(accepted.max_tool_calls == 0,
                       "typed nonsemantic hints are accepted without changing generation");
+
+    hints["safety_identifier"] = std::string(129, 'x');
+    failures +=
+        check(api_error([&] {
+                  (void)parse_openai_responses_create_request(hints, limits());
+              }).param == "safety_identifier",
+              "a safety_identifier over 128 characters is rejected, not thrown past the parser");
+    hints["safety_identifier"] = std::string(128, 'x');
 
     hints["client_metadata"] = nullptr;
     failures += check(parse_openai_responses_create_request(hints, limits()).prompt.model == "m",
@@ -285,7 +294,7 @@ int test_reasoning_encrypted_content_request() {
     return failures;
 }
 
-int test_image_detail_fallback() {
+int test_image_details() {
     int failures = 0;
     for (const char* role : {"user", "assistant"}) {
         const Json image = {{"type", "input_image"},
@@ -296,7 +305,7 @@ int test_image_detail_fallback() {
                               {"content", Json::array({image})}};
         Json body = {{"model", "m"}, {"input", Json::array({message})}};
         const auto baseline = parse_openai_responses_create_request(body, limits());
-        for (const Json detail : {Json("auto"), Json("low"), Json("high"), Json("original"), Json(nullptr)}) {
+        for (const Json detail : {Json("auto"), Json("original"), Json(nullptr)}) {
             body["input"][0]["content"][0]["detail"] = detail;
             const auto request = parse_openai_responses_create_request(body, limits());
             const auto& part = request.prompt.input_turns[0].content[0];
@@ -305,6 +314,17 @@ int test_image_detail_fallback() {
                                   part.source.value == "data:image/png;base64,AA==" &&
                                   part.cache_boundary_after.has_value(),
                               "image detail canonicalizes to auto without changing media or cache markers");
+        }
+        for (const auto& [detail, expected] : {
+                std::pair{"low", ninfer::ImageDetail::Low},
+                std::pair{"high", ninfer::ImageDetail::High}}) {
+            body["input"][0]["content"][0]["detail"] = detail;
+            const auto request = parse_openai_responses_create_request(body, limits());
+            const auto& part = request.prompt.input_turns[0].content[0];
+            failures += check(part.image_detail == expected &&
+                                  part.source.value == "data:image/png;base64,AA==" &&
+                                  part.cache_boundary_after.has_value(),
+                              "standard image detail preserves its value, media and cache marker");
         }
         body["input"][0]["content"][0].erase("detail");
         failures += check(parse_openai_responses_create_request(body, limits()).prompt.input_items ==
@@ -315,7 +335,7 @@ int test_image_detail_fallback() {
             body["input"][0]["content"][0]["detail"] = detail;
             const auto error = api_error([&] { (void)parse_openai_responses_create_request(body, limits()); });
             failures += check(error.status == 400 && error.param == "input" &&
-                                  (!detail.is_string() || error.code == "invalid_value"),
+                                  (!detail.is_string() || error.code == "image_detail_not_supported"),
                               "unknown or malformed image detail remains an HTTP 400 error");
         }
     }
@@ -346,7 +366,7 @@ int test_typed_items_and_cache_markers() {
                                       {"prompt_cache_breakpoint", Json{{"mode", "explicit"}}}},
                                  Json{{"type", "input_image"},
                                       {"image_url", "data:image/png;base64,AA=="},
-                                      {"detail", "original"}}})}},
+                                      {"detail", "low"}}})}},
               Json{{"id", "msg_refusal"},
                    {"type", "message"},
                    {"role", "assistant"},
@@ -375,8 +395,22 @@ int test_typed_items_and_cache_markers() {
                           request.prompt.input_turns[1].content[0].cache_boundary_after &&
                           request.prompt.input_turns[1].content[0].cache_boundary_after->kind ==
                               ninfer::PromptCacheMarkerKind::SharedStablePrefix &&
-                          request.prompt.input_turns[1].content[1].kind == ContentKind::Image,
+                          request.prompt.input_turns[1].content[1].kind == ContentKind::Image &&
+                          request.prompt.input_turns[1].content[1].image_detail ==
+                              ninfer::ImageDetail::Low,
                       "typed multimodal tool output and explicit cache marker preserved");
+    Json unknown_detail = body;
+    unknown_detail["input"][2]["output"][1]["detail"] = "unsupported";
+    failures += check(api_error([&] {
+                          (void)parse_openai_responses_create_request(unknown_detail, limits());
+                      }).code == "image_detail_not_supported",
+                      "an unknown input_image detail was accepted");
+    RequestLimits lenient        = limits();
+    lenient.lenient_image_detail = true;
+    const auto lenient_request   = parse_openai_responses_create_request(unknown_detail, lenient);
+    failures += check(lenient_request.prompt.input_turns[1].content[1].image_detail ==
+                          ninfer::ImageDetail::Auto,
+                      "--lenient-image-detail did not read an unknown input_image detail as auto");
     failures += check(request.prompt.input_turns[2].role == ninfer::ChatRole::Assistant &&
                           request.prompt.input_turns[2].content[0].text == "cannot answer that" &&
                           request.prompt.input_items[3].at("status") == "incomplete" &&
@@ -606,6 +640,13 @@ int test_assistant_item_boundaries_and_errors() {
              {"content", Json::array({Json{{"type", "reasoning_text"}, {"text", "thought"}}})}};
     const Json call = Json{
         {"type", "function_call"}, {"call_id", "call_1"}, {"name", "lookup"}, {"arguments", "{}"}};
+    const OpenAIResponsesCreateRequest bare_reasoning = parse_openai_responses_create_request(
+        Json{{"model", "m"},
+             {"input",
+              Json::array({Json{{"type", "reasoning"}, {"summary", Json::array()}}, first})}},
+        limits());
+    failures += check(bare_reasoning.prompt.input_turns.size() == 1,
+                      "reasoning Item without optional content is accepted");
     const auto rejected = [&](Json input) {
         return api_error([&] {
             (void)parse_openai_responses_create_request(
@@ -943,6 +984,46 @@ int test_explicit_rejections() {
     });
     failures += check(invalid_strict.status == 400 && invalid_strict.param == "tools",
                       "strict tool flag rejects non-boolean values");
+    value          = base;
+    value["tools"] = Json::array({Json{{"type", "function"}, {"name", "f"}, {"async", false}}});
+    failures += check(
+        api_code([&] { (void)parse_openai_responses_create_request(value, limits()); }).empty(),
+        "async:false is the neutral synchronous function contract");
+    value["tools"][0]["async"] = true;
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(value, limits());
+                      }) == "async_tools_not_supported",
+                      "async:true function tools are rejected explicitly");
+
+    value          = base;
+    value["input"] = Json::array(
+        {Json{{"role", "user"}, {"content", "hi"}},
+         Json{{"type", "function_call"},
+              {"call_id", "call_1"},
+              {"name", "f"},
+              {"arguments", "{}"},
+              {"async", false}},
+         Json{{"type", "function_call_output"}, {"call_id", "call_1"}, {"output", "ok"}}});
+    value["tools"] = Json::array({Json{{"type", "function"}, {"name", "f"}}});
+    failures += check(
+        api_code([&] { (void)parse_openai_responses_create_request(value, limits()); }).empty(),
+        "a replayed synchronous function_call is accepted");
+    value["input"][1]["async"] = true;
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(value, limits());
+                      }) == "async_tools_not_supported",
+                      "a replayed asynchronous function_call is rejected explicitly");
+
+    value                    = base;
+    value["access_programs"] = Json{{"cyber", "standard"}};
+    failures += check(api_code([&] {
+                          (void)parse_openai_responses_create_request(value, limits());
+                      }) == "access_programs_not_supported",
+                      "access_programs is a recognized but unsupported request field");
+    value["access_programs"] = nullptr;
+    failures += check(
+        api_code([&] { (void)parse_openai_responses_create_request(value, limits()); }).empty(),
+        "null access_programs is accepted");
 
     value         = base;
     value["text"]         = Json{{"format", Json{{"type", "json_schema"},
@@ -1218,6 +1299,11 @@ int test_response_object() {
                           response.at("output")[1].at("type") == "message",
                       "reasoning and message are emitted as typed output Items");
     failures += check(
+        response.contains("access_programs") && response.at("access_programs").is_null() &&
+            response.at("output")[1].at("content")[0].at("logprobs").is_array() &&
+            response.at("usage").at("input_tokens_details").at("cache_write_tokens") == 0,
+        "the response lacks the required access_programs, logprobs or cache_write_tokens field");
+    failures += check(
         response.at("usage").at("input_tokens_details").at("cached_tokens") == 4 &&
             response.at("usage").at("output_tokens") == 7 &&
             response.at("usage").at("output_tokens_details").at("reasoning_tokens") == 3 &&
@@ -1468,7 +1554,9 @@ int test_sse_sequence_and_failures() {
         ApiError{.status = 500, .type = "server_error", .message = "stopped", .code = "stopped"}));
     failures += check(failure.at("type") == "response.failed" &&
                           failure.at("response").at("status") == "failed" &&
-                          failure.at("response").at("completed_at").is_null(),
+                          failure.at("response").at("completed_at").is_null() &&
+                          failure.at("response").at("error").at("code") == "server_error" &&
+                          failure.at("response").at("error").at("message") == "stopped (stopped)",
                       "runtime failure uses response.failed with no completion timestamp");
 
     OpenAIResponsesCreateRequest cancelled_request = parse_openai_responses_create_request(
@@ -1482,6 +1570,16 @@ int test_sse_sequence_and_failures() {
     failures += check(cancelled_terminal.at("type") == "response.failed" &&
                           cancelled_terminal.at("response").at("status") == "cancelled",
                       "cancelled generation uses the protocol terminal failure event");
+
+    OpenAIResponsesEventStream image_failure("resp_image", 123, cancelled_request, {});
+    (void)image_failure.start();
+    const Json image_error =
+        parse_event(image_failure.failed(
+                        ApiError{.status = 400, .message = "bad image", .code = "invalid_image"}))
+            .at("response")
+            .at("error");
+    failures += check(image_error == Json{{"code", "invalid_image"}, {"message", "bad image"}},
+                      "a failure code of the wire enum was not kept as it is");
     return failures;
 }
 
@@ -1580,7 +1678,7 @@ int main(int argc, char** argv) {
         return failures == 0 ? 0 : 1;
     }
     if (argc == 2 && std::string_view(argv[1]) == "--image-detail-only") {
-        const int failures = test_image_detail_fallback() + test_typed_items_and_cache_markers() +
+        const int failures = test_image_details() + test_typed_items_and_cache_markers() +
                              test_response_output_history_round_trip();
         if (failures == 0) { std::cout << "OpenAI Responses image detail tests passed\n"; }
         return failures == 0 ? 0 : 1;
@@ -1591,7 +1689,7 @@ int main(int argc, char** argv) {
     failures += test_basic_request_and_resolution();
     failures += test_budgets_and_nonsemantic_hints();
     failures += test_reasoning_encrypted_content_request();
-    failures += test_image_detail_fallback();
+    failures += test_image_details();
     failures += test_typed_items_and_cache_markers();
     failures += test_contiguous_assistant_items();
     failures += test_response_output_history_round_trip();

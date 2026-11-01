@@ -95,6 +95,20 @@ std::string_view device_route_schedule(std::string_view key, std::int32_t width)
     return {};
 }
 
+bool device_route_measured(std::string_view key, std::int32_t width) {
+    if (const Forced* forced = forced_route(); forced != nullptr && forced->key == key) {
+        return true;
+    }
+    const int device = current_device();
+    if (device < 0 || device >= kMaxDevices) { return false; }
+    const DeviceRouteProfile* profile =
+        installed_pointers()[static_cast<std::size_t>(device)].load(std::memory_order_acquire);
+    if (profile == nullptr) { return false; }
+    const auto entry = profile->routes.find(key);
+    return entry != profile->routes.end() && !entry->second.empty() &&
+           width <= entry->second.back().last;
+}
+
 DeviceRouteForce::DeviceRouteForce(std::string key, std::string schedule) {
     delete forced_route();
     forced_route() = new Forced{std::move(key), std::move(schedule)};

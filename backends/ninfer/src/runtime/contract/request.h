@@ -1,11 +1,14 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "ninfer/base.h"
+#include "ninfer/observability/execution.h"
+#include "ninfer/request.h"
 #include <atomic>
 #include <cstdint>
 #include <optional>
 
 #include <memory>
+#include <vector>
 
 namespace ninfer::text {
 class GrammarState;
@@ -13,11 +16,20 @@ class GrammarState;
 
 namespace ninfer::runtime {
 
+// One branch of Engine::submit_branches: the tokens that continue the request's prompt, and the
+// token ids whose exact log probabilities the record of its first generated token carries.
+struct ReadBranch {
+    std::vector<TokenId> tokens;
+    std::vector<TokenId> readout_tokens;
+};
+
 // Engine has already selected the model/mode preset, applied every explicit override,
 // and validated these values before constructing the runtime request.
 struct ResolvedExecutionOptions {
     StructuredOutputOptions structured_output;
     std::shared_ptr<text::GrammarState> grammar;
+    // Default tool_choice none may name the one vocabulary id the sampler must not emit.
+    std::optional<TokenId> suppressed_tool_open;
     ResolvedSamplingParameters sampling;
     // Applied once the model closes its reasoning block.
     std::optional<ResolvedSamplingParameters> post_thinking_sampling;
@@ -26,6 +38,15 @@ struct ResolvedExecutionOptions {
     ThinkingControlOptions thinking;
     // Gather each generated token's log probability and its likely alternatives.
     bool logprobs = false;
+    // With logprobs: the token ids whose exact log probabilities the first generated token's
+    // record carries (ExecutionOptions::readout_tokens).
+    std::vector<TokenId> readout_tokens;
+    // ExecutionOptions::speculative_drafting.
+    bool speculative_drafting = true;
+    // Engine::submit_branches: after the prompt, each branch runs as a block over it and its first
+    // generated token is read; null for an ordinary request. Such a request is greedy, reads one
+    // token and drafts nothing; its own readout_tokens are empty.
+    std::shared_ptr<const std::vector<ReadBranch>> branches;
     // Engine-assigned publication order; never supplied by an external client.
     std::uint64_t publication_order = 0;
 };

@@ -47,11 +47,11 @@ private:
 };
 
 namespace core {
-// WDDM residency (Windows builds with NINFER_D3D12_RESIDENCY, --wddm-evictable-budget): owning
-// DeviceArenas come from a D3D12 heap held resident at maximum priority, so WDDM evicts other
-// allocations on the adapter rather than paging the arena out. Elsewhere enabling it throws.
-void set_wddm_residency_lock_enabled(bool enabled);
-[[nodiscard]] bool wddm_residency_lock_enabled() noexcept;
+// The WDDM evictable budget (Windows builds, --wddm-evictable-budget): every owning DeviceArena
+// commits its pages when it is created, so WDDM makes room for them at startup rather than at the
+// first launch that touches them. Other builds refuse to enable it.
+void set_wddm_evictable_budget(bool enabled);
+[[nodiscard]] bool wddm_evictable_budget() noexcept;
 } // namespace core
 
 class DeviceArena {
@@ -162,6 +162,19 @@ private:
     void* data_       = nullptr;
     std::size_t size_ = 0;
     std::shared_ptr<core::ResidentMemorySession> resident_session_;
+};
+
+// Registers an existing host allocation without moving its bytes. The allocation must outlive
+// the registration and every queued transfer; portable registration serves every device rank.
+class HostMemoryRegistration {
+public:
+    HostMemoryRegistration(void* data, std::size_t bytes);
+    ~HostMemoryRegistration();
+    HostMemoryRegistration(const HostMemoryRegistration&) = delete;
+    HostMemoryRegistration& operator=(const HostMemoryRegistration&) = delete;
+
+private:
+    void* data_ = nullptr;
 };
 
 using WorkspaceArena = DeviceArena;

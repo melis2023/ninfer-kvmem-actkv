@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/pdl.cuh"
+#include "ops/common/device_limits.h"
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/small_t_layout.cuh"
@@ -75,7 +76,7 @@ template <class Geometry, int TileCols, int ActiveCols, class Epilogue = Q4KSpli
           class RowPolicy = Q4KSplitIdentityRows, bool MaskedColumns = false, int KWarps = 8,
           int Stages = 1, int TilesPerWarp = 1,
           int MinBlocks = (KWarps < 8 ? 2 : (TileCols <= 16 ? 6 : 4))>
-__launch_bounds__(256, MinBlocks) __global__
+__launch_bounds__(256, resident_ctas_bound(256, MinBlocks)) __global__
     void q4_ksplit_mma_kernel(const __nv_bfloat16* __restrict__ x,
                                const std::uint8_t* __restrict__ codes,
                                const std::uint8_t* __restrict__ scales,
@@ -206,20 +207,64 @@ __launch_bounds__(256, MinBlocks) __global__
 #pragma unroll
         for (int half = 0; half < 2; ++half) {
             // Four code bytes per row cover steps ks = 2*half and 2*half + 1.
-            unsigned a_top[kTpw][4], a_bot[kTpw][4];
-#pragma unroll
+#if defined(NINFER_SM75_DEVICE)
+            // Turing has no BF16 MMA or BF16 arithmetic: the codes decode to FP16 natively, and a
+            // tile whose activations are all FP16 values runs FP16 MMA on them, converted once.
+            // These are the operands mma_bf16 forms, in its order, so the bits are the same; a
+            // tile holding any other activation runs mma_bf16, which settles each output on its
+            // own operands. Columns past the live extent are zero.
+            unsigned h_top[kTpw][4], h_bot[kTpw][4];
+#    pragma unroll
             for (int t = 0; t < kTpw; ++t) {
-                Q4MmaDecodeAtom::decode_eight(half == 0 ? top[t].x : top[t].y, a_top[t]);
-                Q4MmaDecodeAtom::decode_eight(half == 0 ? bot[t].x : bot[t].y, a_bot[t]);
+                Q4MmaDecodeAtom::decode_eight_f16(half == 0 ? top[t].x : top[t].y, h_top[t]);
+                Q4MmaDecodeAtom::decode_eight_f16(half == 0 ? bot[t].x : bot[t].y, h_bot[t]);
             }
-#pragma unroll
+#    pragma unroll
             for (int nt = 0; nt < kNt; ++nt) {
                 const int col = nt * 8 + gid;
                 uint4 b       = make_uint4(0u, 0u, 0u, 0u);
                 if (col < live_columns) {
                     b = load_vec<uint4>(&stage.activations[k_split][col][16 * lid + 8 * half]);
                 }
-#pragma unroll
+                uint4 h;
+                if (sm75::bf16_fragments_as_f16(b, h)) {
+#    pragma unroll
+                    for (int t = 0; t < kTpw; ++t) {
+                        float(&g)[4] = group_acc[t][nt];
+                        mma_f16(g[0], g[1], g[2], g[3], h_top[t][0], h_bot[t][0], h_top[t][1],
+                                h_bot[t][1], h.x, h.y);
+                        mma_f16(g[0], g[1], g[2], g[3], h_top[t][2], h_bot[t][2], h_top[t][3],
+                                h_bot[t][3], h.z, h.w);
+                    }
+                } else {
+#    pragma unroll
+                    for (int t = 0; t < kTpw; ++t) {
+                        unsigned a_top[4], a_bot[4];
+                        Q4MmaDecodeAtom::decode_eight(half == 0 ? top[t].x : top[t].y, a_top);
+                        Q4MmaDecodeAtom::decode_eight(half == 0 ? bot[t].x : bot[t].y, a_bot);
+                        float(&g)[4] = group_acc[t][nt];
+                        mma_bf16(g[0], g[1], g[2], g[3], a_top[0], a_bot[0], a_top[1], a_bot[1],
+                                 b.x, b.y);
+                        mma_bf16(g[0], g[1], g[2], g[3], a_top[2], a_bot[2], a_top[3], a_bot[3],
+                                 b.z, b.w);
+                    }
+                }
+            }
+#else
+            unsigned a_top[kTpw][4], a_bot[kTpw][4];
+#    pragma unroll
+            for (int t = 0; t < kTpw; ++t) {
+                Q4MmaDecodeAtom::decode_eight(half == 0 ? top[t].x : top[t].y, a_top[t]);
+                Q4MmaDecodeAtom::decode_eight(half == 0 ? bot[t].x : bot[t].y, a_bot[t]);
+            }
+#    pragma unroll
+            for (int nt = 0; nt < kNt; ++nt) {
+                const int col = nt * 8 + gid;
+                uint4 b       = make_uint4(0u, 0u, 0u, 0u);
+                if (col < live_columns) {
+                    b = load_vec<uint4>(&stage.activations[k_split][col][16 * lid + 8 * half]);
+                }
+#    pragma unroll
                 for (int t = 0; t < kTpw; ++t) {
                     float(&g)[4] = group_acc[t][nt];
                     mma_bf16(g[0], g[1], g[2], g[3], a_top[t][0], a_bot[t][0], a_top[t][1],
@@ -228,6 +273,7 @@ __launch_bounds__(256, MinBlocks) __global__
                              a_bot[t][3], b.z, b.w);
                 }
             }
+#endif
         }
 
 #pragma unroll

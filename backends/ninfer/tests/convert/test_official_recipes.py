@@ -67,6 +67,103 @@ def test_q6_recipe_is_registered() -> None:
     assert RECIPES["qwen3_8_27b_q6"] is qwen3_8_27b_q6
 
 
+def test_flash_next_quality_recipe_writes_grouped_experts_and_preserves_sensitive_values(tmp_path):
+    from tools.artifact.codecs.direct import decode_direct
+    from tools.artifact.codecs.row_split import dequantize_row_split
+    from tools.artifact.reader import Artifact
+    from tools.artifact.schema import binding_parts
+    from tools.convert.pipeline import convert
+    from tools.convert.qwen4_exp_gguf import NGRAM_TENSOR
+    from tools.convert.sources.gguf import GGUFFile, write_gguf
+
+    model = Model({
+        "text": {"config": {"architectures": ["Qwen4ExpForCausalLM"]}},
+        "ngram": {"config": {"rows": 2, "row_width": 160}},
+        "mtp": {"config": {"architectures": ["Qwen4ExpMTP"]}, "target": "text"},
+        "vision": {"config": {}, "target": "text"},
+    })
+    values, expected = {}, {}
+    for prefix in ("text/layers/0/moe/", "mtp/layer/moe/"):
+        gate_up, downs = [], []
+        for expert in range(2):
+            for role in ("gate", "up", "down"):
+                name = prefix + f"experts/{expert}/{role}"
+                expected[name] = Q5 if prefix.startswith("text/") and role == "down" else Q4
+                (downs if role == "down" else gate_up).append(name)
+        model.packing_groups.extend((tuple(gate_up), tuple(downs)))
+    expected.update({
+        "text/token_embedding": Q8, "text/output_head": Q6,
+        "text/layers/0/attention/query": Q8, "text/layers/0/moe/shared/gate": Q8,
+        "text/layers/0/gdn/a_projection": "bf16", "text/layers/0/attn_hc/down": "bf16",
+        "text/layers/0/moe/router": "bf16", "text/layers/0/ple/key": "bf16",
+        "text/layers/0/indexer/query": "bf16", "mtp/fc_hidden": "bf16",
+        "mtp/layer/moe/shared/down": "bf16", "vision/layers/0/mlp/fc1": "bf16",
+    })
+    for index, name in enumerate(expected):
+        value = (torch.arange(256).float() * .17 + index).sin().reshape(2, 128).bfloat16()
+        values[name] = value
+        inputs = () if name == "text/token_embedding" else (name + "/input",)
+        model.add(Parameter(name, value.shape, array_source(value, name), inputs=inputs))
+    path = tmp_path / "table.gguf"
+    write_gguf(path, {}, [(NGRAM_TENSOR, (2, 160), 20, bytes(180))])
+    with GGUFFile(path) as table:
+        recipe = Recipe(model)
+        RECIPES["qwen3_8_flash_next"](model, recipe, {"ngram": table})
+        output = tmp_path / "quality.ninfer"
+        convert(model, recipe, output, device="cpu", rows_per_chunk=1)
+    with Artifact(output) as artifact:
+        parents = {}
+        for name, format in expected.items():
+            (parent, begin, end), = binding_parts(artifact.directory.bindings[name], artifact.by_id)
+            obj = artifact.object(parent)
+            assert obj.format == format
+            raw = artifact.read_object(obj.id)
+            decoded = (decode_direct(raw, format, obj.shape) if format == "bf16" else
+                       dequantize_row_split(raw, format, obj.shape, dtype=torch.float32))
+            value = decoded.flatten()[begin:end].reshape(values[name].shape)
+            if format == "bf16":
+                assert torch.equal(value, values[name])
+            else:
+                levels = {Q4: 7, Q5: 15, Q6: 31, Q8: 127}[format]
+                assert (value.float() - values[name].float()).abs().max() <= .501 / levels
+            parents[name] = obj.id
+        for group in model.packing_groups:
+            assert len({parents[name] for name in group}) == 1
+        uses = {u["parameter"]: u for u in artifact.directory.uses}
+        assert uses["text/layers/0/moe/experts/1/down"]["activation_policy"] == "AllowA8"
+        assert uses["text/layers/0/moe/router"]["activation_policy"] == "A16Only"
+
+
+def test_flash_next_quality_recipe_refuses_another_family_before_reading_the_table():
+    model = _dense_model()
+    with pytest.raises(ValueError, match="Flash-Next mathematics"):
+        RECIPES["qwen3_8_flash_next"](model, Recipe(model), {})
+
+
+def test_flash_next_mtp_refuses_unscaled_fused_fp8_experts():
+    from tools.convert.official_recipes import flash_next_mtp_formats
+
+    model = Model({"mtp": {"config": {}}})
+    name = "mtp/layer/moe/experts/0/gate"
+    codes = torch.ones((2, 128)).to(torch.float8_e4m3fn)
+    model.add(Parameter(name, codes.shape, array_source(codes, "HF fused FP8"), inputs=("x",)))
+    recipe = Recipe(model)
+    flash_next_mtp_formats(model, recipe)
+    with pytest.raises(ValueError, match="fused FP8 source scales"):
+        recipe.prepare(device="cpu")
+
+
+def test_flash_next_quality_recipe_does_not_ignore_a_selected_gguf_mtp(tmp_path):
+    from tools.convert.sources.gguf import GGUFFile, write_gguf
+
+    path = tmp_path / "mtp.gguf"
+    write_gguf(path, {}, [])
+    model = Model({"text": {"config": {"architectures": ["Qwen4ExpForCausalLM"]}},
+                   "mtp": {"config": {}, "target": "text"}})
+    with GGUFFile(path) as mtp, pytest.raises(ValueError, match="HF safetensors MTP source"):
+        RECIPES["qwen3_8_flash_next"](model, Recipe(model), {"mtp": mtp})
+
+
 def test_registered_recipe_gives_the_mlp_pair_q4() -> None:
     formats = _formats(qwen3_8_27b)
     assert _single(formats, f"{LAYER}/mlp/gate") == Q4

@@ -4,7 +4,7 @@
 #include "text/jinja.h"
 
 #include "models/qwen3_5/frontend/prepared_prompt.h"
-#include <ninfer/types.h>
+#include "ninfer/request.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -53,6 +53,7 @@ struct MediaData {
     std::string media_type;
     std::string source_name;
     ImageResizePolicy image_resize_policy = ImageResizePolicy::Downsize;
+    ImageDetail image_detail              = ImageDetail::Auto;
 };
 
 struct ChatPart {
@@ -91,6 +92,13 @@ struct ChatMessage {
     [[nodiscard]] bool has_media() const noexcept;
 };
 
+// The syntax a model writes its tool calls in, which decides how a forced call is opened.
+enum class ToolCallSyntax : std::uint8_t {
+    Qwen,  // <tool_call>\n<function=NAME>\n ...
+    Gemma, // <|tool_call>call:NAME{ ...
+    Flint, // <tool_call>NAME<arg_key> ...
+};
+
 struct ChatRenderOptions {
     PromptContinuationMode continuation = PromptContinuationMode::NewAssistantTurn;
     // Internal renderer control used by frontend qualification. Product PromptInput always
@@ -102,7 +110,9 @@ struct ChatRenderOptions {
     std::string chat_template_kwargs_json;
     bool add_vision_id = false;
     std::vector<std::string> tool_jsons;
+    // Function whose call the generation prompt opens; the opener is written in `tool_call_syntax`.
     std::string forced_tool_name;
+    ToolCallSyntax tool_call_syntax = ToolCallSyntax::Qwen;
     std::vector<PromptCacheMarker> cache_markers;
 };
 
@@ -120,6 +130,10 @@ struct RenderedChat {
     // to keep the task brief and the tool schema resident across reselects.
     std::optional<text::ByteSpan> first_user_region;
     std::optional<text::ByteSpan> tools_region;
+    // Tool-call arguments of the last assistant message, set only when this request is a tool
+    // continuation (the final message is a tool result). KVMem scores history against the
+    // action that triggered the tool, not against the user's original question.
+    std::optional<text::ByteSpan> action_region;
 
     bool starts_in_reasoning = false;
     std::vector<MediaPlaceholderByteSpec> media_placeholders;

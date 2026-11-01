@@ -17,6 +17,7 @@
 // instruction, so this is a fresh kernel following this fork's FP8/K8V4 prompt kernels' shape
 // instead.
 
+#include "ops/common/device_limits.h"
 #include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/kv_cache/nvfp4_group16_codec.cuh"
 #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"
@@ -63,6 +64,7 @@ inline constexpr int kCausalPromptNvfp4SmemBytes =
     kCausalPromptNvfp4ScaleBytes + kCausalPromptNvfp4StatsBytes;
 
 static_assert(kCausalPromptNvfp4DConsumers == 8);
+static_assert(kCausalPromptNvfp4SmemBytes <= kMaxSharedBytesPerBlock);
 
 template <typename Geometry, typename Metadata>
 __global__ __maxnreg__(120) void causal_attention_prompt_nvfp4_kernel(

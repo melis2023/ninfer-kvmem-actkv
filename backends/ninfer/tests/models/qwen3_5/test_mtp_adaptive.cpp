@@ -2,7 +2,7 @@
 // width. What these checks defend is the choice: the survival estimate, the measured cost model,
 // and that the controller widens under full acceptance and settles low under none.
 
-#include "models/qwen3_5/program/speculative/mtp_adaptive.h"
+#include "runtime/contract/mtp_adaptive.h"
 
 #include <array>
 #include <cmath>
@@ -13,9 +13,9 @@
 
 namespace {
 
-using ninfer::models::qwen3_5::detail::MtpAdaptiveBatchController;
-using ninfer::models::qwen3_5::detail::MtpAdaptiveSignal;
-using ninfer::models::qwen3_5::detail::MtpRoundCostModel;
+using ninfer::runtime::MtpAdaptiveBatchController;
+using ninfer::runtime::MtpAdaptiveSignal;
+using ninfer::runtime::MtpRoundCostModel;
 
 void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
@@ -57,9 +57,10 @@ struct Simulation {
 // Rounds of one row with `maximum` drafts always ready; `accept` gives the accepted drafts of a
 // round at a width, `seconds` its cost.
 template <typename Accept, typename Seconds>
-Simulation simulate(std::uint32_t maximum, Accept accept, Seconds seconds) {
+Simulation simulate(std::uint32_t maximum, Accept accept, Seconds seconds,
+                    std::uint32_t floor = 3) {
     MtpAdaptiveBatchController controller;
-    controller.reset(maximum);
+    controller.reset(maximum, floor);
     MtpAdaptiveSignal signal;
     Simulation out;
     const std::array<const MtpAdaptiveSignal*, 1> signals{&signal};
@@ -85,6 +86,20 @@ void the_controller_widens_and_narrows() {
     const Simulation fixed_short =
         simulate(2, [](std::uint32_t window) { return window; }, seconds);
     require(fixed_short.widest <= 2, "the window exceeded its maximum");
+    // With a floor of one (each draft a step of its own, as in Qwen3.8-Flash-Next) rejected drafts
+    // settle at a single draft, and drafts that keep surviving still widen the window.
+    const Simulation rejecting_floor_one =
+        simulate(7, [](std::uint32_t) { return 0U; }, seconds, 1);
+    require(rejecting_floor_one.final_window == 1, "a floor of one did not settle at one draft");
+    const Simulation accepting_floor_one =
+        simulate(7, [](std::uint32_t window) { return window; }, seconds, 1);
+    require(accepting_floor_one.final_window >= 5, "a floor of one did not widen under acceptance");
+    // Drafts that survive about two positions settle between the extremes when every step costs.
+    const auto stepped = [](std::uint32_t window) { return 0.012 + 0.004 * window; };
+    const Simulation partial = simulate(
+        7, [](std::uint32_t window) { return window < 2 ? window : 2U; }, stepped, 1);
+    require(partial.final_window >= 2 && partial.final_window <= 3,
+            "two surviving drafts did not settle at two or three");
 }
 
 } // namespace

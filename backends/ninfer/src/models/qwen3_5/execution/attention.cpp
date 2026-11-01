@@ -130,13 +130,18 @@ void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
                                    : statistics->prefill_origin;
         Tensor k_sum = statistics->key_sums.slice(2, layer, 1)
                            .slice(1, 0, buckets).view({dimension(attention.key_width()), buckets});
-        Tensor q_rows = statistics->query_sums.slice(2, layer, 1).slice(1, 0, tokens)
-                             .view({dimension(attention.query_width()), tokens});
         ops::token_sums(normalized_key.view({dimension(attention.key_width()), tokens}),
                         origin, statistics->ranges.slice(0, 0, 2), block, k_sum, stream);
         if (block != 1) {
-            ops::token_sums(normalized_query.view({dimension(attention.query_width()), tokens}),
-                            origin, statistics->ranges.slice(0, 2, 2), 1, q_rows, stream);
+            Tensor q_values = statistics->query_values.slice(2, layer, 1)
+                                  .view({dimension(attention.query_width()), statistics->query_values.ne[1]});
+            const auto q_input = normalized_query.view({dimension(attention.query_width()), tokens});
+            const auto q_range = statistics->ranges.slice(0, 2, 2);
+            if (q_values.dtype == DType::FP32) {
+                ops::accumulate_query_sum(q_input, origin, q_range, q_values, stream);
+            } else {
+                ops::capture_query_rows(q_input, origin, q_range, q_values, stream);
+            }
         }
     }
     ops::rope(positions, dimension(rope.rotary_dim), rope.rope_theta, yarn, normalized_query,

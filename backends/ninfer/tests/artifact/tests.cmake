@@ -2,6 +2,13 @@ ninfer_add_test(ninfer_artifact_reader_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_reader.cpp"
   LIBRARIES ninfer_artifact)
 
+ninfer_add_test(ninfer_artifact_selection_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_selection.cpp"
+  LIBRARIES ninfer_artifact)
+ninfer_add_test(ninfer_artifact_ptq1_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ptq1.cpp"
+  LIBRARIES ninfer_artifact)
+
 ninfer_add_test(ninfer_artifact_permute_row_split_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_permute_row_split.cpp"
   LIBRARIES ninfer_artifact)

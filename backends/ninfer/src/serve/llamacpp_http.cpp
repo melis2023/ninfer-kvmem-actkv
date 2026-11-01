@@ -194,39 +194,103 @@ void HttpServer::handle_rerank(const httplib::Request& req, httplib::Response& r
     }
     GenerationService& service = lease.service();
     const auto cancelled       = [&req] { return client_disconnected(req); };
-    // One judgement per document, submitted a lane's worth at a time: the Engine runs a window
-    // together, and the ingress queue keeps room for other clients' requests.
-    const std::size_t window =
-        std::max<std::size_t>(1, static_cast<std::size_t>(service.options().max_concurrency));
+    RerankAnswers answers;
+    for (std::size_t k = 0; k < kRerankAnswers.size(); ++k) {
+        const std::vector<ninfer::TokenId> ids = service.tokenize(kRerankAnswers[k], false);
+        if (ids.size() != 1) { continue; }
+        answers.tokens.push_back(ids.front());
+        answers.yes.push_back(k < 2);
+    }
+    std::vector<GenerationRequest> judgements;
+    judgements.reserve(request.documents.size());
+    for (const std::string& document : request.documents) {
+        judgements.push_back(make_rerank_judgement(request, document, answers));
+    }
+    // A judgement is never continued: its continuation is the first the cache evicts.
+    const ninfer::ContextCacheHints judgement_cache{
+        .retention            = ninfer::CacheRetentionHint::Disposable,
+        .update_session_index = false,
+    };
+    const RequestLogMetadata metadata{.model = request.model};
     std::vector<RerankScore> scores;
     scores.reserve(request.documents.size());
     int prompt_tokens = 0;
     try {
-        for (std::size_t begin = 0; begin < request.documents.size(); begin += window) {
-            const std::size_t end = std::min(begin + window, request.documents.size());
-            std::vector<GenerationRequest> judgements;
-            std::vector<PreparedRequest> batch;
-            std::vector<std::shared_ptr<RequestLifecycle>> lifecycles;
-            for (std::size_t index = begin; index < end; ++index) {
-                judgements.push_back(make_rerank_judgement(request, request.documents[index]));
-                batch.push_back(service.prepare(judgements.back(),
-                                                GenerationConsumerMode::Aggregate,
-                                                {.phase_timings = true}, cancelled));
-                const RequestLogMetadata metadata{.model = request.model};
-                lifecycles.push_back(begin_request(make_request_log_context(
-                    ++request_seq_, "rerank", judgements.back(), metadata, batch.back())));
+        // One Engine request: the instruction and query run once, and each document runs as a
+        // branch after them; a document longer than one shared pass holds runs in the windows.
+        std::optional<PreparedRequest> branched;
+        if (service.runs_branches()) {
+            std::vector<BranchRead> reads;
+            reads.reserve(judgements.size());
+            for (const GenerationRequest& judgement : judgements) {
+                reads.push_back(BranchRead{.request = &judgement, .readout = answers.tokens});
             }
-            for (std::size_t offset = 0; offset < batch.size(); ++offset) {
-                GenerationOutcome outcome;
-                try {
-                    outcome = service.run(batch[offset], nullptr, cancelled);
-                } catch (const ApiException& exception) {
-                    lifecycles[offset]->failure(make_generation_request_failure(exception.error()));
-                    throw;
+            try {
+                branched.emplace(service.submit_branches(reads, {.phase_timings = true}, cancelled,
+                                                         judgement_cache));
+            } catch (const std::length_error&) {}
+        }
+        if (branched) {
+            PreparedRequest& prepared = *branched;
+            const std::shared_ptr<RequestLifecycle> lifecycle =
+                begin_request(make_request_log_context(++request_seq_, "rerank", judgements.front(),
+                                                       metadata, prepared), prepared);
+            GenerationOutcome outcome;
+            try {
+                outcome = service.run(prepared, nullptr, cancelled);
+            } catch (const ApiException& exception) {
+                lifecycle->failure(make_generation_request_failure(exception.error()));
+                throw;
+            }
+            lifecycle->done(outcome);
+            if (outcome.branches.size() != judgements.size()) {
+                throw std::logic_error("the branched judgement returned a record count unlike its "
+                                       "documents");
+            }
+            for (std::size_t index = 0; index < judgements.size(); ++index) {
+                const ninfer::BranchResult& branch = outcome.branches[index];
+                prompt_tokens += static_cast<int>(branch.prompt_tokens);
+                scores.push_back({.index = index, .score = rerank_score(branch.first, answers)});
+            }
+        } else {
+            // One judgement per document, submitted a lane's worth at a time as one group: the
+            // Engine runs a window together, and the ingress queue keeps room for other clients'
+            // requests.
+            const std::size_t window = std::max<std::size_t>(
+                1, static_cast<std::size_t>(service.options().max_concurrency));
+            for (std::size_t begin = 0; begin < judgements.size(); begin += window) {
+                const std::size_t end = std::min(begin + window, judgements.size());
+                std::vector<StagedRequest> staged;
+                for (std::size_t index = begin; index < end; ++index) {
+                    staged.push_back(
+                        service.stage(judgements[index], GenerationConsumerMode::Aggregate,
+                                      {.phase_timings = true}, cancelled, judgement_cache));
                 }
-                lifecycles[offset]->done(outcome);
-                prompt_tokens += outcome.prompt_tokens;
-                scores.push_back({.index = begin + offset, .score = rerank_score(outcome)});
+                std::vector<PreparedRequest> batch = service.submit_group(std::move(staged));
+                std::vector<std::shared_ptr<RequestLifecycle>> lifecycles;
+                for (std::size_t offset = 0; offset < batch.size(); ++offset) {
+                    lifecycles.push_back(begin_request(make_request_log_context(
+                        ++request_seq_, "rerank", judgements[begin + offset], metadata,
+                        batch[offset]), batch[offset]));
+                }
+                for (std::size_t offset = 0; offset < batch.size(); ++offset) {
+                    GenerationOutcome outcome;
+                    try {
+                        outcome = service.run(batch[offset], nullptr, cancelled);
+                    } catch (const ApiException& exception) {
+                        lifecycles[offset]->failure(
+                            make_generation_request_failure(exception.error()));
+                        throw;
+                    }
+                    lifecycles[offset]->done(outcome);
+                    prompt_tokens += outcome.prompt_tokens;
+                    if (outcome.content_logprobs.empty()) {
+                        throw std::runtime_error("the rerank judgement produced no answer token");
+                    }
+                    scores.push_back(
+                        {.index = begin + offset,
+                         .score = rerank_score(outcome.content_logprobs.front(), answers)});
+                }
             }
         }
     } catch (const ApiException& exception) {
@@ -303,7 +367,7 @@ void HttpServer::handle_text_completion(const httplib::Request& req, httplib::Re
     TextCompletionContext context =
         make_text_completion_context(request, std::move(prompt), prepared);
     auto lifecycle = begin_request(
-        make_request_log_context(req_id, protocol, request.generation, metadata, prepared));
+        make_request_log_context(req_id, protocol, request.generation, metadata, prepared), prepared);
 
     if (!request.response.stream) {
         GenerationOutcome outcome;

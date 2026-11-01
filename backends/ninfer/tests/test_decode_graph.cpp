@@ -74,6 +74,19 @@ int main() {
         executable.launch(device.stream);
         device.synchronize();
         failures += expect_value(storage.base(), 0x22222222U, "updated graph launch");
+
+        // A definition with other nodes than the executable's cannot be updated in place; the
+        // executable takes it anyway, as a fresh instantiation.
+        ninfer::DecodeGraphDefinition third;
+        third.capture(device.stream, [&] {
+            CUDA_CHECK(cudaMemsetAsync(storage.base(), 0x44, sizeof(std::uint32_t), device.stream));
+            CUDA_CHECK(cudaMemsetAsync(storage.base(), 0x55, 2, device.stream));
+        });
+        executable.update(third);
+        executable.upload(device.stream);
+        executable.launch(device.stream);
+        device.synchronize();
+        failures += expect_value(storage.base(), 0x44445555U, "graph of another topology");
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "decode graph test failed: " << error.what() << '\n';

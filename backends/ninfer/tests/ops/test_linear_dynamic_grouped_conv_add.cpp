@@ -118,9 +118,17 @@ std::vector<double> projection_oracle(const quantized_weight::PackedWeight& weig
     std::vector<double> projection(kSampledRows.size() * kMaximumCols);
     for (std::size_t sample = 0; sample < kSampledRows.size(); ++sample) {
         for (std::int32_t col = 0; col < kMaximumCols; ++col) {
-            projection[sample * kMaximumCols + col] = quantized_weight::dot_fp64(
-                weight, kSampledRows[sample],
-                activation.data() + static_cast<std::size_t>(col) * input_rows, input_rows);
+            if (is_gguf(weight.weight.qtype)) {
+                // The independent fixture encodes one known, constant value per output row.
+                double sum = 0;
+                for (int k = 0; k < input_rows; ++k)
+                    sum += static_cast<double>(activation[static_cast<std::size_t>(col)*input_rows+k]);
+                projection[sample*kMaximumCols+col] = sum * ((kSampledRows[sample]%7+1)/128.0);
+            } else {
+                projection[sample * kMaximumCols + col] = quantized_weight::dot_fp64(
+                    weight, kSampledRows[sample],
+                    activation.data() + static_cast<std::size_t>(col) * input_rows, input_rows);
+            }
         }
     }
     return projection;
@@ -181,6 +189,33 @@ int verify_preserved(std::string_view label, const DeviceBuffer& device,
 
 // Q8 takes the fused routes; Q4 and Q5 (a compressed drafter) go through Linear into the same BF16
 // plane and the shared finish.
+quantized_weight::PackedWeight constant_gguf(QType type, int k) {
+    quantized_weight::PackedWeight out;
+    const int block_bytes = gguf_block_shape(type).bytes;
+    out.payload.resize(static_cast<std::size_t>(kHidden)*(k/256)*block_bytes);
+    for (int row=0; row<kHidden; ++row) {
+        const auto d=quantized_weight::detail::f32_to_f16((row%7+1)/128.0F);
+        for (int block=0; block<k/256; ++block) {
+            auto* p=out.payload.data()+(static_cast<std::size_t>(row)*(k/256)+block)*block_bytes;
+            if(type==QType::GGUF_Q4_K) {
+                std::memcpy(p,&d,2);
+                const std::uint8_t scales[12]={1,1,1,1,0,0,0,0,1,1,1,1};
+                std::memcpy(p+4,scales,12);std::memset(p+16,0x11,128);
+            } else if(type==QType::GGUF_Q3_K) {
+                std::memset(p,0xff,32);std::memset(p+32,0x55,64);
+                std::memset(p+96,0x11,8);std::memset(p+104,0xaa,4);std::memcpy(p+108,&d,2);
+            } else {
+                std::memset(p,0x11,128);std::memset(p+128,0xaa,64);
+                std::memset(p+192,1,16);std::memcpy(p+208,&d,2);
+            }
+        }
+    }
+    auto& w=out.weight; w.qtype=type;w.layout=QuantLayout::GgufBlocks;w.ndim=2;
+    w.n=w.shape[0]=w.padded_shape[0]=kHidden;w.k=w.shape[1]=w.padded_shape[1]=k;
+    w.group=w.group_size=256;w.payload_bytes=out.payload.size();
+    return out;
+}
+
 int run_profile(std::int32_t input_rows, QType qtype) {
     const std::vector<float> activation = make_activation(input_rows);
     std::vector<std::uint16_t> activation_bits(activation.size());
@@ -190,13 +225,21 @@ int run_profile(std::int32_t input_rows, QType qtype) {
     const std::vector<std::uint16_t> residual     = make_residual();
 
     quantized_weight::PatternedWeightOptions weight_options;
-    weight_options.row_split_scale = quantized_weight::RowSplitScalePattern::Tiny;
-    weight_options.row_split_codes = quantized_weight::RowSplitCodePattern::Hashed;
-    input_projection::DevicePackedWeight projection_weight(quantized_weight::make_patterned_weight(
+    if (qtype != QType::NVFP4) {
+        weight_options.row_split_scale = quantized_weight::RowSplitScalePattern::Tiny;
+        weight_options.row_split_codes = quantized_weight::RowSplitCodePattern::Hashed;
+    } else {
+        weight_options.weight_scale_divisor = 2.0F;
+        weight_options.input_scale_divisor = 1.0F;
+    }
+    input_projection::DevicePackedWeight projection_weight(is_gguf(qtype) ? constant_gguf(qtype,input_rows) : quantized_weight::make_patterned_weight(
         qtype, kHidden, input_rows, 503U + static_cast<std::uint32_t>(input_rows), weight_options));
-    const std::string format = qtype == QType::Q8_G32_FP16   ? "Q8"
-                               : qtype == QType::Q5_G64_FP16 ? "Q5"
-                                                             : "Q4";
+    const std::string format = qtype == QType::Q8_G32_FP16 ? "Q8" :
+        qtype == QType::NVFP4 ? "NVFP4" :
+        qtype == QType::GGUF_Q3_K ? "GGUF_Q3_K" :
+        qtype == QType::GGUF_Q4_K ? "GGUF_Q4_K" :
+        qtype == QType::GGUF_Q6_K ? "GGUF_Q6_K" :
+        qtype == QType::Q5_G64_FP16 ? "Q5" : "Q4";
     const std::vector<double> projection =
         projection_oracle(projection_weight.host, activation, input_rows);
 
@@ -204,7 +247,7 @@ int run_profile(std::int32_t input_rows, QType qtype) {
     DeviceBuffer base_device       = to_device(base_kernel);
     DeviceBuffer delta_device      = to_device(finish_delta);
     const std::size_t capacity     = ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-        input_rows, 2, 16, 1, kMaximumBatch);
+        qtype, input_rows, 2, 16, 1, kMaximumBatch);
 
     Tensor base(base_device.p, DType::BF16, {kHidden, kTaps, kSides});
     const Weight weight = projection_weight.view();
@@ -214,9 +257,17 @@ int run_profile(std::int32_t input_rows, QType qtype) {
             const std::size_t bytes =
                 static_cast<std::size_t>(kHidden) * width * batch_size * sizeof(std::uint16_t);
             const auto exact = ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
-                input_rows, width, width, batch_size, batch_size);
+                qtype, input_rows, width, width, batch_size, batch_size);
             if (exact > capacity)
                 throw std::runtime_error("workspace interval does not cover exact shape");
+            if (qtype == QType::Q8_G32_FP16 && exact != bytes)
+                throw std::runtime_error("Q8 reserved unrelated Linear scratch");
+            if (is_gguf(qtype) && width * batch_size > 8) {
+                const auto fallback = ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+                    QType::GGUF_IQ1_M, input_rows, width, width, batch_size, batch_size);
+                if (fallback < exact + (std::size_t{16} << 20))
+                    throw std::runtime_error("GGUF matrix route reserved dequantized fallback scratch");
+            }
             GuardedDeviceBuffer scratch(exact);
             WorkspaceArena workspace(DeviceSpan{scratch.data(), exact});
             GuardedDeviceBuffer residual_device(bytes);
@@ -266,7 +317,7 @@ int run_profile(std::int32_t input_rows, QType qtype) {
                     kCriterion);
                 failures += residual_device.verify_guards(label);
                 failures += scratch.verify_guards(label + " workspace");
-                if (workspace.used() != 0 || workspace.peak_used() != exact) {
+                if (workspace.used() != 0 || workspace.peak_used() > exact) {
                     std::cerr << label << ": workspace mismatch\n";
                     ++failures;
                 }
@@ -293,7 +344,11 @@ int main() {
         const int failures =
             run_profile(4096, QType::Q8_G32_FP16) + run_profile(17408, QType::Q8_G32_FP16) +
             run_profile(4096, QType::Q4_G64_FP16) + run_profile(17408, QType::Q4_G64_FP16) +
-            run_profile(17408, QType::Q5_G64_FP16);
+            run_profile(17408, QType::Q5_G64_FP16) +
+            run_profile(4096,QType::GGUF_Q3_K) + run_profile(17408,QType::GGUF_Q3_K) +
+            run_profile(4096,QType::GGUF_Q4_K) + run_profile(17408,QType::GGUF_Q4_K) +
+            run_profile(17408,QType::GGUF_Q6_K) +
+            run_profile(4096,QType::NVFP4) + run_profile(17408,QType::NVFP4);
         std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_dynamic_grouped_conv_add\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

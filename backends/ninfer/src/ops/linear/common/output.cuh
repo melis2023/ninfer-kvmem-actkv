@@ -37,6 +37,32 @@ struct LinearBf16StridedOutput {
     }
 };
 
+// FP32 plane of the projection, one row per output row: the materialisation the NVFP4
+// int8-grouped gate_up route hands from its gate GEMM to its up GEMM's GateProduct epilogue.
+struct LinearF32Output {
+    float* data;
+    std::int32_t rows;
+
+    __device__ __forceinline__ void store(int row, int token, float value) const {
+        data[static_cast<std::int64_t>(token) * rows + row] = value;
+    }
+};
+
+// GateProduct store: silu(gate) * value in FP32, one BF16 rounding. The gate plane is the FP32
+// output of the gate GEMM, so the nonlinearity's argument never leaves FP32.
+struct LinearBf16GateSiluOutput {
+    __nv_bfloat16* data;
+    std::int32_t rows;
+    const float* gate;
+    std::int64_t gate_stride;
+
+    __device__ __forceinline__ void store(int row, int token, float value) const {
+        const float g = gate[static_cast<std::int64_t>(token) * gate_stride + row];
+        data[static_cast<std::int64_t>(token) * rows + row] =
+            __float2bfloat16_rn(value * (g / (1.0F + __expf(-g))));
+    }
+};
+
 struct LinearBf16InputView {
     const __nv_bfloat16* data;
     std::int64_t leading_dim;

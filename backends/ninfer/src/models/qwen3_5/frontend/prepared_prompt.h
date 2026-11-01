@@ -146,6 +146,9 @@ struct PrepareStats {
 // (docs/maintainer/hybrid-prefix-cache-spec.md §7.1). Frontiers are exact token positions.
 struct PreparedTapHints {
     std::vector<runtime::prefix_cache::TapHint> hints;
+    // CacheRetentionHint::Disposable: no request continues this one, so it supersedes nothing it
+    // resumed from (docs/maintainer/hybrid-prefix-cache-spec.md §9.3).
+    bool disposable = false;
 };
 
 struct PreparedPromptData {
@@ -155,7 +158,8 @@ struct PreparedPromptData {
     std::vector<NgramSourceView> ngram_archive_sources;
     std::shared_ptr<const NgramSnapshot> ngram_snapshot;
     // The request's live ngram index over token_ids and ngram_sources, present whenever ngram
-    // drafting is enabled. Preparation builds it so admission only moves it into the request.
+    // drafting is enabled and the prompt was prepared for a drafting request. Preparation builds
+    // it so admission only moves it into the request.
     std::unique_ptr<detail::NgramProposer> ngram_index;
     // Hybrid prefix-cache lookup keys over token_ids (program/prefix/block_keys.h): one chained
     // hash per full 64-token block and, with media, one cumulative Vision key per block.
@@ -165,30 +169,16 @@ struct PreparedPromptData {
     // Exact token range from frontend provenance. Absent means no trusted query;
     // retrieval keeps its recency fallback. Raw token input explicitly uses all rows.
     std::optional<TokenSpan> memory_query;
-    // Proven message spans in token coordinates. Graph propagation discounts
-    // mass that crosses a message boundary; an empty list uses coefficient 1.
-    std::vector<TokenSpan> memory_messages;
-    // Proven tool-result message spans. KVMem keeps each one's first page so a
-    // large result still exposes its header when the recent window is capped.
-    std::vector<TokenSpan> tool_messages;
     // First real user content and the declared tool-definition union. KVMem structural pins
     // use these spans; an absent span falls back to the positional sink.
     std::optional<TokenSpan> first_user_region;
     std::optional<TokenSpan> tools_region;
+    // Tool-call arguments of the action that opened the current tool continuation. Set only
+    // when the last message is a tool result; KVMem scores history against this span.
+    std::optional<TokenSpan> action_query;
     // Proven message boundary before a transient generation header; zero uses all input.
     std::uint32_t memory_input_end = 0;
-    // End of the last completed message before the newest user/tool turn. A
-    // request that replaces that turn shares everything up to this point, so
-    // this is the reusable history boundary (zero means no earlier message).
-    std::uint32_t memory_history_end = 0;
-    // Start of the newest message window (last few user/assistant/tool
-    // messages). KVMem pins the actual pages of this span instead of a fixed
-    // recent-token reservation. Zero disables the dynamic window.
-    std::uint32_t memory_recent_begin = 0;
-    // Thought delimiters, when each is one token; accepted output sampling excludes
-    // rows strictly inside an open thought span.
-    std::int32_t memory_think_open = -1;
-    std::int32_t memory_think_close = -1;
+    std::uint32_t memory_root_end = 0;
 
     std::vector<std::uint8_t> token_types;
     std::vector<std::int32_t> positions;
@@ -202,6 +192,8 @@ struct PreparedPromptData {
     std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output;
     std::string assistant_continuation;
     bool starts_in_reasoning = false;
+    std::int32_t memory_think_open = -1, memory_think_close = -1;
+    std::vector<TokenSpan> memory_messages;
     PrepareStats prepare;
     std::string graft_name;
     std::uint32_t graft_frontier = 0;

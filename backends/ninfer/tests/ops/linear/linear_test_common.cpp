@@ -45,6 +45,11 @@ constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute)
         return {kBf16UnitRoundoff, kBf16UnitRoundoff, 2.0 * kBf16UnitRoundoff};
     case ActivationCompute::A8:
         return {kA8QuantizationAllowance, kBf16UnitRoundoff, 1.5 * kA8QuantizationAllowance};
+    case ActivationCompute::Int8Grouped:
+        // Both operands are integer-quantized (s8 activations at one scale per (token, 32)
+        // block, e2m1 weights at one E4M3 scale per 16 columns), the same structure the A8
+        // allowance was sized for, so the same criterion applies.
+        return {kA8QuantizationAllowance, kBf16UnitRoundoff, 1.5 * kA8QuantizationAllowance};
     case ActivationCompute::A4:
         return {kA4QuantizationAllowance, kBf16UnitRoundoff, kA4QuantizationAllowance};
     }
@@ -126,12 +131,19 @@ std::vector<std::uint16_t> make_activation(std::int32_t k, std::int32_t t, std::
                 coordinate *= 0x846ca68bU;
                 coordinate ^= coordinate >> 16;
             }
-            const float value =
-                activation_signs == ActivationSigns::Centered
-                    ? static_cast<float>(static_cast<int>(coordinate & 0xffU) - 128) *
-                          (1.0F / 256.0F)
-                    : static_cast<float>(32 + static_cast<int>(coordinate & 0x5fU)) *
-                          (1.0F / 256.0F);
+            float value = activation_signs != ActivationSigns::Biased
+                              ? static_cast<float>(static_cast<int>(coordinate & 0xffU) - 128) *
+                                    (1.0F / 256.0F)
+                              : static_cast<float>(32 + static_cast<int>(coordinate & 0x5fU)) *
+                                    (1.0F / 256.0F);
+            if (activation_signs == ActivationSigns::CenteredWideRange) {
+                const std::size_t index = static_cast<std::size_t>(token) * k + column;
+                if (index % 97 == 0) {
+                    value = std::ldexp(value, -30);
+                } else if (index % 89 == 0) {
+                    value = std::ldexp(value, 20);
+                }
+            }
             result[static_cast<std::size_t>(token) * k + column] = test::f32_to_bf16(value);
         }
     }
@@ -249,9 +261,21 @@ quantized_weight::PackedWeight make_t2_g128_fp16_weight(std::int32_t n, std::int
 
 quantized_weight::PackedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
                                                  std::uint32_t seed) {
+    return make_nvfp4_weight(n, k, seed, 0.125F);
+}
+
+quantized_weight::PackedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
+                                                 std::uint32_t seed, float weight_scale_divisor) {
+    return make_nvfp4_weight(n, k, seed, weight_scale_divisor, false);
+}
+
+quantized_weight::PackedWeight make_nvfp4_weight(std::int32_t n, std::int32_t k,
+                                                 std::uint32_t seed, float weight_scale_divisor,
+                                                 bool wide_scale_range) {
     quantized_weight::PatternedWeightOptions options;
-    options.weight_scale_divisor = 0.125F;
+    options.weight_scale_divisor = weight_scale_divisor;
     options.input_scale_divisor  = 3.5F;
+    options.wide_scale_range     = wide_scale_range;
     return quantized_weight::make_patterned_weight(QType::NVFP4, n, k, seed, options);
 }
 

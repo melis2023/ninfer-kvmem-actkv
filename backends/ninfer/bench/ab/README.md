@@ -26,9 +26,8 @@ Outputs (written next to this script): `ab_report.md`, `arm_control.jsonl`,
 1. **Build both arms**: the control from a checkout of the commit to compare with (on Windows,
    `control_build.bat` into `control\src`), the treatment from this checkout's normal build.
    The runner only needs the two `ninfer-serve` paths.
-2. **Set the flags** to compare in `BAT_FLAGS` in `ab_runner.py` (the list the original
-   published run used is committed as-is, with `--prefill-chunk 2048` and
-   `--ngram-min-match 12`). Flag fairness is automatic: the runner queries the control's
+2. **Set the flags** to compare in `BAT_FLAGS` in `ab_runner.py` (the committed list uses
+   `--prefill-chunk 2048` and `--ngram-min-match 12`). Flag fairness is automatic: the runner queries the control's
    `--help` at run time and drops exactly the flags it does not support, logging what it drops.
 3. **Run** `AB_MODEL=<artifact> python3 ab_runner.py`. The runner probes the largest
    `MAX_CONTEXT_CANDIDATES` value at which the control starts and runs **both arms at that same
@@ -75,12 +74,3 @@ Reported metrics (all from the serve's request log):
 Note: a "non-cached prefill tok/s" (computed tokens / prefill wall time) exists in the
 full report's aggregates, but the README table reports the cold row because wall time
 includes prefix-cache reads, so that ratio penalizes the arm that caches more.
-
-## Published run
-
-The original author's run (Wallawalla47/ninfer-custom `master` 9c79553c vs upstream with the
-Windows port, f2406102), 2026-09-22, RTX 5090,
-max-context 180000, flags as committed in `ab_runner.py` (`--prefill-chunk 2048`,
-`--ngram-min-match 12`), seed 42, 14/14 requests completed on both arms, 0 errors:
-TTFT 28.1 s → 14.6 s (−48.1%), prefix-cache hit rate 19.8% → 66.3%, cold prefill
-4,159 → 4,220 tok/s (+1.5%), output 173 → 181 tok/s (+4.6%).

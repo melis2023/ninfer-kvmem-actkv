@@ -17,7 +17,10 @@
 #include "models/qwen3_5/frontend/frontend.h"
 #include "models/qwen4_exp/executor.h"
 #include "models/qwen4_exp/model.h"
-#include "ninfer/types.h"
+#include "ninfer/observability/resources.h"
+#include "ninfer/observability/snapshot.h"
+#include "ninfer/request.h"
+#include "ninfer/types_fwd.h"
 #include "runtime/contract/request.h"
 
 #include <chrono>
@@ -89,6 +92,23 @@ public:
                       OutputConsumerMode consumer_mode, GenerationObservationOptions observation,
                       Clock::time_point pending_deadline = {});
 
+    // One request of submit_group: the arguments of submit.
+    struct GroupMember {
+        models::qwen3_5::PreparedPrompt prompt;
+        PromptSummary prompt_summary;
+        double prepare_seconds = 0.0;
+        ResolvedRequestOptions options;
+        OutputConsumerMode consumer_mode = OutputConsumerMode::Aggregate;
+        GenerationObservationOptions observation;
+        Clock::time_point pending_deadline;
+    };
+
+    // Queues the members together, in order, under one queue lock, so the worker admits them at
+    // one boundary: the first to reach a prefix they share stores its state there and the others
+    // resume from it. Capacity is reserved for the whole group, and an error for one member
+    // queues none.
+    std::vector<Submission> submit_group(std::vector<GroupMember> group);
+
     // Natural-log probabilities of tokens [first_target, n) given their prefixes.
     [[nodiscard]] std::vector<float> score(models::qwen3_5::PreparedPrompt prompt,
                                            std::uint32_t first_target);
@@ -102,6 +122,9 @@ public:
 
 private:
     struct Impl;
+    // A member's request, validated and ready to queue, and its effective thinking budget.
+    std::shared_ptr<Request> make_request(GroupMember& member,
+                                          std::optional<std::uint32_t>& budget);
     std::unique_ptr<Impl> impl_;
 };
 

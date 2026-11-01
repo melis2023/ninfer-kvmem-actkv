@@ -32,10 +32,10 @@ std::int64_t numel_allow_zero(const Tensor& t, const char* label) {
     return total;
 }
 
-} // namespace
-
-void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStream_t stream) {
-    if (logits.dtype != DType::BF16) { throw std::invalid_argument("argmax: logits must be BF16"); }
+bool validate(const Tensor& logits, const Tensor& out, std::int32_t valid_rows) {
+    if (logits.dtype != DType::BF16 && logits.dtype != DType::FP32) {
+        throw std::invalid_argument("argmax: logits must be BF16 or FP32");
+    }
     if (out.dtype != DType::I32) { throw std::invalid_argument("argmax: out must be I32"); }
 
     const std::int64_t logits_n = numel_allow_zero(logits, "logits");
@@ -56,7 +56,7 @@ void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStre
     if (out.ne[0] != logits.ne[1]) {
         throw std::invalid_argument("argmax: out shape must be [logits.ne[1]]");
     }
-    if (logits_n == 0) { return; }
+    if (logits_n == 0) { return false; }
 
     if (!logits.is_contiguous() || !out.is_contiguous()) {
         throw std::invalid_argument("argmax: logits/out must be contiguous");
@@ -65,7 +65,29 @@ void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStre
         throw std::invalid_argument("argmax: logits/out data must be non-null");
     }
 
-    detail::argmax_launch(logits, out, valid_rows, stream);
+    return true;
+}
+
+} // namespace
+
+void argmax(const Tensor& logits, Tensor& out, std::int32_t valid_rows, cudaStream_t stream) {
+    if (validate(logits, out, valid_rows)) {
+        detail::argmax_launch(logits, out, valid_rows, stream);
+    }
+}
+
+void argmax_top2(const Tensor& logits, Tensor& first, Tensor& second,
+                 std::int32_t valid_rows, cudaStream_t stream) {
+    if (valid_rows < 2) { throw std::invalid_argument("argmax_top2 needs at least two tokens"); }
+    if (logits.dtype != DType::BF16) { throw std::invalid_argument("argmax_top2: logits must be BF16"); }
+    const bool populated = validate(logits, first, valid_rows);
+    (void)validate(logits, second, valid_rows);
+    if (!populated) { return; }
+    if (first.data == second.data) {
+        throw std::invalid_argument("argmax_top2 outputs must not overlap");
+    }
+    detail::argmax_launch(logits, first, valid_rows, stream);
+    detail::argmax_second_launch(logits, first, second, valid_rows, stream);
 }
 
 } // namespace ninfer::ops

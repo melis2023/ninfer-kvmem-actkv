@@ -1,0 +1,52 @@
+name: Build workflow checks
+
+on:
+  push:
+    branches: ['build/**']
+    paths:
+      - '.github/scripts/**'
+      - '.github/workflows/build-workflow-checks.yml'
+      - '.github/workflows/native-windows.yml'
+      - '.github/workflows/native-linux.yml'
+      - '.github/workflows/linux-cache-bootstrap.yml'
+      - 'scripts/package-release.ps1'
+      - 'scripts/package-linux-release.py'
+      - 'scripts/assemble-universal-release.py'
+      - 'apps/launcher/**'
+      - 'cmake/NinferRuntime.cmake'
+      - 'cmake/runtime_dispatch.cpp.in'
+      - 'tests/release/**'
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-tools:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - run: sudo apt-get update && sudo apt-get install -y patchelf
+      - run: python -m unittest discover -s tests/release -v
+  windows-lifecycle:
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Parse Windows packager
+        shell: pwsh
+        run: |
+          $parseErrors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$pwd/scripts/package-release.ps1", [ref]$null, [ref]$parseErrors) | Out-Null
+          if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
+      - run: python -m unittest discover -s tests/release -p test_build_lifecycle.py -v
+      - run: python -m unittest discover -s tests/release -p test_windows_kernel_dll.py -v
+      - run: python -m unittest discover -s tests/release -p test_portable_runtime.py -v

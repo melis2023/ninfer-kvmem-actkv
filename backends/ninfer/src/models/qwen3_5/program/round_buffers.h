@@ -4,7 +4,8 @@
 #include "core/tensor.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/speculative_round.h"
-#include "ninfer/types.h"
+#include "ninfer/base.h"
+#include "ninfer/model_enums.h"
 
 #include <array>
 #include <cstddef>
@@ -40,11 +41,13 @@ struct RoundStateSpec {
 struct OrdinaryDecodeIngress {
     std::array<TokenId, kMaximumConcurrency> tokens{};
     std::array<std::int32_t, kMaximumConcurrency> cache_positions{};
-    std::array<std::int32_t, kMaximumConcurrency> logical_frontiers{};
     std::array<std::int32_t, kMaximumConcurrency> rope_positions{};
     std::array<std::int32_t, kMaximumConcurrency> text_kv_table_rows{};
     std::array<std::int32_t, kMaximumConcurrency> state_source_slots{};
     std::array<std::int32_t, kMaximumConcurrency> state_destination_slots{};
+    // The position each sampled token fills (cache position + 1), its decode sampling key: the key
+    // speculative verification draws that position with too (speculative_accept_coupled_drafts).
+    std::array<std::int32_t, kMaximumConcurrency> sample_positions{};
     std::array<ops::SamplingConfig, kMaximumConcurrency> sampling{};
 };
 
@@ -201,6 +204,8 @@ struct RoundStateLayout {
     TensorRegion logprob_values;
     TensorRegion logprob_lse;
     TensorRegion logprob_active;
+    TensorRegion readout_ids;
+    TensorRegion readout_values;
     std::optional<MtpPrefillStateLayout> mtp;
     std::optional<DFlashPrefillStateLayout> dflash_prefill;
     std::optional<MtpDecodeStateLayout> mtp_decode;
@@ -213,11 +218,11 @@ struct OrdinaryDecodeState {
     DeviceSpan egress;
     Tensor tokens;
     Tensor cache_positions;
-    Tensor logical_frontiers;
     Tensor rope_positions;
     Tensor text_kv_table_rows;
     Tensor state_source_slots;
     Tensor state_destination_slots;
+    Tensor sample_positions;
     const ops::SamplingConfig* sampling = nullptr;
     Tensor sampled_tokens;
     Tensor logits;
@@ -365,6 +370,10 @@ struct RoundState {
     Tensor logprob_values;
     Tensor logprob_lse;
     Tensor logprob_active;
+    // The typed readout of a prefill's first token: I32 [kMaximumReadoutTokens] ids a request
+    // named and the FP32 [kMaximumReadoutTokens] log probabilities read for them.
+    Tensor readout_ids;
+    Tensor readout_values;
     std::optional<MtpPrefillState> mtp;
     std::optional<DFlashPrefillState> dflash_prefill;
     std::optional<MtpDecodeState> mtp_decode;

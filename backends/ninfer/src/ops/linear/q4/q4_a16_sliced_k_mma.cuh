@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/pdl.cuh"
+#include "ops/common/device_limits.h"
 #include "ops/common/mma.cuh"
 #include "ops/linear/q4/q4_schedule.cuh"
 
@@ -38,7 +39,9 @@ __device__ __forceinline__ int q4_sliced_k_swizzle(int row, int col) {
 
 template <class Schedule, bool Full, bool FullTokens, class Output, class Epilogue, class RowPolicy>
 __global__
-__launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void q4_a16_sliced_k_mma_kernel(
+__launch_bounds__(Schedule::kThreads,
+                  resident_ctas_bound(Schedule::kThreads, Schedule::kMinBlocksPerSm)) void
+q4_a16_sliced_k_mma_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
     const std::uint8_t* __restrict__ scales, Output output, Epilogue epilogue, int rows, int k,
     int tokens, int padded_k, int token_begin, RowPolicy row_policy) {

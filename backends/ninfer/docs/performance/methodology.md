@@ -1,30 +1,20 @@
-# Serving performance methodology
+# Serving corpus methodology
 
-[Performance index](../performance.md) · [Runner usage](../../tools/bench/README.md#serving-corpus-benchmark)
+[Performance](../performance.md) · [Runner usage](../../tools/bench/README.md#serving-corpus-benchmark)
 
-This is the measurement and publication reference for the serving results in this directory.
-Model pages own measured values and run-specific conditions. Engine and Op benchmarks have their
-own contracts in [bench/README.md](../../bench/README.md); their rates do not establish HTTP serving
-performance.
+The workloads, measurement boundaries and metrics of the serving corpus runners
+(`tools/bench/run_serve_corpus.py`, `tools/bench/run_serve_concurrency.py`). Engine and Op
+benchmarks have their own contracts in [bench/README.md](../../bench/README.md); their rates do not
+establish HTTP serving performance.
 
-## Common serving profile
+## Server profile
 
-The published runs use the following common settings. Model-page run records specify context,
-concurrency, KV capacity, driver API version, sampling exceptions, and artifact paths.
-These are recorded experimental settings, not promises about current executable defaults.
-
-| Setting | Value |
-|---|---|
-| GPU | One NVIDIA GeForce RTX 5090, 32 GiB |
-| CUDA compile/runtime | 13.1 / 13.1 |
-| Route | Persistent `ninfer-serve`, loopback OpenAI Chat Completions, `stream=false` |
-| Prefill chunk | 1,024 tokens |
-| KV cache | INT8 group-64 |
-| CUDA Graph | Enabled |
-| Prefix reuse | Disabled |
-| Stochastic sampling | Temperature 0.6, top-p 0.95, top-k 20, min-p 0, presence penalty 1.0, frequency penalty 0 |
-| Greedy sampling | Exact argmax; identified explicitly per run |
-| Startup and warmup | Outside measured requests/waves |
+Every run serves one persistent `ninfer-serve` over loopback OpenAI Chat Completions with
+`stream=false`, CUDA Graphs on, prefix reuse off (`--no-prefix-reuse`), 1,024-token prefill chunks
+and the KV format the runner is given (`int8` by default). Startup and warmup lie outside the
+measured requests. Stochastic runs pin their whole sampling profile (temperature 0.6, top-p 0.95,
+top-k 20, min-p 0, presence penalty 1.0, frequency penalty 0), so a change of model defaults does
+not change the method; `--sampling greedy` selects exact argmax.
 
 | Report label | Runner mode | Server options |
 |---|---|---|
@@ -52,9 +42,8 @@ seeds, giving 75 requests per corpus. Actual completion lengths are measurements
 
 Fixture content is in [examples/cli/manifest.json](../../examples/cli/manifest.json); fixture
 selection and the five seeds are in [run_serve_corpus.py](../../tools/bench/run_serve_corpus.py).
-Preserve their identity when comparing historical runs. Serial runs submit one request at a time
-to one persistent server. A corpus-makespan C=1 point can also supply these phase statistics;
-model pages identify that shared source.
+Keep their identity when comparing runs. Serial runs submit one request at a time to one
+persistent server. A corpus-makespan C=1 point can also supply these phase statistics.
 
 ### Corpus makespan
 
@@ -69,9 +58,8 @@ weights, backends, and concurrency. Report token totals alongside makespan and r
 
 ### Decode saturation
 
-The published MTP3 waves use `long_decode_aime26_15`, thinking enabled, and an 8,192-token output
-budget per request. Actual rendered prompt length is model-specific and recorded on the model
-page. At each C, a fresh server releases C requests with distinct fixed seeds and waits for every
+The MTP3 waves use `long_decode_aime26_15`, thinking enabled, and an 8,192-token output budget per
+request; the rendered prompt length is model-specific. At each C, a fresh server releases C requests with distinct fixed seeds and waits for every
 response. Each request has a 16,384-token context ceiling; the measured automatic KV capacity is
 `C * 16,384` tokens.
 
@@ -79,11 +67,11 @@ Steady throughput includes only complete one-second server intervals with zero c
 tokens, `running=C`, `prefilling=0`, `decode_ready=C`, at least one decode round, and exactly C rows
 in every round. Ramp-up, prefill, and drain are excluded. Wave makespan still spans client release
 through the last complete response. Acceptance is aggregated over the full wave, not just steady
-intervals. Each published point is one wave, not a repeated-sample mean.
+intervals. Each point is one wave, not a repeated-sample mean.
 
 ## Metrics and statistics
 
-| Published metric | Definition |
+| Metric | Definition |
 |---|---|
 | Prefill phase (tok/s) | `prompt_tokens / prefill_seconds` for each serial request |
 | Server TTFT (ms) | `1000 * (prepare_seconds + vision_seconds + prefill_seconds)` |
@@ -109,51 +97,19 @@ Acceptance in a phase table is the mean of per-request ratios. Acceptance in a c
 table is the ratio of summed accepted and drafted tokens. Do not interchange these aggregations.
 Calculate new statistics and comparisons from unrounded reports. Display phase rates and their
 deviations to one decimal, seconds to two decimals, acceptance to one percentage decimal, and
-tokens/round and speedups to two decimals. Keep token totals and sample counts exact. Historical
-comparisons derived from rounded published means must identify that limitation.
+tokens/round and speedups to two decimals. Keep token totals and sample counts exact.
 
-## Output checks and optional comparisons
+## Output checks and comparisons
 
 Performance runs check execution failures, token accounting, termination reasons, and obvious
-repetition. Record the scope and result of those checks once on the model page. Answer accuracy,
-prompt compliance, and other content audits are included only when required by the task; their
-conclusions apply only to the identified runs.
+repetition. Pathological samples stay in fixed-corpus statistics, labeled next to the affected
+results; statistics that exclude samples name the exclusions. A natural stop or high throughput
+alone does not establish successful task completion.
 
-Retain pathological samples in fixed-corpus statistics and label them next to affected results.
-Supplementary statistics excluding samples must identify the exclusions. A natural stop or high
-throughput alone does not establish successful task completion.
-
-Comparisons are optional. When included, identify both run IDs, the metric, and differences in
-configuration or workload. A throughput speedup is `new / baseline`; a makespan speedup is
-`baseline / new`; relative change is `(new / baseline - 1) * 100%`. C=1 must be the matching
-suite/profile baseline. Distinguish fixed-request workloads with varying output lengths from
-fixed-token measurements. Historical comparisons do not isolate a backend change. MTP0 context
-profiles and speculative scenario suites use different workloads and cannot establish per-scenario
-baseline/speculative speedups.
-
-## Publishing and updating results
-
-Use one model page ordered by configuration and run records, measured workload sections,
-termination/anomalies, and reproduction. Group results by weight format and backend within a
-workload section. Omit unmeasured sections; add comparisons or content audits only when in scope.
-A short page-local run ID links each result to its configuration, command, and source reports.
-
-Record the date, model/weights identity, explicit artifact and relevant companion, known tested
-revision, hardware/toolchain, workload, sample count, and runtime settings. Link common settings
-rather than repeating them; put exceptions and actual automatic KV capacities in the run record.
-Identify missing historical metadata without inferring values.
-
-Commands run from the repository root with a selected Python 3.11 interpreter. Use a fresh output
-directory for reruns; recorded report paths identify the measured evidence. Reproducing a workload
-on another build or artifact does not promise identical historical outputs or timings. Raw reports
-remain local under `profiles/bench/`; reuse existing JSON/CSV/Markdown summaries to verify values.
-
-Model pages own detailed serving results. README and model-card excerpts link to them and update
-with the relevant measurements. Capability scores belong in model-card Evaluation sections, with
-workflow guidance in [eval/README.md](../../eval/README.md); runner usage and report-file descriptions
-belong in [tools/bench/README.md](../../tools/bench/README.md).
-
-When replacing measurements, update their run records, applicable findings, coverage index, and
-excerpts together. Retain older data only for an explicitly requested historical comparison or
-audit. Before publishing, check affected links/anchors, values and material caveats, and
-`git diff --check`.
+A comparison names both runs, the metric, and the differences in configuration or workload. A
+throughput speedup is `new / baseline`; a makespan speedup is `baseline / new`; relative change is
+`(new / baseline - 1) * 100%`. C=1 must be the matching suite/profile baseline. Fixed-request
+workloads with varying output lengths are not fixed-token measurements, and MTP0 context profiles
+and speculative scenario suites use different workloads, so they cannot establish per-scenario
+speculative speedups. Calculate comparisons from unrounded reports; raw reports stay local under
+`profiles/bench/`.

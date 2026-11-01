@@ -239,14 +239,18 @@ void embedding_rotated(const Tensor& ids, const Weight& table, const Tensor& sig
     if (out.ne[0] != width || out.ne[1] != ids.ne[0] || out.ne[2] != 1 || out.ne[3] != 1) {
         throw std::invalid_argument("embedding_rotated: out must be [K, T] with K the sign width");
     }
-    if (table.qtype != QType::T2_G128_FP16 || table.layout != QuantLayout::RowSplit ||
+    const bool ptq1 = table.qtype == QType::PTQ1_G128_FP16;
+    if (!is_ternary(table.qtype) || table.layout != QuantLayout::RowSplit ||
         table.qdata == nullptr || table.scales == nullptr || table.k != width || table.n <= 0 ||
-        table.scale_dtype != DType::FP16 || !aligned4(table.qdata)) {
+        table.scale_dtype != DType::FP16 || !aligned4(table.qdata) ||
+        table.padded_shape[1] != width || table.group != 128 ||
+        (ptq1 ? table.qhigh == nullptr || table.high_plane_bytes == 0
+              : table.qhigh != nullptr || table.high_plane_bytes != 0)) {
         throw std::invalid_argument(
             "embedding_rotated: table must be a row-split t2_g128_fp16 [vocab, K] weight");
     }
     if (ids.ne[0] == 0) { return; }
-    detail::embedding_rotated_t2_launch(ids, table, signs, out, stream);
+    detail::embedding_rotated_ternary_launch(ids, table, signs, out, stream);
 }
 
 } // namespace ninfer::ops

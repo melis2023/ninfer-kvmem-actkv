@@ -64,6 +64,7 @@ struct FoldProfile {
     std::int32_t layers;
     std::int32_t value_heads;
     std::int32_t conv_channels;
+    std::int32_t qk_heads = kQkHeads;
 };
 
 std::vector<float> initial_recurrent_values(std::size_t elements, std::uint32_t seed, int layer,
@@ -102,7 +103,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
         .record_capacity = kRecordCapacity,
         .width           = physical_width,
         .conv_channels   = profile.conv_channels,
-        .qk_heads        = kQkHeads,
+        .qk_heads        = profile.qk_heads,
         .value_heads     = profile.value_heads,
         .key_dim         = kStateDim,
         .value_dim       = kStateDim,
@@ -133,9 +134,9 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
                                  channel] =
                         bf16_pattern(seed + layer * 131U + row * 17U + token * 7U + channel);
                 }
-                for (std::int32_t head = 0; head < kQkHeads; ++head) {
+                for (std::int32_t head = 0; head < profile.qk_heads; ++head) {
                     const std::size_t base =
-                        static_cast<std::size_t>((column * kQkHeads + head) * kStateDim);
+                        static_cast<std::size_t>((column * profile.qk_heads + head) * kStateDim);
                     for (std::int32_t dim = 0; dim < kStateDim; ++dim) {
                         key_records[base + dim] =
                             bf16_pattern(seed + 100003U + layer * 197U + row * 23U + token * 11U +
@@ -263,7 +264,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     expected_recurrent.fill(0);
     DeviceBuffer local_state(recurrent_slot_bytes);
     local_state.fill(0);
-    const std::size_t q_elements = static_cast<std::size_t>(kStateDim) * kQkHeads * width;
+    const std::size_t q_elements = static_cast<std::size_t>(kStateDim) * profile.qk_heads * width;
     const std::size_t out_elements =
         static_cast<std::size_t>(kStateDim) * profile.value_heads * width;
     DeviceBuffer q(q_elements * sizeof(std::uint16_t));
@@ -271,7 +272,7 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
     q.fill(0);
     DeviceBuffer g_row(static_cast<std::size_t>(profile.value_heads) * width * sizeof(float));
     DeviceBuffer beta_row(static_cast<std::size_t>(profile.value_heads) * width * sizeof(float));
-    const Tensor q_tensor(q.p, DType::BF16, {kStateDim, kQkHeads, width, 1});
+    const Tensor q_tensor(q.p, DType::BF16, {kStateDim, profile.qk_heads, width, 1});
     Tensor local_state_tensor(local_state.p, DType::FP32,
                               {kStateDim, kStateDim, profile.value_heads});
     Tensor output(out.p, DType::BF16, {kStateDim, profile.value_heads, width, 1});
@@ -323,10 +324,10 @@ int run_case(const FoldProfile profile, std::int32_t width, std::int32_t rows,
             // Snapshot each transition of the same full W record block. Saving N must not
             // change the input width or regenerate any projection at N.
             for (int token = 0; token < width; ++token) {
-                Tensor query = q_tensor.slice(2, token, 1).view({kStateDim, kQkHeads, 1});
+                Tensor query = q_tensor.slice(2, token, 1).view({kStateDim, profile.qk_heads, 1});
                 Tensor key   = layer_records.key.slice(3, row, 1)
                                  .slice(2, token, 1)
-                                 .view({kStateDim, kQkHeads, 1});
+                                 .view({kStateDim, profile.qk_heads, 1});
                 Tensor value = layer_records.value.slice(3, row, 1)
                                    .slice(2, token, 1)
                                    .view({kStateDim, profile.value_heads, 1});
@@ -662,6 +663,7 @@ int run_record_fold_rounds() {
                  device_destinations = to_device(destination_steps);
 
     int failures = 0;
+
     const std::vector<std::int32_t> commits =
         kWidth == 64   ? std::vector<std::int32_t>{1, 4, 15, 16, 17, 31, 32, 33, 47, 48, 63, 64}
         : kWidth == 32 ? std::vector<std::int32_t>{1, 4, 15, 16, 17, 31, 32}
@@ -789,6 +791,16 @@ int main(int argc, char** argv) {
     }
 
     int failures = 0;
+    if (argc == 2 && std::string(argv[1]) == "--dense-family-only") {
+        for (const FoldProfile profile : {FoldProfile{18, 16, 6144}, FoldProfile{24, 32, 8192}}) {
+            for (int commit = 0; commit <= 6; ++commit)
+                failures += run_case(profile, 6, 1, {commit}, 2400U + commit, true);
+            failures += run_case(profile, 6, 2, {0, 6}, 2410U, true);
+            failures += run_case(profile, 6, 2, {1, 3}, 2411U);
+        }
+        std::cout << (failures ? "FAIL" : "OK") << " dense-family gdn_replay_fold\n";
+        return failures ? 1 : 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--wide-only") {
         for (const int width : {33, 48, 64}) {
             for (int commit = 0; commit <= width; ++commit) {
@@ -813,7 +825,7 @@ int main(int argc, char** argv) {
         return failures == 0 ? 0 : 1;
     }
     if (argc != 1) {
-        std::cerr << "usage: ninfer_gdn_replay_fold_test [--ngram-only|--wide-only]\n";
+        std::cerr << "usage: ninfer_gdn_replay_fold_test [--ngram-only|--wide-only|--dense-family-only]\n";
         return 2;
     }
     failures += run_case({48, 48, 10240}, 2, 1, {2}, 1801U, true);
@@ -840,6 +852,11 @@ int main(int argc, char** argv) {
     failures += run_case({48, 48, 10240}, 8, 2, {8, 3}, 1871U, false, 16);
     failures += run_case({48, 48, 10240}, 8, 8, {0, 1, 2, 3, 4, 5, 7, 8}, 1873U, true, 16);
     failures += run_case({30, 32, 8192}, 8, 2, {5, 8}, 1875U, false, 16);
+    // A 27B layer's share on each of two and four tensor-parallel ranks.
+    failures += run_case({4, 24, 5120, 8}, 6, 4, {0, 2, 5, 6}, 1881U, true);
+    failures += run_case({4, 24, 5120, 8}, 16, 2, {16, 7}, 1883U);
+    failures += run_case({4, 12, 2560, 4}, 6, 4, {6, 1, 3, 0}, 1885U, true);
+    failures += run_case({4, 12, 2560, 4}, 16, 2, {9, 16}, 1887U);
     failures += run_record_fold_rounds<16>();
     failures += run_record_fold_rounds<32>();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";

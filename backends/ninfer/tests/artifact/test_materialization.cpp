@@ -164,6 +164,29 @@ void overlay_placement(DeviceContext& device) {
         rejects([&] { (void)std::move(binder).finish(); },
                 "an object with both device and pinned placement was accepted");
     }
+    {
+        Reader reader(fixture.entry);
+        Binder binder(reader);
+        const auto row = binder.parameter("row", {1, 130}, Residency::Registered);
+        (void)binder.parameter("matrix", {2, 130}, Residency::Registered);
+        const auto* original = binder.host_object(reader.find("q5")).data();
+        auto backing = materialize(reader, std::move(binder).finish(), device);
+        auto moved = std::move(backing);
+        const auto view = bind_view(row, moved);
+        require(view.parts.front().parent->data == original && moved.stats().pinned_object_count == 1 &&
+                    moved.stats().pinned_bytes == 528 && moved.stats().retained_host_bytes == 528,
+                "registered parent moved, duplicated or lost its accounting");
+        cudaPointerAttributes attributes{};
+        CUDA_CHECK(cudaPointerGetAttributes(&attributes, original));
+        require(attributes.type == cudaMemoryTypeHost, "Host object was not registered for DMA");
+        DeviceBuffer copied(528);
+        CUDA_CHECK(cudaMemcpyAsync(copied.p, original, 528, cudaMemcpyHostToDevice, device.transfer_stream));
+        CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
+        std::vector<std::byte> actual(528);
+        copied.copy_to_host(actual.data(), actual.size());
+        require(std::equal(actual.begin(), actual.end(), fixture.payload.begin() + 256),
+                "registered object DMA changed its encoded bytes");
+    }
 }
 
 void failure_and_host_only(DeviceContext& device) {
@@ -249,6 +272,20 @@ void file_roundtrip(DeviceContext& device, const std::filesystem::path& path, bo
         }
         require(elements == weight_element_count(view.shape),
                 "resolved view lost logical coverage");
+        if (writer_fixture && parameter.name == "native_q2") {
+            const Weight w = native_weight(view);
+            require(w.qtype == QType::Q2_G64_FP16 && w.n == 2 && w.k == 65 &&
+                        w.group_size == 64 && w.padded_shape[1] == 128 && w.qhigh == nullptr,
+                    "Python Q2 object lost its native format or geometry during binding");
+            std::array<unsigned char, 2> code{};
+            CUDA_CHECK(cudaMemcpy(code.data(), w.qdata, code.size(), cudaMemcpyDeviceToHost));
+            std::array<std::uint16_t, 4> scales{};
+            CUDA_CHECK(cudaMemcpy(scales.data(), w.scales, sizeof(scales),
+                                  cudaMemcpyDeviceToHost));
+            require(code[0] == 0xe4 && code[1] == 0xe4 &&
+                        scales == std::array<std::uint16_t, 4>{0x3800, 0xbc00, 0x0001, 0x8000},
+                    "Python Q2 offset codes or signed scale words changed on upload");
+        }
         if (view.shape.size() == 2 && is_gguf(view.parts.front().parent->geometry.format)) {
             const auto native = native_weight(view);
             const auto& parent = *view.parts.front().parent;

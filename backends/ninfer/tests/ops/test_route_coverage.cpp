@@ -34,6 +34,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -41,9 +42,10 @@ namespace {
 constexpr std::int32_t kAnyCols = std::numeric_limits<std::int32_t>::max();
 
 // Resolves as the fused Ops do where the device profile sends a width to upstream's routes over
-// the unified templates.
+// the unified templates. A card that cannot select that table resolves its legacy routes.
 template <class Resolve>
 auto under_unified_table(Resolve&& resolve) {
+    if (!ninfer::ops::detail::unified_linear_routes_here()) { return resolve(); }
     ninfer::ops::detail::force_linear_route_table(ninfer::ops::detail::LinearRouteTable::Unified);
     const auto schedule = resolve();
     ninfer::ops::detail::force_linear_route_table(std::nullopt);
@@ -196,6 +198,29 @@ int main() {
                           })},
                          {"linear_swiglu.q8.dflash2.mma.r32.c64.k128"}));
 
+    std::vector<std::string> q5_add_unrouted = {
+        "linear_add.q5.mma.r64.c16.cta_collective_residual",
+        "linear_add.q5.mma.r64.c24.cta_collective_residual",
+        "linear_add.q5.mma.r64.c32.cta_collective_residual"};
+    if (!detail::unified_linear_routes_here()) {
+        // A card that cannot select the unified table (unified_linear_routes in
+        // ops/linear/common/route_table.h) routes none of its schedules.
+        q5_add_unrouted.insert(
+            q5_add_unrouted.end(),
+            {"linear_add.q5.unified.direct_simt.split2.exact.residual",
+             "linear_add.q5.unified.sliced.r16.t8.w4.s2.residual",
+             "linear_add.q5.unified.sliced.r16.t16.w4.s2.residual",
+             "linear_add.q5.unified.sliced.r16.t24.w4.s2.residual",
+             "linear_add.q5.unified.sliced.r32.t32.w4.s2.residual",
+             "linear_add.q5.unified.sliced.r32.t24.w4.s2.pairwise.residual",
+             "linear_add.q5.unified.sliced.r32.t32.w4.s1.residual",
+             "linear_add.q5.unified.sliced.r32.t32.w2.s2.residual",
+             "linear_add.q5.unified.sliced.r32.t64.w2.s1.residual",
+             "linear_add.q5.unified.mma.r32.t32.k128.residual",
+             "linear_add.q5.unified.mma.r32.t128.residual",
+             "linear_add.q5.unified.mma.r64.t128.cta_collective_residual",
+             "linear_add.q5.unified.mma.r64.t128.cta_collective_residual.narrow_tail"});
+    }
     using AddFn = std::function<detail::Q5LinearAddScheduleId(std::int32_t)>;
     reports.push_back(
         survey<detail::Q5LinearAddScheduleId, decltype(detail::q5_linear_add_schedule_name), AddFn>(
@@ -217,9 +242,7 @@ int main() {
                      return detail::q5_linear_add_resolve_plan({5120, 17408, 17408, cols}).schedule;
                  });
              })},
-            {"linear_add.q5.mma.r64.c16.cta_collective_residual",
-             "linear_add.q5.mma.r64.c24.cta_collective_residual",
-             "linear_add.q5.mma.r64.c32.cta_collective_residual"}));
+            std::move(q5_add_unrouted)));
 
     using Q4Q5Fn = std::function<detail::Q4Q5AttnInputScheduleId(std::int32_t)>;
     reports.push_back(
@@ -296,16 +319,21 @@ int main() {
     //                          whose dispatch held both switch bugs the catch-up merge shipped --
     //                          and ParentSplitFixed since 2026-09-11, when the small-T MMA took
     //                          1..8 from it (q4_q5_attn_input_plan.cpp); MixedR32C32S2 since the
-    //                          2026-09-24 catch-up, upstream's 13..32 band on a native sm_120 build,
-    //                          and MixedR32C32K128S2, the native build's T=32 route.
+    //                          2026-09-24 catch-up, upstream's 13..32 band on a native sm_120
+    //                          build, and MixedR32C32K128S2, the native build's T=32 route.
+    //
+    // A card that cannot select the unified table (a Turing card) adds q5_linear_add's 13
+    // unified schedules.
     //
     // All of them are kept on purpose: deleting an upstream schedule costs merge effort at every
     // future catch-up for no measured gain here. The point is that the set is written down.
 #if defined(NINFER_SM8X_COMPAT)
-    constexpr std::size_t kExpectedUnrouted = 32;
+    constexpr std::size_t kTableUnrouted = 32;
 #else
-    constexpr std::size_t kExpectedUnrouted = 28;
+    constexpr std::size_t kTableUnrouted = 28;
 #endif
+    const std::size_t kExpectedUnrouted =
+        kTableUnrouted + (ninfer::ops::detail::unified_linear_routes_here() ? 0 : 13);
     if (total != kExpectedUnrouted) {
         std::cerr << "route coverage changed: " << total << " unrouted schedules, expected "
                   << kExpectedUnrouted

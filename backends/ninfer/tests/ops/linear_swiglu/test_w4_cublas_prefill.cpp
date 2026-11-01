@@ -3,9 +3,9 @@
 // output projection), and the attention and GDN split input projections.
 //
 // The oracle is independent of the route: an FP64 dot product over the exactly decoded group-64
-// weight and the represented BF16 activation, not another kernel and not the integer route. What the
-// route computes differs from it by design -- one int8 scale per weight row, one per token, and a
-// channel equalisation between them -- so the pass bound is the fork's A8 activation allowance
+// weight and the represented BF16 activation, not another kernel and not the integer route. What
+// the route computes differs from it by design -- one int8 scale per weight row, one per token, and
+// a channel equalisation between them -- so the pass bound is the fork's A8 activation allowance
 // rather than a rounding bound, and the observed relative L2 is printed on every case so drift
 // inside the allowance stays visible.
 //
@@ -16,7 +16,9 @@
 // route one token past a tile so that a stale or short second tile shows up as a wrong value.
 //
 // Below kCublasPrefillMinTokens the route declines; those widths are checked too, because a policy
-// that silently produced garbage for a narrow call would pass everything above.
+// that silently produced garbage for a narrow call would pass everything above. A device profile
+// moves that gate per Op and per alternative route, never to the decode floor or below it, and the
+// capacity queries reserve for the route wherever the profile sends a width to it.
 
 #include "core/arena.h"
 #include "core/weight.h"
@@ -25,6 +27,8 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ops/common/device_route.h"
+#include "ops/common/device_tier.h"
 #include "ops/op_check.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
@@ -35,6 +39,7 @@
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -87,9 +92,14 @@ std::vector<std::uint16_t> make_activation(std::int32_t rows, std::int32_t token
 // the width gate means the call went to the integer or A16 route as documented. Accuracy alone
 // cannot say, since an exact A16 fallback would pass every bound in this file.
 int expect_route(const std::string& label, const WorkspaceArena& workspace,
-                 std::size_t weight_bytes, std::int32_t tokens) {
-    const bool engaged  = workspace.peak_used() >= weight_bytes;
-    const bool expected = tokens >= ops::kCublasPrefillMinTokens;
+                 std::size_t weight_bytes, std::int32_t tokens, bool expected) {
+    if (ops::current_device_volta()) {
+        // A Volta card takes its own route at every width (ops/linear/sm70): FP16 weight slabs
+        // into cuBLAS above the small-T widths, never the int8 materialisation. Only accuracy
+        // applies there.
+        return 0;
+    }
+    const bool engaged = workspace.peak_used() >= weight_bytes;
     if (engaged == expected) { return 0; }
     std::cerr << label << ": cuBLAS route " << (engaged ? "ran" : "did not run") << " at T=" << tokens
               << ", expected it to " << (expected ? "run" : "decline") << " (peak workspace "
@@ -123,11 +133,12 @@ std::vector<float> token_column(const std::vector<std::uint16_t>& activation, st
 }
 
 // Tokens to check: the ends, the tokens either side of every tile edge the route can use at the
-// registered shapes (gate_up 1920, the split projections 5376, the down/out projections 13056),
-// and a deterministic scatter. Edges past `tokens` drop out.
+// registered shapes (gate_up 1920, the split projections 5376, the down/out projections 13056,
+// sm_70's column passes 8192), and a deterministic scatter. Edges past `tokens` drop out.
 std::vector<std::int32_t> sample_tokens(std::int32_t tokens, std::uint32_t seed) {
-    std::vector<std::int32_t> picks = {0,    1,     127,   128,   1919,  1920,  1921,  3839,
-                                       3840, 3841,  5375,  5376,  5377,  13055, 13056, 13057};
+    std::vector<std::int32_t> picks = {0,    1,    127,  128,  1919,  1920,  1921,  3839,  3840,
+                                       3841, 5375, 5376, 5377, 8191,  8192,  8193,  13055, 13056,
+                                       13057};
     picks.push_back(tokens - 1);
     for (std::uint32_t i = 0; i < 12; ++i) {
         picks.push_back(static_cast<std::int32_t>(qw::detail::mix64(seed + i * 7919U) %
@@ -171,7 +182,10 @@ struct DeviceWeight {
     }
 };
 
-int run_gate_up(std::int32_t tokens) {
+// Whether the route takes `tokens` columns without a device profile.
+bool compiled_gate(std::int32_t tokens) { return tokens >= ops::kCublasPrefillMinTokens; }
+
+int run_gate_up(std::int32_t tokens, bool expected) {
     constexpr std::int32_t kRows = 34816;
     constexpr std::int32_t kCols = 5120;
     constexpr std::int32_t kOut  = kRows / 2;
@@ -196,7 +210,8 @@ int run_gate_up(std::int32_t tokens) {
 
     const std::string label = "LinearSwiGLU Q4 cuBLAS T=" + std::to_string(tokens);
     int failures            = output.verify_guards(label);
-    failures += expect_route(label, workspace, static_cast<std::size_t>(kRows) * kCols, tokens);
+    failures +=
+        expect_route(label, workspace, static_cast<std::size_t>(kRows) * kCols, tokens, expected);
     const std::vector<double> got = read_bf16(output, out_elements);
     Samples s;
     for (const std::int32_t token : sample_tokens(tokens, 3U)) {
@@ -214,7 +229,7 @@ int run_gate_up(std::int32_t tokens) {
 
 // kCols selects the registered profile: 17408 is mlp/down, 6144 the attention o_proj and GDN
 // out_proj. Both go through one route, so both widths are held to the oracle.
-int run_down(std::int32_t tokens, std::int32_t kCols) {
+int run_down(std::int32_t tokens, std::int32_t kCols, bool expected) {
     constexpr std::int32_t kRows = 5120;
 
     DeviceWeight w(QType::Q5_G64_FP16, kRows, kCols, 5501U);
@@ -265,14 +280,15 @@ int run_down(std::int32_t tokens, std::int32_t kCols) {
         std::cerr << label << ": fixture residual is negligible next to the product\n";
         ++failures;
     }
-    failures += expect_route(label, workspace, static_cast<std::size_t>(kRows) * kCols, tokens);
+    failures +=
+        expect_route(label, workspace, static_cast<std::size_t>(kRows) * kCols, tokens, expected);
     return failures + finish(label, s);
 }
 
 // Two parents over one activation, scattered into three destinations: qk -> qkv[0,4096), value_z
 // rows [0,6144) -> qkv[4096,10240) (a destination offset into a wider tensor), rows [6144,12288)
 // -> z. The destination row offset is the part nothing but this test exercises.
-int run_gdn_input(std::int32_t tokens) {
+int run_gdn_input(std::int32_t tokens, bool expected) {
     constexpr std::int32_t kHidden     = 5120;
     constexpr std::int32_t kQkRows     = 4096;
     constexpr std::int32_t kValueRows  = 6144;
@@ -306,7 +322,7 @@ int run_gdn_input(std::int32_t tokens) {
     const std::string label = "GdnInputProj cuBLAS T=" + std::to_string(tokens);
     int failures            = device_qkv.verify_guards(label) + device_z.verify_guards(label);
     failures += expect_route(label, workspace, static_cast<std::size_t>(kParentRows) * kHidden,
-                             tokens);
+                             tokens, expected);
     const std::vector<double> got_qkv =
         read_bf16(device_qkv, static_cast<std::size_t>(kQkvRows) * tokens);
     const std::vector<double> got_z = read_bf16(device_z, static_cast<std::size_t>(kZRows) * tokens);
@@ -341,7 +357,7 @@ int run_gdn_input(std::int32_t tokens) {
 // Two parents over one activation, each split into a wide half and a 1024-row half, four
 // destinations. The narrow halves start mid-parent (row 6144) and are the smallest destinations the
 // route writes.
-int run_attn_input(std::int32_t tokens) {
+int run_attn_input(std::int32_t tokens, bool expected) {
     constexpr std::int32_t kHidden     = 5120;
     constexpr std::int32_t kQRows      = 6144;
     constexpr std::int32_t kKvRows     = 1024;
@@ -380,7 +396,7 @@ int run_attn_input(std::int32_t tokens) {
     int failures = device_q.verify_guards(label) + device_gate.verify_guards(label) +
                    device_k.verify_guards(label) + device_v.verify_guards(label);
     failures += expect_route(label, workspace, static_cast<std::size_t>(kParentRows) * kHidden,
-                             tokens);
+                             tokens, expected);
     const std::vector<double> got_q    = read_bf16(device_q, q_elements);
     const std::vector<double> got_gate = read_bf16(device_gate, q_elements);
     const std::vector<double> got_k    = read_bf16(device_k, kv_elements);
@@ -407,6 +423,45 @@ int run_attn_input(std::int32_t tokens) {
     return failures + finish(label, s);
 }
 
+// A profile that sends every Op's widths the integer route cannot take to the route up to 300 and
+// keeps the multiples of its tile off it up to 640, with a band that asks for the route at 128.
+int run_profile_gates() {
+    if (ops::current_device_volta()) { return 0; }
+    auto profile = std::make_shared<ops::DeviceRouteProfile>();
+    for (const char* family : {"w4_cublas/q4_linear_swiglu", "w4_cublas/linear_add/5120x17408",
+                               "w4_cublas/linear_add/5120x6144", "w4_cublas/q4_q5_gdn_input",
+                               "w4_cublas/q4_q5_attn_input"}) {
+        profile->routes[family]                      = {{300, "on"}};
+        profile->routes[std::string(family) + "/a8"] = {{128, "on"}, {640, "off"}};
+    }
+    ops::install_device_route_profile(profile);
+    int failures = 0;
+    // 200 is below the compiled gate and taken; 512 is the compiled gate and kept on the integer
+    // route; 128 is the widest decode round, which no band moves onto the route.
+    for (const auto& [tokens, expected] :
+         {std::pair{200, true}, std::pair{512, false}, std::pair{128, false}}) {
+        failures += run_gate_up(tokens, expected);
+        failures += run_down(tokens, 17408, expected);
+        failures += run_down(tokens, 6144, expected);
+        failures += run_gdn_input(tokens, expected);
+        failures += run_attn_input(tokens, expected);
+    }
+    // Planning follows the same profile: an interval that reaches only the integer route's 512
+    // holds no materialised weight, one that reaches 200 holds it.
+    const std::size_t weight = std::size_t{34816} * 5120;
+    const std::size_t taken = ops::linear_swiglu_workspace_capacity_bytes(QType::Q4_G64_FP16, 34816,
+                                                                          5120, kPolicy, 129, 256);
+    const std::size_t kept  = ops::linear_swiglu_workspace_capacity_bytes(QType::Q4_G64_FP16, 34816,
+                                                                          5120, kPolicy, 512, 512);
+    if (taken < weight || kept >= weight) {
+        std::cerr << "cuBLAS prefill workspace does not follow the profile: " << taken
+                  << " bytes for 129..256, " << kept << " for 512\n";
+        ++failures;
+    }
+    ops::install_device_route_profile(nullptr);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -416,18 +471,22 @@ int main() {
         // correctly; 512 is the gate; 1000 and 1921 are unaligned, and 1921 puts one token in a
         // second gate_up tile.
         for (const std::int32_t tokens : {128, 512, 1000, 1921}) {
-            failures += run_gate_up(tokens);
-            failures += run_down(tokens, 17408);
-            failures += run_down(tokens, 6144);
+            failures += run_gate_up(tokens, compiled_gate(tokens));
+            failures += run_down(tokens, 17408, compiled_gate(tokens));
+            failures += run_down(tokens, 6144, compiled_gate(tokens));
         }
         // Three tiles at gate_up's 1920: two full and a partial. The larger shapes need far more
         // tokens to tile, so they get their own.
-        failures += run_gate_up(4133);
-        failures += run_down(13057, 6144);
+        failures += run_gate_up(4133, true);
+        failures += run_down(13057, 6144, true);
+        // sm_70's wide route passes over more than 8,192 columns (a Vision item's patches): two
+        // passes, the second partial.
+        failures += run_gate_up(8192 + 263, true);
         for (const std::int32_t tokens : {128, 512, 1000, 5377}) {
-            failures += run_gdn_input(tokens);
-            failures += run_attn_input(tokens);
+            failures += run_gdn_input(tokens, compiled_gate(tokens));
+            failures += run_attn_input(tokens, compiled_gate(tokens));
         }
+        failures += run_profile_gates();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " cuBLAS prefill route correctness\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

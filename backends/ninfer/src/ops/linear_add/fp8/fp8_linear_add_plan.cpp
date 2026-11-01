@@ -73,7 +73,9 @@ std::size_t fp8_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
                                                     std::int32_t max_tokens) {
     return capacity_by_table(
         min_tokens, max_tokens,
-        [](std::int32_t width) { return fused_route_table("unified/fp8_linear_add", width); },
+        [&](std::int32_t width) {
+            return fused_route_table("unified/fp8_linear_add", width, fp8_wide_route_table(policy));
+        },
         [&](LinearRouteTable table, std::int32_t first, std::int32_t last) {
             return table == LinearRouteTable::Unified
                        ? unified::fp8_linear_add_workspace_capacity_bytes(
@@ -85,7 +87,8 @@ std::size_t fp8_linear_add_workspace_capacity_bytes(std::int32_t output_rows,
 
 void fp8_linear_add_dispatch(const Tensor& x, const Weight& weight, Tensor& residual,
                              LinearPolicy policy, WorkspaceArena& workspace, cudaStream_t stream) {
-    if (fused_route_table("unified/fp8_linear_add", x.ne[1]) == LinearRouteTable::Unified) {
+    if (fused_route_table("unified/fp8_linear_add", x.ne[1], fp8_wide_route_table(policy)) ==
+        LinearRouteTable::Unified) {
         unified::fp8_linear_add_dispatch(x, weight, residual, unified_policy(policy), workspace,
                                          stream);
         return;

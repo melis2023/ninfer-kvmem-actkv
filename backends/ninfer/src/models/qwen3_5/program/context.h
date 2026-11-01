@@ -45,6 +45,7 @@ struct ExecutionCore {
     ops::RopeYarn rope_yarn;
     bool fast_prefill_kernel = false;
     std::uint32_t mtp_attention_window = 0;
+    NativeExpertRuntime* experts = nullptr;
     const MemoryStatistics* memory_statistics = nullptr;
 };
 
@@ -88,6 +89,15 @@ struct PrefillContext {
     // the landing batch, which the cache's next poll() frees, so each chunk function calls this
     // immediately before its pass and nothing outside the chunk call can hold the view.
     std::function<std::span<const cudaEvent_t>()> take_layer_ready;
+    // The typed readout's token count: the first generated token's logits are read at
+    // io.readout_ids[0..readout_count) into io.readout_values; zero reads nothing.
+    std::int32_t readout_count = 0;
+    // False runs the chunk without the drafter's prompt work (MTP KV, DFlash features), past a
+    // request's drafter frontier.
+    bool drafter = true;
+    // Enqueues the first token's copies to the host as soon as a text chunk samples it; the chunk
+    // then returns without waiting for the drafter's work behind them. Empty waits for everything.
+    std::function<void()> first_token;
     std::uint32_t cache_position_shift = 0;
 };
 

@@ -323,12 +323,7 @@ struct KvMemStoreConfig {
     uint64_t gpu_resident_block_bytes = 0;
     uint64_t estimated_block_bytes = 0;
     uint64_t cpu_tier_bytes = 0;
-    uint64_t nvme_tier_bytes = 0;
-    std::string nvme_tier_dir;
-    // Reserve the first part of --kvmem-nvme-* for an immutable raw-K
-    // authority. CPU raw-K chunks then become a bounded cache and cold selected
-    // blocks stream directly from SSD into the existing packed staging slabs.
-    bool raw_k_nvme = false;
+
 };
 
 class KvMemStore {
@@ -339,6 +334,10 @@ public:
     }
 
     const KvMemStoreConfig &config() const { return cfg_; }
+    std::vector<uint32_t> query_fixed_blocks(const std::vector<uint32_t>& mandatory) const;
+    std::vector<uint32_t> pick_graph_blocks(const std::vector<uint32_t>& mandatory) const;
+    std::vector<uint32_t> pick_scored_blocks(const std::vector<uint32_t>& candidates,
+        const std::vector<double>& scores,const std::vector<uint32_t>& mandatory,uint32_t budget, bool signed_scores = false) const;
     uint32_t block_count() const { return static_cast<uint32_t>(blocks_.size()); }
     uint32_t total_tokens() const { return total_tokens_; }
     const std::vector<KvMemBlock> &blocks() const { return blocks_; }
@@ -406,18 +405,6 @@ public:
     // the active RoPE window past `select_budget`.
     std::vector<uint32_t> pick_topk_blocks(
         const std::vector<uint32_t> &mandatory_blocks) const;
-
-    // 0.19 Query admission: fixed pages (sink, latest media, mandatory, recent)
-    // plus every remaining slot ranked by the current Query score. The graph
-    // variant consumes the post-propagation scores, which may be signed.
-    std::vector<uint32_t> query_fixed_blocks(
-        const std::vector<uint32_t> &mandatory) const;
-    std::vector<uint32_t> pick_graph_blocks(
-        const std::vector<uint32_t> &mandatory) const;
-    std::vector<uint32_t> pick_scored_blocks(
-        const std::vector<uint32_t> &candidates, const std::vector<double> &scores,
-        const std::vector<uint32_t> &mandatory, uint32_t budget,
-        bool signed_scores = false) const;
 
     // Select complete variable-length logical groups under the ordinary
     // fixed-physical-block budget. `groups` are half-open token spans in the

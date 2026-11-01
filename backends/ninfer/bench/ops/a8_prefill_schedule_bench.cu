@@ -6,8 +6,8 @@
 // the A16 route it replaces is the difference between two cells of one row.
 //
 // It reports TOP/s beside microseconds because that is the number with a known ceiling: 314.8 TOP/s
-// measured by tools/tensor_core_rate_probe.cu. Work is 2*N*K*T, the convention the probes and
-// TODO.md already use, so these cells are comparable with both.
+// measured by tools/tensor_core_rate_probe.cu. Work is 2*N*K*T, the convention the probes already
+// use, so these cells are comparable with them.
 //
 // Cold timing is not optional here. These GEMMs stream tens of MB of weights per call against 6 MB
 // of L2, so a warm loop measures a residency production never has.

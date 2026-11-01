@@ -1,6 +1,8 @@
 // ninfer::ops - hadamard_transform launcher: one warp per (column, 1024-block), four warps per CTA.
 #include "ops/launcher/hadamard_transform.h"
 
+#include "ops/linear/t5/t5_project.h"
+
 #include "core/device.h"
 #include "ops/kernel/hadamard_producers.cuh"
 #include "ops/kernel/hadamard_transform.cuh"
@@ -105,7 +107,7 @@ void sigmoid_mul_hadamard_launch(const Tensor& gate, const Tensor& x, const Tens
     CUDA_CHECK(cudaGetLastError());
 }
 
-void embedding_rotated_t2_launch(const Tensor& ids, const Weight& table, const Tensor& signs,
+void embedding_rotated_ternary_launch(const Tensor& ids, const Weight& table, const Tensor& signs,
                                  Tensor& out, cudaStream_t stream) {
     const std::int32_t width = out.ne[0];
     const std::int64_t items =
@@ -114,12 +116,25 @@ void embedding_rotated_t2_launch(const Tensor& ids, const Weight& table, const T
     if (ctas > std::numeric_limits<unsigned>::max()) {
         throw std::overflow_error("embedding_rotated: grid exceeds the CUDA launch limit");
     }
-    embed_gather_t2_hadamard_kernel<kWarpsPerCta>
-        <<<static_cast<unsigned>(ctas), kWarpsPerCta * kWarpSize, 0, stream>>>(
-            static_cast<const std::int32_t*>(ids.data),
-            static_cast<const std::uint8_t*>(table.qdata), static_cast<const __half*>(table.scales),
-            static_cast<const __nv_bfloat16*>(signs.data), static_cast<__nv_bfloat16*>(out.data),
-            items, width);
+    if (table.qtype == QType::T5_G128_FP16) {
+        t5_embedding(ids, table, signs, out, stream);
+        return;
+    }
+    if (table.qtype == QType::PTQ1_G128_FP16) {
+        embed_gather_t2_hadamard_kernel<kWarpsPerCta, true>
+            <<<static_cast<unsigned>(ctas), kWarpsPerCta * kWarpSize, 0, stream>>>(
+                static_cast<const std::int32_t*>(ids.data),
+                static_cast<const std::uint8_t*>(table.qdata), static_cast<const __half*>(table.scales),
+                static_cast<const __nv_bfloat16*>(signs.data), static_cast<__nv_bfloat16*>(out.data),
+                items, width, static_cast<const std::uint8_t*>(table.qhigh));
+    } else {
+        embed_gather_t2_hadamard_kernel<kWarpsPerCta>
+            <<<static_cast<unsigned>(ctas), kWarpsPerCta * kWarpSize, 0, stream>>>(
+                static_cast<const std::int32_t*>(ids.data),
+                static_cast<const std::uint8_t*>(table.qdata), static_cast<const __half*>(table.scales),
+                static_cast<const __nv_bfloat16*>(signs.data), static_cast<__nv_bfloat16*>(out.data),
+                items, width);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 

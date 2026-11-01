@@ -1,9 +1,12 @@
 #pragma once
 
+#include "ops/common/device_route.h"
 #include "ops/common/memory.cuh"
 #include "ops/linear/q8/q8_geometry.h"
 
 #include <cstdint>
+#include <string>
+#include <string_view>
 
 namespace ninfer::ops::detail {
 
@@ -71,5 +74,37 @@ using Q8KSplitSm8xFourWarpSchedule =
     Q8KSplitSchedule<KWarps, TileTokens, MinBlocksPerSm, ScaleAccess, ActivationCache, WeightCache,
                      ActivationStage>;
 #endif
+
+// The four-K-warp form of a route's 8-column K-split tile, at most 128 registers a thread (four
+// CTAs an SM), which a device profile may select per contraction and width: "q8_ksplit/<rows>x<k>"
+// -> "kw4" (ninfer-calibrate measures it against the route's schedule). On the TITAN RTX four K
+// warps stream the codes of matrices with 6144 rows or more at 420 to 600 GB/s against 230 to 330
+// with eight or sixteen, and the register bound keeps its K-group prefetch (q8_ksplit_mma.cuh) from
+// costing occupancy. A route already on that schedule, or on a wider tile, has no such form.
+template <class Schedule>
+inline constexpr bool kQ8KSplitHasFourWarpForm =
+    Schedule::kTileTokens == 8 && (Schedule::kKWarps != 4 || Schedule::kMinBlocksPerSm < 4);
+
+template <class Schedule>
+using Q8KSplitFourWarpSchedule =
+    Q8KSplitSchedule<4, Schedule::kTileTokens,
+                     (Schedule::kMinBlocksPerSm < 4 ? 4 : Schedule::kMinBlocksPerSm),
+                     Schedule::kScaleAccess, Schedule::kActivationCache, Schedule::kWeightCache,
+                     Schedule::kActivationStage>;
+
+// The device route key of a K-split contraction over `Geometry`.
+template <class Geometry>
+[[nodiscard]] std::string_view q8_ksplit_route_key() {
+    static const std::string key = "q8_ksplit/" + std::to_string(Geometry::kOutputRows) + "x" +
+                                   std::to_string(Geometry::kInputRows);
+    return key;
+}
+
+// Whether the installed device profile runs the 8-column tile of the K-split contraction over
+// `Geometry` on four K warps at `width`.
+template <class Geometry>
+[[nodiscard]] bool q8_ksplit_four_warps(std::int32_t width) {
+    return device_route_schedule(q8_ksplit_route_key<Geometry>(), width) == "kw4";
+}
 
 } // namespace ninfer::ops::detail

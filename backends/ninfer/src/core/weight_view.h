@@ -42,6 +42,7 @@ struct WeightGeometry {
     std::uint64_t code_bytes_per_row  = 0;
     std::uint64_t high_bytes_per_row  = 0;
     std::uint64_t scale_bytes_per_row = 0;
+    std::uint64_t row_stride_bytes    = 0; // nonzero when codes and scales share each row
     std::uint64_t code_bytes          = 0;
     std::uint64_t high_offset         = 0;
     std::uint64_t high_bytes          = 0;

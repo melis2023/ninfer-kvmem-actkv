@@ -44,11 +44,14 @@ int run_fp8(int heads, int tokens, std::uint32_t seed) {
     std::vector<double> expected(static_cast<std::size_t>(rows) * kWidth);
     std::mt19937 random(seed);
     for (int r = 0; r < rows; ++r) {
-        // Positive normal FP16 scales from 2^-12 to 2^4.
-        const std::uint16_t scale = static_cast<std::uint16_t>(((3 + random() % 17) << 10) | (random() & 0x3ff));
+        // Zero, subnormals, the normal boundary and largest finite FP16, plus normal scales.
+        constexpr std::uint16_t boundaries[] = {0, 1, 0x3ff, 0x400, 0x7bff};
+        const std::uint16_t scale = r % 37 < 5 ? boundaries[r % 37] :
+            static_cast<std::uint16_t>(((3 + random() % 17) << 10) | (random() & 0x3ff));
         for (int j = 0; j < kWidth; ++j) {
             std::uint8_t code = static_cast<std::uint8_t>((r * kWidth + j) & 0xff);
             if ((code & 0x7f) == 0x7f) code ^= 0x01; // E4M3FN NaN
+            if (scale == 0) code = 0;
             staged[static_cast<std::size_t>(r) * row_bytes + j] = code;
             expected[static_cast<std::size_t>(r) * kWidth + j] = decode_e4m3(code) * decode_fp16(scale);
         }

@@ -17,6 +17,7 @@
 #include "quantized_weight.cuh"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_profiler_api.h>
 #include <cuda_runtime.h>
 
@@ -26,6 +27,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -230,7 +232,37 @@ std::string lower(std::string_view text) {
     return out;
 }
 
+// GGUF block formats: their names, and the byte offsets of each block's binary16 multipliers,
+// which the benchmark sets to finite values over otherwise random blocks.
+struct GgufBenchType {
+    QType qtype;
+    const char* name;
+    std::vector<int> half_fields;
+};
+
+const std::vector<GgufBenchType>& gguf_bench_types() {
+    static const std::vector<GgufBenchType> types = {
+        {QType::GGUF_Q8_0, "q8_0", {0}},       {QType::GGUF_Q2_K, "q2_k", {80, 82}},
+        {QType::GGUF_Q3_K, "q3_k", {108}},     {QType::GGUF_Q4_K, "q4_k", {0, 2}},
+        {QType::GGUF_Q5_K, "q5_k", {0, 2}},    {QType::GGUF_Q6_K, "q6_k", {208}},
+        {QType::GGUF_IQ2_XXS, "iq2_xxs", {0}}, {QType::GGUF_IQ2_XS, "iq2_xs", {0}},
+        {QType::GGUF_IQ2_S, "iq2_s", {0}},     {QType::GGUF_IQ3_XXS, "iq3_xxs", {0}},
+        {QType::GGUF_IQ3_S, "iq3_s", {0}},     {QType::GGUF_IQ4_NL, "iq4_nl", {0}},
+        {QType::GGUF_IQ4_XS, "iq4_xs", {0}},   {QType::GGUF_Q4_0, "q4_0", {0}},
+        {QType::GGUF_Q5_0, "q5_0", {0}},       {QType::GGUF_Q2_0, "q2_0", {0}},
+    };
+    return types;
+}
+
+const GgufBenchType* find_gguf_bench_type(QType qtype) {
+    for (const GgufBenchType& type : gguf_bench_types()) {
+        if (type.qtype == qtype) { return &type; }
+    }
+    return nullptr;
+}
+
 const char* qtype_name(QType qtype) {
+    if (const GgufBenchType* gguf = find_gguf_bench_type(qtype)) { return gguf->name; }
     switch (qtype) {
     case QType::Q4_G64_FP16:
         return "Q4";
@@ -259,6 +291,7 @@ const char* policy_name(LinearPolicy policy) {
     if (policy == LinearPolicy::AllowA8) { return "A8"; }
     if (policy == LinearPolicy::AllowA4) { return "A4"; }
     if (policy == LinearPolicy::AllowA8Int) { return "A8I"; }
+    if (policy == LinearPolicy::AllowNvfp4Int8) { return "NVFP4I8"; }
     throw std::invalid_argument("unsupported Linear benchmark policy");
 }
 
@@ -272,6 +305,9 @@ QType parse_qtype(std::string_view text) {
     if (value == "bf16") { return QType::BF16; }
     if (value == "nvfp4") { return QType::NVFP4; }
     if (value == "fp8" || value == "fp8_e4m3fn_row_bf16") { return QType::FP8_E4M3FN_ROW_BF16; }
+    for (const GgufBenchType& type : gguf_bench_types()) {
+        if (value == type.name) { return type.qtype; }
+    }
     throw std::invalid_argument("unknown qtype: " + std::string(text));
 }
 
@@ -281,7 +317,9 @@ LinearPolicy parse_policy(std::string_view text) {
     if (value == "a8" || value == "allowa8") { return LinearPolicy::AllowA8; }
     if (value == "a4" || value == "allowa4") { return LinearPolicy::AllowA4; }
     if (value == "a8int" || value == "allowa8int") { return LinearPolicy::AllowA8Int; }
-    throw std::invalid_argument("Linear benchmark policy must be a16, a8, a4, or a8int");
+    if (value == "nvfp4int8" || value == "allownvfp4int8") { return LinearPolicy::AllowNvfp4Int8; }
+    throw std::invalid_argument(
+        "Linear benchmark policy must be a16, a8, a4, a8int, or nvfp4int8");
 }
 
 std::uint64_t parse_u64(std::string_view text, const char* label) {
@@ -342,9 +380,12 @@ void usage(const char* argv0) {
                  "  %s --qtype Q4|Q5|Q6|Q8|T2|BF16|NVFP4|FP8 --n N --k K --t T [options]\n"
                  "  %s --qtype Q4|Q5|Q6|Q8|T2|BF16|NVFP4|FP8 --n N --k K --sweep START:END[:STEP] "
                  "[options]\n"
-                 "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|all [options]\n\n"
+                 "  %s --suite qwen3_6_27b|qwen3_6_35b_a3b|all [options]\n"
+                 "  --qtype also takes a GGUF block type (q8_0, q2_k, q3_k, q4_k, q5_k, q6_k,\n"
+                 "  iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq4_nl, iq4_xs, q4_0, q5_0, q2_0) over\n"
+                 "  random blocks.\n\n"
                  "Options:\n"
-                 "  --policy a16|a8|a4|a8int Activation-compute policy (default a16).\n"
+                 "  --policy a16|a8|a4|a8int|nvfp4int8 Activation-compute policy (default a16).\n"
                  "  --execution MODE   eager (default) or graph; time the complete Op.\n"
                  "  --graph-calls N    Calls per timed graph (1..64, default 1); report per call.\n"
                  "  --profile          Capture exactly one post-warmup public Linear call.\n"
@@ -524,7 +565,45 @@ std::vector<PointGroup> group_points(const std::vector<BenchPoint>& points) {
     return groups;
 }
 
+// Random GGUF blocks with finite multipliers, as the format's projections read them.
+LinearBenchWeight make_gguf_weight(const GgufBenchType& type, std::int32_t n, std::int32_t k) {
+    const GgufBlockShape block = gguf_block_shape(type.qtype);
+    if (k % block.elements != 0) {
+        throw std::invalid_argument("K must be a whole number of the format's blocks");
+    }
+    const std::uint64_t blocks = static_cast<std::uint64_t>(n) * (k / block.elements);
+    std::vector<std::uint8_t> bytes(blocks * block.bytes);
+    std::uint64_t state = 0x9e3779b97f4a7c15ULL;
+    for (auto& b : bytes) {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        b     = static_cast<std::uint8_t>(state >> 56);
+    }
+    for (std::uint64_t i = 0; i < blocks; ++i) {
+        for (const int offset : type.half_fields) {
+            const __half h = __float2half(0.002f + 0.018f * float((i * 2654435761ULL) % 1000) / 1000.0f);
+            std::memcpy(bytes.data() + i * block.bytes + offset, &h, sizeof(h));
+        }
+    }
+    LinearBenchWeight out;
+    out.storage = DeviceBuffer(bytes.size() + 4096);
+    out.storage.fill(0);
+    out.storage.copy_from_host(bytes.data(), bytes.size());
+    Weight& w  = out.weight;
+    w.qtype    = type.qtype;
+    w.layout   = QuantLayout::GgufBlocks;
+    w.qdata    = out.storage.p;
+    w.payload  = out.storage.p;
+    w.n = w.shape[0] = w.padded_shape[0] = n;
+    w.k = w.shape[1] = w.padded_shape[1] = k;
+    w.ndim       = 2;
+    w.group_size = static_cast<std::uint32_t>(block.elements);
+    w.group      = block.elements;
+    out.model_bytes = bytes.size();
+    return out;
+}
+
 LinearBenchWeight make_weight(QType qtype, std::int32_t n, std::int32_t k) {
+    if (const GgufBenchType* gguf = find_gguf_bench_type(qtype)) { return make_gguf_weight(*gguf, n, k); }
     if (qtype == QType::BF16) {
         bench::DirectBf16Weight direct  = bench::make_direct_bf16_weight(n, k);
         const std::uint64_t model_bytes = direct.model_weight_bytes();

@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include "prefix_checkpoint.hpp"
 #include <cstdlib>
 #include <memory>
@@ -84,9 +84,9 @@ public:
     bool remember(Record record, CoveragePurpose purpose) {
         if (!policy_.enabled) return false;
         const auto info = record.checkpoint_info();
-        if (!info.identity || !info.frontier || info.bytes > policy_.bytes) return false;
+        if (!info.storage || !info.frontier || info.bytes > policy_.bytes) return false;
         // Pointer identity denotes one immutable payload, never frontier equality.
-        for (auto & entry : entries_) if (entry.info.identity == info.identity) {
+        for (auto & entry : entries_) if (entry.info.identity == info.storage) {
             if (entry.info.frontier != info.frontier) throw std::logic_error("checkpoint identity changed frontier");
             entry.info.used = ++clock_;
             entry.info.bytes = info.bytes;
@@ -101,12 +101,12 @@ public:
             if (entries_[i].info.identity && entries_[i].info.frontier == info.frontier) { slot = i; break; }
             if (!entries_[i].info.identity && slot == entries_.size()) slot = i;
         }
-        Entry incoming{std::move(record), {info.frontier, info.bytes, ++clock_, info.identity, purpose}};
+        Entry incoming{std::move(record), {info.frontier, info.bytes, ++clock_, info.storage, purpose}};
         incoming.info.protections = purpose == CoveragePurpose::Root ? 1 : purpose == CoveragePurpose::Anchor ? 2 : 0;
         if (slot == entries_.size()) entries_.push_back(std::move(incoming));
         else entries_[slot] = std::move(incoming);
         prune();
-        return entries_[slot].info.identity == info.identity;
+        return entries_[slot].info.identity == info.storage;
     }
     void prune(const std::vector<CheckpointInfo> & fixed = {}) {
         // Fixed execution leases cannot be evicted here. Charge distinct payloads

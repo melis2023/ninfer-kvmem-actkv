@@ -295,7 +295,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
 
     const std::int64_t created = unix_time_now();
     auto lifecycle             = begin_request(make_request_log_context(
-        req_id, "openai_responses", resolved.generation, metadata, prepared));
+        req_id, "openai_responses", resolved.generation, metadata, prepared), prepared);
     resolved.generation.messages.clear();
 
     if (!request.stream) {

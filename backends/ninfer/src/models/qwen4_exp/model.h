@@ -16,8 +16,10 @@
 #include "models/qwen3_5/model.h"
 #include "models/qwen3_5/weights.h"
 #include "models/qwen4_exp/config.h"
+#include "models/qwen4_exp/expert_location.h"
 #include "ninfer/ops/weight_input.h"
-#include "ninfer/types.h"
+#include "ninfer/model_enums.h"
+#include "ninfer/startup.h"
 
 #include <array>
 #include <cstdint>
@@ -26,6 +28,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -56,22 +59,6 @@ struct GdnWeights {
     WeightId convolution, norm, output;
 };
 
-// Where one expert's rows of one projection sit in the artifact's files (disk-resident experts):
-// one run of one file, or two when the rows straddle the boundary between two files.
-struct ExpertLocation {
-    struct Run {
-        std::size_t file     = 0; // index into Model::files()
-        std::uint64_t offset = 0; // byte offset in that file
-        std::uint64_t bytes  = 0; // 0: unused
-    };
-
-    std::array<Run, 2> runs{};
-    std::uint64_t bytes    = 0; // of all runs
-    QType format           = QType::GGUF_Q8_0;
-    std::int64_t row_bytes = 0;
-    std::int32_t rows      = 0;
-};
-
 struct MoeWeights {
     WeightId router, shared_score;
     // One per expert; empty when the experts stay in the files, which `located` then describes.
@@ -97,6 +84,14 @@ struct TextWeights {
     std::vector<LayerWeights> layers;
 };
 
+// The MTP block (vLLM Qwen4ExpMultiTokenPredictor): the two input norms and projections, one
+// sparse-attention layer with its own MoE, and its final mixer. The token embedding and the head
+// are the text model's.
+struct MtpWeights {
+    WeightId embedding_norm, hidden_norm, fc_embedding, fc_hidden;
+    LayerWeights layer;
+    HyperConnectionWeights final_mixer;
+};
 
 struct LoadOptions {
     // The artifact's entry file; its part files sit next to it.
@@ -109,6 +104,9 @@ struct LoadOptions {
     // Loads the Vision tower the artifact carries (its `vision` component, the Qwen3.5 tower) onto
     // the first stage's device, beside the token embedding its output joins.
     bool vision = false;
+    // Loads the MTP block the artifact carries (its `mtp` component) onto the last stage's device,
+    // beside the head it shares; its experts take the text layers' residency.
+    bool mtp = false;
 };
 
 class Model {
@@ -136,6 +134,17 @@ public:
     // The weight's one mathematical use, as a projection operand, its auxiliaries on the weight's
     // device.
     [[nodiscard]] ops::WeightInput input(WeightId id) const;
+    // The use of a weight read by several inputs (the head, which the MTP block reads too).
+    [[nodiscard]] ops::WeightInput input(WeightId id, std::string_view use) const;
+
+    // The MTP block when the model was loaded with it.
+    [[nodiscard]] const std::optional<MtpConfig>& mtp_config() const noexcept {
+        return mtp_config_;
+    }
+
+    [[nodiscard]] const std::optional<MtpWeights>& mtp_weights() const noexcept {
+        return mtp_weights_;
+    }
 
     [[nodiscard]] const FrontendResources& resources() const noexcept { return resources_; }
 
@@ -178,6 +187,8 @@ private:
     qwen3_5::AuxiliaryReplicas replicas_;
     std::optional<qwen3_5::VisionConfig> vision_config_;
     std::optional<qwen3_5::VisionWeights> vision_weights_;
+    std::optional<MtpConfig> mtp_config_;
+    std::optional<MtpWeights> mtp_weights_;
 };
 
 // Whether the artifact's text component is this family.

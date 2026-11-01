@@ -102,7 +102,7 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
     const int input_tokens = prepared.prompt_tokens;
 
     auto lifecycle = begin_request(make_request_log_context(
-        req_id, "anthropic_messages", request.generation, metadata, prepared));
+        req_id, "anthropic_messages", request.generation, metadata, prepared), prepared);
 
     if (!request.stream) {
         GenerationOutcome outcome;

@@ -15,7 +15,7 @@ void nvfp4_attn_input_decode_launch(const Tensor& x, const Weight& weight, Tenso
                                     Tensor& k, Tensor& v, cudaStream_t stream) {
     using Geometry = Nvfp4N14336K5120;
     using Schedule =
-        Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
+        Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Streaming, 4>;
     static_assert((6144 % 128) == 0);
     static_assert((1024 % 128) == 0);
 

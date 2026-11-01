@@ -38,18 +38,11 @@ void launch(const Tensor& x, const Weight& down, Tensor& residual, std::int32_t 
         reinterpret_cast<const __nv_bfloat16*>(x.data), tokens, codes, scales);
     CUDA_CHECK(cudaGetLastError());
 
-    const std::size_t smem = a8::shared_bytes<Codec, 1, NT, Rows>(kCols);
-    const dim3 grid(kRows / Rows::kRowsPerBlock, tokens / BN);
-    auto* kernel = a8::a8_mma_kernel<Codec, kCols, 1, NT, Rows, a8::ResidualAddEpilogue>;
-    if (smem > 48 * 1024) {
-        configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        static_cast<int>(smem));
-        });
-    }
-    kernel<<<grid, a8::kThreads, smem, stream>>>(
-        static_cast<const std::uint8_t*>(down.qdata), static_cast<const std::uint8_t*>(down.qhigh),
-        static_cast<const __half*>(down.scales), codes, scales, tokens, Rows{0},
+    const dim3 grid(kRows / Rows::kRowsPerBlock, a8::padded_tokens(tokens) / BN);
+    a8::launch_a8_mma<Codec, kCols, 1, NT, Rows, a8::ResidualAddEpilogue>(
+        grid, stream, static_cast<const std::uint8_t*>(down.qdata),
+        static_cast<const std::uint8_t*>(down.qhigh), static_cast<const __half*>(down.scales),
+        codes, scales, tokens, Rows{0},
         a8::ResidualAddEpilogue{reinterpret_cast<__nv_bfloat16*>(residual.data), kRows},
         row_split_panel_shift(down.layout));
     CUDA_CHECK(cudaGetLastError());
@@ -58,7 +51,7 @@ void launch(const Tensor& x, const Weight& down, Tensor& residual, std::int32_t 
 template <class Codec, std::int32_t kCols>
 void launch_for_tile(const Tensor& x, const Weight& down, Tensor& residual, std::int32_t tokens,
                      std::int8_t* codes, __half* scales, cudaStream_t stream) {
-    switch (a8::token_tile(tokens, 512)) {
+    switch (a8::token_tile(a8::padded_tokens(tokens), 512)) {
     case 512:
         launch<Codec, kCols, 16>(x, down, residual, tokens, codes, scales, stream);
         return;
@@ -102,7 +95,7 @@ std::size_t a8_add_workspace_capacity_bytes(std::int32_t input_rows, std::int32_
     if (input_rows != kDownCols && input_rows != kMixerCols) {
         throw std::invalid_argument("a8 add workspace: unregistered input width");
     }
-    return a8::activation_workspace_bytes(input_rows, max_tokens);
+    return a8::padded_activation_workspace_bytes(input_rows, max_tokens);
 }
 
 void a8_add_launch(const Tensor& x, const Weight& down, Tensor& residual, WorkspaceArena& workspace,
@@ -112,12 +105,11 @@ void a8_add_launch(const Tensor& x, const Weight& down, Tensor& residual, Worksp
         throw std::invalid_argument("a8 add: unsupported profile");
     }
 
-    auto scope = workspace.scope();
-    const DeviceSpan codes =
-        workspace.alloc_bytes(static_cast<std::size_t>(tokens) * static_cast<std::size_t>(down.k));
-    const DeviceSpan scales =
-        workspace.alloc_bytes(static_cast<std::size_t>(tokens) *
-                              (static_cast<std::size_t>(down.k) / a8::kGroup) * sizeof(__half));
+    const auto columns      = static_cast<std::size_t>(a8::padded_tokens(tokens));
+    auto scope              = workspace.scope();
+    const DeviceSpan codes  = workspace.alloc_bytes(columns * static_cast<std::size_t>(down.k));
+    const DeviceSpan scales = workspace.alloc_bytes(
+        columns * (static_cast<std::size_t>(down.k) / a8::kGroup) * sizeof(__half));
     auto* code_data  = reinterpret_cast<std::int8_t*>(codes.data);
     auto* scale_data = reinterpret_cast<__half*>(scales.data);
 

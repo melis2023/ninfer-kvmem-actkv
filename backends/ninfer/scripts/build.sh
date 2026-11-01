@@ -8,7 +8,7 @@
 #
 #   ./scripts/build.sh                 configure + build into build-linux
 #   ./scripts/build.sh --test          ... then run the test suite
-#   ./scripts/build.sh --package       ... then build the release archive for VERSION
+#   ./scripts/build.sh --package       ... then build the release archive labelled with CUDA, architectures and commit
 #   ./scripts/build.sh --benchmarks    ... include bench/ (implied by --package)
 #   ./scripts/build.sh --clean         delete the build directory first
 #   ./scripts/build.sh --target ninfer-serve
@@ -51,7 +51,7 @@ done
 # to be kept consistent by hand.
 if (( package )); then benchmarks=1; fi
 
-case "$arch" in 80|86|89|120a) ;; *) printf 'CUDA arch must be 80, 86, 89 or 120a, got %s\n' "$arch" >&2; exit 2 ;; esac
+case "$arch" in 70|75|80|86|89|120a) ;; *) printf 'CUDA arch must be 70, 75, 80, 86, 89 or 120a, got %s\n' "$arch" >&2; exit 2 ;; esac
 
 # --- locate the toolchain ---------------------------------------------------------------------
 
@@ -90,7 +90,9 @@ cd -- "$repo_root"
 benchmarks_option=OFF
 if (( benchmarks )); then benchmarks_option=ON; fi
 
-cmake -S . -B "$build_dir" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="$arch" \
+runtime=OFF
+if [[ "$package" == 1 ]]; then runtime=ON; fi
+cmake -S . -B "$build_dir" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="$arch" -DNINFER_SHARED_RUNTIME="$runtime" \
       -DNINFER_BUILD_BENCHMARKS="$benchmarks_option"
 if [[ -n "$target" ]]; then
   cmake --build "$build_dir" --target "$target"

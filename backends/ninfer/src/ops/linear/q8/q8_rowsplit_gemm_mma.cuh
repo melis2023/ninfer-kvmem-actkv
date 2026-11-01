@@ -8,6 +8,7 @@
 // shared tile; x uses a two-stage cp.async pipeline. Tensor Cores execute
 // m16n8k16 BF16 MMA with FP32 accumulation.
 
+#include "ops/common/device_limits.h"
 #include "ops/common/mma.cuh"
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
@@ -113,7 +114,7 @@ struct Q8RowSplitMmaGemmSchedule {
     static_assert(STAGES == 2, "Q8G32 MMA uses a two-stage cp.async pipeline");
     static_assert(ACTIVATION_STAGES == 1 || ACTIVATION_STAGES == STAGES,
                   "Q8G32 MMA activation staging is single-buffered or follows the pipeline");
-    static_assert(SMEM_BYTES <= 99 * 1024, "sm_120a per-CTA shared memory limit");
+    static_assert(SMEM_BYTES <= kMaxSharedBytesPerBlockSm8x, "sm_120a per-CTA shared memory limit");
 };
 
 __device__ __forceinline__ int q8_g32_swz64(int row, int col) {
@@ -152,7 +153,7 @@ __global__ __launch_bounds__(Cfg::THREADS, Cfg::MIN_BLOCKS) void q8_rowsplit_gem
         float projected[Epilogue == Q8Epilogue::Residual ? BM * BN : 1];
     };
 
-    static_assert(sizeof(SharedStorage) <= 99 * 1024);
+    static_assert(sizeof(SharedStorage) <= kMaxSharedBytesPerBlockSm8x);
     __shared__ __align__(16) SharedStorage shared;
     auto& As = shared.operands.weights;
     auto& Bs = shared.operands.activations;

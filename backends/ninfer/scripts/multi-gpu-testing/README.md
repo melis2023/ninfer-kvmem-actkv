@@ -6,7 +6,8 @@ rented dual-GPU hardware. The tests that need a real second card are
 measures the boundary-transfer cost the pipeline pays and decides whether tensor parallelism is
 worth building on that box.
 They assume a vast.ai instance, but nothing here is specific to that provider beyond the CLI calls
-in `iterate.sh`. The scripts clone and fetch `NINFER_REPO` at `NINFER_BRANCH`, by default this
+in `iterate.sh`. The rental harness in [`scripts/pods`](../pods/README.md) covers the same work
+with a guard, local state and artifact mirroring, and is the one maintained for current rentals. The scripts clone and fetch `NINFER_REPO` at `NINFER_BRANCH`, by default this
 repository's `master`; the build target follows the first GPU's compute capability unless
 `NINFER_ARCH` names one (`86` for the RTX 30 and 40 series, `120a` for Blackwell, which needs CUDA
 13.1 or newer in the image).

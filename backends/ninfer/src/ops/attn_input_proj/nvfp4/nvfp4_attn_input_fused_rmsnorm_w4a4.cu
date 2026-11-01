@@ -1,4 +1,5 @@
 #include "ops/attn_input_proj/nvfp4/nvfp4_attn_input_plan.h"
+#include "ops/common/blackwell_routes.h"
 
 #include "core/device.h"
 #include "ops/kernel/rmsnorm.cuh"
@@ -101,6 +102,7 @@ void launch_nvfp4_attn_input_fused_rmsnorm_quantize(const Tensor& residual,
                                                     float input_scale_divisor,
                                                     Nvfp4W4a4Workspace workspace,
                                                     cudaStream_t stream) {
+    require_nvfp4_a4_card();
     const std::int32_t tokens = residual.ne[1];
     rmsnorm_nvfp4_quantize_kernel<Nvfp4ScaleLayout::Tiled>
         <<<nvfp4_w4a4_padded_tokens(tokens), kBlock, 0, stream>>>(
@@ -115,6 +117,7 @@ void launch_nvfp4_attn_input_fused_rmsnorm_quantize_rowmajor(const Tensor& resid
                                                              float input_scale_divisor,
                                                              Nvfp4W4a4Workspace workspace,
                                                              cudaStream_t stream) {
+    require_nvfp4_a4_card();
     const std::int32_t tokens = residual.ne[1];
     rmsnorm_nvfp4_quantize_kernel<Nvfp4ScaleLayout::RowMajor>
         <<<static_cast<std::uint32_t>(tokens), kBlock, 0, stream>>>(
@@ -128,6 +131,7 @@ void nvfp4_attn_input_fused_rmsnorm_launch(const Tensor& residual, const Tensor&
                                            float eps, const Weight& weight, Tensor& q, Tensor& gate,
                                            Tensor& k, Tensor& v, WorkspaceArena& workspace,
                                            cudaStream_t stream) {
+    require_nvfp4_a4_card();
     const std::int32_t tokens = residual.ne[1];
     // T==1 takes the GEMV consumer, 4<=T<1024 the RowMajor-quantize + MMA consumer, and
     // T>=1024 the Tiled-quantize + TMA consumer. T==2,3 have no fused entry (measured

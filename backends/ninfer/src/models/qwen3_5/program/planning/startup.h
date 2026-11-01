@@ -42,7 +42,7 @@ struct MemoryStatisticsLayout {
     TensorLayout candidate_keys;
     TensorLayout candidate_origin;
     TensorLayout prefill_origin;
-    TensorLayout query_sums;
+    TensorLayout query_values;
     TensorLayout attention_queries;
     TensorLayout attention_tokens;
     TensorLayout attention_rows, attention_positions, attention_scratch, attention_norms, attention_output;
@@ -50,7 +50,7 @@ struct MemoryStatisticsLayout {
 };
 
 struct PersistentLayout {
-    TensorLayout memory_query_workspace;
+    std::optional<TensorLayout> memory_query_workspace;
     qwen3_5::DecoderStateLayout decoder;
     qwen3_5::StateImageDeviceLayout state_images;
     // ReplaySSM records, one layout per state shard: the first here, the rest in `extra`.
@@ -117,7 +117,6 @@ struct SequencePlanningInputs {
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
     bool fast_prefill_kernel                = false;
-    bool invariant_attention                = false;
     std::uint32_t draft_window              = 0;
     std::uint32_t lookup_ngram             = 0;
     MtpDraftPolicy mtp_policy               = MtpDraftPolicy::Fixed;
@@ -129,6 +128,7 @@ struct SequencePlanningInputs {
     ops::RopeYarn rope_yarn;
     std::uint32_t mtp_attention_window = 0;
     models::LoadOptions features;
+    std::optional<std::uint64_t> expert_cache_bytes;
     bool use_cuda_graph    = true;
     // Nonzero replaces the computed per-profile CUDA Graph allowance in total.
     std::size_t cuda_graph_allowance_bytes = 0;
@@ -155,7 +155,6 @@ struct SequencePlanImpl {
     std::uint32_t max_concurrency           = 1;
     std::uint32_t prefill_chunk             = 0;
     bool fast_prefill_kernel                = false;
-    bool invariant_attention                = false;
     std::uint32_t draft_window              = 0;
     std::uint32_t lookup_ngram             = 0;
     MtpDraftPolicy mtp_policy               = MtpDraftPolicy::Fixed;
@@ -168,6 +167,7 @@ struct SequencePlanImpl {
     ops::RopeYarn rope_yarn;
     std::uint32_t mtp_attention_window = 0;
     models::LoadOptions features;
+    std::optional<std::uint64_t> expert_cache_bytes;
     bool use_cuda_graph    = true;
     bool causal_scoring    = false;
     bool structured_output = false;
@@ -195,6 +195,13 @@ struct SequencePlanImpl {
                                        (widest_verify_window(plan) + 1U));
 }
 
+// The int32 control block a stage boundary carries for `columns` columns: cache positions,
+// RoPE positions (three rows with multimodal RoPE), KV table rows, valid columns and the source and
+// destination state slots, each at most `columns` entries, plus alignment.
+[[nodiscard]] inline std::uint64_t stage_control_bytes(std::uint64_t columns) noexcept {
+    return (8U * columns + 16U) * sizeof(std::int32_t);
+}
+
 struct SequencePlannerImpl {
     SequencePlanningInputs inputs;
     runtime::SequenceCapacityCurve curve;
@@ -217,11 +224,8 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
 finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl> planner,
                             std::uint32_t main_page_groups);
 
-// Builds a full-logical-context plan with the caller's physical page count, bypassing the
-// capacity-curve minimum. Used only to capture the startup graph set; the plan is never served.
 [[nodiscard]] std::unique_ptr<SequencePlanImpl>
-make_graph_probe_plan(const execution::Parameters& parameters, DeviceContext& device,
-                      const EngineOptions& options, std::uint32_t main_page_groups);
+make_graph_probe_plan(const execution::Parameters&, DeviceContext&, const EngineOptions&);
 
 // Resolves the single Host RAM budget into the plan's context-cache shape: one StateImage per
 // position it retains and Host KV for everything else. StateImages are the fixed per-position cost

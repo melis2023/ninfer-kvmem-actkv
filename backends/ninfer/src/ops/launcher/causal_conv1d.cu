@@ -135,6 +135,14 @@ void causal_conv1d_smallt_split_launch(const Tensor& x, const Tensor& weight,
         smallt_split_launch<2048, 2048, 6144>(x, weight, conv_state_in, conv_state_out, out0, out1,
                                               out2, stream);
         return;
+    case CausalConvSplitGeometry::Rows1024x1024x3072:
+        smallt_split_launch<1024, 1024, 3072>(x, weight, conv_state_in, conv_state_out, out0, out1,
+                                              out2, stream);
+        return;
+    case CausalConvSplitGeometry::Rows512x512x1536:
+        smallt_split_launch<512, 512, 1536>(x, weight, conv_state_in, conv_state_out, out0, out1,
+                                            out2, stream);
+        return;
     }
     throw std::logic_error("causal_conv1d: unhandled split geometry");
 }
@@ -182,6 +190,14 @@ void causal_conv1d_prefill_split_launch(const Tensor& x, const Tensor& weight,
     case CausalConvSplitGeometry::Rows2048x2048x6144:
         prefill_split_launch<2048, 2048, 6144>(x, weight, conv_state_in, conv_state_out, out0, out1,
                                                out2, stream);
+        return;
+    case CausalConvSplitGeometry::Rows1024x1024x3072:
+        prefill_split_launch<1024, 1024, 3072>(x, weight, conv_state_in, conv_state_out, out0, out1,
+                                               out2, stream);
+        return;
+    case CausalConvSplitGeometry::Rows512x512x1536:
+        prefill_split_launch<512, 512, 1536>(x, weight, conv_state_in, conv_state_out, out0, out1,
+                                             out2, stream);
         return;
     }
     throw std::logic_error("causal_conv1d: unhandled split geometry");

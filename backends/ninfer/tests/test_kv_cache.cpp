@@ -467,6 +467,28 @@ int exercise_layout_and_transfer(ninfer::DeviceContext& context, ninfer::KVPageG
         const std::vector<ninfer::DeviceKVPageHandle> record_handles = handles(from_records);
         destination.zero_pages(record_handles, context.stream);
         std::vector<const std::byte*> const_records(records.begin(), records.end());
+        // The diagnostic must describe the transfer's actual host-allocation and pitch
+        // boundaries, rather than just the physical page runs. The scattered slabs above
+        // form three copy runs; assigning a different allocation group to every row splits
+        // those into five without changing the byte payload.
+        const auto merged = source.host_record_copy_stats(source_handles, const_records, {}, host_layout);
+        const std::array<std::uint32_t, 5> individual_groups{0, 1, 2, 3, 4};
+        const auto individual = source.host_record_copy_stats(
+            source_handles, const_records, individual_groups, host_layout);
+        std::uint64_t bytes_per_record = 0, calls_per_run = 0;
+        for (std::size_t plane = 0; plane < source.plane_count(); ++plane) {
+            bytes_per_record += host_layout.planes[plane].page_payload_bytes;
+            calls_per_run += geometry.device_plane_order == ninfer::PagedKVPlaneOrder::PageMajor
+                ? 1U : static_cast<std::uint64_t>(source.plane(plane).ne[3]);
+        }
+        failures += expect(merged.runs == 3 && merged.copies == 3 * calls_per_run &&
+                           individual.runs == 5 && individual.copies == 5 * calls_per_run &&
+                           merged.payload_bytes == 5 * bytes_per_record &&
+                           individual.payload_bytes == merged.payload_bytes,
+                           label + " copy diagnostics lost run, head or allocation boundaries");
+        const auto empty = source.host_record_copy_stats({}, {}, {}, host_layout);
+        failures += expect(empty.runs == 0 && empty.copies == 0 && empty.payload_bytes == 0,
+                           label + " empty transfer has nonzero diagnostic work");
         destination.copy_from_host_records(const_records, {}, record_handles, host_layout,
                                            context.stream);
         std::optional<ninfer::HostKVAllocation> record_roundtrip =

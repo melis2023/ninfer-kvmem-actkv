@@ -16,6 +16,7 @@
 #include "models/qwen3_5/state/decoder_state.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/round_buffers.h"
+#include "models/qwen3_5/execution/rotation.h"
 #include "models/qwen3_5/execution/stage_runtime.h"
 
 #include <array>
@@ -26,6 +27,8 @@
 #include <vector>
 
 namespace ninfer::models::qwen3_5::execution {
+
+class NativeExpertRuntime;
 
 using Phase = qwen3_5::TextPhase;
 
@@ -68,6 +71,48 @@ struct DFlashFeatureSink {
 
 class VisionPrefillSession;
 
+// The most segments one batched prefill pass runs: a lane's last prompt chunk, or a branched
+// read's prompt part and its branch blocks.
+inline constexpr std::size_t kMaximumPrefillSegments = 64;
+
+// What a batched prefill segment produces at its last column.
+enum class SegmentOutput : std::uint8_t {
+    // Samples its next token as a finalizing chunk does, with its logprob record and readout.
+    Sample,
+    // A branch block: the greedy token, its logprob record and readout, without the sampler.
+    Read,
+    // A branched read's prompt part: nothing.
+    None,
+};
+
+// One segment of a batched prefill pass (TextContext::prefill_final_batch).
+struct PrefillSegment {
+    // The segment's tokens: a lane's prompt up to its frontier, or one branch's own tokens.
+    std::span<const int> ids;
+    // The absolute position of ids[0]; a branch continues its read's prompt frontier.
+    std::uint32_t begin                 = 0;
+    std::int32_t kv_table_row           = 0;
+    std::int32_t state_source_slot      = 0;
+    // Negative for a branch block: its GDN state goes to a transient buffer per layer and is not
+    // kept, and its K/V rows past the prompt frontier are scratch the next block overwrites.
+    std::int32_t state_destination_slot = 0;
+    SegmentOutput output                = SegmentOutput::Sample;
+    // The device sampling record; Read takes its logprob adjustments from it, None ignores it.
+    const ops::SamplingConfig* sampling = nullptr;
+    // The typed readout's token ids; empty reads nothing.
+    std::span<const std::int32_t> readout;
+};
+
+// Host destinations of a batched prefill, one row per segment with output, in segment order: its
+// token, kLogprobTopK logprob ids and values (written when logprobs are armed), and
+// kReadoutLogprobsMaximum readout values, of which a row's first readout.size() are written.
+struct PrefillBatchHost {
+    std::int32_t* tokens  = nullptr;
+    std::int32_t* top_ids = nullptr;
+    float* top_values     = nullptr;
+    float* readout        = nullptr;
+};
+
 class TextContext {
 public:
     TextContext(DeviceContext& ctx, const execution::Parameters& weights, WorkspaceArena& work,
@@ -78,6 +123,8 @@ public:
                 const qwen3_5::PagedKVCache* batch_text_kv = nullptr,
                 const qwen3_5::PagedKVCache* batch_mtp_kv  = nullptr);
     ~TextContext();
+
+    void set_expert_runtime(NativeExpertRuntime* experts) noexcept { experts_ = experts; }
 
     TextContext(const TextContext&)            = delete;
     TextContext& operator=(const TextContext&) = delete;
@@ -90,9 +137,17 @@ public:
     }
 
     void set_memory_statistics(const MemoryStatistics* value) noexcept { statistics_ = value; }
-    void capture_attention_tokens(const Tensor& ids);
     void set_sampling(const ops::SamplingConfig* config) noexcept { sampling_config_ = config; }
     void set_cache_position_shift(std::uint32_t shift) noexcept { cache_position_shift_ = shift; }
+
+    // The typed readout a finalizing chunk performs on its sampled token's logits: the first
+    // `count` ids of io.readout_ids, read into io.readout_values; zero reads nothing.
+    void set_readout(std::int32_t count) noexcept { readout_count_ = count; }
+
+    // Runs right after a finalizing chunk samples its token, before the drafter's work on the
+    // chunk: it enqueues the token's copies to the host. The chunk then returns without waiting for
+    // that work, which the stream orders before anything later.
+    void set_first_token_hook(std::function<void()> hook) { first_token_hook_ = std::move(hook); }
 
     void set_rope_yarn(const ops::RopeYarn& yarn) noexcept { rope_yarn_ = yarn; }
 
@@ -147,6 +202,18 @@ public:
                                                    std::uint32_t nominal_length,
                                                    VisionPrefillSession& vision,
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
+    // The last chunks of several requests' text prompts, and branched reads' blocks, in one pass
+    // over the layer stack. Token-wise work runs over all columns at once; segment by segment, in
+    // order, attention appends and reads the segment's KV row and each GDN layer advances its
+    // state, as prefill_chunk would for that segment alone. A branch block follows its read's
+    // prompt part: it shares the read's KV row past the prompt frontier and starts each GDN layer
+    // from the state the prompt part left, so it sees the prompt and itself only. Segments with
+    // output then read their last column: Sample samples as a finalizing chunk does (keyed by its
+    // frontier), Read takes the greedy token; both gather the logprob record and the readout.
+    // `host` receives every output row before this returns; prefill_hidden holds the final-norm
+    // hidden of every column, segment after segment. No drafter work or pipeline stages.
+    [[nodiscard]] PrefillChunkResult prefill_final_batch(std::span<const PrefillSegment> segments,
+                                                         PrefillBatchHost host);
     void ordinary_decode_batch(const Tensor& ids, const Tensor& cache_positions,
                                const Tensor& rope_positions, const Tensor& kv_table_rows,
                                const Tensor& linear_state_source_slots,
@@ -178,6 +245,7 @@ public:
                              const Tensor& position, ops::CausalAttentionExecutionEnvelope envelope,
                              Tensor& mtp_hidden, Tensor& logits, Tensor& draft_token);
 private:
+    void capture_attention_tokens(const Tensor&);
     [[nodiscard]] bool mtp_enabled() const noexcept {
         return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
     }
@@ -187,6 +255,11 @@ private:
     void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
                   const ops::SparseMoeHints& hints);
     [[nodiscard]] ops::SparseMoeHints next_projection_hints(int layer) const;
+
+    // Per-request width of a bound sequence batch; an unbatched call is one row of all columns.
+    [[nodiscard]] std::int32_t row_width(std::int32_t columns) const noexcept {
+        return active_sequence_batch_ != 0 ? active_sequence_width_ : columns;
+    }
     void run_layers(Tensor& x, Phase phase);
     template <class Tap>
     void run_layers(Tensor& x, Phase phase, Tap& tap);
@@ -197,6 +270,20 @@ private:
     // sees all of its layers on rank 0; a later stage's tapped outputs cross after the residual.
     template <class Tap>
     void run_staged(Tensor& x, Phase phase, Tap& tap);
+    // The whole layer stack with every rank running its share of each layer; the residual ends on
+    // rank 0 as on one device.
+    template <class Tap>
+    void run_tensor_parallel(Tensor& x, Phase phase, Tap& tap);
+    // The GDN and FFN geometry of the rank a pass is issuing: a tensor-parallel share, or the model.
+    [[nodiscard]] const TextConfig& layer_config() const noexcept {
+        return stage_runtime_ != nullptr && stage_runtime_->tensor_parallel
+                   ? stage_runtime_->tensor_parallel->shard
+                   : config_;
+    }
+    // A mixer's output projection: added to the residual, or in a tensor-parallel pass written to
+    // the rank's FP32 partial, which the exchange adds.
+    void project_residual(const Tensor& input, const LinearParameters& p, Tensor& x,
+                          InputBasis basis, bool wide_verification);
     // The Linear Attention state pool holding GDN layer `layer`, and its index within that pool.
     struct GdnStateRef {
         LinearAttentionStatePool* pool;
@@ -254,8 +341,22 @@ private:
     [[nodiscard]] PrefillChunkResult
     prefill_impl(std::span<const int> ids, const TextPrefill* text_prefill,
                  const MultimodalPrefill* multimodal, Tap& tap, bool finalize_at_end);
+
+    // A batched prefill segment's columns and sequence bindings within one pass. A negative
+    // destination slot leaves the segment's GDN state in a transient buffer (a branch block).
+    struct SegmentBinding {
+        std::int32_t column  = 0;
+        std::int32_t columns = 0;
+        Tensor positions;
+        Tensor kv_table_row;
+        ops::CausalAttentionExecutionEnvelope envelope;
+        std::int32_t state_source_slot      = 0;
+        std::int32_t state_destination_slot = 0;
+    };
+
     DeviceContext& ctx_;
     const Parameters& parameters_;
+    NativeExpertRuntime* experts_ = nullptr;
     const TextConfig& config_;
     WorkspaceArena& work_;
     qwen3_5::PagedKVCacheView kv_;
@@ -281,6 +382,8 @@ private:
     const ops::CausalAttentionExecutionEnvelope* active_causal_attention_envelope_ = nullptr;
     std::int32_t active_sequence_batch_                                            = 0;
     std::int32_t active_sequence_width_                                            = 0;
+    // Non-empty during prefill_final_batch: a prefill pass's sequences, column range by range.
+    std::span<const SegmentBinding> active_segments_;
     std::int32_t rope_delta_                                                       = 0;
     std::int32_t linear_state_source_slot_                                         = 0;
     std::int32_t linear_state_destination_slot_                                    = 0;
@@ -298,10 +401,16 @@ private:
     const std::int32_t* proposal_head_ids_      = nullptr;
     int proposal_head_n_                        = 0;
     const ops::SamplingConfig* sampling_config_ = nullptr;
+    std::int32_t readout_count_                 = 0;
+    std::function<void()> first_token_hook_;
     ops::RopeYarn rope_yarn_;
     std::uint32_t mtp_attention_window_         = 0;
     const MtpParameters* mtp_                   = nullptr;
     StageRuntime* stage_runtime_                = nullptr;
+    // A tensor-parallel pass: the rank whose share is being issued, and where its output
+    // projections write their FP32 partial instead of adding to the residual.
+    std::size_t tensor_rank_  = 0;
+    Tensor* residual_partial_ = nullptr;
 };
 
 } // namespace ninfer::models::qwen3_5::execution

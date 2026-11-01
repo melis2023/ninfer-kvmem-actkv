@@ -14,6 +14,12 @@
 
 namespace ninfer::ops {
 
+/** Native ternary weights use T2_G128_FP16, PTQ1_G128_FP16 or T5_G128_FP16 RowSplit,
+ * group 128 and FP16 multipliers. Exact packing and the T5 compute contract are defined in
+ * docs/maintainer/tensor-formats.md. Split parents must use the same packing. PTQ1 has a high
+ * plane; T2/T5 do not. T5 requires A8 permission and workspace, with per-group s8 activations
+ * and positive K divisible by 1024; it has no A16 fallback. Public activations remain BF16.
+ */
 /**
  * Returns the A16-only transient capacity required by LinearAdd for every T in the inclusive
  * [min_tokens,max_tokens] interval. The QType and dimensions are the fixed implementation profile.

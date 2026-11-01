@@ -4,6 +4,7 @@
 // hybrid_cache.{h,cpp}.
 
 #include "models/qwen3_5/program/program_impl.h"
+#include "models/qwen3_5/program/planning/prefill_service_work.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/internal.h"
@@ -221,6 +222,12 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
     auto quote                         = std::make_shared<HybridQuoteImpl>();
     quote->summary                     = plan.summary;
     quote->sampling                    = plan.sampling;
+    quote->grammar                     = plan.grammar;
+    quote->suppressed_tool_open        = plan.suppressed_tool_open;
+    quote->logprobs                    = plan.logprobs;
+    quote->readout_tokens              = plan.readout_tokens;
+    quote->branches                    = plan.branches;
+    quote->drafting                    = plan.drafting;
     quote->text_kv_page_entitlement    = plan.text_kv_page_entitlement;
     quote->backend_kv_page_entitlement = plan.backend_kv_page_entitlement;
     quote->vision_control_plan         = plan.vision_control_plan;
@@ -274,8 +281,20 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
         if (prompt.block_hashes.size() != prompt.token_ids.size() / kBlock) {
             throw std::logic_error("prepared prompt carries no hybrid block keys");
         }
+        // A branched read resumes at its whole prompt too: its branches follow the frontier, so
+        // the lookup reads one branch token past it.
+        std::vector<TokenId> branched_tokens;
+        std::span<const TokenId> lookup(prompt.token_ids);
+        std::uint32_t lookup_tokens = n;
+        if (plan.branches != nullptr) {
+            branched_tokens.reserve(n + 1U);
+            branched_tokens.assign(prompt.token_ids.begin(), prompt.token_ids.end());
+            branched_tokens.push_back(plan.branches->front().tokens.front());
+            lookup        = branched_tokens;
+            lookup_tokens = n + 1U;
+        }
         pc::MatchResult match =
-            index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
+            index.match(lookup, prompt.block_hashes, prompt.block_extras, lookup_tokens);
         const auto filling = [](const pc::MatchResult& result) {
             return std::any_of(
                 result.candidates.begin(), result.candidates.end(),
@@ -285,7 +304,7 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
             // A prefetch (§6.6) is copying blocks this prompt resumes over: they land within a
             // batch's copy time, and skipping them would pick a shallower source.
             hybrid_->settle_prefetch();
-            match = index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
+            match = index.match(lookup, prompt.block_hashes, prompt.block_extras, lookup_tokens);
         }
         quote->cached_prefix_tokens = static_cast<std::uint32_t>(match.path.size()) * kBlock;
         const std::vector<VisionTokenRange> ranges =
@@ -293,7 +312,7 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
         std::erase_if(match.candidates, [&](const pc::MatchCandidate& candidate) {
             return candidate.filling_blocks != 0 || inside_vision(candidate.frontier, ranges);
         });
-        const pc::AdmissionChoice choice = index.choose(match, n);
+        const pc::AdmissionChoice choice = index.choose(match, lookup_tokens);
         std::vector<std::size_t> order;
         if (choice.candidate) { order.push_back(*choice.candidate); }
         for (std::size_t i = 0; i < match.candidates.size(); ++i) {
@@ -349,6 +368,7 @@ HybridAdmissionQuote ProgramImpl::hybrid_quote(const PreparedPromptData& prompt,
     if (quote->summary.effective_output_tokens != 0) {
         units += quote->summary.effective_output_tokens - 1ULL;
     }
+    units += branch_service_work(plan.branches.get(), prefill_chunk);
     quote->summary.service_work_quanta = units;
 
     out.readiness = runtime::Readiness::Ready;
@@ -503,10 +523,12 @@ bool ProgramImpl::hybrid_await_sibling(const PreparedPromptData& prompt, std::ui
         }
         if (wait && !inside_exclusion(wait->target, state.exclusions) &&
             wait->target > state.last_capture) {
-            // Waiting saves this request's prefill of the shared tokens; a new tap costs the
-            // sibling one split. The sibling's remaining prefill to the snapshot is the wait,
-            // doubled because decode rounds of other lanes interleave with it.
-            const double saved = hybrid_cost_.prefill_seconds(reuse, wait->target - reuse);
+            // Waiting saves this request's prefill of the shared tokens, beyond the pass it runs
+            // either way; a new tap costs the sibling one split. The sibling's remaining prefill
+            // to the snapshot is the wait, doubled because decode rounds of other lanes
+            // interleave with it.
+            const double saved = hybrid_cost_.prefill_seconds(reuse, n - reuse) -
+                                 hybrid_cost_.prefill_seconds(wait->target, n - wait->target);
             const double predicted =
                 2.0 * hybrid_cost_.prefill_seconds(prefill.cursor, wait->target - prefill.cursor);
             if (saved > (wait->plan_tap ? hybrid_cost_.chunk_seconds : 0.0) &&
@@ -889,9 +911,6 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
             sequence.mtp_kv_valid  = prepare_mtp ? reuse - 1U : 0U;
             sequence.dflash_context_frontier =
                 is_masked_draft_backend(speculative_backend) ? reuse : 0U;
-            // A reused prefix owns its ring rows; there is no live decode capture to append.
-            sequence.dflash_pending_base  = sequence.dflash_context_frontier;
-            sequence.dflash_pending_valid = false;
         }
         sequence.endpoint_valid    = false;
         sequence.tail_hidden_valid = false;
@@ -904,30 +923,34 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
         sequence.rebuild_tail_begin = quote.root_rebuild_tail_begin;
         bind_sequence_kv(sequence);
 
-        const std::uint32_t initial_mtp_extent =
-            prepare_mtp ? std::min({draft_window,
-                                    quote.summary.effective_output_tokens > 1
-                                        ? quote.summary.effective_output_tokens - 2
-                                        : 0U,
-                                    capacity - n > 0 ? capacity - n - 1 : 0U})
-                        : 0U;
+        const auto initial_mtp_extent = initial_mtp_prefill_extent(
+            prepare_mtp ? draft_window : 0U, quote.summary.effective_output_tokens, capacity, n);
         const std::uint32_t backend_materialized =
             speculative_backend == SpeculativeBackend::Mtp
                 ? std::min(capacity, n + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
             : speculative_backend == SpeculativeBackend::DFlash ? n
                                                                 : 0U;
         ensure_sequence_kv_mapped(sequence, n, backend_materialized);
+        request.grammar              = quote.grammar;
+        request.suppressed_tool_open = quote.suppressed_tool_open;
+        request.logprobs = quote.logprobs;
+        request.readout_tokens = quote.readout_tokens;
+        request.branches       = quote.branches;
         install_sampling(sequence, request, quote.sampling);
+        sequence.mtp_draft_count    = 0;
+        sequence.mtp_drafts_pending = false;
         sequence.rope_delta = prompt.rope_delta;
         set_device_i32(io.rope_delta, sequence.rope_delta);
 
         request.timings              = {};
         request.pending              = {};
-        request.publish_continuation = quote.summary.publish_continuation;
+        request.publish_continuation =
+            quote.summary.publish_continuation && quote.drafting && !quote.branches;
         request.lease_ceiling =
-            std::min(capacity, n + (quote.summary.effective_output_tokens == 0
-                                        ? 0U
-                                        : quote.summary.effective_output_tokens - 1U));
+            std::min(capacity, n + std::max(quote.summary.effective_output_tokens == 0
+                                                ? 0U
+                                                : quote.summary.effective_output_tokens - 1U,
+                                            branch_extent(quote.branches.get())));
         request.active_resources = detail::PhysicalResources{
             .device = {.active_lanes     = 1,
                        .state_slots      = 1,
@@ -998,11 +1021,37 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
                 });
             }
             const std::array<std::uint32_t, 1> existing{reuse};
-            taps = pc::plan_taps(n, reuse, hints,
+            // A branched read's prompt frontier is a tap position: its branches follow it, and its
+            // explicit boundary is what the next read of the same state resumes from.
+            const std::uint32_t tap_tokens = quote.branches != nullptr ? n + 1U : n;
+            taps = pc::plan_taps(tap_tokens, reuse, hints,
                                  reuse != 0 ? std::span<const std::uint32_t>(existing)
                                             : std::span<const std::uint32_t>(),
                                  exclusions, hybrid_->taps());
+            if (prompt.tap_hints.disposable) {
+                // No request continues a disposable one: past the last boundary its client named,
+                // the prompt is its own (a decision read's question), so no snapshot there serves
+                // another request, and an exact tap would only cost a prefill pass.
+                std::uint32_t named = 0;
+                for (const pc::TapHint& hint : hints) {
+                    if (hint.kind == pc::TapHintKind::Explicit) {
+                        named = std::max(named, hint.position);
+                    }
+                }
+                std::erase_if(taps,
+                              [named](const pc::PlannedTap& tap) { return tap.position > named; });
+            }
         }
+        // Without drafting the drafter stops at the deepest exact tap; a flexible tap lands at a
+        // chunk boundary, possibly past it.
+        std::optional<std::uint32_t> drafter_frontier;
+        if (!quote.drafting) {
+            std::erase_if(taps, [](const pc::PlannedTap& tap) {
+                return tap.placement != pc::TapPlacement::Exact;
+            });
+            drafter_frontier = taps.empty() ? reuse : std::max(reuse, taps.back().position);
+        }
+        const bool disposable = prompt.tap_hints.disposable;
         const std::uint64_t path_hash =
             full == 0 ? pc::kRootLookupHash : transaction.hashes[full - 1U];
         const std::uint64_t trailing = all_vision_key(ranges);
@@ -1016,9 +1065,11 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
             .cursor             = reuse,
             .prompt_tokens      = n,
             .initial_mtp_extent = initial_mtp_extent,
+            .drafter_frontier   = drafter_frontier,
             .elapsed_seconds    = 0.0,
             .prepare_mtp        = prepare_mtp,
             .reuse              = quote.summary.prefix_reuse_path,
+            .reported_reuse_path = quote.summary.prefix_reuse_path,
             .mtp_bridge =
                 prepare_mtp && reuse != 0 ? MtpBridgeMode::BeforeSuffix : MtpBridgeMode::None,
         };
@@ -1069,6 +1120,7 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
         lane_state.path.swap(transaction.path);
         lane_state.active                 = true;
         lane_state.publish                = publish;
+        lane_state.disposable             = disposable;
         lane_state.path_hash              = path_hash;
         lane_state.trailing_extra         = trailing;
         lane_state.deepest_snapshot       = reuse;
@@ -1080,11 +1132,6 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
 
         request.prefill->elapsed_seconds =
             std::chrono::duration<double>(Clock::now() - started).count();
-        // The speculative auto-bypass state is per request: a fresh request must start with the
-        // full neural drafter instead of inheriting a dead-drafter verdict left on this lane by
-        // whatever ran here before it.
-        request.draft_bypass_strikes = 0;
-        request.draft_bypass         = false;
         request.lifecycle = Lifecycle::Prefilling;
 
         HybridCacheCounters& counters = hybrid_->counters();
@@ -1322,7 +1369,9 @@ void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint3
 
 void ProgramImpl::hybrid_supersede_resume(HybridLaneState& lane, std::uint32_t frontier) {
     pc::PrefixCacheIndex& index = hybrid_->index();
-    if (!lane.resume_snapshot.valid() || frontier <= lane.resume_frontier ||
+    // No request continues a disposable one, so the snapshot it resumed from still serves the
+    // requests that share it (the other reads of one decision request).
+    if (lane.disposable || !lane.resume_snapshot.valid() || frontier <= lane.resume_frontier ||
         !index.valid(lane.resume_snapshot)) {
         return;
     }
@@ -1397,7 +1446,8 @@ bool ProgramImpl::hybrid_finish_lane(SequenceState& sequence, RequestControl& re
                 text_kv_addresses->can_release_after_deactivate(sequence.kv->text) &&
                 (!sequence.kv->backend || backend_kv_addresses->can_release_after_deactivate(
                                               *sequence.kv->backend));
-            if (endpoint && kv_releasable && backend_caught_up && frontier != 0 &&
+            if (endpoint && request.publish_continuation && kv_releasable && backend_caught_up &&
+                frontier != 0 &&
                 frontier >= lane_state.deepest_snapshot + pc::kMinimumTapSeparation &&
                 frontier <= sequence.ledger.size() && lane_state.path.size() >= anchor_blocks &&
                 !sequence.state.fork_pending && sequence.state.read == sequence.state.write &&

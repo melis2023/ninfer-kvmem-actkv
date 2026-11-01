@@ -10,8 +10,7 @@ only; `output throughput` (generated tokens / wall clock) is reported alongside 
 prefill and the tail where early finishers leave the batch.
 
 Arms are interleaved -- in order on even passes, reversed on odd -- because between-process spread
-on one RTX 3090 is 3-5% (TODO.md, "This card is power-capped"), which is larger than most effects
-worth measuring. Always A/B inside one sitting.
+on a power-capped RTX 3090 is 3-5%, which is larger than most effects worth measuring. Always A/B inside one sitting.
 
 usage:
   python tools/bench/run_chat_decode.py --model MODEL.ninfer --prompts PROMPTS.jsonl \
@@ -21,7 +20,7 @@ usage:
   useful for env-gated quality trades, where the interleaving above is what makes the A/B valid.
 
   PROMPTS.jsonl holds one object per line with a "prompt" string. Any chat prompt set works; the
-  comparisons in docs/performance.md use the eight prompts of
+  RTX 3090 chat measurements used the eight prompts of
   syv-ai/qwen38-27b-rtx3090's bench/prompts_real.jsonl (thinking off, 1024 output tokens).
 """
 

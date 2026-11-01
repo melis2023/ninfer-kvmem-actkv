@@ -2,6 +2,8 @@
 #include "ninfer/ops/gdn_input_proj.h"
 
 #include "ops/input_projection_test_common.h"
+#include "ops/linear/common/route_table.h"
+#include "ops/linear/sm70/sm70_gemm.h"
 
 #include <cuda_runtime.h>
 
@@ -1159,6 +1161,137 @@ int run_fp8() {
 
 } // namespace
 
+// Two-chain byte gate for the NVFP4 conv-snapshot path.
+//
+// The model's decode rounds -- T=1 without speculation, T=K+1 with it -- run this fused
+// projection+conv+snapshot kernel, and `nvfp4_gdn_snapshot_dispatch` sends it to one of two
+// different kernel pairs on the route table: `nvfp4_gdn_snapshot_decode_launch` /
+// `nvfp4_gdn_snapshot_small_t_launch` on the legacy table, the `unified::` snapshot on the
+// unified one. The A16 linear gate covers the plain gdn_input_proj but never this path, and the
+// 4K e2e run under the A16 family disagreed between the two chains while every linear parent was
+// byte-identical -- so this is the surface that gate was blind to. Run both forced tables on
+// identical inputs and compare every output byte; the sign-bit control keeps the comparison
+// honest, and the two data regimes (power-of-two divisor, then 0.1) make sure FP32 rounding
+// really happens in at least one of them.
+int run_nvfp4_snapshot_two_chain_bytes() {
+    constexpr std::int32_t kHidden           = 5120;
+    constexpr std::int32_t kValueRows        = 6144;
+    constexpr std::int32_t kZRows            = 6144;
+    constexpr std::int32_t kChannels         = 10240;
+    constexpr std::int32_t kRows             = kChannels + kZRows;
+    constexpr std::int32_t kSnapshotBaseSlot = 1;
+    constexpr std::int32_t kInitialSlot      = 2;
+    int failures = 0;
+    for (const bool odd : {false, true}) {
+        quantized_weight::PatternedWeightOptions options;
+        options.weight_scale_divisor = odd ? 0.1F : 0.125F;
+        options.input_scale_divisor  = 3.5F;
+        DevicePackedWeight parent(quantized_weight::make_patterned_weight(QType::NVFP4, kRows,
+                                                                         kHidden, 823U, options));
+        for (const std::int32_t tokens : {1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 15, 16}) {
+            const std::string label = std::string(odd ? "odd " : "") + "snapshot T=" +
+                                      std::to_string(tokens);
+            const auto run = [&](ops::detail::LinearRouteTable table, bool perturb) {
+                const std::int32_t slots = std::max(tokens + 2, kInitialSlot + 1);
+                std::vector<float> activation = make_bf16_activation(
+                    kHidden, tokens, 809U + static_cast<std::uint32_t>(tokens));
+                std::vector<std::uint16_t> activation_bits = bf16_bits(activation);
+                if (perturb) {
+                    activation_bits[0] = std::uint16_t(activation_bits[0] ^ 0x8000u);
+                }
+                const std::vector<float> conv_weight = make_conv_weight(kChannels, 811U);
+                const std::vector<std::uint16_t> conv_weight_bits = bf16_bits(conv_weight);
+                const std::vector<std::uint16_t> state_before = make_state(
+                    kChannels, slots, kInitialSlot, 821U + static_cast<std::uint32_t>(tokens));
+                const std::vector<std::int32_t> initial_value{kInitialSlot};
+                const std::vector<std::int32_t> snapshot_base_value{kSnapshotBaseSlot};
+
+                DeviceBuffer device_activation    = to_device(activation_bits);
+                DeviceBuffer device_conv_weight   = to_device(conv_weight_bits);
+                DeviceBuffer device_initial       = to_device(initial_value);
+                DeviceBuffer device_snapshot_base = to_device(snapshot_base_value);
+                GuardedBf16Tensor state(kChannels * 3, slots);
+                state.copy_from_bits(state_before);
+                GuardedBf16Tensor query(kQueryRows, tokens);
+                GuardedBf16Tensor key(kKeyRows, tokens);
+                GuardedBf16Tensor value(kValueRows, tokens);
+                GuardedBf16Tensor z(kZRows, tokens);
+                Tensor x(device_activation.p, DType::BF16, {kHidden, tokens});
+                Tensor conv(device_conv_weight.p, DType::BF16, {kChannels, 4});
+                Tensor conv_state(state.data(), DType::BF16, {kChannels, 3, slots});
+                Tensor initial(device_initial.p, DType::I32, {1});
+                Tensor snapshot_base(device_snapshot_base.p, DType::I32, {1});
+                Tensor q                          = query.tensor();
+                Tensor k                          = key.tensor();
+                Tensor v                          = value.tensor();
+                Tensor z_out                      = z.tensor();
+
+                ops::detail::force_linear_route_table(table);
+                std::vector<std::uint8_t> bytes;
+                try {
+                    // The capacity query itself reads the route table, so it is asked under the
+                    // forced table and the arena is sized from that answer.
+                    const std::size_t workspace_bytes =
+                        ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                            QType::NVFP4, kRows, kHidden, ops::LinearPolicy::A16Only, 1, tokens,
+                            tokens);
+                    WorkspaceArena workspace(std::max<std::size_t>(256, workspace_bytes));
+                    ops::gdn_input_proj_conv_snapshot(x, parent.view(), conv, conv_state, Tensor{},
+                                                      initial, snapshot_base, q, k, v, z_out,
+                                                      ops::LinearPolicy::A16Only, workspace,
+                                                      nullptr);
+                    cuda_synchronize();
+                    const auto append = [&bytes](const std::vector<std::uint16_t>& bits) {
+                        const auto* raw = reinterpret_cast<const std::uint8_t*>(bits.data());
+                        bytes.insert(bytes.end(), raw, raw + bits.size() * sizeof(std::uint16_t));
+                    };
+                    append(query.bits());
+                    append(key.bits());
+                    append(value.bits());
+                    append(z.bits());
+                    append(state.bits());
+                    failures += query.verify_guards(label);
+                    failures += key.verify_guards(label);
+                    failures += value.verify_guards(label);
+                    failures += z.verify_guards(label);
+                    failures += state.verify_guards(label);
+                } catch (const std::exception& error) {
+                    std::cerr << label << ": " << error.what() << "\n";
+                    bytes.clear();
+                }
+                ops::detail::force_linear_route_table(std::nullopt);
+                return bytes;
+            };
+            const auto legacy_bytes  = run(ops::detail::LinearRouteTable::Legacy, false);
+            const auto unified_bytes = run(ops::detail::LinearRouteTable::Unified, false);
+            const auto perturbed     = run(ops::detail::LinearRouteTable::Unified, true);
+            if (legacy_bytes.empty() || unified_bytes.empty() || perturbed.empty()) {
+                std::cerr << label << ": a run produced no output\n";
+                ++failures;
+                continue;
+            }
+            std::size_t differing = 0;
+            for (std::size_t index = 0; index < legacy_bytes.size(); ++index) {
+                if (legacy_bytes[index] == unified_bytes[index]) { continue; }
+                if (differing < 3) {
+                    std::cerr << label << ": A16 snapshot chains differ at byte " << index << ", "
+                              << int(legacy_bytes[index]) << " vs " << int(unified_bytes[index])
+                              << "\n";
+                }
+                ++differing;
+            }
+            const bool controlled = perturbed != unified_bytes;
+            std::cout << "a16 snapshot two-chain " << label << ": "
+                      << (differing == 0 ? "identical" : "DIFFERS") << " of "
+                      << legacy_bytes.size() << " B, control=" << (controlled ? "live" : "DEAD")
+                      << "\n";
+            if (differing != 0) { ++failures; }
+            if (!controlled) { ++failures; }  // a blind comparison proves nothing
+        }
+    }
+    return failures;
+}
+
 int main() {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
@@ -1177,8 +1310,14 @@ int main() {
                      "widest width\n";
         ++failures;
     }
+    // Q8 decode widths take fused kernels without workspace, except on sm_70, which materializes
+    // every width for its projection routes.
+    const std::size_t q8_decode_bytes =
+        ops::detail::sm70::enabled() ? ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
+                                           2048, 2048, 4096, 1, 16, 16)
+                                     : 0;
     if (ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1, 16) !=
-            0 ||
+            q8_decode_bytes ||
         ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 1, 17) !=
             ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(2048, 2048, 4096, 1, 17,
                                                                        17)) {
@@ -1218,6 +1357,7 @@ int main() {
     failures += run_q8();
     failures += run_nvfp4();
     failures += run_fp8();
+    failures += run_nvfp4_snapshot_two_chain_bytes();
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_input_proj_conv_snapshot\n";
     return failures == 0 ? 0 : 1;
 }

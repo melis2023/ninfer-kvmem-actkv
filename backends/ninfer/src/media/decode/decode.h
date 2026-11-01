@@ -68,17 +68,27 @@ struct VideoInfo {
     std::vector<int> indices;
 };
 
+// Which source frames a video samples. Span: the count the target fps gives over the video's
+// duration, clamped to [min_frames, max_frames], spread from the first frame to the last (Qwen's
+// processor). Floor: min(max_frames, frames) frames at i * frames / count rounded down, whatever
+// the fps (transformers' default sampler, which Gemma 4's video processor uses).
+enum class FrameSpacing {
+    Span,
+    Floor,
+};
+
 // Exact display geometry without RGB conversion. Image probing decodes the first displayed frame
 // so codec crop and orientation match decode_image(). Video probing walks the selected frame
 // sequence so frame-count, truncation, pixel-budget, crop, and sampling semantics match
 // decode_video(), but it does not materialize RGB frames.
 ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& policy);
 VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& policy,
-                        double target_fps, int min_frames, int max_frames);
+                        double target_fps, int min_frames, int max_frames,
+                        FrameSpacing spacing = FrameSpacing::Span);
 
 Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy);
 Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, double target_fps,
-                   int min_frames, int max_frames);
+                   int min_frames, int max_frames, FrameSpacing spacing = FrameSpacing::Span);
 
 enum class LibraryLogSeverity {
     Error,

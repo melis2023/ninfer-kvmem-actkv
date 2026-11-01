@@ -23,6 +23,8 @@ using namespace ninfer::test;
 using namespace ninfer::test::direct_bf16_weight;
 
 constexpr ReductionCriterion kA16Tolerance{1.0 / 256.0, 1.0 / 256.0, 2.0 / 256.0};
+// An FP32 result keeps the FP32 accumulation unrounded: its reduction-order error only.
+constexpr ReductionCriterion kFp32Tolerance{1.0e-5, 1.0e-6, 2.0e-5};
 
 std::vector<std::uint16_t> make_activation_bits(std::int32_t hidden, std::int32_t tokens) {
     std::vector<std::uint16_t> result(static_cast<std::size_t>(hidden) * tokens);
@@ -84,24 +86,29 @@ std::vector<std::int32_t> sampled_tokens(std::int32_t tokens) {
         return result;
     }
     std::vector<std::int32_t> result{0, 1, tokens / 2, tokens - 2, tokens - 1};
+    if (tokens > 8192) { result.insert(result.end(), {8191, 8192}); }
     std::sort(result.begin(), result.end());
     result.erase(std::unique(result.begin(), result.end()), result.end());
     return result;
 }
 
-int run_bf16_linear_case(DeviceWeight& weight, std::int32_t tokens, bool replay = false) {
+int run_bf16_linear_case(DeviceWeight& weight, std::int32_t tokens, bool replay = false,
+                         bool fp32 = false) {
     const std::int32_t rows                    = weight.host.n;
     const std::int32_t hidden                  = weight.host.k;
     std::vector<std::uint16_t> activation_bits = make_activation_bits(hidden, tokens);
     std::vector<float> activation              = materialize(activation_bits);
     DeviceBuffer device_activation             = to_device(activation_bits);
-    GuardedDeviceBuffer guarded_output(static_cast<std::size_t>(rows) * tokens *
-                                       sizeof(std::uint16_t));
+    const std::size_t element                  = fp32 ? sizeof(float) : sizeof(std::uint16_t);
+    GuardedDeviceBuffer guarded_output(static_cast<std::size_t>(rows) * tokens * element);
     guarded_output.fill(0xff);
 
     Tensor x(device_activation.p, DType::BF16, {hidden, tokens});
-    Tensor output(guarded_output.data(), DType::BF16, {rows, tokens});
-    DeviceArena workspace(256);
+    Tensor output(guarded_output.data(), fp32 ? DType::FP32 : DType::BF16, {rows, tokens});
+    // The A16 routes hold no workspace except sm_70's wide route (ops/linear/sm70).
+    DeviceArena workspace(std::max<std::size_t>(
+        256, ops::linear_workspace_capacity_bytes(QType::BF16, rows, hidden,
+                                                  ops::LinearPolicy::A16Only, tokens, tokens)));
     ops::linear(x, weight.view(), output, ops::LinearPolicy::A16Only, workspace, nullptr);
     cuda_synchronize();
 
@@ -124,13 +131,21 @@ int run_bf16_linear_case(DeviceWeight& weight, std::int32_t tokens, bool replay 
         graph.launch(context.stream);
         cuda_synchronize();
     }
-    const std::string suffix = " T=" + std::to_string(tokens) + (replay ? " graph" : " eager");
+    const std::string suffix = " T=" + std::to_string(tokens) + (replay ? " graph" : " eager") +
+                               (fp32 ? " fp32" : "");
     int failures             = guarded_output.verify_guards("BF16_A16 Linear output" + suffix);
-    const std::vector<std::uint16_t> output_bits =
-        from_device<std::uint16_t>(guarded_output.data(), static_cast<std::size_t>(rows) * tokens);
-    for (std::size_t index = 0; index < output_bits.size(); ++index) {
-        const std::uint16_t bits = output_bits[index];
-        if (!std::isfinite(bf16_to_f32(bits))) {
+    const std::size_t count  = static_cast<std::size_t>(rows) * tokens;
+    std::vector<float> output_values(count);
+    if (fp32) {
+        output_values = from_device<float>(guarded_output.data(), count);
+    } else {
+        const auto bits = from_device<std::uint16_t>(guarded_output.data(), count);
+        for (std::size_t index = 0; index < count; ++index) {
+            output_values[index] = bf16_to_f32(bits[index]);
+        }
+    }
+    for (std::size_t index = 0; index < output_values.size(); ++index) {
+        if (!std::isfinite(output_values[index])) {
             std::cerr << "BF16_A16 Linear output" << suffix << " element " << index
                       << " is not finite\n";
             ++failures;
@@ -143,8 +158,7 @@ int run_bf16_linear_case(DeviceWeight& weight, std::int32_t tokens, bool replay 
     if (tokens == 1) {
         const std::vector<double> complete =
             oracle_all_rows(weight.host, std::span<const float>(activation));
-        actual.reserve(rows);
-        for (const std::uint16_t bits : output_bits) { actual.push_back(bf16_to_f32(bits)); }
+        actual.assign(output_values.begin(), output_values.end());
         expected = complete;
     } else {
         const std::vector<std::int32_t> sampled       = sampled_rows(rows);
@@ -153,8 +167,7 @@ int run_bf16_linear_case(DeviceWeight& weight, std::int32_t tokens, bool replay 
         expected.reserve(actual.capacity());
         for (const std::int32_t row : sampled) {
             for (const std::int32_t token : token_samples) {
-                actual.push_back(
-                    bf16_to_f32(output_bits[static_cast<std::size_t>(token) * rows + row]));
+                actual.push_back(output_values[static_cast<std::size_t>(token) * rows + row]);
                 expected.push_back(dot_fp64(
                     weight.host, row,
                     std::span<const float>(
@@ -164,7 +177,7 @@ int run_bf16_linear_case(DeviceWeight& weight, std::int32_t tokens, bool replay 
     }
     failures += verify_reduction("BF16_A16 Linear [" + std::to_string(rows) + "," +
                                      std::to_string(hidden) + "]" + suffix,
-                                 actual, expected, kA16Tolerance);
+                                 actual, expected, fp32 ? kFp32Tolerance : kA16Tolerance);
     const std::vector<std::uint16_t> activation_after =
         from_device<std::uint16_t>(device_activation, activation_bits.size());
     if (activation_after != activation_bits) {
@@ -259,10 +272,13 @@ int run_selector_linear() {
 
 int run_general_bf16_linear() {
     // Shapes outside the specialised table (14336/5120, 5120/6144, 256/5120) route to the general
-    // runtime-shape GEMM fallback, or its GEMV form up to eight tokens when K is a multiple of 8.
-    // Cover the minimal tile, non-tile-aligned extents (the row/column boundary guards), multi-tile
-    // grids, the QAT full-precision vocab head's real shape, and Qwen3.8-Flash-Next's BF16
-    // projections (the Gated DeltaNet a/b rows and the sparse-attention indexer).
+    // runtime-shape GEMM: its GEMV form up to eight tokens when K is a multiple of 8, the SIMT tile
+    // below 64 tokens and cuBLAS's tensor-core GEMM from 64 on. Cover the minimal tile,
+    // non-tile-aligned extents (the row/column boundary guards), multi-tile grids, the QAT
+    // full-precision vocab head's real shape, Qwen3.8-Flash-Next's BF16 projections (the Gated
+    // DeltaNet a/b rows and the sparse-attention indexer) and the Gemma 4 vision tower's (the
+    // patch projection, a block's Q/K/V, [gate; up] and down, the projection into the text model),
+    // with BF16 results and, through every form of the GEMM, FP32 ones.
     int failures = 0;
     const std::vector<std::pair<int, int>> shapes = {
         {32, 32},   // exactly one 32x32 tile
@@ -272,13 +288,40 @@ int run_general_bf16_linear() {
         {32, 2560},     // Flash-Next GDN a / b
         {640, 2560},    // Flash-Next indexer q/k
         {248320, 5120},  // QAT bf16 lm_head [vocab, hidden]
+        {1152, 768},     // Gemma 4 vision patch projection
+        {3456, 1152},    // Gemma 4 vision Q/K/V
+        {8608, 1152},    // Gemma 4 vision [gate; up]
+        {1152, 4304},    // Gemma 4 vision down
+        {2816, 1152},    // Gemma 4 vision projection into the text model
     };
     for (const auto& [n, k] : shapes) {
         DeviceWeight weight(make_patterned(n, k, 421U));
-        // The vocab head's host reference is costly, so it covers decode widths only.
-        const std::vector<int> widths = n > 4096 ? std::vector<int>{1, 2}
+        // The vocab head's host reference is costly, so it covers decode widths only; the vision
+        // shapes take a few tower widths (a 70-token frame has 630 patches).
+        const std::vector<int> widths =
+            n > 4096 && k > 4096 ? std::vector<int>{1, 2}
+            : k == 1152 || k == 768 || k == 4304 ? std::vector<int>{9, 63, 64, 70, 630}
                                                  : std::vector<int>{1, 2, 3, 7, 8, 9, 32, 33, 128};
         for (int tokens : widths) { failures += run_bf16_linear_case(weight, tokens); }
+        // FP32 results: the vision tower's projections at its widths and the small shapes at the
+        // GEMV, SIMT and cuBLAS widths.
+        if (n <= 4096 || k <= 4096) {
+            for (int tokens : k == 1152 || k == 768 || k == 4304 ? std::vector<int>{9, 64, 630}
+                                                                 : std::vector<int>{1, 8, 9, 33, 128}) {
+                failures += run_bf16_linear_case(weight, tokens, false, true);
+            }
+        }
+    }
+    // A Qwen3.5 Vision item of 16,384 tokens projects 65,536 patches at once; sm_70's wide route
+    // takes such a call in passes of kWideColumns columns. Two passes, the second partial.
+    for (const auto& [n, k] : std::vector<std::pair<int, int>>{{4304, 1152}, {1152, 4304}}) {
+        DeviceWeight weight(make_patterned(n, k, 425U));
+        failures += run_bf16_linear_case(weight, 8192 + 263);
+    }
+    // A registered shape with an FP32 result takes the runtime-shape GEMM.
+    DeviceWeight registered(make_patterned(256, 5120, 423U));
+    for (int tokens : {1, 33, 64}) {
+        failures += run_bf16_linear_case(registered, tokens, false, true);
     }
     return failures;
 }

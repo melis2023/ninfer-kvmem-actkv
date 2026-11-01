@@ -4,6 +4,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 #include <vector>
@@ -54,6 +56,24 @@ int main() {
 
     const ninfer::PromptInput prompt =
         ninfer::product::prompt_from_messages(input_file.path(), false, false);
+    std::ifstream stream(input_file.path());
+    const std::string serialized{std::istreambuf_iterator<char>(stream),
+                                  std::istreambuf_iterator<char>()};
+    const auto memory = ninfer::product::prompt_from_messages_json(serialized, false, false);
+    if (memory.options.tool_jsons != prompt.options.tool_jsons ||
+        memory.messages.size() != prompt.messages.size() ||
+        memory.messages[1].tool_calls.front().arguments_json != arguments) {
+        std::cerr << "in-memory messages parsing changed tools or argument ordering\n";
+        return 1;
+    }
+    for (const auto invalid : {"{", "{\"messages\":[]}",
+                               "{\"messages\":[{\"role\":\"unknown\",\"content\":\"x\"}]}"}) {
+        bool rejected = false;
+        try {
+            (void)ninfer::product::prompt_from_messages_json(invalid, false, false);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        if (!rejected) { std::cerr << "invalid messages accepted\n"; return 1; }
+    }
     if (prompt.options.tool_jsons != std::vector<std::string>{tool} ||
         prompt.messages.size() != 2 || prompt.messages[1].tool_calls.size() != 1 ||
         prompt.messages[1].tool_calls.front().arguments_json != arguments) {

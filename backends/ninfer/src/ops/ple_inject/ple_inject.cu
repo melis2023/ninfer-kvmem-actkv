@@ -1,6 +1,7 @@
 // ninfer::ops - the PLE block of Qwen3.8-Flash-Next after its projections (contract in
 // include/ninfer/ops/ple_inject.h). Three launches: per-token statistics, gate and normalised
-// convolution input; the convolution and stack update; the history advance.
+// convolution input; the convolution and stack update; the history advance, which the record form
+// leaves to ple_history_advance.
 #include "ninfer/ops/ple_inject.h"
 
 #include "core/device.h"
@@ -179,37 +180,12 @@ void require_tensor(const Tensor* tensor, DType dtype, std::int32_t n0, std::int
             message);
 }
 
-} // namespace
-
-std::size_t ple_inject_workspace_bytes(std::int32_t tokens) {
-    require(tokens > 0, "tokens must be positive");
-    WorkspaceLayoutBuilder layout;
-    (void)layout.alloc(DType::FP32, {kStreams, tokens});
-    (void)layout.alloc(DType::FP32, {kWidth, tokens});
-    return layout.peak_bytes(1);
-}
-
-void ple_inject(Tensor& stack, const Tensor& key, const Tensor& value,
-                const PleInjectWeights& weights, float eps, Tensor& history,
-                WorkspaceArena& workspace, cudaStream_t stream) {
-    require(stack.dtype == DType::FP32 && stack.is_contiguous() && stack.data != nullptr &&
-                stack.ne[0] == kHidden && stack.ne[1] == kStreams && stack.ne[3] == 1,
-            "stack must be contiguous FP32 [2560, 4, tokens]");
+// The gate and the stack update of `tokens` positions, N into `normalized`; the history is read.
+void inject(Tensor& stack, const Tensor& key, const Tensor& value, const PleInjectWeights& weights,
+            float eps, const Tensor& history, Tensor& gate, Tensor& normalized,
+            cudaStream_t stream) {
     const std::int32_t tokens = stack.ne[2];
-    require(tokens > 0, "tokens must be positive");
-    require(eps > 0.0f, "eps must be positive");
-    require_tensor(&key, DType::BF16, kWidth, tokens, "key must be BF16 [10240, tokens]");
-    require_tensor(&value, DType::BF16, kHidden, tokens, "value must be BF16 [2560, tokens]");
-    require_tensor(weights.norm_key, DType::BF16, kWidth, 1, "norm_key must be BF16 [10240]");
-    require_tensor(weights.norm_query, DType::BF16, kWidth, 1, "norm_query must be BF16 [10240]");
-    require_tensor(weights.norm_conv, DType::BF16, kWidth, 1, "norm_conv must be BF16 [10240]");
-    require_tensor(weights.conv, DType::BF16, kTaps, kWidth, "conv must be BF16 [4, 10240]");
-    require_tensor(&history, DType::FP32, kWidth, kHistory, "history must be FP32 [10240, 9]");
-
-    auto scope        = workspace.scope();
-    Tensor gate       = workspace.alloc(DType::FP32, {kStreams, tokens});
-    Tensor normalized = workspace.alloc(DType::FP32, {kWidth, tokens});
-    const auto bf16   = [](const Tensor* tensor) {
+    const auto bf16           = [](const Tensor* tensor) {
         return static_cast<const __nv_bfloat16*>(tensor->data);
     };
     ple_gate_kernel<<<tokens, kThreads, 0, stream>>>(
@@ -223,9 +199,71 @@ void ple_inject(Tensor& stack, const Tensor& key, const Tensor& value,
         static_cast<const float*>(history.data), static_cast<const float*>(gate.data),
         static_cast<const float*>(normalized.data), tokens);
     CUDA_CHECK(cudaGetLastError());
+}
+
+void require_inputs(const Tensor& stack, const Tensor& key, const Tensor& value,
+                    const PleInjectWeights& weights, float eps, const Tensor& history) {
+    require(stack.dtype == DType::FP32 && stack.is_contiguous() && stack.data != nullptr &&
+                stack.ne[0] == kHidden && stack.ne[1] == kStreams && stack.ne[3] == 1,
+            "stack must be contiguous FP32 [2560, 4, tokens]");
+    const std::int32_t tokens = stack.ne[2];
+    require(tokens > 0, "tokens must be positive");
+    require(eps > 0.0f, "eps must be positive");
+    require_tensor(&key, DType::BF16, kWidth, tokens, "key must be BF16 [10240, tokens]");
+    require_tensor(&value, DType::BF16, kHidden, tokens, "value must be BF16 [2560, tokens]");
+    require_tensor(weights.norm_key, DType::BF16, kWidth, 1, "norm_key must be BF16 [10240]");
+    require_tensor(weights.norm_query, DType::BF16, kWidth, 1, "norm_query must be BF16 [10240]");
+    require_tensor(weights.norm_conv, DType::BF16, kWidth, 1, "norm_conv must be BF16 [10240]");
+    require_tensor(weights.conv, DType::BF16, kTaps, kWidth, "conv must be BF16 [4, 10240]");
+    require_tensor(&history, DType::FP32, kWidth, kHistory, "history must be FP32 [10240, 9]");
+}
+
+void advance(Tensor& history, const Tensor& normalized, std::int32_t tokens, cudaStream_t stream) {
     ple_history_kernel<<<div_up(kWidth, 256), 256, 0, stream>>>(
         static_cast<float*>(history.data), static_cast<const float*>(normalized.data), tokens);
     CUDA_CHECK(cudaGetLastError());
+}
+
+} // namespace
+
+std::size_t ple_inject_workspace_bytes(std::int32_t tokens) {
+    require(tokens > 0, "tokens must be positive");
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::FP32, {kStreams, tokens});
+    (void)layout.alloc(DType::FP32, {kWidth, tokens});
+    return layout.peak_bytes(1);
+}
+
+void ple_inject(Tensor& stack, const Tensor& key, const Tensor& value,
+                const PleInjectWeights& weights, float eps, Tensor& history,
+                WorkspaceArena& workspace, cudaStream_t stream) {
+    require_inputs(stack, key, value, weights, eps, history);
+    const std::int32_t tokens = stack.ne[2];
+    auto scope                = workspace.scope();
+    Tensor gate               = workspace.alloc(DType::FP32, {kStreams, tokens});
+    Tensor normalized         = workspace.alloc(DType::FP32, {kWidth, tokens});
+    inject(stack, key, value, weights, eps, history, gate, normalized, stream);
+    advance(history, normalized, tokens, stream);
+}
+
+void ple_inject_record(Tensor& stack, const Tensor& key, const Tensor& value,
+                       const PleInjectWeights& weights, float eps, const Tensor& history,
+                       Tensor& normalized, WorkspaceArena& workspace, cudaStream_t stream) {
+    require_inputs(stack, key, value, weights, eps, history);
+    const std::int32_t tokens = stack.ne[2];
+    require_tensor(&normalized, DType::FP32, kWidth, tokens,
+                   "normalized must be FP32 [10240, tokens]");
+    auto scope  = workspace.scope();
+    Tensor gate = workspace.alloc(DType::FP32, {kStreams, tokens});
+    inject(stack, key, value, weights, eps, history, gate, normalized, stream);
+}
+
+void ple_history_advance(Tensor& history, const Tensor& normalized, cudaStream_t stream) {
+    require_tensor(&history, DType::FP32, kWidth, kHistory, "history must be FP32 [10240, 9]");
+    require(normalized.ne[1] > 0, "normalized needs at least one position");
+    require_tensor(&normalized, DType::FP32, kWidth, normalized.ne[1],
+                   "normalized must be FP32 [10240, tokens]");
+    advance(history, normalized, normalized.ne[1], stream);
 }
 
 } // namespace ninfer::ops

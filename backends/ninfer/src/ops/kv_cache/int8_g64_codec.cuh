@@ -23,6 +23,33 @@ inline constexpr int kKVCacheInt8HeadDim = 256;
 inline constexpr int kKVCacheInt8Group   = 64;
 inline constexpr int kKVCacheInt8Groups  = kKVCacheInt8HeadDim / kKVCacheInt8Group;
 
+// DFlash2 draft ring: head_dim 128, same G64 key group and G32 value group as the target.
+inline constexpr int kKVCacheInt8D128HeadDim = 128;
+inline constexpr int kKVCacheInt8D128Groups  = kKVCacheInt8D128HeadDim / kKVCacheInt8Group;
+
+template <typename Geometry>
+__device__ __forceinline__ std::int64_t
+kv_cache_int8_quant_code_index_d128(int physical_page, int kv_head, int d, int page_offset) {
+    return paged_kv_element_offset<kKVCacheInt8D128HeadDim, Geometry::KVHeads>(
+        physical_page, kv_head, page_offset, d);
+}
+
+template <typename Geometry>
+__device__ __forceinline__ std::int64_t
+kv_cache_int8_quant_scale_index_d128(int physical_page, int kv_head, int group, int page_offset) {
+    return paged_kv_element_offset<kKVCacheInt8D128Groups, Geometry::KVHeads>(
+        physical_page, kv_head, page_offset, group);
+}
+
+template <typename Geometry>
+__device__ __forceinline__ std::int64_t
+kv_cache_int8_quant_src_index_d128(int kv_head, int d, int token) {
+    return static_cast<std::int64_t>(d) +
+           static_cast<std::int64_t>(kKVCacheInt8D128HeadDim) *
+               (static_cast<std::int64_t>(kv_head) +
+                static_cast<std::int64_t>(Geometry::KVHeads) * token);
+}
+
 template <typename Geometry>
 __device__ __forceinline__ std::int64_t
 kv_cache_int8_quant_code_index(int physical_page, int kv_head, int d, int page_offset) {

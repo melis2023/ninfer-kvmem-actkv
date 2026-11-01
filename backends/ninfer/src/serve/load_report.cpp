@@ -73,7 +73,9 @@ Json load_report(const LoadCapacity& capacity, const LoadSample& sample) {
                           {"committed_decode_tokens", stats.committed_decode_tokens},
                           {"reused_prompt_tokens", stats.reused_prompt_tokens},
                           {"decode_rounds", stats.decode_rounds},
-                          {"decode_row_rounds", stats.decode_row_rounds}}},
+                          {"decode_row_rounds", stats.decode_row_rounds},
+                          {"shared_prefill_passes", stats.shared_prefill_passes},
+                          {"shared_prefill_requests", stats.shared_prefill_requests}}},
     };
     if (stats.kvmem.enabled) report["kvmem"] = kvmem_status_json(stats.kvmem);
     return report;
@@ -104,6 +106,11 @@ std::string make_stats_report(const LoadCapacity& capacity, const LoadSample& sa
     for (const char* block : {"tokens", "throughput_tokens_per_second", "scheduler", "decode_batch",
                               "host_work", "context_cache"}) {
         report[block] = std::move(cumulative.at(block));
+    }
+    for (const char* block : {"ngram_table", "experts"}) {
+        if (auto found = cumulative.find(block); found != cumulative.end()) {
+            report[block] = std::move(*found);
+        }
     }
     Json entries = Json::array();
     for (std::uint32_t i = 0; i < stats.queue_entries; ++i) {

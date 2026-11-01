@@ -8,6 +8,7 @@
 // remain BF16. Tensor Cores accumulate the complete K reduction in FP32, then the represented BF16
 // row scale is applied once before BF16 output storage.
 
+#include "ops/common/device_limits.h"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
 #include "ops/linear/fp8/fp8_a16_codec.cuh"
@@ -52,7 +53,7 @@ struct Fp8A16GemmSchedule {
     static_assert(kActivationStages == 1 || kActivationStages == 2);
     static_assert(kMinBlocksPerSm > 0);
     static_assert(kWarps >= 1 && kThreads <= 1024);
-    static_assert(kSharedBytes <= 99 * 1024);
+    static_assert(kSharedBytes <= kMaxSharedBytesPerBlock);
 };
 
 template <class Geometry, class Schedule, bool FullTokens, class Output = Fp8ContiguousOutput>

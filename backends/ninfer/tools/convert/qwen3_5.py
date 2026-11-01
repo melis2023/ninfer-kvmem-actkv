@@ -305,8 +305,16 @@ class _Builder:
         component = name.split("/", 1)[0]
         target = self.model.config
         if component in ("text", "mtp"):
-            actual = text_config(selected.config, mtp=component == "mtp")
             expected = target
+            if target.get("model_type") == "qwen4_exp_text":
+                from .qwen4_exp import mtp_config as flash_mtp_config, text_config as flash_text_config
+
+                actual = flash_text_config(selected.config)
+                if component == "mtp":
+                    actual = actual | flash_mtp_config(selected.config)
+                    expected = target | self.model.components["mtp"]["config"]
+            else:
+                actual = text_config(selected.config, mtp=component == "mtp")
             fields = {"hidden_size"}
             if name.endswith(("token_embedding", "output_head")):
                 fields.add("vocab_size")
@@ -378,8 +386,10 @@ class _Builder:
             elif component == "mtp":
                 compatible = index == 0
             else:
-                compatible = index < len(actual["layer_types"]) and (
-                    actual["layer_types"][index] == expected["layer_types"][index]
+                source_index = (self.model.source_layers[index]
+                                if self.model.source_layers is not None else index)
+                compatible = source_index < len(actual["layer_types"]) and (
+                    actual["layer_types"][source_index] == expected["layer_types"][index]
                 )
             if not compatible:
                 raise ValueError(
@@ -400,36 +410,39 @@ class _Builder:
         offset=0,
         rows=None,
         transpose=None,
+        split_source_name=None,
     ):
         shape = tuple(shape)
         original = shape if source_shape is None else tuple(source_shape)
 
         def factory(selected, format=None):
             self.validate_source(selected, store, name)
-            selected_name = source_name
-            if name.startswith("text/") and _has_model_config(selected):
-                if "text_config" not in selected.config:
-                    selected_name = selected_name.replace(
-                        "model.language_model.", "model.", 1
-                    )
-                elif "text_config" not in store.config and selected_name.startswith(
-                    "model."
-                ):
-                    selected_name = selected_name.replace(
-                        "model.", "model.language_model.", 1
-                    )
+            def remap(source_key):
+                if name.startswith("text/") and _has_model_config(selected):
+                    if "text_config" not in selected.config:
+                        return source_key.replace("model.language_model.", "model.", 1)
+                    if "text_config" not in store.config and source_key.startswith("model."):
+                        return source_key.replace("model.", "model.language_model.", 1)
+                return source_key
+
+            selected_name = remap(source_name)
+            selected_shape, selected_offset = original, offset
+            # Check the selected checkpoint, including recipe source overrides.
+            if split_source_name is not None and selected.has(remap(split_source_name)):
+                selected_name = remap(split_source_name)
+                selected_shape, selected_offset = shape, 0
             if transpose is not None:
                 if format is not None:
                     raise ValueError(f"{name}: transpose source requires value access")
                 ref = tensor_source(selected, selected_name, original)
                 return transpose_source(ref, transpose, shape)
-            if len(original) == 2 and offset == 0:
-                ref = matrix_source(selected, selected_name, original, format)
+            if len(selected_shape) == 2 and selected_offset == 0:
+                ref = matrix_source(selected, selected_name, selected_shape, format)
                 return select_rows(ref, rows) if rows is not None else ref
             if format is not None:
                 raise ValueError(f"{name}: provide an explicit encoded source mapping")
             return tensor_source(
-                selected, selected_name, shape, offset=offset, source_shape=original
+                selected, selected_name, shape, offset=selected_offset, source_shape=selected_shape
             )
 
         self.model.add(
@@ -618,6 +631,7 @@ class _Builder:
                     (ir, h),
                     source_shape=(e, 2 * ir, h),
                     offset=(expert * 2 + half) * ir * h,
+                    split_source_name=sp + f"experts.{expert}.{role}_proj.weight",
                     inputs=(prefix + "ffn_input",),
                 )
                 gate_up.append(ep + role)
@@ -628,6 +642,7 @@ class _Builder:
                 (h, ir),
                 source_shape=(e, h, ir),
                 offset=expert * h * ir,
+                split_source_name=sp + f"experts.{expert}.down_proj.weight",
                 inputs=(ep + "product",),
             )
             downs.append(ep + "down")

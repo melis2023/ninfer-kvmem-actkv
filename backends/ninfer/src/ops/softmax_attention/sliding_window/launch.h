@@ -35,4 +35,9 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
                                      Tensor& partial_m, Tensor& partial_l, Tensor& out,
                                      cudaStream_t stream);
 
+// Dequantize an int8 G64 cyclic ring into BF16 planes so the existing BF16 attention
+// kernel can consume a quantized draft cache.
+void dequant_cyclic_i8_launch(const CyclicKVCacheLayerView& context, const Tensor& out_k,
+                              const Tensor& out_v, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail

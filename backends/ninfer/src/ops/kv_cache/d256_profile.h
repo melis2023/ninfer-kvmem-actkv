@@ -2,7 +2,7 @@
 
 #include "core/dtype.h"
 
-#include <ninfer/types.h>
+#include "ninfer/kv_cache_storage.h"
 
 #include <cstdint>
 #include <stdexcept>

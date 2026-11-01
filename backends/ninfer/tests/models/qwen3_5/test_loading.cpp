@@ -192,6 +192,18 @@ void logical_data_and_instances() {
     require(plan.parameter(plan.weights().text.token_embedding).binding.parts[0].object ==
                 plan.parameter(plan.weights().text.output_head).binding.parts[0].object,
             "explicit shared embedding/head did not bind the same parent");
+    // A stored A4 permission stays only for a weight whose rank runs the 120a code; elsewhere the
+    // weight takes its A16 route.
+    const auto query_policy = [](const qwen::LoadPlan& loaded) {
+        const auto& mixer = std::get<qwen::AttentionWeights>(loaded.weights().text.layers[0].mixer);
+        return loaded.uses(mixer.query)[0].policy;
+    };
+    require(query_policy(qwen::plan_load(reader, {}, {}, {ops::DeviceTier::Ampere})) ==
+                ops::LinearPolicy::A16Only,
+            "a rank without the 120a code kept an A4 permission");
+    require(query_policy(qwen::plan_load(reader, {}, {}, {ops::DeviceTier::Blackwell})) ==
+                (ops::kBuildBlackwell ? ops::LinearPolicy::AllowA4 : ops::LinearPolicy::A16Only),
+            "a rank running the 120a code lost an A4 permission");
     const auto capacity = plan.materialization().device_capacity(0);
     require(!plan.weights().vision && plan.resources().preprocessor_config_json.empty(),
             "unused Vision was required");

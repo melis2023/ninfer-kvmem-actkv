@@ -149,5 +149,9 @@ struct Config {
 // The config of an artifact's `vision` component, which another family that reuses this tower
 // parses too.
 [[nodiscard]] VisionConfig parse_vision_config(const artifact::Directory& directory);
+// Tensor parallelism: the share of the text model one of `ranks` ranks runs. The GDN key and value
+// heads and the dense FFN's intermediate rows are divided by `ranks`; attention and every other
+// width stay whole. Throws std::invalid_argument unless they divide and the FFN is dense.
+[[nodiscard]] TextConfig tensor_parallel_share(const TextConfig& text, std::size_t ranks);
 
 } // namespace ninfer::models::qwen3_5

@@ -49,9 +49,21 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
                 u[0]=tmp0[0]; u[2]=tmp0[1]; u[4]=tmp0[2]; u[6]=tmp0[3];
                 u[1]=tmp1[0]; u[3]=tmp1[1]; u[5]=tmp1[2]; u[7]=tmp1[3];
 
-                sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q4_0_q8_1_impl<VDR_Q4_0_Q8_1_MMQ>
-                    (&x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_0], u,
-                     x_df[i*(MMQ_TILE_NE_K/QI4_0) + i/QI4_0 + k0/(QR4_0*QI4_0)], y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]);
+                // NInfer: the -8 offset term comes from the quantized activation, not from the
+                // block's FP16 sum, which overflows once a block of 32 values sums past 65504.
+                const int * v = &x_qs[i*(MMQ_TILE_NE_K + 1) + k0/QR4_0];
+                int sumi = 0;
+                int qsum = 0;
+#pragma unroll
+                for (int l = 0; l < VDR_Q4_0_Q8_1_MMQ; ++l) {
+                    sumi = ggml_cuda_dp4a((v[l] >> 0) & 0x0F0F0F0F, u[2*l+0], sumi);
+                    sumi = ggml_cuda_dp4a((v[l] >> 4) & 0x0F0F0F0F, u[2*l+1], sumi);
+                    qsum = ggml_cuda_dp4a(0x01010101, u[2*l+0], qsum);
+                    qsum = ggml_cuda_dp4a(0x01010101, u[2*l+1], qsum);
+                }
+                sum[j0/nwarps*I/warp_size + i0/warp_size] +=
+                    x_df[i*(MMQ_TILE_NE_K/QI4_0) + i/QI4_0 + k0/(QR4_0*QI4_0)] *
+                    __low2float(y_ds[j*MMQ_TILE_Y_K + k01/QI8_1]) * float(sumi - 8*qsum);
             }
         }
     }

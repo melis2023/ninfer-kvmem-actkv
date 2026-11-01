@@ -2,6 +2,7 @@
 #include "serve/cuda_residency_json.h"
 #include "product/cuda_memory_options.h"
 #include "product/logging/pretty_format.h"
+#include "product/reasoning_loop_options.h"
 #include "product/speculative_options.h"
 
 #include <spdlog/logger.h>
@@ -10,7 +11,9 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <iomanip>
 #include <sstream>
@@ -106,6 +109,7 @@ Json tool_call_parse_json(const ninfer::ToolCallParseDiagnostics& diagnostics) {
                 {"recovered_call_count", diagnostics.recovered_call_count},
                 {"malformed_call_reported", diagnostics.malformed_call_reported},
                 {"trailing_content_dropped", diagnostics.trailing_content_dropped},
+                {"recovered_from_reasoning", diagnostics.recovered_from_reasoning},
                 {"fallback_reason",
                  ninfer::tool_call_parse_fallback_reason_name(diagnostics.fallback_reason)}};
 }
@@ -332,7 +336,7 @@ const char* vision_residency_name(ninfer::VisionResidency residency) {
 
 Json vision_workspace_json(const std::optional<ninfer::VisionWorkspaceMemorySummary>& vision) {
     if (!vision) { return nullptr; }
-    return Json{{"residency", vision_residency_name(vision->residency)},
+    Json out{{"residency", vision_residency_name(vision->residency)},
                 {"aggregate_prompt_tokens", vision->aggregate_prompt_tokens},
                 {"max_item_tokens", vision->max_item_tokens},
                 {"general_capacity_bytes", vision->general_capacity_bytes},
@@ -341,6 +345,21 @@ Json vision_workspace_json(const std::optional<ninfer::VisionWorkspaceMemorySumm
                 {"handoff_capacity_bytes", vision->handoff_capacity_bytes},
                 {"handoff_active_bytes", vision->handoff_active_bytes},
                 {"handoff_peak_bytes", vision->handoff_peak_bytes}};
+    if (vision->cpu_weights_lazy) {
+        out["cpu_weights"] = {{"bytes", vision->cpu_weight_bytes},
+            {"loading", vision->cpu_weights_loading}, {"users", vision->cpu_weight_users},
+            {"loads", vision->cpu_weight_loads}, {"unloads", vision->cpu_weight_unloads},
+            {"last_load_seconds", vision->cpu_weight_last_load_seconds},
+            {"idle_timeout_seconds", vision->cpu_weight_idle_seconds}};
+    }
+    return out;
+}
+
+Json rope_json(const ninfer::RopeScalingSummary& rope) {
+    const char* type = rope.type == ninfer::RopeScalingType::Yarn            ? "yarn"
+                       : rope.type == ninfer::RopeScalingType::Interpolation ? "interpolation"
+                                                                             : "none";
+    return Json{{"type", type}, {"factor", rope.factor}, {"native_context", rope.native_context}};
 }
 
 Json speculative_json(const GenerationMetrics& metrics) {
@@ -595,8 +614,7 @@ std::string format_request_done(const RequestLogContext& context,
     // Prefill emits the first token; the remaining (gen - 1) come from decode.
     const double decode_tokens =
         outcome.completion_tokens > 0 ? static_cast<double>(outcome.completion_tokens - 1) : 0.0;
-    const double computed_prefill_tokens = static_cast<double>(
-        std::max(0, outcome.prompt_tokens - static_cast<int>(metrics.prefix_cache_hit_tokens)));
+    const double computed_prefill_tokens = metrics.computed_prefill_tokens;
 
     std::ostringstream out;
     out << "[req " << context.id << "] done finish="
@@ -647,6 +665,11 @@ std::string format_request_done(const RequestLogContext& context,
             << " control=" << (outcome.thinking.applied ? "applied" : "unused");
     }
     if (outcome.thinking.post_thinking_sampling) { out << " post_thinking=applied"; }
+    if (outcome.thinking.loop_detected) {
+        out << " reasoning_loop=" << (outcome.thinking.applied ? "concluded" : "stopped")
+            << " loop_thinking=" << outcome.thinking.loop_thinking_tokens
+            << " loop_coverage=" << outcome.thinking.loop_coverage;
+    }
     return out.str();
 }
 
@@ -723,35 +746,37 @@ std::string format_server_start_json(
             std::string(requested_reasoning_effort_name(*options.default_reasoning_effort));
     }
 
-    record["server"] =
-        Json{{"host", options.host},
-             {"port", options.port},
-             {"public_model_id", public_model_id},
-             {"api_key_configured", !options.api_key.empty()},
-             {"cors_enabled", options.enable_cors},
-             {"unconstrained_response_format", options.unconstrained_response_format},
-             {"assistant_prefill", options.assistant_prefill},
-             {"derive_session_keys", options.derive_session_keys},
-             {"lenient_assistant_history", options.lenient_assistant_history},
-             {"max_request_bytes", options.max_request_bytes},
-             {"media_cache_bytes", options.media_cache_bytes},
-             {"media_live_bytes", options.media_live_bytes},
-             {"media_preprocess_threads", options.media_preprocess_threads},
-             {"request_log_jsonl", options.request_log_jsonl},
-             // null: requests that omit a limit get the Engine's concurrent lane budget.
-             {"default_output_tokens", options.default_max_tokens
-                                           ? Json(*options.default_max_tokens)
-                                           : Json(nullptr)},
-             {"default_output_policy",
-              options.default_max_tokens ? "fixed" : "concurrent_lane_budget"},
-             {"default_thinking",
-              options.enable_thinking ? Json(*options.enable_thinking) : Json(nullptr)},
-             {"default_thinking_budget", std::move(default_thinking_budget)},
-             {"default_reasoning_effort", std::move(default_reasoning_effort)},
-             {"default_preserve_thinking",
-              options.preserve_thinking ? Json(*options.preserve_thinking) : Json(nullptr)},
-             {"default_graft",
-              options.default_graft.empty() ? Json(nullptr) : Json(options.default_graft)}};
+    record["version"] = options.build_version;
+    record["server"]  = Json{
+        {"host", options.host},
+        {"port", options.port},
+        {"public_model_id", public_model_id},
+        {"api_key_configured", !options.api_key.empty()},
+        {"cors_enabled", options.enable_cors},
+        {"unconstrained_response_format", options.unconstrained_response_format},
+        {"assistant_prefill", options.assistant_prefill},
+        {"derive_session_keys", options.derive_session_keys},
+        {"lenient_assistant_history", options.lenient_assistant_history},
+        {"lenient_image_detail", options.lenient_image_detail},
+        {"max_request_bytes", options.max_request_bytes},
+        {"cpu_vision_idle_seconds", options.cpu_vision_idle_seconds},
+        {"media_cache_bytes", options.media_cache_bytes},
+        {"media_live_bytes", options.media_live_bytes},
+        {"media_preprocess_threads", options.media_preprocess_threads},
+        {"request_log_jsonl", options.request_log_jsonl},
+        // null: requests that omit a limit get the Engine's concurrent lane budget.
+        {"default_output_tokens",
+         options.default_max_tokens ? Json(*options.default_max_tokens) : Json(nullptr)},
+        {"default_output_policy", options.default_max_tokens ? "fixed" : "concurrent_lane_budget"},
+        {"default_thinking",
+         options.enable_thinking ? Json(*options.enable_thinking) : Json(nullptr)},
+        {"default_thinking_budget", std::move(default_thinking_budget)},
+        {"reasoning_loop", product::reasoning_loop_name(options.reasoning_loop)},
+        {"default_reasoning_effort", std::move(default_reasoning_effort)},
+        {"default_preserve_thinking",
+         options.preserve_thinking ? Json(*options.preserve_thinking) : Json(nullptr)},
+        {"default_graft",
+         options.default_graft.empty() ? Json(nullptr) : Json(options.default_graft)}};
     record["artifact"]                             = Json{{"path", options.artifact_path},
                                                           {"size_bytes", std::move(artifact_size)},
                                                           {"architecture", load.architecture},
@@ -798,6 +823,7 @@ std::string format_server_start_json(
         {"rope_yarn_factor", engine_options.rope_yarn_factor},
         {"rope_scaling_factor", engine_options.rope_scaling_factor},
         {"rope_scaling_original_context", engine_options.rope_scaling_original_context},
+        {"rope", rope_json(load.rope)},
         {"structured_output", engine_options.structured_output},
         {"concurrent_prefill", engine_options.concurrent_prefill},
         {"recover_invariant_failures", engine_options.recover_invariant_failures},
@@ -818,6 +844,8 @@ std::string format_server_start_json(
         {"auto_resume", engine_options.suspend.auto_resume},
         {"mlp_a8_decode", engine_options.mlp_a8_decode},
         {"prefill_a8", engine_options.prefill_a8},
+        {"nvfp4_w4a8_int", engine_options.nvfp4_w4a8_int},
+        {"nvfp4_w4a16", engine_options.nvfp4_w4a16},
         {"prefix_reuse", options.allow_prefix_reuse},
         {"speculative_backend",
          product::speculative_backend_name(engine_options.speculative.backend)},
@@ -859,9 +887,11 @@ std::string format_server_start_json(
              {"branch_anchors", cache.branch_anchors},
              {"endpoint_anchors", cache.endpoint_anchors},
              {"long_anchor_min_spacing_tokens", cache.long_anchor_min_spacing_tokens},
+             {"progress_anchor_tokens", cache.progress_anchor_tokens},
              {"mode", cache.mode == ContextCacheMode::Hybrid ? "hybrid" : "legacy"},
              {"host_cache_budget_bytes",
               cache.host_cache_budget_bytes ? Json(*cache.host_cache_budget_bytes) : Json(nullptr)},
+             {"host_cache_auto", options.context_cache.host_cache_auto},
              {"hybrid",
               cache.mode == ContextCacheMode::Hybrid
                   ? Json{{"device_snapshot_slots", cache.hybrid.device_snapshot_slots.value_or(0)},
@@ -895,7 +925,9 @@ std::string format_server_start_json(
              {"kv_capacity_headroom_bytes", memory.kv_capacity_headroom_bytes},
              {"planned_slack_bytes", memory.planned_slack_bytes},
              {"cuda_graph_allowance_bytes", memory.cuda_graph_allowance_bytes},
-             {"cuda_graph_measured_bytes", memory.cuda_graph_measured_bytes},
+             {"cuda_graph_measured_bytes", memory.cuda_graph_measured_bytes
+                                               ? Json(*memory.cuda_graph_measured_bytes)
+                                               : Json(nullptr)},
              {"kv_payload_bytes", memory.kv_payload_bytes},
              {"host_state_capacity_slots", memory.host_state_capacity_slots},
              {"host_state_occupied_slots", memory.host_state_occupied_slots},
@@ -945,21 +977,22 @@ std::string format_request_done_json(const std::string& server_instance_id, std:
         Json{{"finish_reason", finish_reason_name(outcome.finish_reason)},
              {"prompt_tokens", outcome.prompt_tokens},
              {"completion_tokens", outcome.completion_tokens},
-             {"computed_prefill_tokens",
-              std::max(0, outcome.prompt_tokens -
-                              static_cast<int>(outcome.metrics.prefix_cache_hit_tokens))},
+             {"computed_prefill_tokens", outcome.metrics.computed_prefill_tokens},
              {"prefix_cache_hit_tokens", outcome.metrics.prefix_cache_hit_tokens},
              {"prefix_reuse_path", prefix_reuse_path_name(outcome.metrics.prefix_reuse_path)},
              {"thinking_budget", outcome.thinking.requested_budget
                                      ? Json(*outcome.thinking.requested_budget)
                                      : Json(nullptr)},
              {"effective_thinking_budget", outcome.thinking.effective_budget
-                                              ? Json(*outcome.thinking.effective_budget)
-                                              : Json(nullptr)},
+                                               ? Json(*outcome.thinking.effective_budget)
+                                               : Json(nullptr)},
              {"model_thinking_tokens", outcome.thinking.model_thinking_tokens},
              {"thinking_control_tokens", outcome.thinking.injected_tokens},
              {"thinking_control_applied", outcome.thinking.applied},
              {"post_thinking_sampling", outcome.thinking.post_thinking_sampling},
+             {"reasoning_loop_detected", outcome.thinking.loop_detected},
+             {"reasoning_loop_thinking_tokens", outcome.thinking.loop_thinking_tokens},
+             {"reasoning_loop_coverage", outcome.thinking.loop_coverage},
              {"tool_call_count", outcome.tool_calls.size()},
              {"tool_call_parse", tool_call_parse_json(outcome.tool_call_parse)}};
     record["timings_seconds"] = Json{
@@ -1215,6 +1248,51 @@ std::string format_throughput_json(const std::string& server_instance_id, std::u
                  {"host_snapshot_evictions", delta(&RuntimeStats::hybrid_host_snapshot_evictions)},
                  {"host_dead_reclaims", delta(&RuntimeStats::hybrid_host_dead_reclaims)},
                  {"unbacked_node_losses", delta(&RuntimeStats::hybrid_unbacked_node_losses)}};
+    }
+    // Qwen3.8-Flash-Next's n-gram table reads: the interval's rows and passes, the latency
+    // quantiles as the upper bound of the histogram bucket that holds them, and the device time the
+    // PLE layer waited for its rows.
+    const NgramTableStats& rows_now  = current.ngram_table;
+    const NgramTableStats& rows_then = previous.ngram_table;
+    if (rows_now.rows != 0) {
+        std::array<std::uint64_t, NgramTableStats::kLatencyBuckets> latency{};
+        std::uint64_t batches = 0;
+        for (std::size_t b = 0; b < latency.size(); ++b) {
+            latency[b] =
+                monotonic_delta(rows_then.latency_histogram[b], rows_now.latency_histogram[b]);
+            batches += latency[b];
+        }
+        const auto quantile = [&](double q) -> Json {
+            const auto rank    = static_cast<std::uint64_t>(std::ceil(q * double(batches)));
+            std::uint64_t seen = 0;
+            for (std::size_t b = 0; b < latency.size() && batches != 0; ++b) {
+                seen += latency[b];
+                if (seen >= rank) { return std::uint64_t{1} << b; }
+            }
+            return nullptr;
+        };
+        record["ngram_table"] = Json{
+            {"rows", monotonic_delta(rows_then.rows, rows_now.rows)},
+            {"resident_rows", monotonic_delta(rows_then.resident_rows, rows_now.resident_rows)},
+            {"batches", batches},
+            {"read_seconds", monotonic_delta(rows_then.read_seconds, rows_now.read_seconds)},
+            {"read_latency_us", Json{{"p50", quantile(0.5)}, {"p99", quantile(0.99)}}},
+            {"stalls", monotonic_delta(rows_then.stalls, rows_now.stalls)},
+            {"stall_seconds", monotonic_delta(rows_then.stall_seconds, rows_now.stall_seconds)}};
+    }
+    // Qwen3.8-Flash-Next's host- or disk-resident experts: the interval's routes, device-slot
+    // hits, CPU-computed pairs and bytes copied to the devices.
+    const ExpertResidencyStats& experts_now  = current.experts;
+    const ExpertResidencyStats& experts_then = previous.experts;
+    if (experts_now.routes != 0) {
+        record["experts"] = Json{
+            {"routes", monotonic_delta(experts_then.routes, experts_now.routes)},
+            {"hits", monotonic_delta(experts_then.hits, experts_now.hits)},
+            {"cpu_routes", monotonic_delta(experts_then.cpu_routes, experts_now.cpu_routes)},
+            {"admitted", monotonic_delta(experts_then.admitted, experts_now.admitted)},
+            {"transferred_bytes",
+             monotonic_delta(experts_then.transferred_bytes, experts_now.transferred_bytes)},
+            {"slots", experts_now.slots}};
     }
     record["engine_recoveries"] =
         monotonic_delta(previous.engine_recoveries, current.engine_recoveries);

@@ -22,4 +22,7 @@ void launch_t2_mma_r64_c32(const Tensor& x, const Weight& w, Tensor& out, cudaSt
 void launch_t2_mma_r64_c64(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 void launch_t2_mma_r64_c128(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream);
 
+void launch_t2_small_t_v2_ptq1(const Tensor&, const Weight&, Tensor&, cudaStream_t);
+void launch_t2_ptq1_wide_t(const Tensor&, const Weight&, Tensor&, std::int32_t, cudaStream_t);
+
 } // namespace ninfer::ops::detail

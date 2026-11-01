@@ -4,6 +4,8 @@
 // adapters normalize before this layer and render IDs, usage, and response events after it.
 
 #include "ninfer/engine.h"
+#include "serve/branch_memo.h"
+#include <nlohmann/json.hpp>
 #include "serve/request.h"
 #include "serve/serve_options.h"
 
@@ -58,6 +60,8 @@ struct GenerationMetrics {
     std::uint64_t ngram_archive_drafted_tokens  = 0;
     std::uint64_t ngram_archive_accepted_tokens = 0;
     NgramArchiveStats ngram_archive;
+    // Actual logical prefill progress, including partial progress on cancellation.
+    std::uint32_t computed_prefill_tokens     = 0;
     std::uint32_t prefix_cache_hit_tokens     = 0;
     ninfer::PrefixReusePath prefix_reuse_path = ninfer::PrefixReusePath::Root;
     ninfer::MaterializationDiagnostics materialization;
@@ -73,6 +77,8 @@ struct GenerationOutcome {
     std::string reasoning;
     // The content tokens' logprob records, when the request asked for them.
     std::vector<ninfer::TokenLogprob> content_logprobs;
+    // A branched read's records (GenerationService::submit_branches), one per read.
+    std::vector<ninfer::BranchResult> branches;
     std::vector<ninfer::GeneratedToolCall> tool_calls;
     ninfer::ToolCallParseDiagnostics tool_call_parse;
     int prompt_tokens     = 0;
@@ -105,10 +111,19 @@ enum class GenerationConsumerMode : std::uint8_t {
 // Translate Engine request failures into the shared protocol-neutral HTTP error contract.
 ApiError request_error_to_api_error(const ninfer::RequestError& exception);
 
+// The reads of GenerationService::submit_branches and what the branch memo held for them: each
+// read's record when the memo held it, and in order, the reads the Engine runs, each with its key
+// when the memo keeps its record.
+struct HeldBranches {
+    std::vector<std::optional<ninfer::BranchResult>> records;
+    std::vector<std::optional<BranchKey>> run;
+};
+
 // Preparation ends by synchronously submitting the owning prompt to the Engine FIFO. The returned
 // request keeps its ingress/response lifetime reservation until the HTTP response is released and
 // is consumed exactly once by run().
 struct PreparedRequest {
+    std::function<void(const nlohmann::json&)> monitor_update;
     ninfer::GenerationHandle generation;
     ninfer::ResolvedSamplingParameters sampling;
     double prepare_seconds     = 0.0;
@@ -133,6 +148,26 @@ struct PreparedRequest {
     std::shared_ptr<RequestLifetime> lifetime;
     // Keeps the serving model loaded while the request lives: the router's lease on it.
     std::shared_ptr<void> model_hold;
+    // Set by submit_branches. Without `generation`, the memo held every read.
+    std::optional<HeldBranches> held_branches;
+};
+
+// A request prepared up to its Engine submission: its prompt is rendered and tokenized and it
+// holds ingress capacity, but the Engine has not seen it.
+struct StagedRequest {
+    PreparedRequest prepared;
+    ninfer::GenerationSubmission submission;
+};
+
+// One read of GenerationService::submit_branches or stage_read: a request, the tokens that continue
+// its prompt (empty for the prompt itself), and the token ids its first token's record reads out.
+struct BranchRead {
+    const GenerationRequest* request = nullptr;
+    std::vector<ninfer::TokenId> continuation;
+    std::vector<ninfer::TokenId> readout;
+    // False runs the read even when the branch memo holds its record, and keeps the record it
+    // reads out of the memo: a near tie read again alone.
+    bool memo = true;
 };
 
 // The Engine configuration a serve invocation selects. Separate from the service so the mapping
@@ -221,6 +256,35 @@ public:
                                           ninfer::GenerationObservationOptions observation = {},
                                           std::function<bool()> is_cancelled               = {},
                                           ContextCacheHints context_cache = {}) const;
+    // prepare() up to the Engine submission, which submit_group() makes.
+    [[nodiscard]] StagedRequest stage(const GenerationRequest& req,
+                                      GenerationConsumerMode consumer_mode,
+                                      ninfer::GenerationObservationOptions observation = {},
+                                      std::function<bool()> is_cancelled               = {},
+                                      ContextCacheHints context_cache                  = {}) const;
+    // Submits staged requests at once, in order: they enter the Engine's queue together, so a
+    // Qwen3.5-core Engine runs the last prompt chunks of short ones in one shared prefill pass.
+    [[nodiscard]] std::vector<PreparedRequest> submit_group(std::vector<StagedRequest> staged) const;
+    // stage() of a read's request, its prompt continued by the read's tokens and its readout
+    // replaced by the read's.
+    [[nodiscard]] StagedRequest stage_read(const BranchRead& read,
+                                           ninfer::GenerationObservationOptions observation,
+                                           std::function<bool()> is_cancelled,
+                                           const ContextCacheHints& context_cache) const;
+    // Reads the first token of several one-token reads that share a prefix as one Engine request
+    // (ninfer::Engine::submit_branches): the prefix runs once and each read's own tokens run as a
+    // block over it. The first read is staged as stage_read() does and holds the request's ingress
+    // capacity; the others are prepared in turn, a request's prompt once for all of its reads.
+    // run() returns one record per read in `branches`. A read whose request caches its prompt
+    // (cache_prompt) answers from the branch memo when it holds the read's record (unless the read
+    // turns the memo off), and the Engine runs the rest; without any, the request reaches no
+    // Engine. False from runs_branches() when the Engine cannot.
+    [[nodiscard]] PreparedRequest submit_branches(std::span<const BranchRead> reads,
+                                                  ninfer::GenerationObservationOptions observation,
+                                                  std::function<bool()> is_cancelled,
+                                                  const ContextCacheHints& context_cache) const;
+
+    [[nodiscard]] bool runs_branches() const { return engine_->runs_branches(); }
     [[nodiscard]] int count_prompt_tokens(const GenerationRequest& req,
                                           std::function<bool()> is_cancelled = {}) const;
 
@@ -244,8 +308,8 @@ private:
         UnboundedStartup,
     };
 
-    [[nodiscard]] PreparedRequest
-    prepare_impl(const GenerationRequest& req, GenerationConsumerMode consumer_mode,
+    [[nodiscard]] StagedRequest
+    stage_impl(const GenerationRequest& req, GenerationConsumerMode consumer_mode,
                  ninfer::GenerationObservationOptions observation,
                  std::function<bool()> is_cancelled, ContextCacheHints context_cache,
                  CacheParticipation cache_participation, DeadlinePolicy deadline_policy) const;
@@ -261,6 +325,7 @@ private:
     // Token counting runs the whole preparation path on handler threads, so it has its own bound:
     // a flood of counts is rejected before it can occupy the threads generation prepares on.
     std::shared_ptr<RequestCapacity> count_capacity_;
+    std::shared_ptr<BranchMemo> branch_memo_;
 };
 
 } // namespace ninfer::serve

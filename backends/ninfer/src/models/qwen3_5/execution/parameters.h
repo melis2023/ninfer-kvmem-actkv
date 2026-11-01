@@ -42,7 +42,14 @@ struct DenseParameters {
     std::optional<LinearParameters> up;
 };
 
-using FfnParameters = std::variant<DenseParameters, ops::SparseMoeWeights>;
+struct StreamedMoeParameters {
+    // Routed Weight fields contain only the codec profile; all operand addresses come from the
+    // delivery tables. Router and shared expert remain immutable resident native operands.
+    ops::SparseMoeWeights weights;
+    std::size_t delivery_layer = 0;
+};
+
+using FfnParameters = std::variant<DenseParameters, ops::SparseMoeWeights, StreamedMoeParameters>;
 
 struct AttentionParameters {
     ops::ProjectionWeights projection;
@@ -75,12 +82,17 @@ struct TextParameters {
     LinearParameters output_head;
     Tensor final_norm;
     std::vector<BlockParameters> layers;
-    // How many stages the layer loop spans. One is the identity plan and the fast path.
+    // Tensor parallelism: `layers` holds rank 0's share of each layer and rank_layers[r - 1] rank
+    // r's, whose attention layers carry no mixer (rank 0 runs attention alone). Empty otherwise.
+    std::vector<std::vector<BlockParameters>> rank_layers;
+    // How many stages the layer loop spans, or how many tensor-parallel ranks share every layer.
+    // One is the identity plan and the fast path.
     std::size_t rank_count = 1;
     // Stage s owns layers [stage_begin[s], stage_end(s)).
     std::vector<std::uint32_t> stage_begin{0};
 
     [[nodiscard]] bool split_execution() const noexcept { return rank_count > 1; }
+    [[nodiscard]] bool tensor_parallel() const noexcept { return !rank_layers.empty(); }
     [[nodiscard]] std::uint32_t stage_end(std::size_t stage) const {
         return stage + 1 < stage_begin.size() ? stage_begin[stage + 1]
                                               : static_cast<std::uint32_t>(layers.size());

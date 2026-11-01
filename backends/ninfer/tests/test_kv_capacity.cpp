@@ -1,3 +1,4 @@
+#include "ninfer/engine_options.h"
 #include "runtime/engine/kv_capacity.h"
 
 #include <iostream>

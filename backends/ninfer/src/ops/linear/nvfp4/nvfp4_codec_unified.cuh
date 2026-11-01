@@ -3,6 +3,7 @@
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/linear/fp8/fp8_a16_codec.cuh"
+#include "ops/linear/nvfp4/nvfp4_e4m3_scale.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp4.h>
@@ -12,10 +13,36 @@
 
 namespace ninfer::ops::detail::unified {
 
+// The ue4m3 scale table for the A16 decode path, expanded from the same list the int8 routes use
+// (nvfp4_e4m3_scale.h). Over the reachable domain 0x00..0x7E every entry is exactly half the vendor
+// __nv_fp8x2_e4m3 value; both users below compensate with a power-of-two fold (2^15), so every
+// product stays bit-identical.
+__device__ constexpr float kNvfp4E4M3ScaleA16[256] = {
+    NINFER_E4M3_SCALE_LIST(NINFER_E4M3_SCALE_VALUE)};
+
+// E2M1 pair -> FP32 without the vendor conversion, which ptxas outlines on sm_86/sm_89 into a call
+// with BSSY/BSYNC bookkeeping. This form builds both halves as FP16 bit patterns and converts: the
+// FP16 pattern carries the e2m1 significand in [11:9] and the sign in [15], and FP16 subnormals
+// line the exp==0 codes up on a common 2^-14 factor, so the conversion yields e2m1 * 2^-14 exactly
+// and the trailing *2^14 rescale below is a power of two.
+__device__ __forceinline__ float2 decode_nvfp4_e2m1x2_raw(std::uint8_t storage) {
+    const unsigned v = static_cast<unsigned>(storage) | (static_cast<unsigned>(storage) << 12);
+    const unsigned r = ((v << 9) & 0x0E000E00u) | ((v & 0x00080008u) << 12);
+    __half2 packed;
+    packed.x = __ushort_as_half(static_cast<unsigned short>(r & 0xFFFFu));
+    packed.y = __ushort_as_half(static_cast<unsigned short>(r >> 16));
+    return __half22float2(packed);
+}
+
+// The same expansion without the 2^14 rescale: callers whose group coefficient is a free scalar
+// fold that power of two into the coefficient instead of paying one FMUL per code here -- which is
+// exact because 16384 is a power of two.
 __device__ __forceinline__ float2 decode_nvfp4_e2m1x2(std::uint8_t storage) {
-    __nv_fp4x2_e2m1 value;
-    value.__x = storage;
-    return static_cast<float2>(value);
+    const float2 raw = decode_nvfp4_e2m1x2_raw(storage);
+    float2 result;
+    result.x = raw.x * 16384.0F;
+    result.y = raw.y * 16384.0F;
+    return result;
 }
 
 __device__ __forceinline__ float decode_nvfp4_e4m3(std::uint8_t storage) {
@@ -26,8 +53,8 @@ __device__ __forceinline__ float decode_nvfp4_e4m3(std::uint8_t storage) {
 
 __device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, std::uint8_t scale) {
 #if NINFER_NATIVE_FP8_FP4_PAIR_CVT
-    // Stored UE4M3 weight scales map 0x7F to zero, like the software table below. Native E4M3
-    // conversion would otherwise inject NaNs into the matrix product on Blackwell.
+    // Stored UE4M3 weight scales map 0x7F to zero, like the software table.
+    // Native E4M3 conversion would otherwise inject NaNs into the matrix product.
     if (scale == 0x7Fu) { scale = 0; }
     // E2M1 times a finite E4M3 scale needs at most six significand bits, so the BF16 product is
     // exact and equals the FP32 expansion below.
@@ -44,8 +71,13 @@ __device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, st
     asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(result) : "r"(values), "r"(multiplier));
     return result;
 #else
-    const float2 values    = decode_nvfp4_e2m1x2(code);
-    const float multiplier = decode_nvfp4_e4m3(scale);
+    // E2M1 * E4M3 scale to a BF16 pair without either vendor conversion: the code side is the
+    // raw bit-trick expansion (e2m1 * 2^-14), the scale side is the ue4m3 table (exactly
+    // e4m3fn / 2 over the reachable domain) raised back by 2^15.  Both factors are power-of-two
+    // rescalings of exact values, so the product rounds once to the same bits the vendor pair
+    // produced (lut_bitcheck.cu is bit-exact over the full domain).
+    const float2 values    = decode_nvfp4_e2m1x2_raw(code);
+    const float multiplier = kNvfp4E4M3ScaleA16[scale] * 32768.0F;
 
     union {
         __nv_bfloat162 pair;
@@ -54,6 +86,48 @@ __device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, st
 
     result.pair = __floats2bfloat162_rn(values.x * multiplier, values.y * multiplier);
     return result.bits;
+#endif
+}
+
+// Eight elements at once: four code bytes under the one scale byte they share. The widening pass
+// reads a 32-bit code word and one scale byte per sixteen columns anyway, so the scale expansion
+// and its table lookup are hoisted out of four pairs here. Each pair still does exactly the
+// arithmetic nvfp4_scaled_pair_bf16 does on the same inputs -- same inputs, same operations, same
+// rounding -- so the output is bit-identical; the saving is the redundancy, not a change of math.
+__device__ __forceinline__ void nvfp4_scaled_quad_bf16(unsigned codes, std::uint8_t scale,
+                                                       unsigned out[4]) {
+#if NINFER_NATIVE_FP8_FP4_PAIR_CVT
+    if (scale == 0x7Fu) { scale = 0; }
+    const auto scale_pair = static_cast<std::uint16_t>(scale | (static_cast<unsigned>(scale) << 8));
+    unsigned multiplier;
+    asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(multiplier) : "h"(scale_pair));
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        unsigned values, result;
+        const unsigned code = (codes >> (8 * i)) & 0xFFu;
+        asm("{\n"
+            ".reg .b8 packed;\n"
+            "mov.b32 {packed, _, _, _}, %1;\n"
+            "cvt.rn.bf16x2.e2m1x2 %0, packed;\n"
+            "}\n"
+            : "=r"(values)
+            : "r"(code));
+        asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(result) : "r"(values), "r"(multiplier));
+        out[i] = result;
+    }
+#else
+    const float multiplier = kNvfp4E4M3ScaleA16[scale] * 32768.0F;
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const float2 values =
+            decode_nvfp4_e2m1x2_raw(static_cast<std::uint8_t>((codes >> (8 * i)) & 0xFFu));
+        union {
+            __nv_bfloat162 pair;
+            unsigned bits;
+        } result;
+        result.pair = __floats2bfloat162_rn(values.x * multiplier, values.y * multiplier);
+        out[i] = result.bits;
+    }
 #endif
 }
 
@@ -76,6 +150,12 @@ static_assert(alignof(Nvfp4QuantizedK16) == 8);
 
 __device__ __forceinline__ void
 pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint32_t& codes_hi) {
+#if defined(NINFER_PRE_BLACKWELL_DEVICE)
+    // Blackwell's FP4 conversion; an image of another architecture in a build of several never
+    // runs the routes that call it.
+    codes_lo = codes_hi = 0;
+    __trap();
+#else
     asm volatile("{\n"
                  ".reg .b8 b0;\n"
                  ".reg .b8 b1;\n"
@@ -101,6 +181,7 @@ pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint
                    "f"(values[2].x), "f"(values[2].y), "f"(values[3].x), "f"(values[3].y),
                    "f"(values[4].x), "f"(values[4].y), "f"(values[5].x), "f"(values[5].y),
                    "f"(values[6].x), "f"(values[6].y), "f"(values[7].x), "f"(values[7].y));
+#endif
 }
 
 // Reciprocal replaces the sixteen per-value divisions with one reciprocal plus multiplies.

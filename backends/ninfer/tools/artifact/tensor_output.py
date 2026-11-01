@@ -7,9 +7,10 @@ ArtifactWriter owns file placement, sharding, write coverage, and publication.
 from __future__ import annotations
 
 import torch
+import numpy as np
 
 from .codecs.direct import encode_direct
-from .codecs.fp8_row import encode_fp8_row_scaled
+from .codecs.fp8_row import encode_fp8_row_interleaved, encode_fp8_row_scaled
 from .codecs.nvfp4 import encode_nvfp4
 from .codecs.row_split import encode_row_split, split_row_planes
 from .formats import (
@@ -24,6 +25,7 @@ from .layouts import (
     block_scale_geometry,
     gguf_blocks_geometry,
     row_scale_geometry,
+    row_interleaved_geometry,
     row_split_geometry,
 )
 from .schema import TensorObject
@@ -63,7 +65,7 @@ class TensorOutput:
                 (g.base_bytes, g.high_offset),
                 (g.high_offset + g.high_bytes, g.scale_offset),
             )
-        elif isinstance(self.format, Fp8RowFormat):
+        elif isinstance(self.format, Fp8RowFormat) and self.format.scale_dtype == "bf16":
             g = row_scale_geometry(self.format, obj.shape)
             gaps = ((g.code_plane_bytes, g.scale_plane_offset),)
         elif isinstance(self.format, Nvfp4Format):
@@ -82,6 +84,7 @@ class TensorOutput:
         codes: torch.Tensor,
         scales: torch.Tensor,
         weight_divisor: bytes | None = None,
+        *, packed: bool = False,
     ) -> None:
         obj = self.object
         if len(obj.shape) != 2 or not 0 <= row_begin < obj.shape[0]:
@@ -89,9 +92,40 @@ class TensorOutput:
         rows, k = codes.shape[0], obj.shape[1]
         if rows <= 0 or row_begin + rows > obj.shape[0]:
             raise ValueError(f"{obj.id}: encoded rows exceed parent")
+        if packed and self.format.name not in ("q2_g64_fp16", "q8_g32_fp16", "ptq1_g128_fp16"):
+            raise ValueError("packed code planes require native Q2 or Q8")
         self._padding()
         if isinstance(self.format, QuantFormat):
             g = row_split_geometry(self.format, obj.shape)
+            if packed and self.format.name == "ptq1_g128_fp16":
+                if (codes.dtype != torch.uint8 or tuple(codes.shape) != (rows, g.groups_per_row * 26)
+                        or scales.dtype != torch.float16 or tuple(scales.shape) != (rows, g.groups_per_row)):
+                    raise ValueError("packed PTQ1 rows require 26 code/tail bytes per group and FP16 scales")
+                records = codes.detach().cpu().contiguous().numpy().reshape(rows, g.groups_per_row, 26)
+                scale_words = scales.detach().cpu().contiguous().numpy()
+                if not np.isfinite(scale_words).all():
+                    raise ValueError("PTQ1 scales must be finite binary16 words")
+                self.write_bytes(g.base_offset + row_begin * g.base_row_bytes, records[:, :, :24].tobytes())
+                self.write_bytes(g.high_offset + row_begin * g.high_row_bytes, records[:, :, 24:].tobytes())
+                self.write_bytes(g.scale_offset + row_begin * g.scale_row_bytes, scale_words.tobytes())
+                return
+            if packed:
+                if (codes.dtype != torch.uint8 or tuple(codes.shape) != (rows, g.base_row_bytes)
+                        or scales.dtype != torch.float16 or
+                        tuple(scales.shape) != (rows, g.groups_per_row)):
+                    raise ValueError("packed native rows have incompatible code/scale geometry")
+                code_words = codes.detach().cpu().contiguous().numpy()
+                scale_values = scales.detach().cpu().contiguous().numpy()
+                if not np.isfinite(scale_values).all():
+                    raise ValueError("packed native scales must be finite binary16 words")
+                if self.format.name == "q8_g32_fp16" and (
+                        (scale_values.view("<u2") == 0x8000).any() or (code_words == 0x80).any() or
+                        ((scale_values == 0)[..., None] &
+                         (code_words.reshape(rows, g.groups_per_row, 32) != 0)).any()):
+                    raise ValueError("packed Q8 rows violate the native code/scale contract")
+                self.write_bytes(g.base_offset + row_begin * g.base_row_bytes, code_words.tobytes())
+                self.write_bytes(g.scale_offset + row_begin * g.scale_row_bytes, scale_values.tobytes())
+                return
             block = encode_row_split(codes, scales, self.format, (rows, k))
             planes = split_row_planes(block, row_split_geometry(self.format, (rows, k)))
             self.write_bytes(g.base_offset + row_begin * g.base_row_bytes, planes.base)
@@ -100,6 +134,11 @@ class TensorOutput:
                 g.scale_offset + row_begin * g.scale_row_bytes, planes.scale
             )
         elif isinstance(self.format, Fp8RowFormat):
+            if self.format.scale_dtype == "fp16":
+                g = row_interleaved_geometry(self.format, obj.shape)
+                self.write_bytes(row_begin * g.row_bytes,
+                                 encode_fp8_row_interleaved(codes, scales, (rows, k)))
+                return
             g = row_scale_geometry(self.format, obj.shape)
             local = row_scale_geometry(self.format, (rows, k))
             block = memoryview(encode_fp8_row_scaled(codes, scales, (rows, k)))

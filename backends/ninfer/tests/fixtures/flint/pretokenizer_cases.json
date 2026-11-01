@@ -1,0 +1,481 @@
+[
+ {
+  "text": "Hello world, this is a test.",
+  "word_ends": [
+   5,
+   11,
+   12,
+   17,
+   20,
+   22,
+   27,
+   28
+  ]
+ },
+ {
+  "text": "don't I'M you'RE they've we'll He'd it's 'tis",
+  "word_ends": [
+   5,
+   9,
+   16,
+   24,
+   30,
+   35,
+   40,
+   42,
+   45
+  ]
+ },
+ {
+  "text": "CamelCaseWord HTTPServer XMLHttpRequest iPhone eBay",
+  "word_ends": [
+   5,
+   9,
+   13,
+   24,
+   32,
+   39,
+   41,
+   46,
+   48,
+   51
+  ]
+ },
+ {
+  "text": "ALLCAPS WORD's OK'll",
+  "word_ends": [
+   7,
+   14,
+   20
+  ]
+ },
+ {
+  "text": "1234567 89 0 3.14159 1,000,000 v2.0.1",
+  "word_ends": [
+   3,
+   6,
+   7,
+   8,
+   10,
+   11,
+   12,
+   13,
+   14,
+   15,
+   18,
+   20,
+   21,
+   22,
+   23,
+   26,
+   27,
+   30,
+   32,
+   33,
+   34,
+   35,
+   36,
+   37
+  ]
+ },
+ {
+  "text": "x\u00b2+y\u00b3 \u00bd \u2163 \u2460\u2461\u2462",
+  "word_ends": [
+   1,
+   3,
+   5,
+   7,
+   8,
+   10,
+   11,
+   14,
+   15,
+   24
+  ]
+ },
+ {
+  "text": "\u4e2d\u6587\u5206\u8bcd\u6d4b\u8bd5\uff0c\u8fd9\u662f\u4e00\u4e2a\u53e5\u5b50\u3002\u65e5\u672c\u8a9e\u306e\u30c6\u30ad\u30b9\u30c8\u3001\u30ab\u30bf\u30ab\u30ca\u30fb\u3072\u3089\u304c\u306a",
+  "word_ends": [
+   18,
+   21,
+   39,
+   42,
+   66,
+   69,
+   81,
+   96
+  ]
+ },
+ {
+  "text": "\u30a2\u30fb\u30a4 \u309b\u309c\u309d\u309e \u30fc\u301c",
+  "word_ends": [
+   3,
+   9,
+   10,
+   16,
+   22,
+   23,
+   26,
+   29
+  ]
+ },
+ {
+  "text": "\u0e20\u0e32\u0e29\u0e32\u0e44\u0e17\u0e22ABCdef \u0e44\u0e17\u0e22ABCDE \u0e01\u0e02\u0e04Ab",
+  "word_ends": [
+   27,
+   37,
+   42,
+   54
+  ]
+ },
+ {
+  "text": "\u041f\u0440\u0438\u0432\u0435\u0442, \u043c\u0438\u0440! \u042d\u0442\u043e \u0442\u0435\u0441\u0442: \u0417\u0410\u0413\u041b\u0410\u0412\u041d\u042b\u0415 \u0438 \u0441\u0442\u0440\u043e\u0447\u043d\u044b\u0435.",
+  "word_ends": [
+   12,
+   13,
+   20,
+   21,
+   28,
+   37,
+   38,
+   57,
+   60,
+   77,
+   78
+  ]
+ },
+ {
+  "text": "\u0645\u0631\u062d\u0628\u0627 \u0628\u0627\u0644\u0639\u0627\u0644\u0645 123 \u0639\u0631\u0628\u064a",
+  "word_ends": [
+   10,
+   25,
+   26,
+   29,
+   38
+  ]
+ },
+ {
+  "text": "  leading spaces   and    runs\t\ttabs\n\nnewlines\r\nCRLF  \n  mixed",
+  "word_ends": [
+   1,
+   9,
+   16,
+   18,
+   22,
+   25,
+   30,
+   31,
+   36,
+   38,
+   46,
+   48,
+   52,
+   55,
+   56,
+   62
+  ]
+ },
+ {
+  "text": "trailing spaces   ",
+  "word_ends": [
+   8,
+   15,
+   18
+  ]
+ },
+ {
+  "text": "\n\n\n",
+  "word_ends": [
+   3
+  ]
+ },
+ {
+  "text": "a\u0001b \u0001\u0002c \u0000 end\u007f",
+  "word_ends": [
+   1,
+   3,
+   4,
+   5,
+   7,
+   8,
+   9,
+   13,
+   14
+  ]
+ },
+ {
+  "text": "zero\u200bwidth\u200djoin \ufeffbom",
+  "word_ends": [
+   4,
+   12,
+   19,
+   20,
+   26
+  ]
+ },
+ {
+  "text": "emoji \ud83d\ude00\ud83d\udc4d\ud83c\udffd family \ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67 flags \ud83c\uddfa\ud83c\uddf8",
+  "word_ends": [
+   5,
+   18,
+   25,
+   30,
+   33,
+   37,
+   40,
+   44,
+   50,
+   59
+  ]
+ },
+ {
+  "text": "combining e\u0301 a\u0300\u0300 \u0301x",
+  "word_ends": [
+   9,
+   13,
+   19,
+   23
+  ]
+ },
+ {
+  "text": "punct!!! ??? ... --- ((( ))) [x] {y} <tag> @user #hash $5 %20 ^&*",
+  "word_ends": [
+   5,
+   8,
+   12,
+   16,
+   20,
+   24,
+   28,
+   30,
+   31,
+   32,
+   34,
+   35,
+   36,
+   38,
+   41,
+   42,
+   44,
+   48,
+   50,
+   54,
+   56,
+   57,
+   59,
+   61,
+   65
+  ]
+ },
+ {
+  "text": " !leading-space-punct\n !! \n",
+  "word_ends": [
+   2,
+   9,
+   15,
+   21,
+   22,
+   25,
+   27
+  ]
+ },
+ {
+  "text": "code: if (x == 1) { return foo_bar(baz); }\n\tint main() {}\n",
+  "word_ends": [
+   4,
+   5,
+   8,
+   10,
+   11,
+   14,
+   15,
+   16,
+   17,
+   19,
+   26,
+   30,
+   34,
+   38,
+   40,
+   43,
+   47,
+   52,
+   54,
+   58
+  ]
+ },
+ {
+  "text": "<think>not special here</think> <|user|> <tool_call>",
+  "word_ends": [
+   6,
+   10,
+   18,
+   23,
+   25,
+   30,
+   31,
+   34,
+   38,
+   40,
+   42,
+   46,
+   51,
+   52
+  ]
+ },
+ {
+  "text": "MiXeD cAsE wOrDs AnD 'S 's 'Ll 'LL",
+  "word_ends": [
+   2,
+   4,
+   5,
+   7,
+   9,
+   10,
+   12,
+   14,
+   16,
+   19,
+   20,
+   22,
+   23,
+   25,
+   26,
+   28,
+   30,
+   32,
+   34
+  ]
+ },
+ {
+  "text": "'s alone 's",
+  "word_ends": [
+   2,
+   8,
+   10,
+   11
+  ]
+ },
+ {
+  "text": "x'y z'ss O'Neil rock'n'roll",
+  "word_ends": [
+   1,
+   3,
+   7,
+   8,
+   10,
+   15,
+   20,
+   22,
+   27
+  ]
+ },
+ {
+  "text": "\u01c5ungla \u01c8 \u01c7 \u01cb titlecase",
+  "word_ends": [
+   7,
+   10,
+   13,
+   16,
+   26
+  ]
+ },
+ {
+  "text": "\u02b0\u02b2 modifier \u02b0a a\u02b0 A\u02b0b",
+  "word_ends": [
+   4,
+   13,
+   17,
+   21,
+   26
+  ]
+ },
+ {
+  "text": "\u24b6\u24d1 \u249c circled",
+  "word_ends": [
+   6,
+   10,
+   18
+  ]
+ },
+ {
+  "text": "tab\tsep\tvalues\t",
+  "word_ends": [
+   3,
+   7,
+   14,
+   15
+  ]
+ },
+ {
+  "text": "\u3000ideographic space\u3000",
+  "word_ends": [
+   14,
+   20,
+   23
+  ]
+ },
+ {
+  "text": "a\u00a0b\u2003c",
+  "word_ends": [
+   1,
+   4,
+   8
+  ]
+ },
+ {
+  "text": "\u0661\u0662\u0663 \u0664\u0665\u0666 Arabic-Indic digits",
+  "word_ends": [
+   6,
+   7,
+   13,
+   20,
+   26,
+   33
+  ]
+ },
+ {
+  "text": "\u0661\u0662\u0663\u0664\u0665",
+  "word_ends": [
+   6,
+   10
+  ]
+ },
+ {
+  "text": "end with apostrophe'",
+  "word_ends": [
+   3,
+   8,
+   19,
+   20
+  ]
+ },
+ {
+  "text": "mix123abc456def",
+  "word_ends": [
+   3,
+   6,
+   9,
+   12,
+   15
+  ]
+ },
+ {
+  "text": "ABC123DEF",
+  "word_ends": [
+   3,
+   6,
+   9
+  ]
+ },
+ {
+  "text": "a.b,c;d:e",
+  "word_ends": [
+   1,
+   3,
+   5,
+   7,
+   9
+  ]
+ }
+]

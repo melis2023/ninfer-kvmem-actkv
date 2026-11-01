@@ -201,7 +201,7 @@ int run_t2_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weigh
     Tensor output              = qkv.tensor();
     Tensor z_output            = z.tensor();
     const std::size_t capacity = ops::gdn_input_proj_split_workspace_capacity_bytes(
-        QType::T2_G128_FP16, kQkRows, QType::T2_G128_FP16, kValueRows + kZRows, kHidden, kPolicy,
+        query_key.host.weight.qtype, kQkRows, value_z_weight.host.weight.qtype, kValueRows + kZRows, kHidden, kPolicy,
         tokens, tokens);
     GuardedDeviceBuffer scratch(std::max<std::size_t>(capacity, 1));
     DeviceArena workspace(DeviceSpan{scratch.data(), std::max<std::size_t>(capacity, 1)});
@@ -210,7 +210,7 @@ int run_t2_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weigh
                         workspace, nullptr);
     cuda_synchronize();
 
-    const std::string suffix = " T2 allow-a8-int T=" + std::to_string(tokens);
+    const std::string suffix = (query_key.host.weight.qtype == QType::PTQ1_G128_FP16 ? " PTQ1 allow-a8-int T=" : " T2 allow-a8-int T=") + std::to_string(tokens);
     int failures             = qkv.verify_guards("gdn qkv" + suffix);
     failures += z.verify_guards("gdn z" + suffix);
     failures += qkv.verify_fully_written("gdn qkv" + suffix);
@@ -234,15 +234,15 @@ int run_t2_case(DevicePackedWeight& query_key, DevicePackedWeight& value_z_weigh
     return failures;
 }
 
-int run_t2() {
+int run_t2(QType qtype = QType::T2_G128_FP16) {
     constexpr std::int32_t kHidden = 5120;
     DevicePackedWeight query_key(
-        quantized_weight::make_patterned_weight(QType::T2_G128_FP16, 4096, kHidden, 433U));
+        quantized_weight::make_patterned_weight(qtype, 4096, kHidden, 433U));
     DevicePackedWeight value_z_weight(
-        quantized_weight::make_patterned_weight(QType::T2_G128_FP16, 12288, kHidden, 439U));
+        quantized_weight::make_patterned_weight(qtype, 12288, kHidden, 439U));
     int failures = 0;
     for (const std::int32_t tokens :
-         {1, 2, 4, 8, 9, 16, 17, 33, 65, 128, 129, 192, 193, 300, 600, 1007, 1024}) {
+         {1, 2, 4, 8, 9, 16, 17, 32, 33, 64, 65, 128, 129, 192, 193, 300, 600, 1007, 1024}) {
         failures += run_t2_case(query_key, value_z_weight, tokens);
     }
     return failures;
@@ -532,13 +532,17 @@ int run_fp8() {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     if (cuda_unavailable()) {
         std::cout << "SKIP: no usable CUDA device\n";
         return 77;
     }
 
     int failures = 0;
+    if (argc == 2 && std::string(argv[1]) == "--ptq1-only") {
+        return run_t2(QType::PTQ1_G128_FP16) == 0 ? 0 : 1;
+    }
+    if(argc!=1) return 2;
     failures += run_q4_q5();
     failures += run_t2();
     failures += run_q8();

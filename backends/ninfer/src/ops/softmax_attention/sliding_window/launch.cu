@@ -203,4 +203,46 @@ void sliding_window_attention_launch(const Tensor& q, const Tensor& query_k, con
     });
 }
 
+__global__ void dequant_cyclic_i8_kernel(const std::int8_t* __restrict__ k,
+                                         const std::int8_t* __restrict__ v,
+                                         const __half* __restrict__ scale_k,
+                                         const __half* __restrict__ scale_v,
+                                         __nv_bfloat16* __restrict__ out_k,
+                                         __nv_bfloat16* __restrict__ out_v, int elements,
+                                         int head_dim, int groups) {
+    const int idx = static_cast<int>(blockIdx.x) * static_cast<int>(blockDim.x) + threadIdx.x;
+    if (idx >= elements) { return; }
+    const int d     = idx % head_dim;
+    const int row   = idx / head_dim;
+    const int group = d / (head_dim / groups);
+    const float ks  = __half2float(scale_k[static_cast<std::int64_t>(row) * groups + group]);
+    const float vs  = __half2float(scale_v[static_cast<std::int64_t>(row) * groups + group]);
+    out_k[idx]      = __float2bfloat16(static_cast<float>(k[idx]) * ks);
+    out_v[idx]      = __float2bfloat16(static_cast<float>(v[idx]) * vs);
+}
+
+void dequant_cyclic_i8_launch(const CyclicKVCacheLayerView& context, const Tensor& out_k,
+                              const Tensor& out_v, cudaStream_t stream) {
+    if (context.storage != KvCacheStorage::Int8Group64) {
+        throw std::invalid_argument("dequant_cyclic_i8: unsupported storage");
+    }
+    if (context.k_scales.data == nullptr || context.v_scales.data == nullptr) {
+        throw std::invalid_argument("dequant_cyclic_i8: missing scale planes");
+    }
+    const std::int64_t elements = static_cast<std::int64_t>(out_k.ne[0]) * out_k.ne[1] * out_k.ne[2] *
+                                  out_k.ne[3];
+    const int head_dim = out_k.ne[0];
+    const int groups   = context.k_scales.ne[0];
+    const int threads  = 256;
+    const int blocks   = static_cast<int>((elements + threads - 1) / threads);
+    dequant_cyclic_i8_kernel<<<blocks, threads, 0, stream>>>(
+        static_cast<const std::int8_t*>(context.k.data),
+        static_cast<const std::int8_t*>(context.v.data),
+        static_cast<const __half*>(context.k_scales.data),
+        static_cast<const __half*>(context.v_scales.data),
+        static_cast<__nv_bfloat16*>(out_k.data), static_cast<__nv_bfloat16*>(out_v.data),
+        static_cast<int>(elements), head_dim, groups);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 } // namespace ninfer::ops::detail

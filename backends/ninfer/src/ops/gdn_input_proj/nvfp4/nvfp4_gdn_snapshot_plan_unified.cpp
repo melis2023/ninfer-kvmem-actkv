@@ -35,7 +35,11 @@ Nvfp4GdnConvPlan nvfp4_gdn_conv_resolve_plan(LinearPolicy policy, std::int32_t t
         throw std::invalid_argument("nvfp4 gdn conv: invalid compute policy");
     }
     if (batch_size > 1) { return {Nvfp4GdnConvScheduleId::Materialized}; }
-    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8) {
+    // AllowNvfp4Int8 keeps the A16 schedule domain here: the materialised path quantises through
+    // a hardcoded A4 projection, and the int8 policy must not widen what runs on a card without
+    // FP4 tensor cores.
+    if (policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
+        policy == LinearPolicy::AllowNvfp4Int8) {
         if (tokens == 1) { return {Nvfp4GdnConvScheduleId::DecodeFusedA16}; }
         if (tokens <= 16) { return {Nvfp4GdnConvScheduleId::SmallTFusedA16}; }
         throw std::invalid_argument("nvfp4 gdn conv A16 is registered only through T=16");

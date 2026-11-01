@@ -16,6 +16,12 @@ namespace ninfer::ops {
 
 inline constexpr int kResidualAddPairsPerThread = 4;
 
+__global__ void residual_add_f32_kernel(const float* y, float* x, std::int64_t n) {
+    const auto start = blockIdx.x * static_cast<std::int64_t>(blockDim.x) + threadIdx.x;
+    const auto stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = start; i < n; i += stride) { x[i] += y[i]; }
+}
+
 __device__ __forceinline__ __nv_bfloat162 residual_add_pair(__nv_bfloat162 y, __nv_bfloat162 x) {
     const float r0 = __low2float(x) + __low2float(y);
     const float r1 = __high2float(x) + __high2float(y);

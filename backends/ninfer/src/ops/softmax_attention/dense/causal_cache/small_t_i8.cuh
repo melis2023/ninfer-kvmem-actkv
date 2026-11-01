@@ -66,8 +66,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, std::int32_t wave_splits,
-        std::int32_t invariant_segment_keys,
         float scale, float* partial_acc, float* partial_m, float* partial_l) {
+    // A Volta card runs its own kernel (small_t_sm70.cuh): a build of several architectures
+    // compiles this kernel empty in the Volta image.
+#if !defined(NINFER_SM70_DEVICE)
     constexpr bool PackedKeys          = Keys != KvKeyCoding::Int8;
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
@@ -208,35 +210,26 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         return;
     }
 
-    const int window = last_pos + 1;
+    const int live_end = last_pos + 1;
+    const int window   = causal_small_t_tile_window(first_pos, TokenTile, logical_capacity);
     const int active_split_count =
-        invariant_segment_keys > 0
-            ? (logical_capacity + invariant_segment_keys - 1) / invariant_segment_keys
-            : causal_small_t_active_splits<Geometry, true>(window, split_count, TokenTile,
-                                                           wave_splits);
+        causal_small_t_active_splits<Geometry, true>(window, split_count, TokenTile, wave_splits);
     if (split >= active_split_count) { return; }
 
-    int split_start = 0;
-    int split_end   = 0;
-    if (invariant_segment_keys > 0) {
-        // Fixed segments: every launch covers [s * N, (s + 1) * N), whatever its width.
-        split_start = split * invariant_segment_keys;
-        const int segment_limit = split_start + invariant_segment_keys;
-        split_end   = (segment_limit < window) ? segment_limit : window;
-    } else {
-        const int logical_tiles = div_up(window, Bc);
-        const bool tile_split   = logical_tiles >= active_split_count;
-        const int units_per_split =
-            tile_split ? div_up(logical_tiles, active_split_count)
-                       : div_up(window, active_split_count);
-        split_start = split * units_per_split * (tile_split ? Bc : 1);
-        const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
-        split_end   = (split_limit < window) ? split_limit : window;
-    }
+    const int logical_tiles = div_up(window, Bc);
+    const bool tile_split   = logical_tiles >= active_split_count;
+    const int units_per_split =
+        tile_split ? div_up(logical_tiles, active_split_count) : div_up(window, active_split_count);
+    const int split_start = split * units_per_split * (tile_split ? Bc : 1);
+    const int split_limit = split_start + units_per_split * (tile_split ? Bc : 1);
+    const int split_end   = (split_limit < window) ? split_limit : window;
     if (split_start >= split_end) {
         write_neutral();
         return;
     }
+    // Keys at or past the live end are beyond every live column: none is loaded.
+    const int load_end = split_end < live_end ? split_end : live_end;
+
     const int first_tile = (split_start / Bc) * Bc;
     const int key_blocks = div_up(split_end - first_tile, Bc);
     const int first_page = first_tile >> kPagedKVPageShift;
@@ -456,7 +449,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                     const int key_l = chunk / (D / 16);
                     const int d     = (chunk - key_l * (D / 16)) * 16;
                     const int key   = tile_k0 + key_l;
-                    if (key >= split_start && key < split_end) {
+                    if (key >= split_start && key < load_end) {
                         const std::int64_t off = kv_cache_packed_key_chunk_index<Geometry, Keys>(
                             physical_page, kv_head, d, key & kPagedKVPageMask);
                         // A plain load: the fused append above may have written these bytes in
@@ -515,7 +508,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int key = tile_k0 + tid;
                 k_scale_next  = int2{};
                 v_scale_next  = ValueScaleRow{};
-                if (key >= split_start && key < split_end) {
+                if (key >= split_start && key < load_end) {
                     const std::int64_t off = kv_cache_int8_quant_scale_index<Geometry>(
                         page, kv_head, 0, key & kPagedKVPageMask);
                     k_scale_next = load_vec<int2>(&cache_k_scale[off]);
@@ -536,7 +529,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                     const int key_l = chunk / (D / 16);
                     const int d     = (chunk - key_l * (D / 16)) * 16;
                     const int key   = tile_k0 + key_l;
-                    if (key >= split_start && key < split_end) {
+                    if (key >= split_start && key < load_end) {
                         if constexpr (PackedValues) {
                             v_next[i] = load_vec<int2>(
                                 reinterpret_cast<const std::uint8_t*>(cache_v_i8) +
@@ -577,7 +570,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     auto issue_kv_tile = [&](int tile_k0, int physical_page) {
         for (int key_l = tid; key_l < Bc; key_l += Threads) {
             const int key = tile_k0 + key_l;
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < load_end) {
                 const std::int64_t off = kv_cache_int8_quant_scale_index<Geometry>(
                     physical_page, kv_head, 0, key & kPagedKVPageMask);
                 ninfer::ops::cp_async<8>(&k_scale_s[key_l * Groups], &cache_k_scale[off]);
@@ -605,7 +598,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int key_l = chunk / (D / 16);
                 const int d     = (chunk - key_l * (D / 16)) * 16;
                 const int key   = tile_k0 + key_l;
-                if (key >= split_start && key < split_end) {
+                if (key >= split_start && key < load_end) {
                     const std::int64_t off = kv_cache_int4_value_code_index<Geometry>(
                         physical_page, kv_head, d >> 1, key & kPagedKVPageMask);
                     ninfer::ops::cp_async<8>(
@@ -622,7 +615,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int dc    = chunk - key_l * (D / 16);
                 const int d     = dc * 16;
                 const int key   = tile_k0 + key_l;
-                if (key >= split_start && key < split_end) {
+                if (key >= split_start && key < load_end) {
                     const std::int64_t off = kv_cache_int8_quant_code_index<Geometry>(
                         physical_page, kv_head, d, key & kPagedKVPageMask);
                     std::int8_t* dst = &k_i8[key_l * D + causal_small_t_tc_swz(key_l, dc * 8) * 2];
@@ -669,7 +662,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int d     = dc * 8;
             const int key   = k0 + key_l;
             __half* dst     = &v_f16[key_l * D + causal_small_t_tc_swz(key_l, d)];
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < load_end) {
                 // The lanes of one value group read the same scale: a shared-memory broadcast,
                 // where a shuffle from a computed lane costs an out-of-line call.
                 const int grp  = PackedValues ? (d >> 5) : (d >> 6);
@@ -994,6 +987,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             *reinterpret_cast<float2*>(&partial_acc[dst]) = make_float2(acc[n][2], acc[n][3]);
         }
     }
+#endif
 }
 
 } // namespace ninfer::ops

@@ -14,6 +14,28 @@
 #    define NINFER_PRE_SM80_DEVICE 1
 #endif
 
+// Turing device code: the Turing forms of the sm_80 instructions (sm75_mma.cuh) replace them. A
+// build of several architectures selects them in its Turing image alone, so its other images keep
+// their own instructions (ops/common/device_tier.h).
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750 && __CUDA_ARCH__ < 800
+#    define NINFER_SM75_DEVICE 1
+#endif
+
+// Device code without Blackwell's block-scaled FP8 and FP4 tensor-core instructions, TMA and the
+// mbarrier transaction forms. A build of several architectures compiles a kernel built on them into
+// every image; the host launches it only on a card that runs the 120a code
+// (ops/common/device_tier.h), and the other images hold a trap in its place.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
+#    define NINFER_PRE_BLACKWELL_DEVICE 1
+#endif
+
+// Device code that has Turing's FP16 m16n8k8 and INT8 m8n8k16 MMA (every image but sm_70's), and
+// the host pass. The Turing forms (sm75_mma.cuh) are defined there, so a Turing kernel variant
+// compiles in every image that may hold it; a Volta image holds none.
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
+#    define NINFER_SM75_FORMS 1
+#endif
+
 namespace ninfer::ops::pre_sm80 {
 
 __device__ __forceinline__ unsigned lane_id() {

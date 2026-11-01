@@ -2,6 +2,7 @@
 
 #include "serve/generation_service.h"
 #include "serve/openai_common.h"
+#include "serve/kvmem_metrics.h"
 
 #include <algorithm>
 #include <iterator>
@@ -29,6 +30,39 @@ std::string response_status(ninfer::FinishReason reason) {
         return "completed";
     }
     return "failed";
+}
+
+// Response.error.code is a closed enum on the wire. A failure whose code is outside it is reported
+// as server_error, and its own code moves into the message.
+Json response_error(const ApiError& error) {
+    static constexpr std::string_view kWireCodes[] = {"server_error",
+                                                      "rate_limit_exceeded",
+                                                      "invalid_prompt",
+                                                      "data_residency_mismatch",
+                                                      "bio_policy",
+                                                      "misalignment_policy_violation",
+                                                      "vector_store_timeout",
+                                                      "invalid_image",
+                                                      "invalid_image_format",
+                                                      "invalid_base64_image",
+                                                      "invalid_image_url",
+                                                      "image_too_large",
+                                                      "image_too_small",
+                                                      "image_parse_error",
+                                                      "image_content_policy_violation",
+                                                      "invalid_image_mode",
+                                                      "image_file_too_large",
+                                                      "unsupported_image_media_type",
+                                                      "empty_image_file",
+                                                      "failed_to_download_image",
+                                                      "image_file_not_found"};
+    if (std::find(std::begin(kWireCodes), std::end(kWireCodes), error.code) !=
+        std::end(kWireCodes)) {
+        return Json{{"code", error.code}, {"message", error.message}};
+    }
+    return Json{
+        {"code", "server_error"},
+        {"message", error.code.empty() ? error.message : error.message + " (" + error.code + ")"}};
 }
 
 struct ItemIds {
@@ -72,6 +106,7 @@ Json response_common(const std::string& id, std::int64_t created_at,
         {"id", id},
         {"object", "response"},
         {"created_at", created_at},
+        {"access_programs", nullptr},
         {"background", false},
         {"instructions",
          request.prompt.instructions ? Json(*request.prompt.instructions) : Json(nullptr)},
@@ -195,12 +230,13 @@ BuiltOpenAIResponse build_response(const std::string& id, std::int64_t created_a
     const int observed_cached = std::max(runtime.cached_input_tokens,
                                          static_cast<int>(outcome.metrics.prefix_cache_hit_tokens));
     const int cached_tokens   = std::clamp(observed_cached, 0, outcome.prompt_tokens);
-    response["usage"] =
-        Json{{"input_tokens", outcome.prompt_tokens},
-             {"input_tokens_details", Json{{"cached_tokens", cached_tokens}}},
-             {"output_tokens", outcome.completion_tokens},
-             {"output_tokens_details", Json{{"reasoning_tokens", outcome.reasoning_tokens}}},
-             {"total_tokens", outcome.prompt_tokens + outcome.completion_tokens}};
+    response["usage"]         = Json{
+        {"input_tokens", outcome.prompt_tokens},
+        {"input_tokens_details", Json{{"cached_tokens", cached_tokens}, {"cache_write_tokens", 0}}},
+        {"output_tokens", outcome.completion_tokens},
+        {"output_tokens_details", Json{{"reasoning_tokens", outcome.reasoning_tokens}}},
+        {"total_tokens", outcome.prompt_tokens + outcome.completion_tokens}};
+    response["kvmem"] = kvmem_generation_metrics(outcome);
     built.body = std::move(response);
     return built;
 }
@@ -547,8 +583,7 @@ std::string OpenAIResponsesEventStream::failed(const ApiError& error) {
         in_progress_response(impl_->id, impl_->created_at, impl_->request, impl_->runtime);
     response["status"]       = "failed";
     response["completed_at"] = nullptr;
-    response["error"]        = Json{{"code", error.code.empty() ? Json(nullptr) : Json(error.code)},
-                                    {"message", error.message}};
+    response["error"]        = response_error(error);
     return sse(impl_->event("response.failed", Json{{"response", response}}));
 }
 

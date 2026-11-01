@@ -298,10 +298,11 @@ int run_q4_q5() {
     const auto run = [&](std::int32_t width, std::int32_t batch, std::vector<std::int32_t> valid,
                          std::uint32_t seed) {
         const std::size_t snapshot_bytes =
-            ops::gdn_input_proj_conv_snapshot_workspace_capacity_bytes(
-                kQueryRows, kKeyRows, kValueRows, batch, width, width);
-        const std::size_t record_bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(
-            kQueryRows, kKeyRows, kValueRows, batch, width, width);
+            ops::gdn_input_proj_split_conv_snapshot_workspace_capacity_bytes(
+                QType::Q4_G64_FP16, QType::Q5_G64_FP16, batch, width, width);
+        const std::size_t record_bytes =
+            ops::gdn_input_proj_split_conv_record_workspace_capacity_bytes(
+                QType::Q4_G64_FP16, QType::Q5_G64_FP16, batch, width, width);
         return run_case(
             "Q4/Q5 B=" + std::to_string(batch) + " T=" + std::to_string(width), kHidden, kValueRows,
             kZRows, width, batch, std::move(valid), snapshot_bytes, record_bytes,

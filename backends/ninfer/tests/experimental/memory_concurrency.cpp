@@ -265,10 +265,11 @@ int main(int argc, char** argv) {
                                192 - row * 16, false, "ORCHID-" + std::to_string(7100 + row),
                                image == &red ? "red" : image == &blue ? "blue" : ""});
         }
-        // CPU image encoding and staged prefill are serialized. A cold short
-        // reply may finish before another image lane becomes decode-ready.
+        // CPU image encoding, staged prefill and asynchronous SSD reads can
+        // leave a cold lane unready until another lane's short reply finishes.
         // Unchanged warm sessions below still must form a compact batch and fill all lanes.
-        batch("mixed-prefill", initial, !pressure && !options.enable_vision);
+        batch("mixed-prefill", initial,
+              !pressure && !options.enable_vision && !options.kvmem.disk_bytes);
         initial.front().cancel = true;
         batch("cancel-one", initial, !pressure);
         initial.front().cancel = false;

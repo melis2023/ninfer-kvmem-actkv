@@ -34,6 +34,8 @@ class Model:
     packing_groups: list[tuple[str, ...]] = field(default_factory=list)
     token_count: int = 0
     special_token_ids: tuple[int, ...] = ()
+    # Flash-Next slices bind local text layer i to this layer in the source checkpoint.
+    source_layers: tuple[int, ...] | None = None
 
     @property
     def config(self) -> dict:

@@ -4,6 +4,7 @@
 // 16-row by 8/16-token tile. Sixteen/eight warps split K, double-buffer global-to-shared staging,
 // and reduce FP32 fragments in shared memory before the final BF16 store.
 
+#include "ops/common/device_limits.h"
 #include "ops/common/math.h"
 #include "core/pdl.cuh"
 #include "ops/common/memory.cuh"
@@ -15,6 +16,11 @@
 #include <cstdint>
 
 namespace ninfer::ops::detail {
+
+// The two staging stages of a schedule: 16 weight rows and the token tile, 64 K a warp each.
+[[nodiscard]] constexpr int bf16_n256_k5120_staging_bytes(int k_warps, int tile_tokens) {
+    return 2 * (16 + tile_tokens) * k_warps * 64 * static_cast<int>(sizeof(__nv_bfloat16));
+}
 
 template <int KWarps, int TileTokens>
 struct Bf16N256K5120MmaSchedule {
@@ -31,13 +37,14 @@ struct Bf16N256K5120MmaSchedule {
     static constexpr int kStageElements     = (16 + kTileTokens) * kGroupK;
     static constexpr int kStagingBytes =
         kPipelineStages * kStageElements * static_cast<int>(sizeof(__nv_bfloat16));
+    static_assert(kStagingBytes == bf16_n256_k5120_staging_bytes(kKWarps, kTileTokens));
     static constexpr int kPartialBytes =
         kKWarps * kTokenMmas * 32 * 4 * static_cast<int>(sizeof(float));
     static_assert(kStagingBytes >= kPartialBytes);
     static constexpr int kSharedBytes = kStagingBytes;
 
     static_assert((5120 % kGroupK) == 0);
-    static_assert(kSharedBytes <= 99 * 1024);
+    static_assert(kSharedBytes <= shape_max_shared_bytes_per_block(false));
 };
 
 __device__ __forceinline__ int bf16_n256_k5120_swizzle(int row, int col) {

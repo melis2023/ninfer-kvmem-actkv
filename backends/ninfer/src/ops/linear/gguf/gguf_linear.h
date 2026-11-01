@@ -39,6 +39,7 @@ struct GgufProduct {
     const float* gate     = nullptr;
     float* f32            = nullptr;
     std::int32_t f32_rows = 0;
+    gguf::GateActivation activation = gguf::GateActivation::Silu; // GateProduct only
 };
 
 // What a workspace query needs of a product: its format and [rows, k]. A gather of the input
@@ -65,9 +66,11 @@ void gguf_linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& 
 void gguf_linear_add(const Tensor& x, const Weight& w, Tensor& residual,
                      WorkspaceArena& workspace, cudaStream_t stream);
 
-// out = silu(gate x) * (up x). `up` null means `gate` is one [gate; up] parent of 2 * out rows.
+// out = act(gate x) * (up x), act SiLU unless `activation` says GELU (tanh). `up` null means
+// `gate` is one [gate; up] parent of 2 * out rows.
 void gguf_swiglu(const Tensor& x, const Weight& gate, const Weight* up, Tensor& out,
-                 WorkspaceArena& workspace, cudaStream_t stream);
+                 WorkspaceArena& workspace, cudaStream_t stream,
+                 gguf::GateActivation activation = gguf::GateActivation::Silu);
 // `up` null: `gate` is the one [gate; up] parent.
 [[nodiscard]] std::size_t gguf_swiglu_workspace_bytes(const GgufShape& gate, const GgufShape* up,
                                                       std::int32_t min_tokens,

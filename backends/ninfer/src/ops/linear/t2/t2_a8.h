@@ -12,6 +12,7 @@
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"
+#include "ops/linear/ptq1/ptq1_dispatch.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -35,15 +36,15 @@ inline constexpr std::int32_t kT2I8SmallMaxTokens = 64;
 [[nodiscard]] bool t2_a8_supported(const Weight& w, std::int32_t tokens);
 // Activation planes for T in [1, max_tokens]; zero when no admitted call can take the route.
 [[nodiscard]] std::size_t t2_a8_workspace_bytes(std::int32_t output_rows, std::int32_t input_rows,
-                                                LinearPolicy policy, std::int32_t max_tokens);
+                                                LinearPolicy policy, std::int32_t max_tokens, bool ptq1_tile = false);
 
 // Bytes of one quantised activation plane pair for T up to max_tokens.
-[[nodiscard]] std::size_t t2_a8_activation_bytes(std::int32_t input_rows, std::int32_t max_tokens);
+[[nodiscard]] std::size_t t2_a8_activation_bytes(std::int32_t input_rows, std::int32_t max_tokens, bool ptq1_tile = false);
 
 // Records into `layout` exactly the planes t2_a8_quantize allocates for `tokens`; false when no
 // integer route takes that width.
 bool t2_a8_layout_activations(WorkspaceLayoutBuilder& layout, std::int32_t input_rows,
-                              std::int32_t tokens);
+                              std::int32_t tokens, bool ptq1_tile = false);
 
 // x quantised once for several T2 GEMMs over the same activations; the planes live in the caller's
 // workspace scope.
@@ -52,10 +53,11 @@ struct T2A8Activations {
     const __half* scales;
     std::int32_t tokens;
     std::int32_t input_rows;
+    bool ptq1_tile = false;
 };
 
 [[nodiscard]] T2A8Activations t2_a8_quantize(const Tensor& x, WorkspaceArena& workspace,
-                                             cudaStream_t stream);
+                                             cudaStream_t stream, bool ptq1_tile = false);
 // One pass over a parent weight: rows [0, split) go to first[first_offset + row, t], the rest to
 // second[second_offset + row - split, t].
 void t2_a8_project_split(const T2A8Activations& x, const Weight& w, Tensor& first,

@@ -6,7 +6,7 @@
 #   * the repository's own models\ -- what .gitignore has always ignored, and where a large local
 #     collection tends to end up because it sits beside build-ninja\ rather than inside scripts\;
 #   * scripts\models\ -- where scripts\download-model.{bat,sh} put them by default, and what
-#     docs/rtx-3090-linux.md documents as the download location.
+#     docs/build-linux.md documents as the download location.
 #
 # A sweep that hardcodes either one fails for whoever followed the other instruction, so probe:
 # the first candidate that actually contains an artifact wins, repository root first. Testing for

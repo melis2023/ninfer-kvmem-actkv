@@ -268,6 +268,13 @@ policy, template instantiation, and launch-error handling. Launcher headers are 
 contract headers, models, product code, permanent tests, and public benchmarks do not include
 them.
 
+A launch with more than 48 KiB of dynamic shared memory first calls
+`raise_dynamic_shared_memory(kernel, bytes)` (`src/core/device.h`), in the function that launches
+the kernel or in a helper templated on the kernel pointer. CUDA 13's nvcc gives every translation
+unit its own copy of a template kernel, each with its own attributes. The pointer that raises the
+limit must therefore be the pointer the launch uses. A once-only flag keyed by a type or held in a
+header's function-local static raises the limit of one copy only.
+
 ### 4.3 Kernel and common facilities
 
 The kernel layer owns `__global__` functions and Op-local `__device__` computation. A kernel may
@@ -544,8 +551,11 @@ implementations, accepting justified tile/CTA-wave steps. A permissive activatio
 identify the arithmetic actually executed, so use the selected implementation's precision when
 interpreting throughput against a hardware peak.
 
-[Linear tuning and performance reports](linear-tuning.md) defines the Linear-specific T ranges,
-priority points, specialization tradeoffs, and final report format.
+For Linear and related token projections the latency-sensitive interval is `1 <= T <= 128` (sixteen
+verification columns for each of eight requests), with `T = 512` and `T = 1024` as the bulk anchors;
+other extents take the broad routes and get supporting measurements where a transition warrants
+them. Each card's choice between interchangeable schedules comes from its
+[device profile](../device-profiles.md).
 
 Choose the development surface from the requested complete Op. A related simple Op can help
 isolate shared computation when that answers a live design question, but completing a separate

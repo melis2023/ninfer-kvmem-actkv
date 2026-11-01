@@ -10,9 +10,11 @@ target_sources(ninfer_model_loading PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/load/dflash2.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/load/resources.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/load/prepare.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/load/expert_sources.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/load/storage_trades.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/load/vision_overlay.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/load/vision_cpu.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/load/vision_cpu_cache.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/resources.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/frontend/tokenizer.cpp"
 )

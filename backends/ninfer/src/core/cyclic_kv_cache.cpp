@@ -1,4 +1,5 @@
 #include "core/cyclic_kv_cache.h"
+#include "core/paged_kv_storage.h"
 
 #include "core/device.h"
 
@@ -49,7 +50,8 @@ std::ptrdiff_t layer_pitch(const std::vector<Tensor>& layers, const char* label)
 
 CyclicKVCacheLayout plan_cyclic_kv_cache(LayoutBuilder& builder, std::uint32_t layers,
                                          std::uint32_t capacity, std::int32_t num_kv_heads,
-                                         std::int32_t head_dim, std::int32_t lane_capacity) {
+                                         std::int32_t head_dim, std::int32_t lane_capacity,
+                                         KvCacheStorage storage) {
     if (layers == 0 || capacity == 0 ||
         capacity > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         num_kv_heads <= 0 || head_dim <= 0 || lane_capacity <= 0) {
@@ -62,17 +64,39 @@ CyclicKVCacheLayout plan_cyclic_kv_cache(LayoutBuilder& builder, std::uint32_t l
     layout.num_kv_heads    = num_kv_heads;
     layout.head_dim        = head_dim;
     layout.lane_capacity   = lane_capacity;
+    layout.storage         = storage;
+    const PagedKVStorageLayout physical = paged_kv_storage_layout(storage, head_dim);
     layout.k.reserve(layers);
     layout.v.reserve(layers);
     const auto padded = static_cast<std::int32_t>(layout.padded_capacity);
+    const auto add_vector = [&](const PagedKVVectorLayout& vector, const std::string& name) {
+        return builder.add_tensor(vector.data_dtype,
+                                  {vector.data_leading_extent, padded, num_kv_heads, lane_capacity},
+                                  kArenaAlign, name);
+    };
+    const auto add_scales = [&](const PagedKVVectorLayout& vector, const std::string& name) {
+        return builder.add_tensor(vector.scale_dtype,
+                                  {vector.scale_leading_extent, padded, num_kv_heads, lane_capacity},
+                                  kArenaAlign, name);
+    };
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
         const std::string prefix = "Cyclic KV layer " + std::to_string(layer);
-        layout.k.push_back(builder.add_tensor(DType::BF16,
-                                              {head_dim, padded, num_kv_heads, lane_capacity},
-                                              kArenaAlign, prefix + " K"));
-        layout.v.push_back(builder.add_tensor(DType::BF16,
-                                              {head_dim, padded, num_kv_heads, lane_capacity},
-                                              kArenaAlign, prefix + " V"));
+        layout.k.push_back(add_vector(physical.key, prefix + " K"));
+        layout.v.push_back(add_vector(physical.value, prefix + " V"));
+        if (physical.key.data_dtype != DType::BF16) {
+            layout.k_bf16.push_back(builder.add_tensor(
+                DType::BF16, {head_dim, padded, num_kv_heads, lane_capacity}, kArenaAlign,
+                prefix + " K shadow"));
+            layout.v_bf16.push_back(builder.add_tensor(
+                DType::BF16, {head_dim, padded, num_kv_heads, lane_capacity}, kArenaAlign,
+                prefix + " V shadow"));
+        }
+        if (physical.key.has_scale()) {
+            layout.k_scales.push_back(add_scales(physical.key, prefix + " K scales"));
+        }
+        if (physical.value.has_scale()) {
+            layout.v_scales.push_back(add_scales(physical.value, prefix + " V scales"));
+        }
     }
     return layout;
 }
@@ -81,29 +105,66 @@ std::size_t CyclicKVCacheLayout::payload_bytes() const noexcept {
     std::size_t total = 0;
     for (const TensorRegion& region : k) { total += region.region.bytes; }
     for (const TensorRegion& region : v) { total += region.region.bytes; }
+    for (const TensorRegion& region : k_scales) { total += region.region.bytes; }
+    for (const TensorRegion& region : v_scales) { total += region.region.bytes; }
     return total;
 }
 
 CyclicKVCache::CyclicKVCache(DeviceSpan backing, const CyclicKVCacheLayout& layout)
-    : capacity_(layout.capacity), padded_capacity_(layout.padded_capacity),
-      num_kv_heads_(layout.num_kv_heads), head_dim_(layout.head_dim),
-      lane_capacity_(layout.lane_capacity) {
+    : storage_(layout.storage), capacity_(layout.capacity),
+      padded_capacity_(layout.padded_capacity), num_kv_heads_(layout.num_kv_heads),
+      head_dim_(layout.head_dim), lane_capacity_(layout.lane_capacity) {
     if (layout.k.empty() || layout.v.size() != layout.k.size() || capacity_ == 0 ||
         padded_capacity_ < capacity_ || num_kv_heads_ <= 0 || head_dim_ <= 0 ||
         lane_capacity_ <= 0) {
         throw std::invalid_argument("Cyclic KV layout is inconsistent");
     }
-    const std::array<std::int32_t, 4> expected_shape{
-        head_dim_, static_cast<std::int32_t>(padded_capacity_), num_kv_heads_, lane_capacity_};
+    const PagedKVStorageLayout physical = paged_kv_storage_layout(storage_, head_dim_);
+    if (layout.k_scales.size() != (physical.key.has_scale() ? layout.k.size() : 0U) ||
+        layout.v_scales.size() != (physical.value.has_scale() ? layout.v.size() : 0U)) {
+        throw std::invalid_argument("Cyclic KV scale plane count is inconsistent");
+    }
+    const auto expected_tail = [&](const TensorRegion& region) {
+        return region.shape[1] == static_cast<std::int32_t>(padded_capacity_) &&
+               region.shape[2] == num_kv_heads_ && region.shape[3] == lane_capacity_;
+    };
     k_.reserve(layout.k.size());
     v_.reserve(layout.v.size());
+    k_scales_.reserve(layout.k_scales.size());
+    v_scales_.reserve(layout.v_scales.size());
     for (std::size_t layer = 0; layer < layout.k.size(); ++layer) {
-        if (layout.k[layer].dtype != DType::BF16 || layout.v[layer].dtype != DType::BF16 ||
-            layout.k[layer].shape != expected_shape || layout.v[layer].shape != expected_shape) {
+        if (layout.k[layer].dtype != physical.key.data_dtype ||
+            layout.v[layer].dtype != physical.value.data_dtype ||
+            !expected_tail(layout.k[layer]) || !expected_tail(layout.v[layer])) {
             throw std::invalid_argument("Cyclic KV layer layout is inconsistent");
         }
         k_.push_back(layout.k[layer].bind(backing));
         v_.push_back(layout.v[layer].bind(backing));
+        if (physical.key.has_scale()) {
+            if (layout.k_scales[layer].dtype != physical.key.scale_dtype ||
+                !expected_tail(layout.k_scales[layer])) {
+                throw std::invalid_argument("Cyclic KV key scale layout is inconsistent");
+            }
+            k_scales_.push_back(layout.k_scales[layer].bind(backing));
+        }
+        if (physical.value.has_scale()) {
+            if (layout.v_scales[layer].dtype != physical.value.scale_dtype ||
+                !expected_tail(layout.v_scales[layer])) {
+                throw std::invalid_argument("Cyclic KV value scale layout is inconsistent");
+            }
+            v_scales_.push_back(layout.v_scales[layer].bind(backing));
+        }
+        if (!layout.k_bf16.empty()) {
+            if (layout.k_bf16.size() != layout.k.size() ||
+                layout.v_bf16.size() != layout.v.size() ||
+                layout.k_bf16[layer].dtype != DType::BF16 ||
+                layout.v_bf16[layer].dtype != DType::BF16 ||
+                !expected_tail(layout.k_bf16[layer]) || !expected_tail(layout.v_bf16[layer])) {
+                throw std::invalid_argument("Cyclic KV shadow layout is inconsistent");
+            }
+            k_bf16_.push_back(layout.k_bf16[layer].bind(backing));
+            v_bf16_.push_back(layout.v_bf16[layer].bind(backing));
+        }
     }
 }
 
@@ -116,6 +177,11 @@ CyclicKVCacheLayerView CyclicKVCache::layer_view(std::uint32_t layer) const {
     return {
         .k               = k_[layer],
         .v               = v_[layer],
+        .k_scales        = k_scales_.empty() ? Tensor{} : k_scales_[layer],
+        .v_scales        = v_scales_.empty() ? Tensor{} : v_scales_[layer],
+        .k_bf16          = k_bf16_.empty() ? Tensor{} : k_bf16_[layer],
+        .v_bf16          = v_bf16_.empty() ? Tensor{} : v_bf16_[layer],
+        .storage         = storage_,
         .capacity        = capacity_,
         .padded_capacity = padded_capacity_,
         .num_kv_heads    = num_kv_heads_,
@@ -131,19 +197,39 @@ CyclicKVCacheSlotView CyclicKVCache::slot_view(std::int32_t slot) const {
     const Tensor k =
         k_.front()
             .slice(3, slot, 1)
-            .view({head_dim_, static_cast<std::int32_t>(padded_capacity_), num_kv_heads_});
+            .view({k_.front().ne[0], static_cast<std::int32_t>(padded_capacity_), num_kv_heads_});
     const Tensor v =
         v_.front()
             .slice(3, slot, 1)
-            .view({head_dim_, static_cast<std::int32_t>(padded_capacity_), num_kv_heads_});
+            .view({v_.front().ne[0], static_cast<std::int32_t>(padded_capacity_), num_kv_heads_});
+    const Tensor k_scales =
+        k_scales_.empty()
+            ? Tensor{}
+            : k_scales_.front()
+                  .slice(3, slot, 1)
+                  .view({k_scales_.front().ne[0],
+                         static_cast<std::int32_t>(padded_capacity_), num_kv_heads_});
+    const Tensor v_scales =
+        v_scales_.empty()
+            ? Tensor{}
+            : v_scales_.front()
+                  .slice(3, slot, 1)
+                  .view({v_scales_.front().ne[0],
+                         static_cast<std::int32_t>(padded_capacity_), num_kv_heads_});
     return {
-        .k_layer0            = k,
-        .v_layer0            = v,
-        .k_layer_bytes       = k.bytes(),
-        .v_layer_bytes       = v.bytes(),
-        .k_layer_pitch_bytes = layer_pitch(k_, "K"),
-        .v_layer_pitch_bytes = layer_pitch(v_, "V"),
-        .layers              = layer_count(),
+        .k_layer0                = k,
+        .v_layer0                = v,
+        .k_scales_layer0         = k_scales,
+        .v_scales_layer0         = v_scales,
+        .k_layer_bytes           = k.bytes(),
+        .v_layer_bytes           = v.bytes(),
+        .k_scale_layer_bytes     = k_scales.bytes(),
+        .v_scale_layer_bytes     = v_scales.bytes(),
+        .k_layer_pitch_bytes     = layer_pitch(k_, "K"),
+        .v_layer_pitch_bytes     = layer_pitch(v_, "V"),
+        .k_scale_layer_pitch_bytes = k_scales_.empty() ? 0 : layer_pitch(k_scales_, "K scales"),
+        .v_scale_layer_pitch_bytes = v_scales_.empty() ? 0 : layer_pitch(v_scales_, "V scales"),
+        .layers                  = layer_count(),
     };
 }
 
@@ -170,6 +256,30 @@ void CyclicKVCache::copy_slot_from(const CyclicKVCache& source, std::int32_t sou
                                    cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync(destination_v.data, source_v.data, destination_v.bytes(),
                                    cudaMemcpyDeviceToDevice, stream));
+        if (!k_scales_.empty()) {
+            Tensor destination = k_scales_[layer].slice(3, destination_slot, 1);
+            Tensor source_page = source.k_scales_[layer].slice(3, source_slot, 1);
+            CUDA_CHECK(cudaMemcpyAsync(destination.data, source_page.data, destination.bytes(),
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
+        if (!v_scales_.empty()) {
+            Tensor destination = v_scales_[layer].slice(3, destination_slot, 1);
+            Tensor source_page = source.v_scales_[layer].slice(3, source_slot, 1);
+            CUDA_CHECK(cudaMemcpyAsync(destination.data, source_page.data, destination.bytes(),
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
+        if (!k_bf16_.empty()) {
+            Tensor destination = k_bf16_[layer].slice(3, destination_slot, 1);
+            Tensor source_page = source.k_bf16_[layer].slice(3, source_slot, 1);
+            CUDA_CHECK(cudaMemcpyAsync(destination.data, source_page.data, destination.bytes(),
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
+        if (!v_bf16_.empty()) {
+            Tensor destination = v_bf16_[layer].slice(3, destination_slot, 1);
+            Tensor source_page = source.v_bf16_[layer].slice(3, source_slot, 1);
+            CUDA_CHECK(cudaMemcpyAsync(destination.data, source_page.data, destination.bytes(),
+                                       cudaMemcpyDeviceToDevice, stream));
+        }
     }
 }
 

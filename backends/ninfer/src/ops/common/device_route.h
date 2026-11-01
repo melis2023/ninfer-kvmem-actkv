@@ -43,6 +43,9 @@ void install_device_route_profile(std::shared_ptr<const DeviceRouteProfile> prof
 // The schedule the current device's profile names for `key` at `width`; empty when there is no
 // profile, no entry for the key, or the width lies past the entry's last band.
 [[nodiscard]] std::string_view device_route_schedule(std::string_view key, std::int32_t width);
+// Whether device_route_schedule() answers for `key` at `width` from a measurement: a band of the
+// current device's profile reaches the width, or a DeviceRouteForce names the key.
+[[nodiscard]] bool device_route_measured(std::string_view key, std::int32_t width);
 
 // Calibration times candidate schedules with the compiled routes bypassed: while a scope is alive,
 // device_route_schedule() answers `schedule` for `key` whatever the installed profile says.

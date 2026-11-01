@@ -1,4 +1,5 @@
 #include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_w4a4_tma_launch.h"
+#include "ops/common/blackwell_routes.h"
 
 #include "core/device.h"
 #include "ops/linear/nvfp4/nvfp4_config.h"
@@ -68,17 +69,15 @@ void launch_nvfp4_linear_swiglu_w4a4_tma(const std::uint8_t* activation_codes,
                                          const std::uint8_t* weight_codes,
                                          const std::uint8_t* weight_scales, __nv_bfloat16* output,
                                          std::int32_t tokens, float alpha, cudaStream_t stream) {
+    require_nvfp4_a4_card();
     if (tokens <= 0) {
         throw std::invalid_argument("nvfp4 LinearSwiGLU TMA needs a positive token count");
     }
 
     using Geometry                     = Nvfp4N34816K5120;
     constexpr std::size_t kSharedBytes = sizeof(Nvfp4LinearSwiGluTmaSharedStorage<M256N128S3>);
-    configure_cuda_device_once([] {
-        return cudaFuncSetAttribute(nvfp4_linear_swiglu_w4a4_tma_kernel<Geometry, M256N128S3>,
-                                    cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                    static_cast<int>(kSharedBytes));
-    });
+    raise_dynamic_shared_memory(nvfp4_linear_swiglu_w4a4_tma_kernel<Geometry, M256N128S3>,
+                                static_cast<int>(kSharedBytes));
 
     const Nvfp4W4a4TmaDescriptors descriptors = make_descriptors<Geometry, M256N128S3>(
         activation_codes, activation_scales, weight_codes, weight_scales, tokens);

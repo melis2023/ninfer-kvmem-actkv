@@ -1,12 +1,13 @@
 #pragma once
 
 #include "artifact/schema.h"
+#include "artifact/selection.h"
 #include "core/arena.h"
 #include "core/device.h"
 #include "core/evictable_weight_pool.h"
 #include "core/vmm.h"
 #include "core/weight_view.h"
-#include "ninfer/types.h"
+#include "ninfer/startup.h"
 
 #include <memory>
 #include <map>
@@ -31,6 +32,13 @@ struct DevicePlacement {
     std::size_t rank = 0;
     // Zero bytes reserved right after the object (Binder::device_tail), written by every upload.
     std::uint64_t tail = 0;
+    // Set when the row-split object is permuted into the panel layout after every upload
+    // (Binder::panel_device); the device parent then carries QuantLayout::RowSplitPanel.
+    bool panel = false;
+    // Set for a piece of a stored object (Binder::select_device): `object` is then a handle past
+    // the artifact's objects, and the bytes are `selection` of `source`.
+    std::optional<ObjectHandle> source;
+    std::optional<ObjectSelection> selection;
     bool replica = false;
 };
 
@@ -46,11 +54,14 @@ struct HostPlacement {
     ObjectHandle object;
     // Already-read resources move into final storage without invalidating their byte views.
     std::vector<std::byte> data;
+    bool registered = false;
 };
 
 struct MaterializationPlan {
     const Reader* source            = nullptr;
     std::size_t object_count        = 0;
+    // Pieces of stored objects, handles [object_count, object_count + selected_count).
+    std::size_t selected_count      = 0;
     std::uint64_t prior_read_bytes  = 0;
     std::uint64_t owned_value_bytes = 0;
     // One device arena per pipeline rank. Entry 0 is the primary device and always exists, so a
@@ -84,7 +95,7 @@ struct MaterializationStats {
     std::vector<std::uint64_t> device_capacity_by_rank;
     std::uint64_t retained_host_bytes   = 0;
     std::uint64_t owned_value_bytes     = 0;
-    std::uint64_t pinned_bytes          = 0; // page-locked Host block (Residency::Pinned)
+    std::uint64_t pinned_bytes          = 0; // pinned block plus separately registered Host objects
     std::uint64_t peak_staging_bytes    = 0;
     std::size_t device_object_count     = 0;
     std::size_t pinned_object_count     = 0;
@@ -158,6 +169,8 @@ private:
         std::optional<WeightParent> pinned;
         std::optional<WeightParent> host;
         std::vector<std::byte> host_data;
+        // Unregister before freeing host_data. Moving ObjectStorage keeps the vector's address.
+        std::unique_ptr<HostMemoryRegistration> registration;
     };
 
     // The pool owns the physical memory behind a pool-backed arena; destroy the arena first.

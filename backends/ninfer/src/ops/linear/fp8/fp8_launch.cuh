@@ -68,12 +68,9 @@ void launch_fp8_a8_mma(const Weight& weight, Tensor& out, Fp8A8Workspace workspa
     const Fp8ContiguousOutput output{static_cast<__nv_bfloat16*>(out.data), Geometry::kOutputRows};
 
     if constexpr (Schedule::kSharedBytes > 48 * 1024) {
-        configure_cuda_device_once([] {
-            return cudaFuncSetAttribute(
-                fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8IdentityEpilogue,
-                               Fp8ContiguousOutput>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
-        });
+        raise_dynamic_shared_memory(fp8_mma_kernel<Geometry, Schedule, FullTokens,
+                                                   Fp8IdentityEpilogue, Fp8ContiguousOutput>,
+                                    Schedule::kSharedBytes);
     }
     fp8_mma_kernel<Geometry, Schedule, FullTokens>
         <<<blocks, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(

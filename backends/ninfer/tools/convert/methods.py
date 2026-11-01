@@ -132,7 +132,8 @@ class PrepareRequest:
             raise ValueError("encoded method input range is invalid")
         first = pieces[0]
         if any(
-            (p.format, p.weight_divisor) != (first.format, first.weight_divisor)
+            (p.format, p.weight_divisor, p.packed) !=
+            (first.format, first.weight_divisor, first.packed)
             for p in pieces
         ):
             raise ValueError("encoded inputs cannot share one parent format/divisor")
@@ -143,6 +144,7 @@ class PrepareRequest:
             torch.cat([p.codes for p in pieces]),
             torch.cat([p.scales for p in pieces]),
             first.weight_divisor,
+            first.packed,
         )
 
 
@@ -202,6 +204,8 @@ def grouped_absmax(request: PrepareRequest) -> PreparedMethod:
         or len(request.target.shape) != 2
     ):
         raise ValueError("grouped_absmax requires a grouped-integer matrix target")
+    if request.target.format == "q2_g64_fp16":
+        raise ValueError("q2_g64_fp16 requires import_encoded from trained GSQ Q2_0 codes")
     _preflight(request)
     n, k = request.target.shape
 
@@ -234,6 +238,8 @@ def grouped_search(request: PrepareRequest) -> PreparedMethod:
         or len(request.target.shape) != 2
     ):
         raise ValueError("grouped_search requires a grouped-integer matrix target")
+    if request.target.format == "q2_g64_fp16":
+        raise ValueError("q2_g64_fp16 requires import_encoded from trained GSQ Q2_0 codes")
     unknown = set(request.parameters) - {"imatrix", "negative_scales"}
     if unknown:
         raise ValueError(
@@ -279,11 +285,12 @@ def grouped_search(request: PrepareRequest) -> PreparedMethod:
 
 
 def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
-    """Round inputs to BF16, then quantize to FP8 codes with BF16 row scales."""
-    if request.target.format != "fp8_e4m3fn_row_bf16" or len(request.target.shape) != 2:
+    """Round inputs to BF16, then quantize to FP8 codes with the target's row scales."""
+    if request.target.format not in ("fp8_e4m3fn_row_bf16", "fp8_e4m3fn_row_fp16") or len(request.target.shape) != 2:
         raise ValueError("fp8_row_maxabs requires the row-scaled FP8 matrix format")
     _preflight(request)
     n, k = request.target.shape
+    scale_dtype = torch.float16 if request.target.format.endswith("_fp16") else torch.bfloat16
 
     def produce(output):
         for begin in range(0, n, request.rows_per_chunk):
@@ -293,16 +300,16 @@ def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
                 .reshape(end - begin, k)
                 .to(torch.bfloat16)
             )
-            encoded = quantize_bf16_rows(values)
+            encoded = quantize_bf16_rows(values, scale_dtype=scale_dtype)
             output.write_codes(begin, encoded.codes, encoded.scales)
 
     return request.job(produce=produce)
 
 
 def import_encoded(request: PrepareRequest) -> PreparedMethod:
-    """Preserve the current FP8/NVFP4/T2/GGUF source codes, scales and weight divisor."""
+    """Preserve compatible FP8/NVFP4/T2/Q2/Q8/GGUF source codes, scales and weight divisor."""
     if (
-        request.target.format not in ("nvfp4", "fp8_e4m3fn_row_bf16", "t2_g128_fp16")
+        request.target.format not in ("nvfp4", "fp8_e4m3fn_row_bf16", "t2_g128_fp16", "ptq1_g128_fp16", "q2_g64_fp16", "q8_g32_fp16")
         and request.target.format not in GGUF_FORMATS
     ) or len(request.target.shape) != 2:
         raise ValueError("import_encoded requires a known encoded matrix target")
@@ -374,7 +381,8 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
         for edge in bounds:
             for begin in range(cursor, edge, chunk):
                 words = request.encoded_rows(begin, min(edge, begin + chunk))
-                output.write_codes(begin, words.codes, words.scales, words.weight_divisor)
+                output.write_codes(begin, words.codes, words.scales, words.weight_divisor,
+                                   packed=words.packed)
             cursor = edge
 
     return request.job(produce=produce, auxiliaries=auxiliaries)

@@ -1,8 +1,10 @@
 #include "runtime/prefix_cache/prefix_index.h"
 
 #include <algorithm>
+#include <cmath>
 #include <functional>
 #include <stdexcept>
+#include <utility>
 
 namespace ninfer::runtime::prefix_cache {
 namespace {
@@ -670,8 +672,13 @@ bool PrefixCacheIndex::allocate_slabs(std::uint32_t count, std::vector<std::uint
         if (victim == kNoId) { return false; }
         Snapshot& chosen = snapshots_[victim];
         // A retained snapshot only yields its slabs to something worth at least as much: GDSF
-        // never inserts what it would evict next.
-        if (!chosen.superseded && chosen.priority > claim) { return false; }
+        // never inserts what it would evict next. Time still advances as if it had inserted and
+        // evicted the claimant; otherwise a tier full of once-hit snapshots refuses every new one
+        // for good, since nothing is ever evicted to raise L.
+        if (!chosen.superseded && chosen.priority > claim) {
+            if (std::isfinite(claim)) { inflation_ = std::max(inflation_, claim); }
+            return false;
+        }
         if (chosen.superseded) {
             // Only requests diverging before its lineage's newer snapshot could use it: both
             // copies go, and GDSF time does not advance.
@@ -862,6 +869,9 @@ std::optional<std::uint32_t> PrefixCacheIndex::acquire_device_slot(double claim)
     }
     // A backed owner keeps its Host copy: the least recently hit gives up its Device copy.
     if (backed != kNoId) { return drop_device_copy(backed); }
+    // Refused for value: time advances as if the claimant had been inserted and evicted, as on
+    // the Host tier.
+    if (unbacked != kNoId && std::isfinite(claim)) { inflation_ = std::max(inflation_, claim); }
     return std::nullopt;
 }
 

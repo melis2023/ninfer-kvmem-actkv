@@ -23,6 +23,7 @@ public:
     SpillExtent() = default;
     uint64_t size() const noexcept;
     uint64_t offset() const noexcept;
+    const void * storage_identity() const noexcept { return state_.get(); }
     explicit operator bool() const noexcept { return bool(state_); }
     void read(uint64_t offset, void * destination, size_t bytes) const;
     void write(uint64_t offset, const void * source, size_t bytes) const;

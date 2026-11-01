@@ -749,6 +749,11 @@ int main() {
                                6000U + static_cast<std::uint32_t>(T));
         failures += split_case(kQwen35Channels, 2048, 2048, 4096, T, false, false,
                                7000U + static_cast<std::uint32_t>(T));
+        // A 27B layer's share on each of two and four tensor-parallel ranks.
+        failures += split_case(5120, 1024, 1024, 3072, T, false, false,
+                               8000U + static_cast<std::uint32_t>(T));
+        failures += split_case(2560, 512, 512, 1536, T, false, false,
+                               9000U + static_cast<std::uint32_t>(T));
     }
 
     // The exact-alias state form, on both geometries, across every route boundary.

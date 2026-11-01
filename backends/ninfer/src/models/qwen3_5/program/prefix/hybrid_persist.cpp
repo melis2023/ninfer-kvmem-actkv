@@ -9,6 +9,7 @@
 // first so a Host tier smaller than the file can choose what to restore before reading any slab.
 
 #include "models/qwen3_5/program/prefix/hybrid_cache.h"
+#include "ninfer/request.h"
 
 #include <array>
 #include <chrono>

@@ -1,7 +1,7 @@
 """FP64 reference forward of Qwen3.8-Flash-Next (Qwen4ExpForConditionalGeneration), text path.
 
 An independent transcription of transformers' modular_qwen4_exp.py (as summarised in
-docs/maintainer/qwen3-8-flash-next-plan.md, section 1) for producing golden tensors: the PLE
+docs/maintainer/qwen4-exp-model.md, section 1) for producing golden tensors: the PLE
 hash and block, hyper-connection read/write, Gated DeltaNet, QSA (indexer and sparse attention),
 the 512-expert MoE, the final mixer and the head. Tensors load lazily by name from the checkpoint's
 safetensors shards, so a layer slice needs only that slice's tensors on disk.

@@ -28,17 +28,9 @@ constexpr std::int32_t kLastSmallTokens = 48;
 using Output                            = Q8SplitOutput3<kQueryRows, kKvRows, kKvRows>;
 using Launch = void (*)(const Tensor&, const Weight&, Tensor&, Tensor&, Tensor&, cudaStream_t);
 
-// Exact input-load unrolling matters in the first two MMA column tiles. Wider blocks use
-// runtime live columns with one specialization per accumulator capacity.
-template <int Columns, bool Exact>
-void launch_small(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
-                  cudaStream_t stream) {
-    constexpr int Capacity = (Columns + 7) / 8 * 8;
-    constexpr int Warps    = Columns <= 4 ? 16 : Columns <= 16 ? 8 : 4;
-    constexpr auto Scales  = Columns <= 4 || (Columns > 8 && Columns <= 16)
-                                 ? Q8KSplitScaleAccess::Direct
-                                 : Q8KSplitScaleAccess::Shared;
-    using Schedule         = Q8KSplitSchedule<Warps, Capacity, 2, Scales>;
+template <int Columns, bool Exact, class Schedule>
+void launch_small_schedule(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
+                           cudaStream_t stream) {
     static_assert((kQueryRows % Schedule::kRowsPerCta) == 0);
     static_assert((kKvRows % Schedule::kRowsPerCta) == 0);
     static_assert((Geometry::kInputRows % Schedule::kGroupK) == 0);
@@ -54,6 +46,28 @@ void launch_small(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, T
         static_cast<const std::uint8_t*>(weight.scales), output, Q8KSplitStoreEpilogue{},
         Q8KSplitIdentityRows{}, x.ne[1]));
     CUDA_CHECK(cudaGetLastError());
+}
+
+// Exact input-load unrolling matters in the first two MMA column tiles. Wider blocks use
+// runtime live columns with one specialization per accumulator capacity. The device profile may
+// run an 8-column tile on its four-K-warp form (q8_ksplit_config.h).
+template <int Columns, bool Exact>
+void launch_small(const Tensor& x, const Weight& weight, Tensor& q, Tensor& k, Tensor& v,
+                  cudaStream_t stream) {
+    constexpr int Capacity = (Columns + 7) / 8 * 8;
+    constexpr int Warps    = Columns <= 4 ? 16 : Columns <= 16 ? 8 : 4;
+    constexpr auto Scales  = Columns <= 4 || (Columns > 8 && Columns <= 16)
+                                 ? Q8KSplitScaleAccess::Direct
+                                 : Q8KSplitScaleAccess::Shared;
+    using Schedule         = Q8KSplitSchedule<Warps, Capacity, 2, Scales>;
+    if constexpr (kQ8KSplitHasFourWarpForm<Schedule>) {
+        if (q8_ksplit_four_warps<Geometry>(x.ne[1])) {
+            launch_small_schedule<Columns, Exact, Q8KSplitFourWarpSchedule<Schedule>>(x, weight, q,
+                                                                                      k, v, stream);
+            return;
+        }
+    }
+    launch_small_schedule<Columns, Exact, Schedule>(x, weight, q, k, v, stream);
 }
 
 template <bool Exact, std::size_t... I>

@@ -94,22 +94,38 @@ const Component& Directory::component(std::string_view name) const {
 }
 
 Json parse_json(std::string_view text, std::string_view label) {
-    std::vector<std::unordered_set<std::string>> member_stack;
-    const auto callback = [&](int, Json::parse_event_t event, Json& parsed) {
-        if (event == Json::parse_event_t::object_start) {
-            member_stack.emplace_back();
-        } else if (event == Json::parse_event_t::key) {
-            const auto& key = parsed.get_ref<const std::string&>();
-            if (!member_stack.back().insert(key).second) {
+    // The DOM callback parser scans a parent for discarded values after each object. Large
+    // binding maps then take quadratic time even though our callback never discards anything.
+    // Validate keys with the public SAX interface, then build the DOM without that callback.
+    struct UniqueKeys final : nlohmann::json_sax<Json> {
+        explicit UniqueKeys(std::string_view name) : label(name) {}
+        std::string_view label;
+        std::vector<std::unordered_set<std::string>> members;
+        bool null() override { return true; }
+        bool boolean(bool) override { return true; }
+        bool number_integer(number_integer_t) override { return true; }
+        bool number_unsigned(number_unsigned_t) override { return true; }
+        bool number_float(number_float_t, const string_t&) override { return true; }
+        bool string(string_t&) override { return true; }
+        bool binary(binary_t&) override { return true; }
+        bool start_object(std::size_t) override { members.emplace_back(); return true; }
+        bool key(string_t& key) override {
+            if (!members.back().insert(key).second) {
                 throw ArtifactError(std::string(label) + ": duplicate JSON member " + key);
             }
-        } else if (event == Json::parse_event_t::object_end) {
-            member_stack.pop_back();
+            return true;
         }
-        return true;
+        bool end_object() override { members.pop_back(); return true; }
+        bool start_array(std::size_t) override { return true; }
+        bool end_array() override { return true; }
+        bool parse_error(std::size_t, const std::string&, const Json::exception& error) override {
+            throw ArtifactError(std::string(label) + ": " + error.what());
+        }
     };
     try {
-        return Json::parse(text.begin(), text.end(), callback);
+        UniqueKeys keys(label);
+        (void)Json::sax_parse(text.begin(), text.end(), &keys);
+        return Json::parse(text.begin(), text.end());
     } catch (const Json::exception& error) {
         throw ArtifactError(std::string(label) + ": " + error.what());
     }

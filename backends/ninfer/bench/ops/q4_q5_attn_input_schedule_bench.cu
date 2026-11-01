@@ -65,7 +65,7 @@ int main(int argc, char** argv) {
     int repeat  = 9;
     int warmup  = 3;
     // A route boundary is only decidable if the margin clears the two schedules' own spread, and
-    // ColdTiming carries min and p95 already. See TODO section 3 on cold-flush margins.
+    // ColdTiming carries min and p95 already. Cold-flush margins overstate wins.
     bool spread = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg(argv[i]);

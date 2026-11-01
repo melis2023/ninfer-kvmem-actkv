@@ -39,20 +39,12 @@ void launch_range(const Weight& weight, const std::int8_t* codes, const __half* 
                   std::int32_t tokens, std::int32_t row_begin, std::int32_t row_count,
                   __nv_bfloat16* dst, std::int32_t dst_rows, cudaStream_t stream) {
     constexpr int BN       = a8::kWarpsN * NT * 8;
-    const std::size_t smem = a8::shared_bytes<Codec, 1, NT, Rows>(kHidden);
-    const dim3 grid(row_count / Rows::kRowsPerBlock, tokens / BN);
-    auto* kernel = a8::a8_mma_kernel<Codec, kHidden, 1, NT, Rows, a8::StoreEpilogue>;
-    if (smem > 48 * 1024) {
-        configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                        static_cast<int>(smem));
-        });
-    }
-    kernel<<<grid, a8::kThreads, smem, stream>>>(
-        static_cast<const std::uint8_t*>(weight.qdata),
-        static_cast<const std::uint8_t*>(weight.qhigh),
-        static_cast<const __half*>(weight.scales), codes, scales, tokens, Rows{row_begin},
-        a8::StoreEpilogue{dst, dst_rows, 0}, row_split_panel_shift(weight.layout));
+    const dim3 grid(row_count / Rows::kRowsPerBlock, a8::padded_tokens(tokens) / BN);
+    a8::launch_a8_mma<Codec, kHidden, 1, NT, Rows, a8::StoreEpilogue>(
+        grid, stream, static_cast<const std::uint8_t*>(weight.qdata),
+        static_cast<const std::uint8_t*>(weight.qhigh), static_cast<const __half*>(weight.scales),
+        codes, scales, tokens, Rows{row_begin}, a8::StoreEpilogue{dst, dst_rows, 0},
+        row_split_panel_shift(weight.layout));
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -94,7 +86,7 @@ std::size_t q4_q5_attn_input_a8_workspace_capacity_bytes(std::int32_t min_tokens
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("q4_q5 attn_input a8 workspace: invalid token interval");
     }
-    return a8::activation_workspace_bytes(kHidden, max_tokens);
+    return a8::padded_activation_workspace_bytes(kHidden, max_tokens);
 }
 
 void q4_q5_attn_input_a8_launch(const Tensor& x, const Weight& query_key, const Weight& gate_value,
@@ -105,15 +97,16 @@ void q4_q5_attn_input_a8_launch(const Tensor& x, const Weight& query_key, const 
         throw std::invalid_argument("q4_q5 attn_input a8: unsupported profile");
     }
 
-    auto scope             = workspace.scope();
-    const DeviceSpan codes = workspace.alloc_bytes(static_cast<std::size_t>(tokens) * kHidden);
-    const DeviceSpan scales = workspace.alloc_bytes(
-        static_cast<std::size_t>(tokens) * (kHidden / a8::kGroup) * sizeof(__half));
+    const std::int32_t columns = a8::padded_tokens(tokens);
+    auto scope                 = workspace.scope();
+    const DeviceSpan codes     = workspace.alloc_bytes(static_cast<std::size_t>(columns) * kHidden);
+    const DeviceSpan scales    = workspace.alloc_bytes(static_cast<std::size_t>(columns) *
+                                                       (kHidden / a8::kGroup) * sizeof(__half));
 
     auto* code_data  = reinterpret_cast<std::int8_t*>(codes.data);
     auto* scale_data = reinterpret_cast<__half*>(scales.data);
 
-    switch (a8::token_tile(tokens, 512)) {
+    switch (a8::token_tile(columns, 512)) {
     case 512:
         launch_all<16>(x, query_key, gate_value, tokens, code_data, scale_data, q, gate, k, v,
                        stream);

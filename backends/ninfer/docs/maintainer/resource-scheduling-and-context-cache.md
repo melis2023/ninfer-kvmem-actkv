@@ -1009,6 +1009,20 @@ Abort 保证：
 
 若 Program 已无法形成可解释的稳定状态，则进入 Engine-wide failure。
 
+取消一个仍在 prefill 的 active 请求时，`ProgramImpl::abort` 先尝试 salvage：把 active state 作为
+endpoint 发布在 prefill cursor（需要至少 1024 tokens；MTP 还需要 tail hidden state，即只有最后一个
+chunk 之后才行；DFlash 的 draft context 需要追上）。salvage 不成立时，`retain_prefill_progress` 发布
+该 lane 已经 capture 的 checkpoint（long anchor 或 rewrite checkpoint）：前提是没有未应答的 capture
+offer、没有未 settle 的 state fork、没有 live endpoint，且 active image 是独占 writer。ledger、prefix
+identity、digests 与 rebuild work 截断到最深 checkpoint 的 frontier，KV 截断到其 required frontier，
+active StateImage 释放，continuation 没有 endpoint，以 Disposable retention 进入 catalog。任何条件不满足
+时它在第一次 mutation 前返回，lane 走原来的 strict clear。若该 cell 绑定了 slot file（原地复用已保存的
+session），Engine 解除绑定，因为没有 endpoint 的 continuation 不能保存为 session。
+`ContextCacheOptions::progress_anchor_tokens`（`ninfer-serve --progress-anchor-tokens N`，默认 16384）让
+Frontend 在 prompt 内部按绝对 token 栅格提出 `PrivateLongAnchor` opportunities，使没有 message boundary
+的超长单条 prompt 被取消时也有 checkpoint 可保留；它们与其他 long anchor 共用
+`max_long_anchors_per_continuation`。Hybrid 模式不使用它，ladder snapshot 覆盖同一情形。
+
 ---
 
 ## 10. Retention、session 与 publication
@@ -1128,6 +1142,6 @@ Context cache disabled 时采用 root-only 语义：不读取或发布 inactive 
 | State stores | `src/models/qwen3_5/program/storage/state_store.h` |
 | logical KV/address spaces | `src/models/qwen3_5/program/storage/kv_store.h` |
 | Host KV extents | `src/models/qwen3_5/program/storage/host_kv_store.h` |
-| public capacity options | `include/ninfer/types.h` |
+| public capacity options | `include/ninfer/engine_options.h` |
 
 路径用于定位当前实现，不改变本文定义的所有权边界。

@@ -160,7 +160,24 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
         require_shape(min_positions, batch, 1, 1, 1, op, "min positions");
         require_contiguous_nonnull(min_positions, op, "min positions");
     }
-    validate_context(context, window, op);
+    auto dequant_scope = workspace.scope();
+    CyclicKVCacheLayerView active = context;
+    if (context.storage != KvCacheStorage::BFloat16) {
+        if (context.k_bf16.data == nullptr || context.v_bf16.data == nullptr) {
+            throw std::invalid_argument(
+                "sliding_window_attention: quantized draft ring has no BF16 shadow");
+        }
+        // The append kernel writes the BF16 shadow alongside the quantized ring, so attention
+        // reads it directly instead of dequantizing the whole ring every step.
+        active.k         = context.k_bf16;
+        active.v         = context.v_bf16;
+        active.storage   = KvCacheStorage::BFloat16;
+        active.k_scales  = Tensor{};
+        active.v_scales  = Tensor{};
+        active.k_bf16    = Tensor{};
+        active.v_bf16    = Tensor{};
+    }
+    validate_context(active, window, op);
     if (envelope.min_context > envelope.max_context ||
         envelope.max_context >
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
@@ -178,7 +195,7 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
         partial = allocate_workspace(workspace, tokens, plan.split_capacity, batch);
     }
     detail::sliding_window_attention_launch(q, query_k, query_v, positions, valid_columns, lanes,
-                                            min_positions, scale, context, plan, partial.acc,
+                                            min_positions, scale, active, plan, partial.acc,
                                             partial.m, partial.l, out, stream);
 }
 

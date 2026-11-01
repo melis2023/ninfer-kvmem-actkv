@@ -30,7 +30,7 @@
 
 set(NINFER_PRODUCT_ROOTS src include apps cmake third_party)
 
-if(ENV{NINFER_BUILD_ID})
+if(DEFINED ENV{NINFER_BUILD_ID} AND NOT "$ENV{NINFER_BUILD_ID}" STREQUAL "")
   set(_id "$ENV{NINFER_BUILD_ID}")
 else()
   set(_id "")
@@ -79,9 +79,18 @@ else()
   endif()
 endif()
 
+# The release the tree belongs to: the first line of VERSION. Products report it with the build id
+# as `<VERSION>+<build id>` (ninfer-serve --version, GET /health, X-NInfer-Version).
+set(_version "unknown")
+if(EXISTS "${SRC_DIR}/VERSION")
+  file(STRINGS "${SRC_DIR}/VERSION" _version LIMIT_COUNT 1)
+  string(STRIP "${_version}" _version)
+endif()
+
 string(REPLACE "\"" "\\\"" _id_escaped "${_id}")
+string(REPLACE "\"" "\\\"" _version_escaped "${_version}")
 # Single string (not a list) so file(WRITE) does not inject a ';' list separator.
-set(_content "// Auto-generated at build time by cmake/GenerateBuildId.cmake -- do not edit.\n#define NINFER_BUILD_ID \"${_id_escaped}\"\n")
+set(_content "// Auto-generated at build time by cmake/GenerateBuildId.cmake -- do not edit.\n#define NINFER_BUILD_ID \"${_id_escaped}\"\n#define NINFER_VERSION \"${_version_escaped}\"\n")
 
 if(EXISTS "${OUT}")
   file(READ "${OUT}" _existing)

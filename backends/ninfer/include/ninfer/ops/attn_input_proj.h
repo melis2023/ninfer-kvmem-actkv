@@ -12,6 +12,12 @@
 
 namespace ninfer::ops {
 
+/** Native ternary weights use T2_G128_FP16, PTQ1_G128_FP16 or T5_G128_FP16 RowSplit,
+ * group 128 and FP16 multipliers. Exact packing and the T5 compute contract are defined in
+ * docs/maintainer/tensor-formats.md. Split parents must use the same packing. PTQ1 has a high
+ * plane; T2/T5 do not. T5 requires A8 permission and workspace, with per-group s8 activations
+ * and positive K divisible by 1024; it has no A16 fallback. Public activations remain BF16.
+ */
 /**
  * Computes four independent linear projections for each token:
  *
@@ -123,6 +129,35 @@ void attn_input_proj_fused_rmsnorm_nvfp4(const Tensor& residual, const Tensor& n
                                          float eps, const Weight& projection_weight, Tensor& q,
                                          Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,
                                          WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * Whether the integer-activation NVFP4 route takes the fused norm for this parent at this width.
+ * The answer is the device profile's `nvfp4_int8/attn_input` band: true exactly when the unified
+ * chain's mainloop answers the call, which is the only chain that carries the fused edge. The
+ * own chain (MMQ/MMVQ) stays on the standalone pair at every width.
+ * Every width the unified route answers qualifies: the fused edge writes per-32 activation groups,
+ * which is the plane both chains rescale against.
+ */
+[[nodiscard]] bool attn_input_proj_fused_rmsnorm_int8_eligible(const Weight& weight,
+                                                               LinearPolicy policy,
+                                                               std::int32_t tokens);
+
+/**
+ * Computes the Offset RMSNorm and the int8 Q/K/output-gate/V projection with one activation pass:
+ * a single kernel turns the residual row into the per-32 s8 codes and FP32 scales the grouped or
+ * narrow mainloop then consumes, replacing this route's separate quantise launch and the model
+ * layer's separate rmsnorm. Same shapes, same policy domain and same workspace capacity as
+ * attn_input_proj_fused_rmsnorm_nvfp4, restricted to AllowNvfp4Int8 where the band says unified.
+ * Bit-for-bit the composition of Offset rmsnorm() into BF16 storage followed by that route's own
+ * per-32 quantiser: the norm half reproduces the D=5120 launcher's pair ownership, accumulation
+ * order, reduction and single BF16 rounding, and the quantise half calls the group function both
+ * chains already share. No hidden tensor is written and no plane layout is shared with the own
+ * chain, whose interleaved MMQ plane this entry refuses.
+ */
+void attn_input_proj_fused_rmsnorm_int8(const Tensor& residual, const Tensor& norm_weight,
+                                        float eps, const Weight& projection_weight, Tensor& q,
+                                        Tensor& gate, Tensor& k, Tensor& v, LinearPolicy policy,
+                                        WorkspaceArena& workspace, cudaStream_t stream);
 
 /**
  * Applies the A16-only single-parent Q/K/output-gate/V projection without transient workspace.

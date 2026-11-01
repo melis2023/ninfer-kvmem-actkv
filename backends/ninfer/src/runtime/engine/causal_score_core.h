@@ -1,7 +1,8 @@
 #pragma once
 
 #include "core/device.h"
-#include "ninfer/types.h"
+#include "ninfer/observability/resources.h"
+#include "ninfer/observability/snapshot.h"
 #include "runtime/engine/kv_capacity.h"
 
 #include <condition_variable>
@@ -100,7 +101,14 @@ public:
         return out;
     }
 
-    [[nodiscard]] RuntimeStats runtime_stats() const noexcept { return {}; }
+    [[nodiscard]] RuntimeStats runtime_stats() const noexcept {
+        std::scoped_lock lock(execution_mutex_);
+        RuntimeStats out;
+        if constexpr (requires { instance_.program->expert_residency_stats(); }) {
+            out.experts = instance_.program->expert_residency_stats();
+        }
+        return out;
+    }
 
     [[nodiscard]] bool is_available() const {
         std::lock_guard lock(queue_mutex_);

@@ -10,7 +10,6 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <iostream>
-#include <numeric>
 #include <span>
 #include <stdexcept>
 #include <vector>
@@ -32,7 +31,8 @@ WeightGeometry geometry_for(QType format, QuantLayout layout, std::uint64_t rows
 
 // The panel layout permutes bytes; it must not move a single boundary.
 void geometry_matches_row_split() {
-    for (const auto format : {QType::Q4_G64_FP16, QType::Q5_G64_FP16, QType::Q6_G64_FP16}) {
+    for (const auto format : {QType::Q2_G64_FP16, QType::Q4_G64_FP16, QType::Q5_G64_FP16,
+                              QType::Q6_G64_FP16}) {
         const auto plain = geometry_for(format, QuantLayout::RowSplit, 256, 5120);
         const auto panel = geometry_for(format, QuantLayout::RowSplitPanel, 256, 5120);
         require(plain.bytes == panel.bytes && plain.code_bytes == panel.code_bytes &&
@@ -48,16 +48,18 @@ void geometry_matches_row_split() {
 }
 
 // Every byte must land where the kernels index it, and nowhere else.
-void permutation_is_the_expected_one() {
-    constexpr std::uint64_t kRows    = 64;
-    constexpr std::uint64_t kColumns = 512;
-    const auto geometry = geometry_for(QType::Q5_G64_FP16, QuantLayout::RowSplitPanel, kRows,
-                                       kColumns);
+void permutation_is_the_expected_one(QType format, std::uint64_t columns) {
+    constexpr std::uint64_t kRows = 128;
+    const auto geometry = geometry_for(format, QuantLayout::RowSplitPanel, kRows, columns);
     const auto groups   = geometry.padded_columns / geometry.group_size;
 
-    // A byte whose value encodes its own (row, group, index) so a misplacement is visible.
+    // A period-256 iota repeats complete rows at the real widths and can hide row swaps.
     std::vector<std::uint8_t> source(static_cast<std::size_t>(geometry.bytes));
-    std::iota(source.begin(), source.end(), std::uint8_t{0});
+    std::uint32_t word = 17;
+    for (auto& byte : source) {
+        word = word * 1664525u + 1013904223u;
+        byte = static_cast<std::uint8_t>(word >> 24);
+    }
 
     std::uint8_t* device = nullptr;
     if (cudaMalloc(&device, source.size()) != cudaSuccess) {
@@ -93,7 +95,7 @@ void permutation_is_the_expected_one() {
             }
         }
     };
-    check_plane(0, 32);
+    check_plane(0, geometry.code_bytes_per_row / groups);
     check_plane(geometry.high_offset, geometry.high_bytes_per_row / groups);
 
     // Scales are deliberately left row-major; if that ever changes this check should change with it.
@@ -129,7 +131,9 @@ int main() {
     try {
         geometry_matches_row_split();
         rejects_what_it_cannot_express();
-        permutation_is_the_expected_one();
+        permutation_is_the_expected_one(QType::Q5_G64_FP16, 512);
+        permutation_is_the_expected_one(QType::Q2_G64_FP16, 640);
+        permutation_is_the_expected_one(QType::Q2_G64_FP16, 2560);
         std::cout << "row-split panel permute checks passed\n";
         return 0;
     } catch (const std::exception& error) {

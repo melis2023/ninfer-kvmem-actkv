@@ -1,10 +1,14 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "ninfer/base.h"
+#include "ninfer/observability/execution.h"
+#include "ninfer/observability/snapshot.h"
+#include "ninfer/request.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/resources.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/context_cache/materialization_planner.h"
+#include "runtime/engine/context_cache/shared_candidate_ranking.h"
 #include "runtime/engine/context_cache/shared_capture_planner.h"
 
 #include <algorithm>
@@ -495,18 +499,23 @@ public:
                     continue;
                 }
                 if (*incoming != index.key) {
+                    if (!cdbg) { continue; }
                     // Own-session guard: a re-touch probes every stored slot, so a
                     // *different* session's response naturally mismatches a slot it does
                     // not own. Label those XSESSION-MISMATCH so they are not mistaken for a
-                    // real key-match failure of the re-touch's own checkpoint.
-                    const CatalogEntry& probe_entry = catalog_[index.slot];
-                    const bool own_session =
-                        probe_entry.session && base.context_cache().session_key &&
-                        *probe_entry.session == *base.context_cache().session_key;
+                    // real key-match failure of the re-touch's own checkpoint. A shared
+                    // entry's slot numbers the shared catalogue, which keeps no session.
+                    const char* label = "SHARED-MISMATCH";
+                    if (!index.shared) {
+                        const CatalogEntry& probe_entry = catalog_[index.slot];
+                        label = probe_entry.session && base.context_cache().session_key &&
+                                        *probe_entry.session == *base.context_cache().session_key
+                                    ? "DIGEST-MISMATCH"
+                                    : "XSESSION-MISMATCH";
+                    }
                     cdbg_log("[candgen] priv SKIP slot=%u %s frontier=%u "
                              "in=(%llx,%llx) st=(%llx,%llx)\n",
-                             index.slot, own_session ? "DIGEST-MISMATCH" : "XSESSION-MISMATCH",
-                             index.key.frontier,
+                             index.slot, label, index.key.frontier,
                              static_cast<unsigned long long>(incoming->digests[0]),
                              static_cast<unsigned long long>(incoming->digests[1]),
                              static_cast<unsigned long long>(index.key.digests[0]),
@@ -2509,6 +2518,7 @@ private:
             SharedCandidateEvidence evidence = SharedCandidateEvidence::None;
             std::uint32_t frontier           = 0;
             std::uint64_t demand_mask        = 0;
+            std::uint32_t reuse_domains      = 0;
             std::uint64_t rebuild_ns         = 0;
             bool pressure_capable            = false;
         };
@@ -2552,7 +2562,8 @@ private:
                                               SharedCandidateEvidence::ExplicitBoundary) ||
                 has_shared_candidate_evidence(opportunity.evidence,
                                               SharedCandidateEvidence::RequestedAutomatic);
-            const bool repeated = matching_reuse_domains(*key, provisional_demand) >= 2U;
+            const std::size_t reuse_domains = matching_reuse_domains(*key, provisional_demand);
+            const bool repeated             = reuse_domains >= 2U;
             // EngineStructural marks a frontier the prompt's own shape exposes - after the
             // leading instructions, after the tools - so a differing request can plausibly
             // land on it, and spending a spare slot speculatively is a reasonable bet.
@@ -2586,6 +2597,7 @@ private:
                 .evidence         = opportunity.evidence,
                 .frontier         = opportunity.frontier,
                 .demand_mask      = demand_mask_for(*key, provisional_demand),
+                .reuse_domains    = static_cast<std::uint32_t>(reuse_domains),
                 .rebuild_ns       = cost_model_.prefill_ns(*rebuild),
                 .pressure_capable = declared || repeated,
             });
@@ -2650,8 +2662,26 @@ private:
         std::vector<std::uint32_t> selected_frontiers;
         std::uint64_t selected_gain = 0;
         ContextPortfolioValue projected_value;
-        if (shared_candidates.size() > 7U) {
-            throw std::logic_error("prepared shared candidates exceeded the fixed subset bound");
+        // The subset search below is exhaustive, so it bounds the candidates it can weigh. How
+        // many a request offers is not bounded by it: the prefix grid alone proposes
+        // kPrefixGridCandidates, the structural boundaries and the client's own come on top, and a
+        // long prompt that a second reuse domain has also asked for passes every filter above.
+        // Narrow to the strongest instead of failing the request's admission.
+        constexpr std::size_t kSubsetSearchLimit = 7U;
+        if (shared_candidates.size() > kSubsetSearchLimit) {
+            std::vector<SharedCandidateRank> ranks;
+            ranks.reserve(shared_candidates.size());
+            for (const ProjectedSharedCandidate& candidate : shared_candidates) {
+                ranks.push_back(SharedCandidateRank{.pressure_capable = candidate.pressure_capable,
+                                                    .reuse_domains    = candidate.reuse_domains,
+                                                    .rebuild_ns       = candidate.rebuild_ns});
+            }
+            std::vector<ProjectedSharedCandidate> strongest;
+            strongest.reserve(kSubsetSearchLimit);
+            for (const std::size_t index : strongest_shared_candidates(ranks, kSubsetSearchLimit)) {
+                strongest.push_back(std::move(shared_candidates[index]));
+            }
+            shared_candidates = std::move(strongest);
         }
         const std::uint32_t subset_count = 1U << shared_candidates.size();
         for (std::uint32_t mask = 1; mask < subset_count; ++mask) {

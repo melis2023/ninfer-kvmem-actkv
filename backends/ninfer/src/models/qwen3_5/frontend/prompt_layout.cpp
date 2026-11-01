@@ -6,8 +6,21 @@
 namespace ninfer::models::qwen3_5::frontend {
 namespace {
 
-constexpr std::string_view kStart       = "<|im_start|>";
-constexpr std::string_view kEnd         = "<|im_end|>";
+constexpr std::string_view kQwenStart   = "<|im_start|>";
+constexpr std::string_view kQwenEnd     = "<|im_end|>";
+// Gemma 4's turns: <|turn>role\n ... <turn|>, the assistant's role named "model".
+constexpr std::string_view kGemmaStart  = "<|turn>";
+constexpr std::string_view kGemmaEnd    = "<turn|>";
+// Flint's turns: a role marker and the turn's text up to the next one; no marker closes a turn.
+struct FlintRole {
+    std::string_view marker;
+    ChatRole role;
+};
+constexpr FlintRole kFlintRoles[] = {{"<|system|>", ChatRole::System},
+                                     {"<|developer|>", ChatRole::Developer},
+                                     {"<|user|>", ChatRole::User},
+                                     {"<|assistant|>", ChatRole::Assistant},
+                                     {"<|observation|>", ChatRole::Tool}};
 constexpr std::string_view kVisionStart = "<|vision_start|>";
 constexpr std::string_view kVisionEnd   = "<|vision_end|>";
 
@@ -22,6 +35,55 @@ std::size_t find_marker(const text::TemplateOutput& output, std::string_view mar
         if (template_bytes(output, pos, pos + marker.size())) return pos;
     }
     return std::string::npos;
+}
+
+// The first Flint role marker at or after `begin`; null where none follows.
+const FlintRole* find_flint_role(const text::TemplateOutput& output, std::size_t begin,
+                                 std::size_t& at) {
+    const FlintRole* found = nullptr;
+    at                     = std::string::npos;
+    for (const FlintRole& role : kFlintRoles) {
+        const std::size_t pos = find_marker(output, role.marker, begin);
+        if (pos < at) {
+            at    = pos;
+            found = &role;
+        }
+    }
+    return found;
+}
+
+// Flint's layout: each turn ends where the next begins, which closes it, since a role marker is a
+// special token a turn's text cannot run into. Its template writes no media.
+PromptLayout inspect_flint_layout(const text::TemplateOutput& output,
+                                  std::span<const Modality> media) {
+    if (!media.empty()) { throw std::invalid_argument("Flint's chat template takes no media"); }
+    PromptLayout result;
+    const std::string_view source = output.text;
+    std::size_t pos               = 0;
+    const FlintRole* role         = find_flint_role(output, 0, pos);
+    while (role != nullptr) {
+        const std::size_t content_begin = pos + role->marker.size();
+        std::size_t next                = std::string::npos;
+        const FlintRole* following      = find_flint_role(output, content_begin, next);
+        const bool closed               = following != nullptr;
+        const std::size_t content_end   = closed ? next : source.size();
+        result.messages.push_back(
+            {role->role, pos, content_begin, content_end, content_end, closed});
+        if (role->role == ChatRole::Assistant) {
+            result.execution_boundaries.push_back(content_begin);
+            if (!closed) {
+                // A final assistant prefix that opened a reasoning block and left it open.
+                const auto body = source.substr(content_begin, content_end - content_begin);
+                result.starts_in_reasoning =
+                    body.starts_with("<think>") &&
+                    template_bytes(output, content_begin, content_begin + 7) &&
+                    find_marker(output, "</think>", content_begin + 7) == std::string::npos;
+            }
+        }
+        role = following;
+        pos  = next;
+    }
+    return result;
 }
 
 } // namespace
@@ -59,14 +121,25 @@ std::optional<std::size_t> source_boundary(const text::TemplateOutput& output, s
 
 PromptLayout inspect_prompt_layout(const text::TemplateOutput& output,
                                    std::span<const Modality> media) {
+    std::size_t flint_at = std::string::npos;
+    if (find_marker(output, kQwenStart, 0) == std::string::npos &&
+        find_marker(output, kGemmaStart, 0) == std::string::npos &&
+        find_flint_role(output, 0, flint_at) != nullptr) {
+        return inspect_flint_layout(output, media);
+    }
     PromptLayout result;
     const std::string_view source = output.text;
+    const bool gemma =
+        find_marker(output, kQwenStart, 0) == std::string::npos &&
+        find_marker(output, kGemmaStart, 0) != std::string::npos;
+    const std::string_view kStart = gemma ? kGemmaStart : kQwenStart;
+    const std::string_view kEnd   = gemma ? kGemmaEnd : kQwenEnd;
     for (auto pos = find_marker(output, kStart, 0); pos != std::string::npos;) {
         const auto header_end = source.find('\n', pos + kStart.size());
         if (header_end == std::string::npos) break;
         const auto role = source.substr(pos + kStart.size(), header_end - pos - kStart.size());
         ChatRole parsed;
-        if (role == "assistant")
+        if (role == "assistant" || (gemma && role == "model"))
             parsed = ChatRole::Assistant;
         else if (role == "user")
             parsed = ChatRole::User;
@@ -119,6 +192,29 @@ PromptLayout inspect_prompt_layout(const text::TemplateOutput& output,
         pos = next;
     }
 
+    // Gemma 4's template writes one <|image|> or <|video|> per media input, in input order; the
+    // processor adds the begin and end markers around the soft tokens it expands it into.
+    if (gemma) {
+        for (std::size_t pos = 0; pos < source.size();) {
+            const auto image = find_marker(output, "<|image|>", pos);
+            const auto video = find_marker(output, "<|video|>", pos);
+            const auto pad   = std::min(image, video);
+            if (pad == std::string::npos) break;
+            const auto modality = pad == image ? Modality::Image : Modality::Video;
+            constexpr std::size_t size = 9; // <|image|> and <|video|>
+            const auto index       = result.media_placeholders.size();
+            if (index >= media.size() || media[index] != modality) {
+                throw std::invalid_argument(
+                    "chat template media placeholders must match input count, type and order");
+            }
+            result.media_placeholders.push_back({{pad, pad + size}, modality, index});
+            pos = pad + size;
+        }
+        if (result.media_placeholders.size() != media.size()) {
+            throw std::invalid_argument("chat template omitted an input media placeholder");
+        }
+        return result;
+    }
     // Each media input contributes one complete Qwen placeholder in input order.
     for (std::size_t pos = 0; pos < source.size();) {
         const auto image = find_marker(output, "<|image_pad|>", pos);

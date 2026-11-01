@@ -1,129 +1,174 @@
-# Build the Windows release archive for the version in the repository's VERSION file.
-#
-#   $env:NINFER_BUILD_ROOT = 'C:\ninfer\build-ninja'; .\scripts\package-release.ps1
-#   .\scripts\build.ps1 -Package         configure + build, then this
-#
-# There is one packager, not one per release. Everything version-specific is derived from VERSION,
-# whose content is the full release tag (for example 0.10.0-rtx3090): the text before the first '-'
-# names RELEASE_NOTES_<version>.md and the checksum file, and the whole tag names the archive. To cut
-# a release, bump VERSION and write its release notes; there is nothing here to copy and edit.
+# Package the configured Windows build. CUDA and architecture labels come from its build tree.
+# Example: $env:NINFER_BUILD_ROOT = 'C:\ninfer\build-release'; ./scripts/package-release.ps1
 $ErrorActionPreference = 'Stop'
-
+Set-StrictMode -Version Latest
 $RepoRoot = Split-Path -Parent $PSScriptRoot
-
-$VersionFile = Join-Path $RepoRoot 'VERSION'
-if (-not (Test-Path -LiteralPath $VersionFile)) { throw "Missing $VersionFile" }
-$ReleaseTag = (Get-Content -LiteralPath $VersionFile -Raw).Trim()
-if (-not $ReleaseTag) { throw "$VersionFile is empty" }
-$ReleaseVersion = $ReleaseTag.Split('-')[0]
-$ReleaseNotes = "RELEASE_NOTES_$ReleaseVersion.md"
-# Checked before anything is deleted or built into dist, so a forgotten release-notes file costs
-# nothing rather than a finished archive that has to be thrown away.
-if (-not (Test-Path -LiteralPath (Join-Path $RepoRoot $ReleaseNotes))) {
-    throw "Missing $(Join-Path $RepoRoot $ReleaseNotes): write the release notes for $ReleaseTag before packaging it"
-}
-
 $BuildRoot = if ($env:NINFER_BUILD_ROOT) { $env:NINFER_BUILD_ROOT } else { Join-Path $RepoRoot 'build-ninja' }
+$BuildRoot = (Resolve-Path -LiteralPath $BuildRoot).Path
+$Cache = Get-Content -LiteralPath (Join-Path $BuildRoot 'CMakeCache.txt')
+function Read-Cache([string]$Name) {
+    $entry = @($Cache | Where-Object { $_ -match "^${Name}:[^=]+=" })
+    if ($entry.Count -ne 1) { throw "Expected one $Name entry in CMakeCache.txt" }
+    return ($entry[0] -split '=', 2)[1]
+}
+$Archs = (Read-Cache 'CMAKE_CUDA_ARCHITECTURES').Split(';')
+foreach ($arch in $Archs) {
+    if ($arch -notmatch '^(70|75|80|86|89|120a)$') { throw "Unsupported architecture: $arch" }
+}
+$Nvcc = Read-Cache 'CMAKE_CUDA_COMPILER'
+# Use the compiler that produced the build, even when another Toolkit is on PATH.
+$CudaRoot = Split-Path -Parent (Split-Path -Parent $Nvcc)
+$CudaVersionText = (& $Nvcc --version) -join "`n"
+if ($LASTEXITCODE -ne 0 -or $CudaVersionText -notmatch 'release (\d+\.\d+),') {
+    throw 'Cannot read the build compiler CUDA version'
+}
+$CudaVersion = $Matches[1]
+$CudaMajor = $CudaVersion.Split('.')[0]
+$Version = (Get-Content -LiteralPath (Join-Path $RepoRoot 'VERSION') -Raw).Trim()
+if ($Version -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') { throw 'VERSION is not a valid release-notes identifier' }
+$ReleaseNotes = Join-Path $RepoRoot "RELEASE_NOTES_$($Version.Split('-')[0]).md"
+$Revision = (& git -C $RepoRoot rev-parse HEAD).Trim()
+if ($LASTEXITCODE -ne 0) { throw 'Cannot resolve the source revision' }
+$SourceState = @(& git -C $RepoRoot status --porcelain --untracked-files=no)
+if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect source changes' }
+if ($env:GITHUB_ACTIONS -eq 'true' -and $SourceState.Count -ne 0) { throw 'CI source tree is modified' }
+$Suffix = if ($SourceState.Count) { '-dirty' } else { '' }
+$ProductName = "ninfer-windows-x64-cuda$CudaVersion-sm$($Archs -join '-')-$($Revision.Substring(0,12))$Suffix"
 $DistRoot = Join-Path $RepoRoot 'dist'
-$ProductName = "ninfer-rtx3090-windows-x64-$ReleaseTag"
 $ProductRoot = Join-Path $DistRoot $ProductName
-$ArchivePath = Join-Path $DistRoot "$ProductName.zip"
-$ChecksumPath = Join-Path $DistRoot "SHA256SUMS-v$ReleaseVersion-windows.txt"
-
-# Ninja is a single-config generator, so release binaries land directly under
-# apps\ / bench\ rather than an apps\Release\ subdirectory.
-$Products = @(
-    @{ Source = 'apps\ninfer.exe'; Destination = 'ninfer.exe' },
-    @{ Source = 'apps\ninfer-serve.exe'; Destination = 'ninfer-serve.exe' },
-    @{ Source = 'bench\ninfer_bench.exe'; Destination = 'ninfer_bench.exe' }
-)
-
-New-Item -ItemType Directory -Force -Path $DistRoot | Out-Null
-$resolvedDist = (Resolve-Path -LiteralPath $DistRoot).Path
-$resolvedProductParent = [System.IO.Path]::GetFullPath((Split-Path -Parent $ProductRoot))
-if ($resolvedProductParent -ne $resolvedDist -or (Split-Path -Leaf $ProductRoot) -ne $ProductName) {
-    throw "Refusing to package outside the expected dist directory: $ProductRoot"
-}
-if (Test-Path -LiteralPath $ProductRoot) { Remove-Item -LiteralPath $ProductRoot -Recurse -Force }
-if (Test-Path -LiteralPath $ArchivePath) { Remove-Item -LiteralPath $ArchivePath -Force }
-# The checksum goes too, and before anything can fail. It is written last, so leaving a previous
-# run's copy in place means a mid-run failure can leave `dist` holding a new archive beside a
-# checksum for the old one -- and publishing that pair is worse than publishing neither.
-if (Test-Path -LiteralPath $ChecksumPath) { Remove-Item -LiteralPath $ChecksumPath -Force }
-New-Item -ItemType Directory -Path $ProductRoot | Out-Null
-
+$ChecksumPath = Join-Path $DistRoot "SHA256SUMS-$ProductName.txt"
+$ArchivePath = Join-Path $DistRoot "$ProductName.7z"
+$SevenZip = (Get-Command 7z -ErrorAction Stop).Source
+$SharedRuntime = (Read-Cache 'NINFER_SHARED_RUNTIME') -eq 'ON'
+if (-not $SharedRuntime) { throw 'Native releases require NINFER_SHARED_RUNTIME=ON' }
+$KernelDll = (Read-Cache 'NINFER_WINDOWS_KERNEL_DLL') -eq 'ON'
+$Commands = @('ninfer', 'ninfer-serve', 'ninfer_bench', 'ninfer-calibrate', 'ninfer-perplexity', 'ninfer-ngram-profile')
+$Products = @($Commands | ForEach-Object { "portable\$_.exe" })
+$BackendRoot = Join-Path $ProductRoot "backends\cuda$CudaMajor"
 foreach ($product in $Products) {
-    $source = Join-Path $BuildRoot $product.Source
-    if (-not (Test-Path -LiteralPath $source)) { throw "Missing release product: $source" }
-    Copy-Item -LiteralPath $source -Destination (Join-Path $ProductRoot $product.Destination)
+    if (-not (Test-Path -LiteralPath (Join-Path $BuildRoot $product))) { throw "Missing product: $product" }
 }
-Get-ChildItem -LiteralPath (Join-Path $BuildRoot 'apps') -Filter '*.dll' | ForEach-Object {
-    Copy-Item -LiteralPath $_.FullName -Destination $ProductRoot
+$Eula = Join-Path $CudaRoot 'EULA.txt'
+if (-not (Test-Path -LiteralPath $Eula)) { throw "Missing CUDA redistributable licence: $Eula" }
+New-Item -ItemType Directory -Force -Path $DistRoot | Out-Null
+# Only replace this exact build's package, never another variant's assets.
+if (Test-Path -LiteralPath $ProductRoot) { Remove-Item -LiteralPath $ProductRoot -Recurse -Force }
+Get-ChildItem -LiteralPath $DistRoot -File | Where-Object {
+    $_.Name -eq (Split-Path -Leaf $ChecksumPath) -or $_.Name -match "^$([regex]::Escape($ProductName))\.7z\.\d+$"
+} | Remove-Item -Force
+New-Item -ItemType Directory -Path $ProductRoot | Out-Null
+foreach ($product in $Products) {
+    Copy-Item -LiteralPath (Join-Path $BuildRoot $product) -Destination $ProductRoot
 }
-# The executables import cublas64_12.dll (the cuBLAS prefill route), which imports cublasLt64_12.dll.
-# Neither is in the vcpkg apps\ directory: they come from the CUDA Toolkit, which a typical Windows
-# machine does not have, so without them every executable here fails to start with "cublas64_12.dll
-# was not found" -- before --prefill-cublas is even asked for. NVIDIA lists both as redistributable in
-# the CUDA Toolkit EULA. Take them from the toolkit that built the binaries.
-$CudaBin = if ($env:CUDA_PATH) { Join-Path $env:CUDA_PATH 'bin' } else { $null }
-foreach ($name in 'cublas64_12.dll', 'cublasLt64_12.dll') {
-    $found = if ($CudaBin) { Join-Path $CudaBin $name } else { $null }
-    if (-not $found -or -not (Test-Path -LiteralPath $found)) {
-        throw "Missing ${name}: set CUDA_PATH to the CUDA 12.x Toolkit that built the release (looked in $CudaBin)"
+New-Item -ItemType Directory -Force -Path $BackendRoot | Out-Null
+Copy-Item -Path (Join-Path $BuildRoot "portable\backends\cuda$CudaMajor\*.dll") -Destination $BackendRoot
+Copy-Item -LiteralPath (Join-Path $BuildRoot "portable\backends\cuda$CudaMajor\architectures.txt") -Destination $BackendRoot
+$RecordedArchs = ((Get-Content -LiteralPath (Join-Path $BackendRoot 'architectures.txt') -Raw).Trim() -split '\s+') -join ';'
+if ($RecordedArchs -ne ($Archs -join ';')) { throw 'Backend architecture metadata differs from the build' }
+# Include the vcpkg runtime closure, including dependencies of FFmpeg and curl.
+$DllDirectories = @()
+$VcpkgEntry = @($Cache | Where-Object { $_ -match '^VCPKG_INSTALLED_DIR:[^=]+=' })
+if ($VcpkgEntry.Count -eq 1) {
+    $VcpkgInstalled = ($VcpkgEntry[0] -split '=', 2)[1]
+    $DllDirectories += Join-Path $VcpkgInstalled "$(Read-Cache 'VCPKG_TARGET_TRIPLET')\bin"
+}
+foreach ($directory in $DllDirectories) {
+    if (Test-Path -LiteralPath $directory) {
+        Get-ChildItem -LiteralPath $directory -Filter '*.dll' | Copy-Item -Destination $BackendRoot
     }
-    Copy-Item -LiteralPath $found -Destination $ProductRoot
 }
-# NVIDIA's grant to redistribute those two DLLs (Attachment A of the EULA: cublas.dll and cublasLt.dll,
-# including files whose names carry a version such as cublas64_12.dll) is conditional: the
-# distribution must be consistent with the EULA and protect NVIDIA's rights. Its text therefore ships
-# beside them, and the archive README says which files it covers.
-$Eula = if ($env:CUDA_PATH) { Join-Path $env:CUDA_PATH 'EULA.txt' } else { $null }
-if (-not $Eula -or -not (Test-Path -LiteralPath $Eula)) {
-    throw "Missing the CUDA Toolkit EULA (looked for $Eula): it must ship with the cuBLAS DLLs"
+foreach ($name in "cublas64_$CudaMajor.dll", "cublasLt64_$CudaMajor.dll") {
+    $candidates = @((Join-Path $CudaRoot "bin\$name"), (Join-Path $CudaRoot "bin\x64\$name"))
+    $found = @($candidates | Where-Object { Test-Path -LiteralPath $_ })
+    if ($found.Count -ne 1) { throw "Expected one $name under $CudaRoot" }
+    Copy-Item -LiteralPath $found[0] -Destination $BackendRoot
 }
-Copy-Item -LiteralPath $Eula -Destination (Join-Path $ProductRoot 'NVIDIA-CUDA-EULA.txt')
-Copy-Item -LiteralPath (Join-Path $RepoRoot 'VERSION') -Destination $ProductRoot
-Copy-Item -LiteralPath (Join-Path $RepoRoot 'LICENSE') -Destination $ProductRoot
-# The archive README must describe the archive. docs\rtx-3090-windows.md is written for a checkout
-# -- it points at scripts\download-model.bat, and the packager copies that script to the archive
-# root -- so a user following it from inside the archive got a missing-file error.
+Copy-Item -LiteralPath $Eula -Destination (Join-Path $BackendRoot 'NVIDIA-CUDA-EULA.txt')
+foreach ($file in 'VERSION', 'LICENSE') { Copy-Item -LiteralPath (Join-Path $RepoRoot $file) -Destination $ProductRoot }
+if (Test-Path -LiteralPath $ReleaseNotes) {
+    Copy-Item -LiteralPath $ReleaseNotes -Destination $ProductRoot
+}
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'docs\release-archive-windows.md') -Destination (Join-Path $ProductRoot 'README.md')
-Copy-Item -LiteralPath (Join-Path $RepoRoot $ReleaseNotes) -Destination $ProductRoot
-# Explicit rather than matched by pattern, so a new script is shipped only once someone has decided
-# it belongs in the archive.
-foreach ($script in @('run.bat', 'download-model.bat')) {
-    $source = Join-Path $RepoRoot "scripts\$script"
-    if (-not (Test-Path -LiteralPath $source)) { throw "Missing release script: $source" }
-    Copy-Item -LiteralPath $source -Destination $ProductRoot
+foreach ($script in 'run.bat', 'download-model.bat') {
+    Copy-Item -LiteralPath (Join-Path $RepoRoot "scripts\$script") -Destination $ProductRoot
 }
-
-# A missing DLL only shows up on a machine that lacks it, and this one has the CUDA Toolkit and the
-# vcpkg tree on its PATH -- which is how the executables nearly shipped needing cublas64_12.dll, so
-# that none of them started on a PC without the Toolkit. Start each one from the folder about to be
-# archived with nothing but Windows on PATH: a DLL the archive does not carry stops it (0xC0000135)
-# and stops the release here.
-$CleanPath = "$env:SystemRoot\System32;$env:SystemRoot"
-foreach ($exe in ($Products | ForEach-Object { $_.Destination })) {
-    $null = cmd /c "set PATH=$CleanPath&& `"$(Join-Path $ProductRoot $exe)`" --help 2>&1"
-    if ($LASTEXITCODE -ne 0) {
-        throw "$exe did not start with only Windows on PATH (exit $LASTEXITCODE): a DLL it needs is missing from the archive or cannot be loaded"
+# Preserve dependency notices from the triplet used by the build.
+if ($VcpkgEntry.Count -eq 1) {
+    $share = Join-Path $VcpkgInstalled "$(Read-Cache 'VCPKG_TARGET_TRIPLET')\share"
+    foreach ($notice in (Get-ChildItem -LiteralPath $share -Filter copyright -Recurse)) {
+        $name = Split-Path -Leaf (Split-Path -Parent $notice.FullName)
+        Copy-Item -LiteralPath $notice.FullName -Destination (Join-Path $ProductRoot "LICENSE-$name.txt")
     }
 }
-
-$innerHashes = Get-ChildItem -LiteralPath $ProductRoot -File | Sort-Object Name | ForEach-Object {
-    $hash = Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256
-    "$($hash.Hash.ToLowerInvariant())  $($_.Name)"
+$Cuobjdump = Join-Path $CudaRoot 'bin\cuobjdump.exe'
+$DeviceModules = @('ninfer-runtime.dll')
+if ($KernelDll) { $DeviceModules += 'ninfer_ggml_quants.dll' }
+foreach ($module in $DeviceModules) {
+    $exe = Join-Path $BackendRoot $module
+    if ((Get-Item -LiteralPath $exe).Length -ge 2GB) { throw "PE device module exceeds 2 GiB: $module" }
+    if (-not (Test-Path -LiteralPath $exe)) { throw "Missing device module: $exe" }
+    Write-Host "Device module: $module; bytes: $((Get-Item -LiteralPath $exe).Length)"
+    if (Get-Command dumpbin -ErrorAction SilentlyContinue) {
+        & dumpbin /headers $exe
+        if ($LASTEXITCODE -ne 0) { throw "Cannot inspect PE headers for $exe" }
+    }
+    $images = (& $Cuobjdump --list-elf $exe 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0) { throw "cuobjdump failed for $exe" }
+    foreach ($arch in $Archs) {
+        if ($images -notmatch "sm_$arch(?:[.\s_]|$)") { throw "$exe lacks the sm_$arch device image" }
+    }
+    Write-Host "Device images verified: $module; architectures: $($Archs -join ',')"
 }
-# LF, not CRLF. `Set-Content` writes CRLF on Windows, and `sha256sum -c` then looks for a file whose
-# name ends in a carriage return: "avcodec-62.dll: FAILED open or read" for every line. The Linux
-# archive's list is written by sha256sum itself and has always been LF, so this also makes the two
-# archives' checksum files interchangeable. Get-FileHash comparisons are unaffected either way.
+New-Item -ItemType Directory -Path (Join-Path $ProductRoot 'help') | Out-Null
+foreach ($product in $Products) {
+    $exe = Join-Path $ProductRoot (Split-Path -Leaf $product)
+    $imports = (& dumpbin /imports $exe 2>&1) -join "`n"
+    if ($LASTEXITCODE -ne 0) { throw "Cannot inspect launcher imports: $exe" }
+    if ($imports -match '(?im)^\s*(?:nvcuda|cudart|cublas|ninfer[-_])[^\s]*\.dll\s*$') {
+        throw "Launcher imports a CUDA backend: $exe"
+    }
+    # No Toolkit, vcpkg or developer directories can satisfy missing runtime DLLs.
+    $savedPath = $env:PATH
+    try {
+        $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+        Write-Host "Startup check: $exe"
+        $helpText = & $exe --help
+        if ($LASTEXITCODE -ne 0) { throw "$exe --help failed with a clean PATH ($LASTEXITCODE)" }
+        $command = [IO.Path]::GetFileNameWithoutExtension($exe)
+        [IO.File]::WriteAllText((Join-Path $ProductRoot "help\$command.txt"), (($helpText -join "`n") + "`n"), [Text.UTF8Encoding]::new($false))
+        & $exe --help
+        if ($LASTEXITCODE -ne 0) { throw 'Saved help check failed' }
+        & $exe --version
+        if ($LASTEXITCODE -ne 0) { throw 'Version check failed' }
+        Write-Host "Startup check passed: $exe"
+    } finally { $env:PATH = $savedPath }
+}
+@{ source_revision = $Revision; modified_sources = [bool]$SourceState.Count; version = $Version;
+   cuda = $CudaVersion; cuda_compiler = $CudaVersionText; architectures = $Archs; platform = 'windows-x64';
+   cuda_archive_ptx_pruned = ((Read-Cache 'NINFER_CUDA_PRUNE_PTX') -eq 'ON');
+   ggml_kernel_dll = $KernelDll; layout = 'shared-runtime-v1'; commands = $Commands;
+   validation = 'Device images present; all launchers passed --help without Toolkit on PATH. GPU inference was not tested.'
+} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $ProductRoot 'BUILD-INFO.json') -Encoding utf8
+$innerHashes = Get-ChildItem -LiteralPath $ProductRoot -File -Recurse | Sort-Object FullName | ForEach-Object {
+    Write-Host "Hashing package file: $($_.Name); bytes: $($_.Length)"
+    "$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $([IO.Path]::GetRelativePath($ProductRoot, $_.FullName).Replace('\', '/'))"
+}
 [IO.File]::WriteAllText((Join-Path $ProductRoot 'SHA256SUMS.txt'), (($innerHashes -join "`n") + "`n"), [Text.ASCIIEncoding]::new())
-Compress-Archive -LiteralPath $ProductRoot -DestinationPath $ArchivePath -CompressionLevel Optimal
-$archiveHash = Get-FileHash -LiteralPath $ArchivePath -Algorithm SHA256
-[IO.File]::WriteAllText($ChecksumPath,
-    "$($archiveHash.Hash.ToLowerInvariant())  $(Split-Path -Leaf $ArchivePath)`n",
-    [Text.ASCIIEncoding]::new())
-
-Get-Item -LiteralPath $ArchivePath, $ChecksumPath |
-    Select-Object Name, @{ Name = 'SizeMB'; Expression = { [math]::Round($_.Length / 1MB, 2) } }
+# Always use volumes. Every asset stays below GitHub's 2 GiB limit, even as the fatbins grow.
+Write-Host "Creating archive: $ArchivePath"
+& $SevenZip a -t7z -mx=3 -bsp1 -v1900m $ArchivePath $ProductRoot
+if ($LASTEXITCODE -ne 0) { throw 'Archive creation failed' }
+Write-Host "Verifying archive: $ArchivePath.001"
+& $SevenZip t -bsp1 "$ArchivePath.001"
+if ($LASTEXITCODE -ne 0) { throw 'Archive verification failed' }
+$volumes = @(Get-ChildItem -LiteralPath $DistRoot -File | Where-Object {
+    $_.Name -match "^$([regex]::Escape($ProductName))\.7z\.\d+$"
+} | Sort-Object Name)
+if ($volumes.Count -eq 0) { throw 'No archive volumes were created' }
+$outerHashes = foreach ($volume in $volumes) {
+    if ($volume.Length -ge 2GB) { throw "Release asset is too large: $($volume.Name)" }
+    Write-Host "Hashing archive volume: $($volume.Name); bytes: $($volume.Length)"
+    "$((Get-FileHash -LiteralPath $volume.FullName -Algorithm SHA256).Hash.ToLowerInvariant())  $($volume.Name)"
+}
+[IO.File]::WriteAllText($ChecksumPath, (($outerHashes -join "`n") + "`n"), [Text.ASCIIEncoding]::new())
+$volumes | Select-Object Name, Length

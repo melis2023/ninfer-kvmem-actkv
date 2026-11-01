@@ -14,6 +14,7 @@
 namespace ninfer::ops::detail {
 
 enum class Bf16GdnGatingScheduleId {
+    SimtGeneral,
     GemvPairedRows,
     SmallTSplit10,
     SimtWarpRowC4,
@@ -68,6 +69,9 @@ std::size_t bf16_gdn_gating_capacity_workspace_bytes(std::int32_t heads, std::in
                                                      std::int32_t min_cols, std::int32_t max_cols);
 const char* bf16_gdn_norm_gating_schedule_name(Bf16GdnNormGatingScheduleId schedule) noexcept;
 Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProblem& problem);
+// The fused 35B split-32 route needs its whole grid resident; elsewhere the norm runs first.
+Bf16GdnNormGatingPlan bf16_gdn_norm_gating_resolve_plan(const Bf16GdnGatingProblem& problem,
+                                                        std::int32_t sm_count);
 std::size_t bf16_gdn_norm_gating_capacity_workspace_bytes(std::int32_t heads,
                                                           std::int32_t input_rows,
                                                           std::int32_t min_cols,

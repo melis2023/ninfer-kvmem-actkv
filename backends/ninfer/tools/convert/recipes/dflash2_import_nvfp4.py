@@ -1,23 +1,24 @@
 """Import the DFlash2 module's NVFP4 weights verbatim from a ModelOpt source.
 
 Unlike ``dflash2_nvfp4.py`` (which re-quantises a BF16/FP8 companion), this override
-keeps the source's NVFP4 codes, block scales and global divisor. Use it when the
+keeps the source's NVFP4 codes and block scales, and converts its multiplicative
+global scale to the equivalent native divisor. Use it when the
 companion checkpoint is already ModelOpt NVFP4, e.g.
 ``maurienne-ai/Qwen3.8-27B-DFlash2-NVFP4-RTNcal``.
 
-The whole drafter is NVFP4: ``attention/output`` and ``mlp/down`` import the source's
-encoded words verbatim, while ``feature_projection`` and the selector hidden
+The supported large projections use NVFP4: ``attention/output`` and ``mlp/down``
+import the source's codes and block scales verbatim, while ``feature_projection`` and the selector hidden
 projection (BF16 in the checkpoint) are quantised to NVFP4. QKV keeps Q8 because the
 fused attention input projection only admits that format, and the convolution kernel
 projections stay BF16 because their prepare path has no NVFP4 kernel.
 """
 from tools.convert.methods import import_encoded
-from tools.convert.quantization.nvfp4 import nvfp4_maxabs
+from tools.convert.nvfp4 import nvfp4_maxabs
 
 # The engine's native QKV input projection requires Q8_G32_FP16.
 _KEPT_Q8 = ('/attention/query', '/attention/key', '/attention/value')
 
-# BF16 in the ModelOpt checkpoint; quantise them so the drafter is one format.
+# BF16 in the ModelOpt checkpoint; quantise the supported projections to NVFP4.
 _REQUANTISE = (
     'dflash2/feature_projection',
     'dflash2/candidate_selector/hidden_projection',

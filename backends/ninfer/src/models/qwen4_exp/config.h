@@ -68,8 +68,16 @@ struct TextConfig {
     }
 };
 
+// The MTP block (the artifact's `mtp` component): one sparse-attention layer with the text model's
+// geometry and its own MoE, which may keep more experts than an expert-pruned text model.
+struct MtpConfig {
+    float rope_theta          = 0;
+    std::uint32_t num_experts = 0;
+};
+
 // Throws artifact::ArtifactError naming the field that is missing, malformed or outside the
 // implemented geometry.
 [[nodiscard]] TextConfig parse_text_config(const artifact::Json& value);
+[[nodiscard]] MtpConfig parse_mtp_config(const artifact::Json& value, const TextConfig& text);
 
 } // namespace ninfer::models::qwen4_exp

@@ -27,12 +27,14 @@ __host__ __device__ constexpr float value_scale() {
 template <class Decoder, int Tiles, bool Direct, int Warps>
 __launch_bounds__(Warps * 32) __global__
     void small_project_kernel(Decoder decoder, std::int32_t rows,
-                              const std::uint16_t* __restrict__ x, std::int32_t k,
+                              const std::uint16_t* __restrict__ x,
+                              const std::uint16_t* __restrict__ xb,
+                              const std::uint8_t* __restrict__ beyond, std::int32_t k,
                               std::int32_t col0, std::int32_t cols, DestinationEpilogue epilogue) {
     __shared__ SmallShared<Tiles, Decoder::kChunk, Warps> shared;
     const std::int32_t row0 = static_cast<std::int32_t>(blockIdx.x) * kSmallTileRows;
     small_tile<Decoder, Tiles, Direct, Warps>(decoder, decoder, row0, row0, kSmallTileRows, rows,
-                                              rows, x, k, col0, cols, shared);
+                                              rows, x, xb, beyond, k, col0, cols, shared);
     if (threadIdx.x >= 32) { return; }
     constexpr float kScale = value_scale<Decoder>();
     for (int e = static_cast<int>(threadIdx.x); e < kSmallTileRows * 8 * Tiles; e += 32) {
@@ -48,14 +50,16 @@ template <class Decoder, int Tiles, bool Direct, int Warps>
 __launch_bounds__(Warps * 32) __global__
     void small_swiglu_kernel(Decoder gate, Decoder up, std::int32_t rows, std::int32_t gate_first,
                              std::int32_t up_first, std::int32_t gate_limit, std::int32_t up_limit,
-                             const std::uint16_t* __restrict__ x, std::int32_t k, std::int32_t col0,
-                             std::int32_t cols, RowFactor gate_factor, RowFactor up_factor,
-                             __nv_bfloat16* __restrict__ out) {
+                             const std::uint16_t* __restrict__ x,
+                             const std::uint16_t* __restrict__ xb,
+                             const std::uint8_t* __restrict__ beyond, std::int32_t k,
+                             std::int32_t col0, std::int32_t cols, RowFactor gate_factor,
+                             RowFactor up_factor, __nv_bfloat16* __restrict__ out) {
     __shared__ SmallShared<Tiles, Decoder::kChunk, Warps> shared;
     const std::int32_t i0 = static_cast<std::int32_t>(blockIdx.x) * (kSmallTileRows / 2);
     small_tile<Decoder, Tiles, Direct, Warps>(gate, up, gate_first + i0, up_first + i0,
-                                              kSmallTileRows / 2, gate_limit, up_limit, x, k, col0,
-                                              cols, shared);
+                                              kSmallTileRows / 2, gate_limit, up_limit, x, xb,
+                                              beyond, k, col0, cols, shared);
     if (threadIdx.x >= 32) { return; }
     constexpr float kScale = value_scale<Decoder>();
     for (int e = static_cast<int>(threadIdx.x); e < (kSmallTileRows / 2) * 8 * Tiles; e += 32) {
@@ -110,24 +114,25 @@ void with_decoder(const Weight& w, F&& f) {
     throw std::invalid_argument("sm70 small-T: unsupported weight format");
 }
 
-// Column launches of 8, 16 or 32 columns over [0, tokens): launch<Tiles, Direct>(x, col0, cols),
-// on the caller's BF16 plane at the direct widths and on the prepared P8 FP16 one otherwise.
+// Column launches of 8, 16 or 32 columns over [0, tokens): launch<Tiles, Direct>(x, xb, beyond,
+// col0, cols), on the caller's BF16 plane at the direct widths and on the prepared P8 FP16 one with
+// its chunk flags otherwise; xb is the BF16 plane.
 template <class Launch>
 void by_columns(const Activation& x, Launch&& launch) {
+    const auto* bf16 = reinterpret_cast<const std::uint16_t*>(x.bf16);
     if (x.data == nullptr) {
-        launch.template operator()<1, true>(reinterpret_cast<const std::uint16_t*>(x.bf16), 0,
-                                            x.tokens);
+        launch.template operator()<1, true>(bf16, bf16, nullptr, 0, x.tokens);
         return;
     }
     const auto* f16 = reinterpret_cast<const std::uint16_t*>(x.data);
     for (std::int32_t col0 = 0; col0 < x.tokens; col0 += 32) {
         const std::int32_t cols = std::min<std::int32_t>(32, x.tokens - col0);
         if (cols <= 8) {
-            launch.template operator()<1, false>(f16, col0, cols);
+            launch.template operator()<1, false>(f16, bf16, x.beyond_chunks, col0, cols);
         } else if (cols <= 16) {
-            launch.template operator()<2, false>(f16, col0, cols);
+            launch.template operator()<2, false>(f16, bf16, x.beyond_chunks, col0, cols);
         } else {
-            launch.template operator()<4, false>(f16, col0, cols);
+            launch.template operator()<4, false>(f16, bf16, x.beyond_chunks, col0, cols);
         }
     }
 }
@@ -151,18 +156,40 @@ void with_warps(std::int32_t tiles, std::int32_t k, Launch&& launch) {
     launch.template operator()<kSmallWarps>();
 }
 
-// Eight values of a BF16 column per thread into the P8 order of sm70_small.cuh, saturated FP16.
+// Eight values of a BF16 column per thread into the P8 order of sm70_small.cuh, saturated FP16,
+// and per 64-value chunk (eight consecutive threads; K is a whole number of chunks) one flag byte:
+// nonzero where the chunk holds a value beyond FP16.
 __global__ void convert_activation_p8_kernel(const uint4* __restrict__ x, uint4* __restrict__ out,
+                                             std::uint8_t* __restrict__ beyond,
                                              std::int64_t groups) {
     const std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    if (i >= groups) { return; }
-    const uint4 v      = x[i];
-    const unsigned f01 = bf16x2_to_f16x2(v.x);
-    const unsigned f23 = bf16x2_to_f16x2(v.y);
-    const unsigned f45 = bf16x2_to_f16x2(v.z);
-    const unsigned f67 = bf16x2_to_f16x2(v.w);
-    out[i]             = make_uint4(__byte_perm(f01, f45, 0x5410u), __byte_perm(f01, f45, 0x7632u),
-                                    __byte_perm(f23, f67, 0x5410u), __byte_perm(f23, f67, 0x7632u));
+    const bool valid     = i < groups;
+    bool saturated       = false;
+    if (valid) {
+        const uint4 v      = x[i];
+        const unsigned f01 = bf16x2_to_f16x2(v.x);
+        const unsigned f23 = bf16x2_to_f16x2(v.y);
+        const unsigned f45 = bf16x2_to_f16x2(v.z);
+        const unsigned f67 = bf16x2_to_f16x2(v.w);
+        out[i]    = make_uint4(__byte_perm(f01, f45, 0x5410u), __byte_perm(f01, f45, 0x7632u),
+                               __byte_perm(f23, f67, 0x5410u), __byte_perm(f23, f67, 0x7632u));
+        saturated = bf16x2_beyond_f16(v.x) || bf16x2_beyond_f16(v.y) ||
+                    bf16x2_beyond_f16(v.z) || bf16x2_beyond_f16(v.w);
+    }
+    const unsigned ballot = __ballot_sync(0xffffffffu, saturated);
+    const int lane        = static_cast<int>(threadIdx.x) & 31;
+    if (valid && (lane & 7) == 0) { beyond[i / 8] = ((ballot >> lane) & 0xffu) != 0u; }
+}
+
+// The bytes of a prepared plane's chunk flags.
+std::size_t beyond_chunk_bytes(std::int32_t k, std::int32_t tokens) {
+    return (static_cast<std::size_t>(k / kSmallChunk) * static_cast<std::size_t>(tokens) + 255) /
+           256 * 256;
+}
+
+std::size_t plane_bytes(std::int32_t k, std::int32_t tokens) {
+    return (static_cast<std::size_t>(k) * static_cast<std::size_t>(tokens) * sizeof(__half) + 255) /
+           256 * 256;
 }
 
 } // namespace
@@ -176,7 +203,8 @@ bool small_shape(const Weight& w) {
 }
 
 std::size_t small_workspace_bytes(std::int32_t k, std::int32_t tokens) {
-    return tokens <= kSmallDirectTokens ? 0 : activation_bytes(k, tokens);
+    return tokens <= kSmallDirectTokens ? 0
+                                        : plane_bytes(k, tokens) + beyond_chunk_bytes(k, tokens);
 }
 
 namespace {
@@ -209,16 +237,20 @@ Activation small_prepare(const Tensor& x, WorkspaceArena& workspace, cudaStream_
     Activation out;
     out.k      = x.ne[0];
     out.tokens = x.ne[1];
-    auto* f16 =
-        static_cast<__half*>(workspace.alloc_bytes(activation_bytes(out.k, out.tokens)).data);
+    auto* f16 = static_cast<__half*>(workspace.alloc_bytes(plane_bytes(out.k, out.tokens)).data);
+    auto* beyond = static_cast<std::uint8_t*>(
+        workspace.alloc_bytes(beyond_chunk_bytes(out.k, out.tokens)).data);
     // K is a whole number of 64-value chunks (small_shape), so every eight values are one group.
     const std::int64_t groups = static_cast<std::int64_t>(out.k) * out.tokens / 8;
     constexpr int kThreads    = 256;
     convert_activation_p8_kernel<<<static_cast<unsigned>((groups + kThreads - 1) / kThreads),
                                    kThreads, 0, stream>>>(static_cast<const uint4*>(x.data),
-                                                          reinterpret_cast<uint4*>(f16), groups);
+                                                          reinterpret_cast<uint4*>(f16), beyond,
+                                                          groups);
     CUDA_CHECK(cudaGetLastError());
-    out.data = f16;
+    out.data          = f16;
+    out.bf16          = static_cast<const __nv_bfloat16*>(x.data);
+    out.beyond_chunks = beyond;
     return out;
 }
 
@@ -228,19 +260,20 @@ void small_project(const Activation& x, const Weight& w, std::span<const Destina
         destinations.size() > kMaxDestinations) {
         throw std::invalid_argument("sm70 small-T: unsupported weight or destinations");
     }
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     DestinationEpilogue epilogue;
     for (const Destination& d : destinations) { epilogue.set[epilogue.count++] = d; }
     epilogue.factor = row_factor(w);
     const dim3 grid(static_cast<unsigned>((w.n + kSmallTileRows - 1) / kSmallTileRows));
     with_decoder(w, [&](auto decoder) {
         using Decoder = decltype(decoder);
-        by_columns(x, [&]<int Tiles, bool Direct>(const std::uint16_t* plane, std::int32_t col0,
-                                                  std::int32_t cols) {
+        by_columns(x, [&]<int Tiles, bool Direct>(
+                          const std::uint16_t* plane, const std::uint16_t* xb,
+                          const std::uint8_t* beyond, std::int32_t col0, std::int32_t cols) {
             with_warps<Decoder, Tiles>(static_cast<std::int32_t>(grid.x), x.k, [&]<int Warps>() {
                 small_project_kernel<Decoder, Tiles, Direct, Warps>
-                    <<<grid, Warps * 32, 0, stream>>>(decoder, w.n, plane, x.k, col0, cols,
-                                                      epilogue);
+                    <<<grid, Warps * 32, 0, stream>>>(decoder, w.n, plane, xb, beyond, x.k, col0,
+                                                      cols, epilogue);
                 CUDA_CHECK(cudaGetLastError());
             });
         });
@@ -262,7 +295,7 @@ void small_swiglu(const Activation& x, const Weight& gate, const Weight* up, Ten
                    !small_shape(*up)))) {
         throw std::invalid_argument("sm70 small-T swiglu: unsupported weights or output");
     }
-#if defined(NINFER_SM70)
+#if defined(NINFER_TIER_VOLTA)
     const std::int32_t up_first   = joined ? rows : 0;
     const std::int32_t gate_limit = joined ? rows : gate.n;
     const std::int32_t up_limit   = joined ? 2 * rows : up_weight.n;
@@ -271,15 +304,18 @@ void small_swiglu(const Activation& x, const Weight& gate, const Weight* up, Ten
         using Decoder = decltype(gate_decoder);
         with_decoder(up_weight, [&](auto up_decoder) {
             if constexpr (std::is_same_v<decltype(up_decoder), Decoder>) {
-                by_columns(x, [&]<int Tiles, bool Direct>(const std::uint16_t* plane,
-                                                          std::int32_t col0, std::int32_t cols) {
+                by_columns(x, [&]<int Tiles, bool Direct>(
+                                  const std::uint16_t* plane, const std::uint16_t* xb,
+                                  const std::uint8_t* beyond, std::int32_t col0,
+                                  std::int32_t cols) {
                     with_warps<Decoder, Tiles>(
                         static_cast<std::int32_t>(grid.x), x.k, [&]<int Warps>() {
                             small_swiglu_kernel<Decoder, Tiles, Direct, Warps>
                                 <<<grid, Warps * 32, 0, stream>>>(
                                     gate_decoder, up_decoder, rows, 0, up_first, gate_limit,
-                                    up_limit, plane, x.k, col0, cols, row_factor(gate),
-                                    row_factor(up_weight), static_cast<__nv_bfloat16*>(out.data));
+                                    up_limit, plane, xb, beyond, x.k, col0, cols,
+                                    row_factor(gate), row_factor(up_weight),
+                                    static_cast<__nv_bfloat16*>(out.data));
                             CUDA_CHECK(cudaGetLastError());
                         });
                 });

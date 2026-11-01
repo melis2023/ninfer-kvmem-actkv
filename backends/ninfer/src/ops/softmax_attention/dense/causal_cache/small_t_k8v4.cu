@@ -5,6 +5,9 @@
 #include "ops/common/math.h"
 #include "ops/softmax_attention/dense/causal_cache/small_t_k8v4.cuh"
 #include "ops/kv_cache/plane_types.h"
+#if defined(NINFER_TIER_VOLTA)
+#    include "ops/softmax_attention/dense/causal_cache/small_t_sm70.cuh"
+#endif
 
 #include <cstdint>
 #include <stdexcept>
@@ -17,62 +20,88 @@ void launch_k8v4_partial(const Tensor& q, CacheInput input, const Tensor& positi
                          PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
                          std::int32_t logical_capacity, std::int32_t splits, Tensor& partial_acc,
                          Tensor& partial_m, Tensor& partial_l, cudaStream_t stream) {
-    constexpr int RowCount             = TokenTile * Geometry::GroupSize;
-    constexpr int RowTiles             = (RowCount + 15) / 16;
-    constexpr int Warps                = RowTiles == 3 ? 12 : 8;
-    // KeyBlock=64 would need 5.5*64*256 = 88KiB of dynamic shared memory here on top of ~30KiB
-    // static (q_s/p_s/etc), since unlike before this kernel keeps a real dequantized BF16 copy of
-    // K beside its raw FP8 staging buffer -- over sm_86/sm_89's ~99KiB-per-block budget (same
-    // constraint as small_t_fp8.cu; see its comment). KeyBlock=32 fits comfortably (~75KiB).
-    constexpr int KeyBlock             = 32;
-    constexpr int MinBlocks            = TokenTile == 1 ? 2 : 1;
-    // k_fp8(Bc*D) + k_b16(2*Bc*D) + v_nvfp4(Bc*D/2) + v_f16(2*Bc*D) = 5.5*Bc*D bytes.
-    constexpr std::size_t DynamicBytes = 11u * KeyBlock * kCausalHeadDim / 2u;
-    using KernelInput                  = CacheInput;
-    const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
-    const auto launch = [&]() {
-        auto kernel = causal_attention_small_t_k8v4_tiled_kernel<
-            Geometry, TokenTile, Warps, MinBlocks, KeyBlock, true, MultiBatch, Masked, KernelInput>;
-        configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(
-                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(DynamicBytes));
+#if defined(NINFER_TIER_VOLTA)
+    if (current_device_volta()) {
+        // Volta's own kernel (small_t_sm70.cuh): the same grid, splits and partial outputs. The
+        // tiled kernel is the other tiers'; a build of Volta alone does not compile it.
+        launch_small_t_sm70_quantized<Geometry, TokenTile, MultiBatch, Masked, CacheInput, true,
+                                      false>(q, input, positions, scale, cache, invocation,
+                                             logical_capacity, splits, partial_acc, partial_m,
+                                             partial_l, stream);
+        return;
+    }
+#endif
+    if constexpr (kBuildPostVolta) {
+        with_shape_set([&]<bool TuringShapes>() {
+            constexpr int RowCount = TokenTile * Geometry::GroupSize;
+            constexpr int RowTiles = (RowCount + 15) / 16;
+            constexpr int Warps    = RowTiles == 3 ? 12 : 8;
+            // KeyBlock=64 would need 5.5*64*256 = 88KiB of dynamic shared memory here on top of
+            // ~30KiB static (q_s/p_s/etc), since unlike before this kernel keeps a real dequantized
+            // BF16 copy of K beside its raw FP8 staging buffer -- over sm_86/sm_89's
+            // ~99KiB-per-block budget (same constraint as small_t_fp8.cu; see its comment).
+            // KeyBlock=32 fits comfortably (~75KiB).
+            constexpr int KeyBlock  = 32;
+            constexpr int MinBlocks = TokenTile == 1 ? 2 : 1;
+            // k_fp8(Bc*D) + k_b16(2*Bc*D) + v_nvfp4(Bc*D/2) + v_f16(2*Bc*D) = 5.5*Bc*D bytes; a
+            // compact stage widens V into k_b16 (kCausalSmallTCompactKV), 3.5*Bc*D bytes.
+            constexpr std::size_t DynamicBytes =
+                (kCausalSmallTCompactKV<RowTiles, KeyBlock, 11 * KeyBlock * kCausalHeadDim / 2,
+                                        TuringShapes>
+                     ? 7u
+                     : 11u) *
+                KeyBlock * kCausalHeadDim / 2u;
+            static_assert(kCausalSmallTQuantizedFixedBytes<RowTiles, KeyBlock> + DynamicBytes <=
+                          shape_max_shared_bytes_per_block(TuringShapes));
+            using KernelInput = CacheInput;
+            const dim3 grid(Geometry::KVHeads, splits, invocation.batch_size);
+            const auto launch = [&]() {
+                auto kernel = causal_attention_small_t_k8v4_tiled_kernel<
+                    Geometry, TokenTile, Warps, MinBlocks, KeyBlock, true, MultiBatch, Masked,
+                    KernelInput, TuringShapes>;
+                raise_dynamic_shared_memory(kernel, static_cast<int>(DynamicBytes));
+
+                const auto q_ptr         = static_cast<const __nv_bfloat16*>(q.data);
+                const auto positions_ptr = static_cast<const std::int32_t*>(positions.data);
+                constexpr auto kStorage  = KvCacheStorage::Fp8KeyNvfp4Value;
+                const auto cache_k_ptr   = static_cast<KvKeyCodeT<kStorage>*>(cache.k_pages.data);
+                const auto cache_v_ptr   = static_cast<KvValueCodeT<kStorage>*>(cache.v_pages.data);
+                const auto k_scale_ptr =
+                    static_cast<KvKeyScaleT<kStorage>*>(cache.k_scale_pages.data);
+                const auto v_scale_ptr =
+                    static_cast<KvValueScaleT<kStorage>*>(cache.v_scale_pages.data);
+                assert_kv_planes<kStorage, decltype(cache_k_ptr), decltype(cache_v_ptr),
+                                 decltype(k_scale_ptr), decltype(v_scale_ptr)>();
+                const auto tables_ptr = static_cast<const std::int32_t*>(cache.block_tables.data);
+                const auto valid_ptr =
+                    invocation.valid_columns == nullptr
+                        ? nullptr
+                        : static_cast<const std::int32_t*>(invocation.valid_columns->data);
+                const auto rows_ptr =
+                    invocation.table_rows == nullptr
+                        ? nullptr
+                        : static_cast<const std::int32_t*>(invocation.table_rows->data);
+                auto* partial_acc_ptr = static_cast<float*>(partial_acc.data);
+                auto* partial_m_ptr   = static_cast<float*>(partial_m.data);
+                auto* partial_l_ptr   = static_cast<float*>(partial_l.data);
+                kernel<<<grid, Warps * 32, DynamicBytes, stream>>>(
+                    q_ptr, input, positions_ptr, cache_k_ptr, cache_v_ptr, k_scale_ptr, v_scale_ptr,
+                    tables_ptr, valid_ptr, rows_ptr, cache.block_tables.ne[0],
+                    invocation.full_width, invocation.column_begin, logical_capacity, scale,
+                    partial_acc_ptr, partial_m_ptr, partial_l_ptr);
+                CUDA_CHECK(cudaGetLastError());
+            };
+
+            launch();
         });
-
-        const auto q_ptr         = static_cast<const __nv_bfloat16*>(q.data);
-        const auto positions_ptr = static_cast<const std::int32_t*>(positions.data);
-        constexpr auto kStorage  = KvCacheStorage::Fp8KeyNvfp4Value;
-        const auto cache_k_ptr   = static_cast<KvKeyCodeT<kStorage>*>(cache.k_pages.data);
-        const auto cache_v_ptr   = static_cast<KvValueCodeT<kStorage>*>(cache.v_pages.data);
-        const auto k_scale_ptr   = static_cast<KvKeyScaleT<kStorage>*>(cache.k_scale_pages.data);
-        const auto v_scale_ptr   = static_cast<KvValueScaleT<kStorage>*>(cache.v_scale_pages.data);
-        assert_kv_planes<kStorage, decltype(cache_k_ptr), decltype(cache_v_ptr),
-                         decltype(k_scale_ptr), decltype(v_scale_ptr)>();
-        const auto tables_ptr    = static_cast<const std::int32_t*>(cache.block_tables.data);
-        const auto valid_ptr =
-            invocation.valid_columns == nullptr
-                ? nullptr
-                : static_cast<const std::int32_t*>(invocation.valid_columns->data);
-        const auto rows_ptr   = invocation.table_rows == nullptr
-                                    ? nullptr
-                                    : static_cast<const std::int32_t*>(invocation.table_rows->data);
-        auto* partial_acc_ptr = static_cast<float*>(partial_acc.data);
-        auto* partial_m_ptr   = static_cast<float*>(partial_m.data);
-        auto* partial_l_ptr   = static_cast<float*>(partial_l.data);
-        kernel<<<grid, Warps * 32, DynamicBytes, stream>>>(
-            q_ptr, input, positions_ptr, cache_k_ptr, cache_v_ptr, k_scale_ptr, v_scale_ptr,
-            tables_ptr, valid_ptr, rows_ptr, cache.block_tables.ne[0], invocation.full_width,
-            invocation.column_begin, logical_capacity, scale, partial_acc_ptr, partial_m_ptr,
-            partial_l_ptr);
-        CUDA_CHECK(cudaGetLastError());
-    };
-
-    launch();
+    }
 }
 
 template <typename Geometry, bool MultiBatch, bool Masked>
 void launch_k8v4_reduce(const Tensor& positions, const CausalSmallTInvocation& invocation,
-                        std::int32_t splits, const Tensor& partial_acc, const Tensor& partial_m,
-                        const Tensor& partial_l, Tensor& out, cudaStream_t stream) {
+                        std::int32_t logical_capacity, std::int32_t splits,
+                        const Tensor& partial_acc, const Tensor& partial_m, const Tensor& partial_l,
+                        Tensor& out, cudaStream_t stream) {
     constexpr int Block = 256;
     const dim3 grid(Geometry::QHeads, invocation.width * invocation.batch_size);
     const auto launch = [&]<bool Offset>() {
@@ -86,7 +115,8 @@ void launch_k8v4_reduce(const Tensor& positions, const CausalSmallTInvocation& i
                     ? nullptr
                     : static_cast<const std::int32_t*>(invocation.valid_columns->data),
                 invocation.width, invocation.full_width, invocation.column_begin,
-                invocation.batch_size, splits, static_cast<__nv_bfloat16*>(out.data));
+                invocation.batch_size, logical_capacity, splits,
+                static_cast<__nv_bfloat16*>(out.data));
     };
     if (invocation.column_begin == 0) {
         launch.template operator()<false>();
@@ -166,18 +196,20 @@ void causal_attention_small_t_k8v4_launch_for(const Tensor& q, CacheInput input,
     const bool masked = invocation.valid_columns != nullptr;
     if (invocation.batch_size == 1) {
         if (masked) {
-            launch_k8v4_reduce<Geometry, false, true>(positions, invocation, splits, partial_acc,
-                                                      partial_m, partial_l, out, stream);
+            launch_k8v4_reduce<Geometry, false, true>(positions, invocation, logical_capacity,
+                                                      splits, partial_acc, partial_m, partial_l,
+                                                      out, stream);
         } else {
-            launch_k8v4_reduce<Geometry, false, false>(positions, invocation, splits, partial_acc,
-                                                       partial_m, partial_l, out, stream);
+            launch_k8v4_reduce<Geometry, false, false>(positions, invocation, logical_capacity,
+                                                       splits, partial_acc, partial_m, partial_l,
+                                                       out, stream);
         }
     } else if (masked) {
-        launch_k8v4_reduce<Geometry, true, true>(positions, invocation, splits, partial_acc,
-                                                 partial_m, partial_l, out, stream);
+        launch_k8v4_reduce<Geometry, true, true>(positions, invocation, logical_capacity, splits,
+                                                 partial_acc, partial_m, partial_l, out, stream);
     } else {
-        launch_k8v4_reduce<Geometry, true, false>(positions, invocation, splits, partial_acc,
-                                                  partial_m, partial_l, out, stream);
+        launch_k8v4_reduce<Geometry, true, false>(positions, invocation, logical_capacity, splits,
+                                                  partial_acc, partial_m, partial_l, out, stream);
     }
 }
 

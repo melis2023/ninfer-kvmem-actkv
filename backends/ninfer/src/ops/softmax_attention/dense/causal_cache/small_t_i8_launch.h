@@ -5,6 +5,7 @@
 
 #include "core/paged_kv_cache.h"
 #include "core/tensor.h"
+#include "ops/common/device_limits.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include <cuda_runtime.h>
@@ -13,6 +14,21 @@
 #include <string>
 
 namespace ninfer::ops::detail {
+
+// Whether a card of a shape set runs the partial kernel's "12x1x64d" tier: its 64-key dynamic arena
+// of 64 KiB beside the kernel's static tiles needs more than 64 KiB of shared memory per block,
+// which Turing does not have; there 2K-8K windows take 12x1x32 and the tier is no calibration
+// candidate.
+[[nodiscard]] constexpr bool small_t_i8_key_block64(bool turing_shapes) {
+    return shape_max_shared_bytes_per_block(turing_shapes) > 64 * 1024;
+}
+
+// Whether any card this build runs takes it, and whether the current device does.
+inline constexpr bool kSmallTI8KeyBlock64Built = kBuildStandardShapes;
+
+[[nodiscard]] inline bool small_t_i8_key_block64_here() {
+    return small_t_i8_key_block64(turing_shapes_here());
+}
 
 // Device-profile key of the INT8-family partial kernel's launch tier:
 // "attn_i8_small/h24/rk8v4/w8". The axis is the launch's implementation window.
@@ -26,8 +42,7 @@ template <typename Geometry, int TokenTile, typename CacheInput>
 void launch_small_t_i8(bool multi_batch, bool masked, const Tensor& q, CacheInput input, const Tensor& pos, float scale,
                        PagedKVBatchLayerView cache, const CausalSmallTInvocation& invocation,
                        std::int32_t logical_capacity, std::int32_t implementation_window,
-                       std::int32_t splits, std::int32_t wave_splits,
-                       std::int32_t invariant_segment_keys, Tensor& partial_acc,
+                       std::int32_t splits, std::int32_t wave_splits, Tensor& partial_acc,
                        Tensor& partial_m, Tensor& partial_l, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail

@@ -12,6 +12,7 @@ from tools.artifact.layouts import encoded_size, gguf_blocks_geometry
 from tools.convert import gguf_blocks
 from tools.convert.sources.gguf import TYPE_BF16, GGUFFile, write_gguf
 
+GEOM27 = gguf_blocks.DenseGeometry(5120, 17408, 248320, 64, 24, 4, 256, 16, 48, 128, 4, False)
 TYPE_Q8_0 = 8
 
 # ggml-common.h: block values and bytes of every type the importer keeps.
@@ -37,7 +38,7 @@ GGML_BLOCKS = {
 }
 
 
-def _q8_0_file(tmp_path, rows: int, columns: int, seed: int):
+def _q8_0_file(tmp_path, rows: int, columns: int, seed: int, name: str = "w"):
     generator = np.random.default_rng(seed)
     blocks = generator.integers(0, 256, size=(rows, columns // 32, 34), dtype=np.uint8)
     scales = generator.uniform(0.01, 0.02, size=(rows, columns // 32)).astype(np.float16)
@@ -46,11 +47,17 @@ def _q8_0_file(tmp_path, rows: int, columns: int, seed: int):
     write_gguf(
         path,
         {"general.architecture": "qwen35"},
-        [("w", (rows, columns), TYPE_Q8_0, blocks.tobytes())],
+        [(name, (rows, columns), TYPE_Q8_0, blocks.tobytes())],
     )
     return path, blocks
 
 
+def _q8_0_values(blocks: np.ndarray) -> np.ndarray:
+    """Independent ggml Q8_0 dequantization: binary16 d times each signed code byte."""
+
+    scales = blocks[..., :2].copy().view(np.float16).astype(np.float32)
+    codes = blocks[..., 2:].copy().view(np.int8).astype(np.float32)
+    return (codes * scales).reshape(blocks.shape[0], -1)
 def _small_block_file(tmp_path, type_id: int, rows: int = 4):
     elements, size = GGML_BLOCKS[type_id]
     columns = 128
@@ -130,28 +137,37 @@ def test_q2_0_gates_decode_before_grouped_bf16_cast(tmp_path, monkeypatch):
     path, _, values = _small_block_file(tmp_path, 42, rows=48)
     grouped = values.reshape(3, 16, 128).transpose(1, 0, 2).reshape(48, 128)
     with GGUFFile(path) as gguf:
-        source = gguf_blocks._gate_projection(gguf, "w")
+        source = gguf_blocks.gdn_control_source(gguf, "w", GEOM27)
         assert torch.equal(source.rows(0, 48), torch.from_numpy(grouped.copy()).to(torch.bfloat16))
 
 
 def test_row_values_are_ggml_dequantization(tmp_path):
-    pytest.importorskip("gguf")
     path, blocks = _q8_0_file(tmp_path, 6, 64, 2)
     with GGUFFile(path) as gguf:
         source = gguf_blocks.block_source(gguf, "w", (6, 64), lambda b, e: np.arange(b, e))
-        scales = blocks[3:5, :, :2].copy().view(np.float16).astype(np.float32)
-        codes = blocks[3:5, :, 2:].view(np.int8).astype(np.float32)
-        assert torch.equal(source.rows(3, 5), torch.from_numpy((codes * scales).reshape(2, 64)))
+        assert torch.equal(source.rows(3, 5), torch.from_numpy(_q8_0_values(blocks[3:5])))
 
 
 def test_output_projection_columns_read_the_grouped_value_heads():
-    columns = gguf_blocks.tiled_input_columns()
+    columns = gguf_blocks.tiled_input_columns(GEOM27)
     assert sorted(columns.tolist()) == list(range(6144))
     for tiled_head in (0, 1, 15, 16, 31, 47):
         key_head, repeat = tiled_head % 16, tiled_head // 16
         assert columns[tiled_head * 128 + 5] == (key_head * 3 + repeat) * 128 + 5
 
 
+def test_q8_0_gdn_controls_round_to_bf16_in_grouped_head_order(tmp_path):
+    # Underdog-Saluki-style exports store ssm_alpha/ssm_beta as Q8_0 blocks: their values reach the
+    # Engine's BF16 operand, the exporter's tiled value heads back in the grouped order.
+    heads = GEOM27.value_heads
+    path, blocks = _q8_0_file(tmp_path, heads, 64, 5, "blk.0.ssm_alpha.weight")
+    with GGUFFile(path) as gguf:
+        values = gguf_blocks.gdn_control_source(gguf, "blk.0.ssm_alpha.weight", GEOM27).rows(0, heads)
+    tiled = _q8_0_values(blocks)
+    # Grouped head k * 3 + r is the exporter's tiled head r * 16 + k.
+    grouped = [r * 16 + k for k in range(16) for r in range(3)]
+    assert values.dtype == torch.bfloat16
+    assert torch.equal(values, torch.from_numpy(tiled[grouped]).to(torch.bfloat16))
 def test_quantized_gates_decode_before_grouped_bf16_cast(tmp_path):
     pytest.importorskip("gguf")
     path, blocks = _q8_0_file(tmp_path, 48, 64, 3)
@@ -161,7 +177,7 @@ def test_quantized_gates_decode_before_grouped_bf16_cast(tmp_path):
     # GGUF tiles by repeat then key; execution groups the three repeats of each key.
     grouped = tiled.reshape(3, 16, 64).transpose(1, 0, 2).reshape(48, 64)
     with GGUFFile(path) as gguf:
-        source = gguf_blocks._gate_projection(gguf, "w")
+        source = gguf_blocks.gdn_control_source(gguf, "w", GEOM27)
         assert source.shape == (48, 64)
         assert torch.equal(source.rows(0, 48), torch.from_numpy(grouped.copy()).to(torch.bfloat16))
 
@@ -173,6 +189,6 @@ def test_bf16_gates_preserve_words_through_grouping(tmp_path):
                [("w", (48, 64), TYPE_BF16, words.tobytes())])
     expected = words.reshape(3, 16, 64).transpose(1, 0, 2).reshape(48, 64)
     with GGUFFile(path) as gguf:
-        source = gguf_blocks._gate_projection(gguf, "w")
+        source = gguf_blocks.gdn_control_source(gguf, "w", GEOM27)
         actual = source.rows(0, 48).view(torch.int16).numpy().view(np.uint16)
         assert np.array_equal(actual, expected)

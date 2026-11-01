@@ -126,14 +126,14 @@ __device__ __forceinline__ void load_nvfp4_coefficients(
 #pragma unroll
         for (int group = 0; group < kGroupsPerLane; ++group) {
             const auto scale    = static_cast<std::uint8_t>(word >> (8 * (first_byte + group)));
-            coefficients[group] = decode_nvfp4_e4m3(scale) * inverse_weight_divisor;
+            coefficients[group] = kNvfp4E4M3ScaleA16[scale] * inverse_weight_divisor;
         }
     } else {
 #pragma unroll
         for (int group = 0; group < kGroupsPerLane; ++group) {
             const std::uint8_t scale =
                 scales[nvfp4_scale_offset<Geometry>(parent_row, group_begin + group)];
-            coefficients[group] = decode_nvfp4_e4m3(scale) * inverse_weight_divisor;
+            coefficients[group] = kNvfp4E4M3ScaleA16[scale] * inverse_weight_divisor;
         }
     }
 }
@@ -179,7 +179,7 @@ compute_nvfp4_rows(const __nv_bfloat16* __restrict__ x, const std::uint8_t* __re
             for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {
                 const std::uint32_t word  = row_codes[local_row].words[pair / 4];
                 const std::uint8_t packed = static_cast<std::uint8_t>(word >> (8 * (pair & 3)));
-                const float2 code         = decode_nvfp4_e2m1x2(packed);
+                const float2 code         = decode_nvfp4_e2m1x2_raw(packed);
                 const float coefficient   = coefficients[local_row][group];
                 constexpr int kChainMask  = Schedule::kAccumulatorChains - 1;
                 accumulators[local_row][(2 * pair) & kChainMask] =
@@ -222,7 +222,10 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
     }
 
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
-    compute_nvfp4_rows<Geometry, Schedule>(x, codes, scales, shared, inverse_weight_divisor,
+    compute_nvfp4_rows<Geometry, Schedule>(x, codes, scales, shared,
+                                           inverse_weight_divisor * 32768.0F,
+                                           // folds the decoder's 2^14 rescale and the table's half
+                                           // scale (bit-exact)
                                            parent_rows, flat_row0, lane, accumulators);
 
 #pragma unroll

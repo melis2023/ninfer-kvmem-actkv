@@ -1,5 +1,7 @@
 #pragma once
-#include "ninfer/types.h"
+#include "ninfer/base.h"
+#include "ninfer/observability/execution.h"
+#include "ninfer/request.h"
 #include "runtime/contract/execution.h"
 #include "runtime/contract/request.h"
 #include <array>
@@ -15,6 +17,8 @@ namespace ninfer::models::qwen3_5 {
 namespace frontend {
 class Tokenizer;
 struct ToolCallOutputContract;
+struct GemmaMarkers;
+struct FlintMarkers;
 } // namespace frontend
 class Frontend;
 
@@ -84,6 +88,9 @@ public:
     // block and its closing whitespace, including the markup of a tool call.
     [[nodiscard]] std::vector<TokenLogprob> take_content_logprobs() noexcept;
     [[nodiscard]] std::shared_ptr<text::GrammarState> grammar_state() const;
+    // The single <tool_call> vocabulary id forbidden for default tool_choice none.
+    // Empty when that spelling is missing or ambiguous, or when a grammar is active.
+    [[nodiscard]] std::optional<TokenId> suppressed_tool_open() const;
     [[nodiscard]] std::vector<GeneratedToolCall> take_tool_calls() noexcept;
     [[nodiscard]] ToolCallParseDiagnostics tool_call_parse_diagnostics() const noexcept;
     [[nodiscard]] std::uint32_t reasoning_tokens() const noexcept;
@@ -98,7 +105,10 @@ private:
                   OutputOptions output, bool starts_in_reasoning, ThinkingControlOptions thinking,
                   std::shared_ptr<const std::vector<TokenId>> thinking_control_tokens,
                   std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output,
-                  std::shared_ptr<text::GrammarState> grammar = {});
+                  std::shared_ptr<text::GrammarState> grammar          = {},
+                  std::shared_ptr<const frontend::GemmaMarkers> gemma = {},
+                  std::shared_ptr<const frontend::FlintMarkers> flint = {},
+                  std::optional<TokenId> suppressed_tool_open         = {});
     std::unique_ptr<Impl> impl_;
 
     friend class Frontend;

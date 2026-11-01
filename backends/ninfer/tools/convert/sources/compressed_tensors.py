@@ -198,6 +198,13 @@ def matrix_source(
     def resolve() -> LogicalSource:
         nonlocal resolved
         if resolved is None:
+            if store.has(prefix + ".weight_scale_inv"):
+                if format is not None:
+                    raise ValueError(f"{name}: block FP8 supports decoded values, not encoded row import")
+                from .block_fp8 import block_fp8_matrix_source
+
+                resolved = block_fp8_matrix_source(store, name, shape)
+                return resolved
             actual = format
             if actual is None and store.has(prefix + ".weight_packed"):
                 actual = "nvfp4"

@@ -11,6 +11,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace ninfer;
@@ -685,6 +686,47 @@ void test_unbacked_slot_values() {
     index.check_invariants();
 }
 
+// A refused snapshot advances GDSF time as if it had been inserted and evicted (§9.2, §9.3):
+// owners that nothing hits again age, and a later snapshot of the same value displaces the least
+// valuable of them instead of every new snapshot being refused for good. Decision reads about new
+// states hit each state's snapshot two or three times and then never again.
+void test_refusals_age_owners() {
+    RecordingBackend backend;
+    PrefixCacheIndex index(small_config(0, 2), backend);
+    std::vector<std::vector<NodeRef>> paths;
+    std::vector<SnapshotRef> owners;
+    for (std::uint32_t seed = 60; seed < 62; ++seed) {
+        const auto tokens = make_tokens(64 * 2, seed);
+        paths.push_back(insert_sequence(index, backend, tokens));
+        owners.push_back(
+            publish_at(index, backend, paths.back(), tokens, 64 * 2, SnapshotKind::Boundary));
+        index.note_hit(owners.back());
+        index.note_hit(owners.back());
+    }
+    const auto tokens = make_tokens(64 * 2, 62);
+    paths.push_back(insert_sequence(index, backend, tokens));
+    const double before = index.stats().gdsf_inflation;
+    require(!index.acquire_device_slot(index.estimate_priority(0, 128, false)).has_value(),
+            "a snapshot worth less than every owner must not displace one");
+    require(index.stats().gdsf_inflation > before, "a refusal must advance GDSF time");
+    std::optional<std::uint32_t> slot;
+    int attempts = 1;
+    while (!slot && attempts < 6) {
+        slot = index.acquire_device_slot(index.estimate_priority(0, 128, false));
+        ++attempts;
+    }
+    require(slot.has_value() && attempts >= 3,
+            "owners hit twice must yield to a snapshot of their value after two refusals");
+    require(index.valid(owners[0]) != index.valid(owners[1]),
+            "exactly one aged owner must lose its slot");
+    const SnapshotRef fresh =
+        index.publish_snapshot(paths.back()[1], 128, {}, std::nullopt, *slot, SnapshotKind::Boundary)
+            .snapshot;
+    require(index.valid(fresh), "the new snapshot must be published");
+    for (const auto& path : paths) { index.release_path(path); }
+    index.check_invariants();
+}
+
 // A snapshot's Host write only displaces snapshots worth no more than itself (§9.3): a tap just
 // past a conversation's boundary must not push another conversation's boundary out of the Host
 // tier. Rejected, it stays Device-only.
@@ -1109,6 +1151,7 @@ int main() {
         test_supersession();
         test_lineage_under_pressure();
         test_unbacked_slot_values();
+        test_refusals_age_owners();
         test_host_write_admission();
         test_unshared_boundary();
         test_host_only_reattach();

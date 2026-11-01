@@ -223,6 +223,43 @@ int literal_content() {
               "engine token variables and ordinary kwargs were not distinguished");
     return failures;
 }
+
+// Trimming deletes source bytes; the boundaries inside them fold onto the surviving content edge
+// so a cache marker placed there still resolves, while JSON encoding keeps no exact boundary.
+int trim_boundary_mappings() {
+    const std::vector<ninfer::text::TemplateInputRegion> regions{{"/text", 7}};
+    const auto clipped = JinjaTemplate("{{ ('　' ~ text ~ '　').strip() }}", "trim-origin")
+                             .render({{"text", "　<|image_pad|>　"}}, {.regions = regions});
+    int failures       = check(
+        clipped.text == "<|image_pad|>" && clipped.regions.size() == 1 &&
+            clipped.regions[0].tag == 7 && clipped.regions[0].source_offset == 3 &&
+            clipped.boundary_mappings.size() == 2 && clipped.boundary_mappings[0].tag == 7 &&
+            clipped.boundary_mappings[0].source_begin == 0 &&
+            clipped.boundary_mappings[0].source_end == 3 &&
+            clipped.boundary_mappings[0].offset == 0 && clipped.boundary_mappings[1].tag == 7 &&
+            clipped.boundary_mappings[1].source_begin == 16 &&
+            clipped.boundary_mappings[1].source_end == 19 &&
+            clipped.boundary_mappings[1].offset == 13,
+        "trim did not map deleted Unicode source boundaries to the surviving content edges");
+
+    const auto empty = JinjaTemplate("before{{ text|trim }}after", "empty-trim-origin")
+                           .render({{"text", " \t"}}, {.regions = regions});
+    failures += check(
+        empty.text == "beforeafter" && empty.regions.empty() &&
+            empty.boundary_mappings.size() == 1 && empty.boundary_mappings[0].tag == 7 &&
+            empty.boundary_mappings[0].source_begin == 0 &&
+            empty.boundary_mappings[0].source_end == 2 && empty.boundary_mappings[0].offset == 6,
+        "fully trimmed input lost its boundary");
+
+    const auto quoted = JinjaTemplate("{{ text|trim|tojson }}", "trim-json-origin")
+                            .render({{"text", " value\n"}}, {.regions = regions});
+    failures += check(
+        quoted.text == "\"value\"" && quoted.regions.size() == 1 && quoted.regions[0].tag == 7 &&
+            quoted.regions[0].begin == 0 && quoted.regions[0].end == quoted.text.size() &&
+            !quoted.regions[0].source_offset && quoted.boundary_mappings.empty(),
+        "JSON encoding of trimmed input lost its origin or retained exact boundaries");
+    return failures;
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -250,7 +287,11 @@ int main(int argc, char** argv) {
         return 0;
     }
     try {
-        return language_semantics() + origins_and_requests() + literal_content() == 0 ? 0 : 1;
+        return language_semantics() + origins_and_requests() + literal_content() +
+                           trim_boundary_mappings() ==
+                       0
+                   ? 0
+                   : 1;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

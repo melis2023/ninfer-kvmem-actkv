@@ -1,5 +1,5 @@
 @echo off
-REM Toolchain pinning this host needs (see docs/rtx-3090-windows.md):
+REM Toolchain pinning this host needs (see docs/build-windows.md):
 REM  - MSVC 14.44 from VS 2022 BuildTools. VS 2026's 14.50 is _MSC_VER 1950 and CUDA 12.8's
 REM    host_config.h accepts 1910-1949 only, so vcvars64.bat must win the PATH race.
 REM  - CUDA 12.8 forced via CUDACXX; 12.4 is also installed and would be found first.

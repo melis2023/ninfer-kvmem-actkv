@@ -11,10 +11,13 @@
 namespace ninfer::ops::detail {
 
 // Registered split partitions, named by their row profile. The wrapper resolves one of these from
-// the destination row counts and refuses anything else.
+// the destination row counts and refuses anything else. The 1024 and 512 profiles are a 27B
+// layer's share on each of two and four tensor-parallel ranks.
 enum class CausalConvSplitGeometry {
     Rows2048x2048x4096,
     Rows2048x2048x6144,
+    Rows1024x1024x3072,
+    Rows512x512x1536,
 };
 
 inline constexpr std::int32_t kCausalConvParallelMaxTokens = 32;

@@ -113,6 +113,25 @@ NgramHashConstants derive_ngram_hash_constants(const NgramHashSpec& spec) {
     return out;
 }
 
+std::uint64_t ngram_hash_fingerprint(const NgramHashConstants& constants) {
+    u64 hash        = 0xcbf29ce484222325ULL;
+    const auto feed = [&](u64 value) {
+        for (unsigned byte = 0; byte < 8; ++byte) {
+            hash ^= (value >> (8U * byte)) & 0xffU;
+            hash *= 0x100000001b3ULL;
+        }
+    };
+    feed(constants.order);
+    feed(constants.heads_per_order);
+    for (const auto* values :
+         {&constants.multipliers, &constants.head_vocab, &constants.head_offset}) {
+        feed(values->size());
+        for (const u64 value : *values) { feed(value); }
+    }
+    feed(constants.rows);
+    return hash;
+}
+
 NgramContext NgramContext::sequence_start(const NgramHashConstants& constants, std::int32_t eos) {
     return NgramContext{std::vector<std::int32_t>(constants.order - 1, eos)};
 }

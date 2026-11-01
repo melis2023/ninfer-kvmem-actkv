@@ -159,6 +159,7 @@ inline QuantSpec quant_spec(QType qtype) {
         return {6, 64, 31, -32};
     case QType::Q8_G32_FP16:
         return {8, 32, 127, -127};
+    case QType::PTQ1_G128_FP16:
     case QType::T2_G128_FP16:
         return {2, 128, 1, -1};
     default:
@@ -346,12 +347,66 @@ struct PatternedWeightOptions {
     RowSplitCodePattern row_split_codes  = RowSplitCodePattern::Coordinate;
     float weight_scale_divisor           = 0.0F;
     float input_scale_divisor            = 0.0F;
+    // NVFP4 only. The default fixture walks eight small scale bytes (0x00..0x1d), which is a
+    // convenient deterministic set but not the domain a production artifact uses: the real planes
+    // reach 0x7E. A gate that only ever saw the small bytes could not arbitrate anything that
+    // depends on the scale's exponent, so this option walks the whole reachable domain instead.
+    bool wide_scale_range                = false;
 };
+
+// Canonical PTQ1 bytes generated independently from the CUDA decode/repack implementation.
+inline PackedWeight make_ptq1_patterned_weight(std::int32_t n, std::int32_t k,
+                                               std::uint32_t seed) {
+    if (n <= 0 || k <= 0 || k % 128) { throw std::invalid_argument("PTQ1 test shape"); }
+    PackedWeight p;
+    const std::size_t groups = static_cast<std::size_t>(n) * (k / 128);
+    p.code_plane_bytes = groups * 24;
+    p.high_plane_offset = detail::align_up_size(p.code_plane_bytes, 256);
+    p.high_plane_bytes = groups * 2;
+    p.scale_plane_offset = p.high_plane_offset + detail::align_up_size(p.high_plane_bytes, 256);
+    p.scale_plane_bytes = groups * 2;
+    p.payload.resize(p.scale_plane_offset + p.scale_plane_bytes);
+    std::uint8_t base[256][24], high[256][2];
+    for (unsigned pattern = 0; pattern < 256; ++pattern) {
+        for (unsigned b = 0; b < 26; ++b) {
+            const auto hash = detail::mix64(seed * 65537ULL + pattern * 257ULL + b);
+            const unsigned denominator = b < 24 ? 243 : 81;
+            const unsigned integer = static_cast<unsigned>(hash % denominator);
+            const auto raw = static_cast<std::uint8_t>((integer * 256 + denominator - 1) / denominator);
+            if (b < 24) base[pattern][b] = raw;
+            else high[pattern][b - 24] = raw;
+        }
+    }
+    for (std::size_t group = 0; group < groups; ++group) {
+        const unsigned pattern = static_cast<unsigned>(detail::mix64(group + seed) & 255);
+        std::memcpy(p.payload.data() + group * 24, base[pattern], 24);
+        std::memcpy(p.payload.data() + p.high_plane_offset + group * 2, high[pattern], 2);
+        const float magnitude = (1 + (pattern % 31)) * 0.00013F;
+        const auto scale = detail::f32_to_f16((pattern & 1) ? -magnitude : magnitude);
+        p.payload[p.scale_plane_offset + group * 2] = static_cast<std::uint8_t>(scale);
+        p.payload[p.scale_plane_offset + group * 2 + 1] = static_cast<std::uint8_t>(scale >> 8);
+    }
+    Weight& w = p.weight;
+    w.qtype = QType::PTQ1_G128_FP16;
+    w.layout = QuantLayout::RowSplit;
+    w.scale_dtype = DType::FP16;
+    w.payload = w.qdata = p.payload.data();
+    w.payload_bytes = p.payload.size();
+    w.high_plane_bytes = p.high_plane_bytes;
+    w.qhigh = p.payload.data() + p.high_plane_offset;
+    w.scales = p.payload.data() + p.scale_plane_offset;
+    w.group = w.group_size = 128;
+    w.ndim = 2;
+    w.n = w.shape[0] = w.padded_shape[0] = n;
+    w.k = w.shape[1] = w.padded_shape[1] = k;
+    return p;
+}
 
 // Builds a deterministic full-shape payload without allocating a source or dequantized matrix.
 // Large registered-shape conformance tests can then verify deterministic FP64 row samples.
 inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int32_t k,
                                           std::uint32_t seed, PatternedWeightOptions options = {}) {
+    if (qtype == QType::PTQ1_G128_FP16) { return make_ptq1_patterned_weight(n, k, seed); }
     if (n <= 0 || k <= 0) {
         throw std::invalid_argument("quantized-weight fixture: shape must be positive");
     }
@@ -471,6 +526,10 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
         };
         const std::int32_t groups_per_row = k / 16;
         const std::int32_t k_tiles        = k / 64;
+        // The wide domain walks every reachable scale byte, 0x00 through 0x7F, which covers the
+        // subnormals, the normals and the 0x7F guard the vendor decode maps to zero. The default
+        // set is the eight small bytes the fixture has always used.
+        const std::int32_t scale_table_size = options.wide_scale_range ? 128 : 8;
         for (std::int32_t row = 0; row < n; ++row) {
             const std::int32_t row_tile  = row / 128;
             const std::int32_t row_inner = row % 128;
@@ -484,9 +543,11 @@ inline PackedWeight make_patterned_weight(QType qtype, std::int32_t n, std::int3
                     static_cast<std::size_t>(row_inner / 32) * 4U +
                     static_cast<std::size_t>(scale_lane);
                 const std::size_t pattern = (static_cast<std::uint32_t>(row) * 5U +
-                                             static_cast<std::uint32_t>(group) * 3U + seed) &
-                                            7U;
-                packed.payload[stored_offset] = kScaleWords[pattern];
+                                             static_cast<std::uint32_t>(group) * 3U + seed) %
+                                            static_cast<std::uint32_t>(scale_table_size);
+                packed.payload[stored_offset] = options.wide_scale_range
+                                                    ? static_cast<std::uint8_t>(pattern)
+                                                    : kScaleWords[pattern];
             }
         }
         detail::store_u32_le(packed.payload, packed.weight_divisor_offset,
@@ -744,6 +805,21 @@ inline double logical_weight_fp64(const PackedWeight& packed, std::int32_t row,
         return static_cast<double>(static_cast<float>(decoded));
     }
 
+    if (weight.qtype == QType::PTQ1_G128_FP16) {
+        const std::size_t group = static_cast<std::size_t>(row) * (weight.k / 128) + column / 128;
+        const int lane = column % 128;
+        const int stage = lane < 80 ? lane / 16 : lane < 120 ? (lane - 80) / 8 : (lane - 120) / 2;
+        const int offset = lane < 80 ? lane % 16 : 16 + (lane - 80) % 8;
+        const unsigned raw = lane < 120 ? packed.payload[group * 24 + offset]
+            : packed.payload[packed.high_plane_offset + group * 2 + (lane - 120) % 2];
+        // Invert the canonical ceil(integer * 256 / 3^stages) encoding, then extract a digit.
+        const unsigned integer = raw * (lane < 120 ? 243 : 81) / 256;
+        unsigned divisor = 1;
+        for (int power = 0; power < (lane < 120 ? 4 : 3) - stage; ++power) divisor *= 3;
+        const int trit = static_cast<int>((integer / divisor) % 3) - 1;
+        const auto scale = detail::load_u16_le(packed.payload, packed.scale_plane_offset + group * 2);
+        return trit * static_cast<double>(detail::f16_to_f32(scale));
+    }
     const detail::QuantSpec spec = detail::quant_spec(weight.qtype);
     const std::int32_t padded_k  = weight.padded_shape[1];
     if (padded_k < weight.shape[1] || padded_k % spec.group_size != 0) {

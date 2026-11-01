@@ -1,4 +1,5 @@
 #include "ops/linear/nvfp4/nvfp4_a4_tma_launch.h"
+#include "ops/common/blackwell_routes.h"
 #include "ops/linear/nvfp4/nvfp4_a4_tma.cuh"
 
 namespace ninfer::ops::detail::unified {
@@ -19,6 +20,7 @@ void launch(const Nvfp4A4Operands& p, __nv_bfloat16* output, cudaStream_t stream
 
 void launch_nvfp4_a4_tma_linear(Nvfp4GeometryId problem, const Nvfp4A4Operands& p,
                                 __nv_bfloat16* output, cudaStream_t stream) {
+    require_nvfp4_a4_card();
     switch (problem) {
     case Nvfp4GeometryId::N14336K5120:
         launch<5120>(p, output, stream);

@@ -1,4 +1,5 @@
 #pragma once
+#include "ops/common/device_limits.h"
 #include "ops/linear/fp8/fp8_geometry.h"
 #include "ops/common/memory.cuh"
 #include <cstddef>
@@ -121,7 +122,7 @@ struct Fp8A16MmaSchedule {
     static_assert(kActivationStages == 1 || kActivationStages == 2);
     static_assert(kMinBlocksPerSm > 0);
     static_assert(kWarps >= 1 && kThreads <= 1024);
-    static_assert(kSharedBytes <= 99 * 1024);
+    static_assert(kSharedBytes <= kMaxSharedBytesPerBlockSm8x);
 };
 
 template <int BlockTokens, int BlockRows, int BlockK, int WarpsTokens, int WarpsRows, int Stages,
@@ -164,7 +165,7 @@ struct Fp8A8MmaSchedule {
     static_assert(kStages >= 2 && kStages <= 8);
     static_assert(kMinBlocksPerSm >= 1);
     static_assert(kWarps >= 1 && kThreads <= 1024);
-    static_assert(kSharedBytes <= 99 * 1024);
+    static_assert(kSharedBytes <= kMaxSharedBytesPerBlockSm8x);
     static_assert(kRaster != Fp8MmaRaster::Grouped || kRasterGroupRows > 0);
 };
 
@@ -189,7 +190,7 @@ struct Fp8A8TmaMmaSchedule
     static constexpr int kReductionBlocks = 1;
     static_assert(BlockK == 64 || BlockK == 128);
     static_assert(BlockTokens <= 256 && BlockRows <= 256);
-    static_assert(kThreads <= 1024 && kSharedBytes <= 99 * 1024);
+    static_assert(kThreads <= 1024 && kSharedBytes <= kMaxSharedBytesPerBlockSm8x);
 };
 
 // Split only an underfilled final wave. Earlier CTAs keep the full K loop and
@@ -241,7 +242,7 @@ struct Fp8A16SlicedKMmaSchedule {
     static constexpr int kPartialBytes = KWarps * RowTiles * (TileTokens / 8) * 32 * 4 * 4;
     static constexpr int kSharedBytes =
         kStagingBytes > kPartialBytes ? kStagingBytes : kPartialBytes;
-    static_assert(kSharedBytes <= 99 * 1024);
+    static_assert(kSharedBytes <= kMaxSharedBytesPerBlockSm8x);
 };
 
 // Shape instances retain measured compile-time K and token extents; the templates also

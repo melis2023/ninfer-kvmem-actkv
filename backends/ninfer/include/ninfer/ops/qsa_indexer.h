@@ -2,6 +2,7 @@
 
 #include "core/arena.h"
 #include "core/tensor.h"
+#include "ninfer/ops/rope.h"
 
 #include <cuda_runtime.h> // cudaStream_t
 
@@ -24,8 +25,15 @@ namespace ninfer::ops {
  * the min(512, blocks) best blocks, ties to the lower block index. groupnorm is the zero-centred
  * RMSNorm x / sqrt(mean x^2 + eps) * (1 + w) over 128 values; rope rotates the first 64 dims
  * rotate-half at angle fl32(fl32(position) * f_i), f_i = fl32(1e7^(-2i/64)), i < 32, and passes
- * dims 64..127 through. The query's own incomplete block (positions 4 floor((p+1)/4) .. p) is
- * attended by every query and is not part of the selection.
+ * dims 64..127 through. Under `yarn` (a factor above one; the model's attention takes the same
+ * rotation) f_i is instead the pair's YaRN inverse frequency, rope_yarn_frequencies(64, 32, 1e7,
+ * yarn), and cos and sin both carry its attention factor; linear position interpolation is not
+ * supported.
+ * The indexer's rotation carries YaRN's attention factor as the main attention's does: the
+ * reference indexer (Hugging Face's `Qwen4ExpTextQSAIndexer`) rotates with the layer's shared
+ * `position_embeddings`, whose cos and sin carry `attention_scaling`.
+ * The query's own incomplete block (positions 4 floor((p+1)/4) .. p) is attended by every query
+ * and is not part of the selection.
  *
  * `projection` is BF16 [640, tokens] (4 query heads of 128, then the key) for the consecutive
  * positions `first_position` .. `first_position + tokens - 1`; `first_position` is a device I32
@@ -45,8 +53,8 @@ struct QsaIndexerWeights {
 // Pools every block that completes in [first_position, first_position + tokens) into `pooled`
 // and leaves the incomplete block's raw keys in `tail`.
 void qsa_indexer_append(const Tensor& projection, const Tensor& first_position,
-                        const QsaIndexerWeights& weights, float eps, Tensor& pooled, Tensor& tail,
-                        cudaStream_t stream);
+                        const QsaIndexerWeights& weights, float eps, const RopeYarn& yarn,
+                        Tensor& pooled, Tensor& tail, cudaStream_t stream);
 
 [[nodiscard]] std::size_t qsa_indexer_select_workspace_bytes(std::int32_t tokens,
                                                              std::int32_t capacity);
@@ -54,8 +62,8 @@ void qsa_indexer_append(const Tensor& projection, const Tensor& first_position,
 // Writes each query's selected blocks in increasing order into `selected` I32 [512, tokens] and
 // their number into `counts` I32 [tokens]. Run after qsa_indexer_append for the same tokens.
 void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
-                        const QsaIndexerWeights& weights, float eps, const Tensor& pooled,
-                        WorkspaceArena& workspace, Tensor& selected, Tensor& counts,
-                        cudaStream_t stream);
+                        const QsaIndexerWeights& weights, float eps, const RopeYarn& yarn,
+                        const Tensor& pooled, WorkspaceArena& workspace, Tensor& selected,
+                        Tensor& counts, cudaStream_t stream);
 
 } // namespace ninfer::ops

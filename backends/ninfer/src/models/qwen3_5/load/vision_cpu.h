@@ -1,7 +1,7 @@
 #pragma once
 
 // Host FP32 Vision weights for `--vision-residency cpu`: the tower's parameters are read from the
-// artifact and decoded once at load, never placed on the device. The encoder that consumes them
+// artifact and decoded on demand, never placed on the device. The encoder that consumes them
 // lives in execution/vision_cpu.h.
 
 #include "artifact/binder.h"
@@ -61,6 +61,8 @@ struct CpuVisionWeights {
                                                std::span<const std::byte> bytes);
 
 namespace loading {
+// Check logical shapes, use auxiliaries and supported formats without reading weight payloads.
+void validate_cpu_vision(artifact::Binder& binder, const VisionConfig& config, const TextConfig& target);
 
 // Reads and decodes the tower without any device or Host placement demand. A projection whose
 // Use carries a Hadamard rotation or an input gather is refused: the CPU encoder feeds every

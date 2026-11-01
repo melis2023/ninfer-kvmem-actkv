@@ -5,6 +5,8 @@
 #include "core/device.h"
 #include "core/decode_graph.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ops/linear/nvfp4/nvfp4_int8_grouped_host.h"
+#include "ops/linear_swiglu/nvfp4/nvfp4_linear_swiglu_plan.h"
 #include "ops/op_tester.h"
 #include "ops/quantized_weight.h"
 
@@ -40,9 +42,16 @@ constexpr ReductionCriterion tolerance_for(ActivationCompute activation_compute)
         // allows twice Linear's relative-L2 quantization allowance plus a bounded gross tail.
         return {8.0e-2, 1.0e-2, 1.2e-1};
     case ActivationCompute::A8Int:
+    case ActivationCompute::A8IntDecode:
         // Same structure as A8: gate and up are each quantized independently before feeding the
         // nonlinear product, so the same allowance applies. Only the activation format differs --
         // s8 with one scale per weight group rather than FP8.
+        return {8.0e-2, 1.0e-2, 1.2e-1};
+    case ActivationCompute::Int8Grouped:
+        // NVFP4 Tier-2 integer route: activations are s8 at one scale per (token, 64) block and
+        // weights are e2m1 at one E4M3 scale per 16 columns, so both projections are quantized
+        // independently before the nonlinear product -- the same structure as A8/A8Int with a
+        // tighter weight grid, so the same allowance applies.
         return {8.0e-2, 1.0e-2, 1.2e-1};
     case ActivationCompute::A4:
         return {1.6e-1, 1.0e-2, 1.6e-1};
@@ -224,6 +233,8 @@ int verify_unchanged(std::string_view label, const test::GuardedDeviceBuffer& de
 void validate_profile(const Profile& profile) {
     const bool q4 = profile.qtype == QType::Q4_G64_FP16 && profile.gate_up_rows == 34816 &&
                     profile.input_rows == 5120 && profile.output_rows == 17408;
+    const bool t2 = is_ternary(profile.qtype) && profile.gate_up_rows == 34816 &&
+                    profile.input_rows == 5120 && profile.output_rows == 17408;
     const bool q8_companion = profile.qtype == QType::Q8_G32_FP16 &&
                               profile.gate_up_rows == 12288 && profile.input_rows == 2048 &&
                               profile.output_rows == 6144;
@@ -233,16 +244,18 @@ void validate_profile(const Profile& profile) {
                        profile.input_rows == 5120 && profile.output_rows == 17408;
     const bool fp8 = profile.qtype == QType::FP8_E4M3FN_ROW_BF16 && profile.gate_up_rows == 34816 &&
                      profile.input_rows == 5120 && profile.output_rows == 17408;
-    if ((!q4 && !q8_companion && !q8_dflash2 && !nvfp4 && !fp8) ||
+    if ((!q4 && !t2 && !q8_companion && !q8_dflash2 && !nvfp4 && !fp8) ||
         profile.gate_up_rows != 2 * profile.output_rows) {
         throw std::invalid_argument("linear_swiglu test: profile is not registered");
     }
     if ((nvfp4 && profile.activation_compute != ActivationCompute::A16 &&
-         profile.activation_compute != ActivationCompute::A4) ||
+         profile.activation_compute != ActivationCompute::A4 &&
+         profile.activation_compute != ActivationCompute::Int8Grouped) ||
         (fp8 && profile.activation_compute != ActivationCompute::A16 &&
          profile.activation_compute != ActivationCompute::A8) ||
         (!nvfp4 && !fp8 && profile.activation_compute != ActivationCompute::A16 &&
-         profile.activation_compute != ActivationCompute::A8Int)) {
+         profile.activation_compute != ActivationCompute::A8Int &&
+         profile.activation_compute != ActivationCompute::A8IntDecode)) {
         throw std::invalid_argument("linear_swiglu test: invalid activation-compute profile");
     }
 }
@@ -255,6 +268,10 @@ int run_profile(std::string_view label, const Profile& profile,
                 std::span<const std::int32_t> token_cases,
                 std::span<const std::int32_t> graph_cases) {
     validate_profile(profile);
+    // An Int8Grouped profile names the policy that admits the int8 family, and that policy is the
+    // whole switch: the plan, the capacity query and the launch all read it, at every width. The
+    // wide mainloop follows the route table, so a case that wants the other one pins it itself; the
+    // vacuous-green guard below compares against the policy, so the two cannot drift apart.
     if (token_cases.empty()) { throw std::invalid_argument("linear_swiglu test: no token cases"); }
     for (std::size_t index = 0; index < token_cases.size(); ++index) {
         if (token_cases[index] <= 0 ||
@@ -304,7 +321,12 @@ int run_profile(std::string_view label, const Profile& profile,
                    ? ops::LinearPolicy::AllowA8
                    : (profile.activation_compute == ActivationCompute::A8Int
                           ? ops::LinearPolicy::AllowA8Int
-                          : ops::LinearPolicy::A16Only));
+                          : (profile.activation_compute == ActivationCompute::A8IntDecode
+                                 ? ops::LinearPolicy::AllowA8IntDecode
+                                 : (profile.activation_compute ==
+                                            ActivationCompute::Int8Grouped
+                                        ? ops::LinearPolicy::AllowNvfp4Int8
+                                        : ops::LinearPolicy::A16Only))));
     const std::size_t workspace_bytes = ops::linear_swiglu_workspace_capacity_bytes(
         profile.qtype, profile.gate_up_rows, profile.input_rows, policy, 1, maximum_tokens);
     WorkspaceArena workspace(std::max<std::size_t>(workspace_bytes, 256));
@@ -324,6 +346,7 @@ int run_profile(std::string_view label, const Profile& profile,
         };
         const std::string label_case =
             std::string(label) + " T=" + std::to_string(tokens) + (replay ? " graph" : " eager");
+        std::vector<double> last_actual;
         DecodeGraphDefinition definition;
         DecodeGraphExecutable graph;
         try {
@@ -356,6 +379,7 @@ int run_profile(std::string_view label, const Profile& profile,
                 const auto actual = read_bf16_output(output, elements);
                 failures +=
                     compare_output(label_case, actual, expected.data(), profile.activation_compute);
+                last_actual = actual;
                 if (replay)
                     failures += verify_unchanged(label_case + " input", device_activation,
                                                  input_bits.data(),
@@ -376,6 +400,51 @@ int run_profile(std::string_view label, const Profile& profile,
         if (workspace.used() != 0 || workspace.peak_used() != exact_workspace) {
             std::cerr << label_case << ": exact workspace query/execution high-water mismatch\n";
             ++failures;
+        }
+        // Vacuous-green guard for the integer profile. The int8 policy falls back to the A16
+        // composition whenever the route table says so or the named route does not admit the width,
+        // and a fallback that still satisfies the quantisation tolerance is exactly how an
+        // Int8Grouped profile passes without the integer kernel ever running. First, dispatch
+        // has to promise exactly the admission rule; second, the integer output has to differ
+        // from the A16 composition of the same weights at quantisation scale.
+        if (profile.activation_compute == ActivationCompute::Int8Grouped && !last_actual.empty()) {
+            const bool admitted = ops::detail::unified::nvfp4_int8_route_admits(tokens);
+            if (ops::detail::nvfp4_linear_swiglu_int8_route_active(policy, tokens) != admitted) {
+                std::cerr << label_case << ": int8 route/dispatch admission mismatch\n";
+                ++failures;
+            }
+            if (admitted) {
+                try {
+                    test::GuardedDeviceBuffer baseline(elements * sizeof(std::uint16_t));
+                    Tensor baseline_destination(baseline.data(), DType::BF16,
+                                                {profile.output_rows, tokens});
+                    workspace.reset();
+                    workspace.reset_peak();
+                    ops::linear_swiglu(x, weight, baseline_destination, ops::LinearPolicy::A16Only,
+                                       workspace, nullptr);
+                    test::cuda_check(cudaDeviceSynchronize(),
+                                     "synchronize the A16 baseline of the int8 guard");
+                    const auto baseline_actual = read_bf16_output(baseline, elements);
+                    double diff_sq = 0.0;
+                    double base_sq = 0.0;
+                    for (std::size_t index = 0; index < elements; ++index) {
+                        const double diff = last_actual[index] - baseline_actual[index];
+                        diff_sq += diff * diff;
+                        base_sq += baseline_actual[index] * baseline_actual[index];
+                    }
+                    const double relative = base_sq > 0.0 ? std::sqrt(diff_sq / base_sq) : 0.0;
+                    if (relative < 1.0e-4 || relative > 5.0e-2) {
+                        std::cerr << label_case << ": int8 output vs A16 baseline rel difference "
+                                  << relative << " outside [1e-4, 5e-2] -- the integer route did "
+                                     "not execute\n";
+                        ++failures;
+                    }
+                } catch (const std::exception& error) {
+                    std::cerr << label_case << ": int8 execution guard failed: " << error.what()
+                              << '\n';
+                    ++failures;
+                }
+            }
         }
     };
     for (int tokens : token_cases) run_case(tokens, false);

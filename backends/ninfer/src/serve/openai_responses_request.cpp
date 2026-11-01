@@ -125,7 +125,8 @@ std::string item_id(const Json& item, const char* prefix) {
     return item.at("id").get<std::string>();
 }
 
-ninfer::product::media_acquire::Source parse_image_source(const Json& part) {
+// `image` receives the part's detail.
+ninfer::product::media_acquire::Source parse_image_source(const Json& part, ContentPart& image) {
     if (part.contains("file_id") && !part.at("file_id").is_null()) {
         bad_request("input_image.file_id requires a Files API, which NInfer does not provide",
                     "input", "file_inputs_not_supported");
@@ -134,7 +135,15 @@ ninfer::product::media_acquire::Source parse_image_source(const Json& part) {
         part.at("image_url").get_ref<const std::string&>().empty()) {
         bad_request("input_image must contain a non-empty image_url", "input");
     }
-    validate_openai_image_detail(part, "input_image.detail", "input");
+    if (part.contains("detail") && !part.at("detail").is_null()) {
+        if (!part.at("detail").is_string()) {
+            bad_request("input_image.detail must be a string", "input");
+        }
+        const std::string detail = part.at("detail").get<std::string>();
+        const auto parsed        = parse_image_detail(detail);
+        image.image_detail       = parsed.value_or(ninfer::ImageDetail::Auto);
+        if (!parsed) { image.unknown_image_detail = detail; }
+    }
 
     ninfer::product::media_acquire::Source source;
     source.value = part.at("image_url").get<std::string>();
@@ -257,11 +266,12 @@ void parse_message_content_part(const Json& value, ChatRole role, ParsedMessage&
         ContentPart part;
         part.kind     = ContentKind::Image;
         part.type_raw = type;
-        part.source   = parse_image_source(value);
+        part.source   = parse_image_source(value, part);
         apply_shared_breakpoint(part, value, breakpoint_count);
+        Json canonical{{"type", "input_image"},
+                       {"image_url", value.at("image_url")},
+                       {"detail", image_detail_name(part.image_detail)}};
         parsed.turn.content.push_back(std::move(part));
-        Json canonical{
-            {"type", "input_image"}, {"image_url", value.at("image_url")}, {"detail", "auto"}};
         if (value.contains("prompt_cache_breakpoint")) {
             canonical["prompt_cache_breakpoint"] = value.at("prompt_cache_breakpoint");
         }
@@ -363,13 +373,16 @@ std::string parse_reasoning_item(const Json& item, Json& canonical) {
         !item.at("summary").is_array()) {
         bad_request("reasoning summary must be an array", "input");
     }
-    if (!item.contains("content") || !item.at("content").is_array()) {
-        bad_request("reasoning Item must contain a content array", "input");
+    // content is optional on the wire: a client that replays only summary or encrypted content
+    // omits it.
+    const bool has_content = item.contains("content") && !item.at("content").is_null();
+    if (has_content && !item.at("content").is_array()) {
+        bad_request("reasoning content must be an array", "input");
     }
 
     std::string text;
     Json content = Json::array();
-    for (const Json& part : item.at("content")) {
+    for (const Json& part : has_content ? item.at("content") : Json::array()) {
         if (!part.is_object() || !part.contains("type") || !part.at("type").is_string() ||
             part.at("type").get<std::string>() != "reasoning_text" || !part.contains("text") ||
             !part.at("text").is_string()) {
@@ -407,12 +420,24 @@ void reject_nonnull_unknown_members(const Json& object,
     }
 }
 
+// `async:false` is the ordinary synchronous function contract; `async:true` asks for a
+// non-blocking call/result protocol that the turn-based tool loop does not provide.
+void reject_async_function(const Json& item, const char* param) {
+    if (!item.contains("async") || item.at("async").is_null()) { return; }
+    if (!item.at("async").is_boolean()) { bad_request("async must be a boolean", param); }
+    if (item.at("async").get<bool>()) {
+        bad_request("asynchronous function calls are not supported", param,
+                    "async_tools_not_supported");
+    }
+}
+
 ToolCall parse_function_call_item(
     const Json& item, Json& canonical,
     std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities) {
     static const std::unordered_set<std::string> allowed = {
-        "id", "type", "call_id", "name", "arguments", "status", "caller", "namespace"};
+        "id", "type", "call_id", "name", "arguments", "status", "caller", "namespace", "async"};
     reject_nonnull_unknown_members(item, allowed, "input");
+    reject_async_function(item, "input");
     if (item.contains("caller") && !item.at("caller").is_null()) {
         bad_request("function_call.caller is not supported", "input",
                     "tool_relationship_not_supported");
@@ -513,7 +538,7 @@ ChatTurn parse_function_call_output_item(
                 ContentPart part;
                 part.kind     = ContentKind::Image;
                 part.type_raw = type;
-                part.source   = parse_image_source(value);
+                part.source   = parse_image_source(value, part);
                 apply_shared_breakpoint(part, value, breakpoint_count);
                 turn.content.push_back(std::move(part));
             } else if (type == "input_file") {
@@ -707,9 +732,10 @@ parse_function_tool(const Json& item, std::optional<std::string> wire_namespace,
                     std::string_view namespace_description,
                     std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities) {
     static const std::unordered_set<std::string> allowed_members = {
-        "type",          "name",         "description", "parameters", "strict", "allowed_callers",
-        "defer_loading", "output_schema"};
+        "type",          "name",          "description", "parameters", "strict", "allowed_callers",
+        "defer_loading", "output_schema", "async"};
     reject_nonnull_unknown_members(item, allowed_members, "tools");
+    reject_async_function(item, "tools");
 
     const OpenAIResponsesFunctionIdentity identity{.name = require_function_name(item, "tools"),
                                                    .wire_namespace = std::move(wire_namespace)};
@@ -1033,6 +1059,7 @@ void parse_text(const Json& body, OpenAIResponsesPromptRequest& prompt) {
     if (text.contains("format") && !text.at("format").is_null()) {
         const Json& format = text.at("format");
         prompt.generation.structured_output = parse_structured_output(format, false, "text.format");
+        prompt.generation.structured_output_param = "text.format";
         prompt.text_format                  = format;
     }
     if (text.contains("verbosity") && !text.at("verbosity").is_null()) {
@@ -1098,6 +1125,7 @@ ParsedPromptFields parse_prompt_fields(const Json& body, const RequestLimits& li
     if (body.contains("input") && !body.at("input").is_null()) {
         parse_input(body.at("input"), out.prompt, out.tool_identities,
                     limits.lenient_assistant_history);
+        settle_image_details(out.prompt.input_turns, limits, "input", "input_image.detail");
     }
     if (body.contains("instructions") && !body.at("instructions").is_null()) {
         if (!body.at("instructions").is_string()) {
@@ -1151,7 +1179,7 @@ void validate_metadata(const Json& body, nlohmann::json& metadata) {
 // persistence) and of prompt_cache_options.mode (explicit shared-prefix breakpoints).
 std::optional<std::string> parse_prompt_cache_hints(const Json& body) {
     require_string_hint(body, "prompt_cache_key", ninfer::kMaximumContextCacheSessionKeyBytes);
-    require_string_hint(body, "safety_identifier", 64);
+    require_string_hint(body, "safety_identifier", 128);
     require_string_hint(body, "user");
     std::optional<std::string> prompt_cache_key;
     if (body.contains("prompt_cache_key") && !body.at("prompt_cache_key").is_null()) {
@@ -1192,6 +1220,8 @@ void reject_unsupported_platform_fields(const Json& body) {
          "prompt requires an OpenAI prompt-template resource"},
         {"context_management", "context_management_not_supported",
          "context_management requires an API compaction pipeline"},
+        {"access_programs", "access_programs_not_supported",
+         "access_programs requires an OpenAI program-access resource"},
         {"moderation", "moderation_not_supported",
          "moderation changes request acceptance and output but no moderator is configured"},
     };
@@ -1204,7 +1234,8 @@ void reject_unsupported_platform_fields(const Json& body) {
 }
 
 void validate_common_top_level(const Json& body, bool create) {
-    static const std::unordered_set<std::string> create_fields = {"background",
+    static const std::unordered_set<std::string> create_fields = {"access_programs",
+                                                                  "background",
                                                                   "chat_template_kwargs",
                                                                   "client_metadata",
                                                                   "context_management",

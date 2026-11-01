@@ -110,7 +110,7 @@ void gdn_input_proj(const Tensor& x, const Weight& query_key_value_z_weight, Ten
 
 /**
  * Two-parent snapshot capacity keyed by the parents' formats. The Q4/Q5 pair answers as the
- * row-count query above; a T2 pair (ternary checkpoints, both parents T2_G128_FP16) projects every
+ * row-count query above; a T2 pair (ternary checkpoints, both parents the same T2_G128_FP16, PTQ1_G128_FP16 or T5_G128_FP16) projects every
  * part through the T2 linear routes, so it adds its private projection planes to the materialized
  * convolution path at every batch size.
  */
@@ -319,6 +319,10 @@ void gdn_input_proj_conv_record(const Tensor& x, const Weight& query_key_value_z
  * GgufProjectionWeights), each block type its own; every part projects through the GGUF linear
  * routes, which quantize the activation to q8_1 as llama.cpp does, and the snapshot and record forms
  * run the materialized convolution over the projected q/k/value plane at every batch size.
+ * Geometry comes from complete output partitions: q/k each have K rows (a positive multiple
+ * of 128), value/z each have V rows (a positive multiple of K), and x has the common parent
+ * input width H. The qkv output has 2*K+V rows; conv_weight is [2*K+V,4] and the history
+ * has [2*K+V,3,Slots]. The snapshot/record contracts above apply with these dimensions.
  */
 [[nodiscard]] std::size_t gdn_input_proj_workspace_capacity_bytes(
     const GgufProjectionWeights& weights, std::int32_t min_tokens, std::int32_t max_tokens);

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ops/common/device_limits.h"
 #include "ops/common/memory.cuh"
 #include <cuda_bf16.h>
 #include <cstdint>
@@ -157,7 +158,7 @@ struct Bf16A16MmaSchedule {
     static_assert(kStages >= 2 && kStages <= 8);
     static_assert(kMinBlocksPerSm >= 1);
     static_assert(kWarps >= 1 && kThreads <= 1024);
-    static_assert(kSharedBytes <= 99 * 1024);
+    static_assert(kSharedBytes <= kMaxSharedBytesPerBlockSm8x);
     static_assert(kRaster != Bf16MmaRaster::Grouped || kRasterGroupRows > 0);
 };
 
@@ -188,7 +189,7 @@ struct Bf16A16SlicedKMmaSchedule {
     static constexpr int kPartialBytes       = KWarps * BlockRows * BlockTokens * sizeof(float);
     static constexpr int kSharedBytes =
         kStagingBytes > kPartialBytes ? kStagingBytes : kPartialBytes;
-    static_assert(kSharedBytes <= 99 * 1024);
+    static_assert(kSharedBytes <= kMaxSharedBytesPerBlockSm8x);
 };
 
 template <int BlockRows, int BlockTokens, int BlockK, int WarpRows, int WarpTokens, int Stages,
@@ -204,7 +205,7 @@ struct Bf16A16TmaMmaSchedule
     static constexpr int kTensorBytes     = Stages * (BlockRows + BlockTokens) * BlockK * 2;
     static constexpr int kBarrierBytes    = Stages * 2 * sizeof(std::uint64_t);
     static constexpr int kSharedBytes     = kTensorBytes + kBarrierBytes;
-    static_assert(kThreads <= 1024 && kSharedBytes <= 99 * 1024);
+    static_assert(kThreads <= 1024 && kSharedBytes <= kMaxSharedBytesPerBlockSm8x);
     static_assert(BlockRows <= 256 && BlockTokens <= 256 && BlockK <= 16384);
 };
 

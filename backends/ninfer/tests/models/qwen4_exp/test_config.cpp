@@ -1,6 +1,6 @@
 // parse_text_config on the text config the converter writes for the Qwen3.8-Flash-Next
 // checkpoint (tests/fixtures/qwen4_exp/text_config.json, which tests/convert/test_qwen4_exp.py
-// holds to tools/convert/qwen4_exp.py), and its refusals.
+// holds to tools/convert/qwen4_exp.py), parse_mtp_config on the MTP block's, and their refusals.
 #include "models/qwen4_exp/config.h"
 
 #include <fstream>
@@ -51,6 +51,21 @@ int run() {
     const NgramHashConstants constants = derive_ngram_hash_constants(config.ngram);
     require(constants.rows == 320001536ULL, "n-gram table rows");
 
+    // A 3..5 source slice starts at a QSA block and contains no PLE. Local layer numbers
+    // describe this stack; they do not imply the full checkpoint's every-fourth phase.
+    Json slice = fixture();
+    slice["num_hidden_layers"] = 2;
+    slice["layer_types"] = Json::array({"full_attention", "linear_attention"});
+    slice["ple_layers"] = Json::array();
+    const auto sliced = parse_text_config(slice);
+    require(sliced.num_hidden_layers == 2 && sliced.ple_layers.empty() &&
+                sliced.layer_types.front() == MixerKind::SparseAttention,
+            "non-prefix layer slice without PLE");
+    slice["layer_types"] = Json::array({"linear_attention", "linear_attention"});
+    slice["ple_layers"] = Json::array({0});
+    require(parse_text_config(slice).ple_layers == std::vector<std::uint32_t>{0},
+            "slice retains PLE at local block zero");
+
     expect_refusal([](Json& c) { c["hidden_size"] = 2048; }, "another hidden width");
     // An expert-pruned release keeps 256 of the 512 experts; fewer than the ten a token selects,
     // or more than 512, are refused.
@@ -66,6 +81,28 @@ int run() {
     expect_refusal([](Json& c) { c["eos_token_id"] = 248320; }, "EOS past the vocabulary");
     expect_refusal([](Json& c) { c["rope_parameters"]["mrope_section"] = Json::array({11, 11, 11}); },
                    "MRoPE sections past the rotary width");
+
+    // The MTP block: the full model's 512 experts beside an expert-pruned text model, the text
+    // model's theta, and nothing else.
+    const Json mtp         = {{"architectures", Json::array({"Qwen4ExpMTP"})},
+                              {"rope_theta", 10000000.0},
+                              {"num_experts", 512}};
+    const TextConfig coder = parse_text_config(pruned);
+    require(parse_mtp_config(mtp, coder).num_experts == 512, "the MTP block keeps its experts");
+    const auto refuses_mtp = [&](const std::function<void(Json&)>& edit, const std::string& label) {
+        Json c = mtp;
+        edit(c);
+        bool refused = false;
+        try {
+            (void)parse_mtp_config(c, config);
+        } catch (const ninfer::artifact::ArtifactError&) { refused = true; }
+        require(refused, "not refused: " + label);
+    };
+    refuses_mtp([](Json& c) { c["rope_theta"] = 1000000.0; }, "another MTP theta");
+    refuses_mtp([](Json& c) { c["num_experts"] = 9; }, "an MTP block with too few experts");
+    refuses_mtp([](Json& c) { c["architectures"] = Json::array({"Qwen3_5MTP"}); },
+                "another MTP architecture");
+    refuses_mtp([](Json& c) { c["hidden"] = 1; }, "an unknown MTP field");
     return 0;
 }
 

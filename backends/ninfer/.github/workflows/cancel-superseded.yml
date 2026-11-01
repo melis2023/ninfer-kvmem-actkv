@@ -7,14 +7,31 @@
 name: Cancel superseded runs
 
 on:
+  push:
+    branches: [master]
   pull_request_target:
     types: [closed]
 
 permissions:
   actions: write
+  contents: read
 
 jobs:
+  master:
+    if: github.event_name == 'push'
+    name: Cancel older master builds and publishers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3.11 .github/scripts/cancel-master-builds.py
   cancel:
+    if: github.event_name == 'pull_request_target'
     name: Cancel the pull request's runs
     runs-on: ubuntu-24.04
     steps:

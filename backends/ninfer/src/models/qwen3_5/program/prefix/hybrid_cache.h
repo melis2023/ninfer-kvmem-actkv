@@ -6,6 +6,7 @@
 #include "models/qwen3_5/program/storage/kv_store.h"
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/state/state_image.h"
+#include "ninfer/types_fwd.h"
 #include "runtime/prefix_cache/prefix_index.h"
 #include "runtime/prefix_cache/tap_planner.h"
 

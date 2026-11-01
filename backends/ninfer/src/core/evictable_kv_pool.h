@@ -30,7 +30,8 @@ public:
     struct Config {
         std::size_t arena_bytes           = 0; // persistent arena capacity
         std::size_t lendable_prefix_bytes = 0; // KV payload prefix eligible for lending
-        std::size_t window_capacity_bytes = 0; // largest extent one lease may hand out
+        // Largest extent one lease may hand out; zero: no leases, granule releases only.
+        std::size_t window_capacity_bytes = 0;
     };
 
     struct LeaseStats {
@@ -120,6 +121,17 @@ public:
     // Test seam: makes the next lease() throw at `rank`, at the stage named, and fires once. The
     // rollback in lease() must still hand back a fully resident, unpoisoned pool.
     void inject_lease_fault(std::size_t rank, LeaseFault stage) noexcept;
+
+    // Gives the physical pieces of resident granules back to the device, for another owner (an
+    // expert cache) to allocate; their home addresses stay reserved and unmapped. restore_granules
+    // backs released granules at home again with fresh pieces whose contents are undefined, or,
+    // when the device cannot supply them all, releases what it created and throws. Like lease(),
+    // neither quiesces a stream: the caller guarantees that the granules lie entirely inside KV
+    // pages that no work addresses. A suspend needs every granule restored first.
+    void release_granules(std::span<const std::size_t> granules);
+    void restore_granules(std::span<const std::size_t> granules);
+    [[nodiscard]] std::size_t released_granules() const noexcept;
+    [[nodiscard]] bool granule_released(std::size_t granule) const noexcept;
 
 private:
     struct Impl;

@@ -1,6 +1,10 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "ninfer/base.h"
+#include "ninfer/engine_options.h"
+#include "ninfer/kv_cache_storage.h"
+#include "ninfer/model_enums.h"
+#include "ninfer/request.h"
 #include "product/logging/logging.h"
 #include "serve/request.h"
 
@@ -22,6 +26,10 @@ struct ServeOptions {
     // Set only when a valid requested copy width was reduced for concurrent execution.
     std::optional<std::uint32_t> requested_ngram_draft_tokens;
     bool help_requested = false;
+    bool version_requested = false;
+    // `<VERSION>+<build id>` of this binary, set by ninfer-serve from its build stamp (not a flag):
+    // GET /health, the X-NInfer-Version header, /props build_info and the server_start record.
+    std::string build_version;
     std::string artifact_path;
     std::filesystem::path chat_template_path;
     std::string host = "127.0.0.1";
@@ -40,10 +48,6 @@ struct ServeOptions {
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(8192);
     KvmemOptions kvmem;
     std::optional<std::size_t> kv_headroom_mib;
-    // --gpu-clock-floor-mhz: NVML locked-clock floor while work runs (0 = driver default).
-    std::uint32_t gpu_clock_floor_mhz  = 0;
-    // --invariant-attention: fixed key segments, width-independent attention output.
-    bool invariant_attention           = false;
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
     // Admission waits behind the active set, so the deadline has to cover the generation
@@ -51,7 +55,8 @@ struct ServeOptions {
     // at C1 on an RTX 3090, and a 6.5K-token one past 100 s; a 30 s deadline expired those
     // callers before they were ever admitted.
     std::uint32_t pending_timeout_ms   = 600000;
-    std::uint32_t prefill_chunk        = 1024;
+    std::uint32_t prefill_chunk        = 0; // 0: the Engine's automatic chunk
+    std::uint32_t decode_rounds_per_prefill = 0;
     bool fast_prefill_kernel           = false;
     std::filesystem::path context_cost_presets;
     std::string device_profile = "auto";
@@ -70,18 +75,24 @@ struct ServeOptions {
     std::vector<int> devices;
     // Layers per stage, one count per entry of `devices`. Empty lets the engine choose.
     std::vector<std::uint32_t> stage_layers;
+    // The `devices` share every layer instead (tensor parallelism).
+    bool tensor_parallel = false;
     // Qwen3.8-Flash-Next: where the expert banks live, and where its n-gram table comes from.
     ExpertResidency expert_residency = ExpertResidency::Device;
     std::optional<std::uint64_t> expert_cache_bytes;
+    HybridExpertOptions hybrid_experts;
     NgramTableOptions ngram_table;
+    std::optional<std::uint32_t> kv_resident_positions; // Flash-Next: --kv-resident
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
     bool ngram_native_sessions = false;
     ContextCacheOptions context_cache;
     bool enable_vision      = false;
     VisionResidency vision_residency       = VisionResidency::Resident;
+    std::uint32_t cpu_vision_idle_seconds = 300; // 0: retain lazily loaded Qwen CPU Vision weights
     std::uint32_t vision_max_merged_tokens = 16384;
     bool use_cuda_graph     = true;
+    std::uint32_t gpu_clock_floor_mhz = 0;
     bool lm_head_q4         = false;
     bool lm_head_q6         = false;
     bool embedding_q4       = false;
@@ -116,6 +127,8 @@ struct ServeOptions {
     [[nodiscard]] bool router() const noexcept { return models_dir || models_preset; }
     bool mlp_a8_decode      = false;
     bool prefill_a8         = true;
+    bool nvfp4_w4a8_int     = false;
+    bool nvfp4_w4a16        = false;
     bool prefill_cublas     = false;
     bool prefill_cublas_projections = true;
     // Explicit total CUDA Graph driver-state allowance in MiB; 0 keeps the computed allowance.
@@ -132,6 +145,9 @@ struct ServeOptions {
     // --lenient-assistant-history: Responses input whose assistant content or reasoning follows
     // function_call Items joins that run's turn instead of failing with invalid_assistant_history.
     bool lenient_assistant_history = false;
+    // --lenient-image-detail: an OpenAI image detail other than auto, low or high is read as auto
+    // instead of failing with image_detail_not_supported.
+    bool lenient_image_detail = false;
     // Directory for /slots session files; empty disables slot save/restore.
     std::filesystem::path slot_save_path;
     // Spill an involuntarily evicted session back to the slot file it was last saved to or
@@ -145,6 +161,9 @@ struct ServeOptions {
     // Empty means no default; otherwise it names an entry of `grafts`.
     std::string default_graft;
     std::optional<std::uint32_t> default_thinking_budget;
+    // --reasoning-loop off|stop|conclude: the reasoning-loop guard for every thinking request,
+    // constrained ones included (off by default).
+    ninfer::ReasoningLoopAction reasoning_loop = ninfer::ReasoningLoopAction::Off;
     // Effort for requests that name none; a request that disables thinking is left alone.
     std::optional<RequestedReasoningEffort> default_reasoning_effort;
     // End-of-thinking message fed to the model when it hits the thinking budget; empty
@@ -161,7 +180,7 @@ struct ServeOptions {
     bool log_stats_panel   = false;
     bool enable_webui      = true;  // serve a WebUI compiled in with NINFER_WEBUI_DIR
     // --webui-mcp-proxy: relay the WebUI's MCP traffic at /cors-proxy. It reaches any http host it
-    // is given and carries no API key, so it stays off unless asked for by name.
+    // is given, so it stays off unless asked for by name.
     bool webui_mcp_proxy = false;
     bool structured_output = false; // accept JSON/JSON Schema constrained requests
     bool concurrent_prefill = false; // admit to free lanes while other requests prefill
@@ -200,7 +219,8 @@ struct ServeOptions {
     return RequestLimits{.default_max_tokens        = options.default_max_tokens,
                          .max_context               = static_cast<int>(options.max_context),
                          .assistant_prefill         = options.assistant_prefill,
-                         .lenient_assistant_history = options.lenient_assistant_history};
+                         .lenient_assistant_history = options.lenient_assistant_history,
+                         .lenient_image_detail      = options.lenient_image_detail};
 }
 
 ServeOptions parse_serve_options(int argc, char** argv);

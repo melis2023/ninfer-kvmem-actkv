@@ -363,13 +363,6 @@ __device__ __forceinline__ void speculative_sparse_warp_accept(
                                   licensed_counts, accepted, terminal_is_finite);
 }
 
-// The first verification column of `row` in the logits and target tokens: its column start when
-// the rows are packed at their own widths, row * cols in the uniform layout.
-__device__ __forceinline__ std::int64_t speculative_row_column(const std::int32_t* column_starts,
-                                                               int row, int cols) {
-    return column_starts != nullptr ? column_starts[row] : static_cast<std::int64_t>(row) * cols;
-}
-
 // Commits the round's accepted tokens plus one correction/bonus token, then
 // advances the target length. The greedy branch
 // (config temperature <= 0) is bit-identical to the original argmax accept: keep
@@ -388,18 +381,18 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_accept_coupled_draf
     const std::int32_t* current_extents, std::int32_t* lengths, std::int32_t* anchors,
     std::int32_t* licensed_tokens, std::int32_t* licensed_counts, std::int32_t* accepted,
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
-    std::int32_t k, const std::int32_t* column_starts) {
+    std::int32_t k) {
     const int tid                   = threadIdx.x;
     const int row                   = static_cast<int>(blockIdx.x);
     const int cols                  = k + 1;
     int extent                      = current_extents[row];
     extent                          = extent < 0 ? 0 : (extent > k ? k : extent);
     const SamplingConfig cfg        = configs[row];
-    const std::int64_t first_column = speculative_row_column(column_starts, row, cols);
-    const std::int32_t* row_targets = target_tokens + first_column;
+    const std::int32_t* row_targets = target_tokens + row * cols;
     const std::int32_t* row_drafts  = drafts + row * k;
     std::int32_t* row_tokens        = licensed_tokens + row * cols;
-    const __nv_bfloat16* row_logits = logits + first_column * physical_rows;
+    const __nv_bfloat16* row_logits =
+        logits + static_cast<std::int64_t>(row) * cols * physical_rows;
     const bool penalties =
         cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f || cfg.token_mask != nullptr;
 
@@ -548,7 +541,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     const __nv_bfloat16* logits, const std::int32_t* drafts, const std::int32_t* current_extents,
     const SamplingConfig* configs, std::int32_t token_domain, std::int32_t physical_rows,
     std::int32_t cols, std::int32_t k, SamplingWorkspace workspace,
-    std::size_t workspace_row_stride, const std::int32_t* column_starts) {
+    std::size_t workspace_row_stride) {
     pdl::enter();
     const int row     = static_cast<int>(blockIdx.z);
     const int col     = static_cast<int>(blockIdx.y);
@@ -571,8 +564,7 @@ __launch_bounds__(kSamplerBlock) __global__ void speculative_sampling_partial_to
     __shared__ unsigned long long greedy_warp_keys[kSamplerBlock / 32];
 
     const int cap                  = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
-    const std::int64_t base =
-        (speculative_row_column(column_starts, row, cols) + col) * physical_rows;
+    const std::int64_t base        = (static_cast<std::int64_t>(row) * cols + col) * physical_rows;
     const std::int32_t* row_drafts = drafts + row * k;
     const int tile_start           = partial * kSamplerPartialTileItems;
     if (!penalties) {
@@ -628,7 +620,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     std::int32_t* licensed_counts, std::int32_t* accepted, const SamplingConfig* configs,
     std::int32_t token_domain, std::int32_t cols, std::int32_t partial_blocks,
     std::int32_t group_count, std::int32_t physical_rows, SamplingWorkspace workspace,
-    std::size_t workspace_row_stride, const std::int32_t* column_starts) {
+    std::size_t workspace_row_stride) {
     pdl::enter();
     const int row   = static_cast<int>(blockIdx.z);
     const int group = static_cast<int>(blockIdx.x);
@@ -639,8 +631,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
     extent          = extent < 0 ? 0 : (extent > k ? k : extent);
     if (col > extent) { return; }
     const SamplingConfig cfg        = configs[row];
-    const std::int64_t first_column = speculative_row_column(column_starts, row, cols);
-    const std::int32_t* row_targets = target_tokens + first_column;
+    const std::int32_t* row_targets = target_tokens + row * cols;
     const std::int32_t* row_drafts  = drafts + row * k;
     std::int32_t* row_tokens        = licensed_tokens + row * cols;
     if (token_domain <= kSamplerTileItems) { return; }
@@ -666,7 +657,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                 // reads as if it could disable the counts here, which it cannot.
                 static_assert(!SparseProposal, "dense finalize path only");
                 const __nv_bfloat16* row_logits =
-                    logits + first_column * physical_rows;
+                    logits + static_cast<std::int64_t>(row) * cols * physical_rows;
                 speculative_store_accept_result<true>(
                     row_drafts, k, row, a, t_star, lengths, anchors, row_tokens, licensed_counts,
                     accepted, &cfg,
@@ -814,7 +805,7 @@ __launch_bounds__(kSamplerGroupBlock) __global__ void speculative_sampling_group
                     // reads as if it could disable the counts here, which it cannot.
                     static_assert(!SparseProposal, "dense finalize path only");
                     const __nv_bfloat16* row_logits =
-                        logits + first_column * physical_rows;
+                        logits + static_cast<std::int64_t>(row) * cols * physical_rows;
                     speculative_store_accept_result<true>(
                         row_drafts, k, row, a, tstar, lengths, anchors, row_tokens, licensed_counts,
                         accepted, &cfg,

@@ -85,6 +85,7 @@ struct HostKvAllocation {
     std::atomic<uint32_t> pins{0};
     std::atomic<uint32_t> readers{0};
     std::atomic<bool> sealed{false};
+    std::atomic<bool> forked{false};
     std::atomic<size_t> resident_size{0};
     bool relocating = false; // protected by account policy
     SpillExtent disk;
@@ -280,16 +281,38 @@ const uint8_t * HostKvRecord::data() const {
     return allocation_ ? allocation_->bytes.get() : nullptr;
 }
 bool HostKvRecord::mutable_resident() const noexcept {
-    return allocation_ && (!allocation_->account->spill ||
+    return allocation_ && (!allocation_->forked.load(std::memory_order_acquire) || allocation_.use_count()==1) && (!allocation_->account->spill ||
         !allocation_->sealed.load(std::memory_order_acquire));
+}
+HostKvRecord HostKvRecord::fork() const {
+    if (!allocation_) return {};
+    if (!allocation_->sealed.load(std::memory_order_acquire))
+        throw MemoryError(MemoryErrorCode::Pending, "fork requires a sealed native KV record");
+    allocation_->forked.store(true, std::memory_order_release);
+    return HostKvRecord(allocation_);
 }
 uint8_t * HostKvRecord::writable_data() {
     if (!allocation_) return nullptr;
+    // Owner operations are serialized. A sole strong reference excludes both
+    // another branch and outstanding read leases/sources. An expired branch
+    // must not force the survivor to reserve a second page forever.
+    if (allocation_.use_count()==1)
+        allocation_->forked.store(false, std::memory_order_release);
+    if (allocation_->forked.load(std::memory_order_acquire)) {
+        // A deferred source lets allocation spill the original if RAM is tight.
+        // Publish this owner's detached record only after the copy succeeds.
+        auto original = source();
+        HostKvStorage storage(allocation_->account);
+        auto detached = storage.allocate(size());
+        original.read(0, detached.writable_data(), detached.size());
+        allocation_ = std::move(detached.allocation_);
+    }
     auto & record = *allocation_;
     auto & account = *record.account;
     if (!account.spill) {
         if (allocation_.use_count() != 1)
             throw MemoryError(MemoryErrorCode::Pending, "native KV record has outstanding read leases");
+        record.sealed.store(false, std::memory_order_release);
         return record.bytes.get();
     }
     {
@@ -338,7 +361,7 @@ void HostKvRecord::write(size_t offset, const void * source, size_t bytes) {
     if (bytes) std::memcpy(writable_data() + offset, source, bytes);
 }
 void HostKvRecord::seal() {
-    if (!allocation_ || !allocation_->account->spill) return;
+    if (!allocation_) return;
     // Publication follows the owner's completed write/DMA. Relocation observes
     // this release before reading the bytes; repeated sealing needs no I/O lock.
     allocation_->sealed.store(true, std::memory_order_release);
@@ -381,6 +404,7 @@ HostKvRecord HostKvReservation::allocate(size_t bytes, const void * source) {
     return HostKvRecord(std::move(allocation));
 }
 HostKvStorage::HostKvStorage(uint64_t capacity_bytes) : HostKvStorage(capacity_bytes, {}) {}
+HostKvStorage::HostKvStorage(std::shared_ptr<detail::HostKvAccount> account) : account_(std::move(account)) {}
 HostKvStorage::HostKvStorage(uint64_t capacity_bytes, std::shared_ptr<SpillFile> spill)
     : account_(std::make_shared<detail::HostKvAccount>(capacity_bytes, std::move(spill))) {}
 HostKvReservation HostKvStorage::reserve(uint64_t bytes) {

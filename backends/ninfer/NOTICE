@@ -1,0 +1,36 @@
+Native PTQ1 support
+===================
+The PTQ1 decode, shared-memory operand staging, and CUDA projection kernels are adapted from
+1314521gjy/ninfer-fusion-kvmem, commit b6e6c20deb93fe5ed84e5715642dad21c0455ef0:
+https://github.com/1314521gjy/ninfer-fusion-kvmem
+The donor source is distributed under Apache License 2.0 (see LICENSE). Its PTQ1 kernels also
+credit the shensanshu/Ada ternary implementation and PrismML's PTQ1_0 decoding definition.
+
+Changes made here: integrated the current v3 artifact format and current Op interfaces;
+preserved existing format IDs, T2 routes and architecture bounds; made activation layouts and
+workspace planning format-aware; fused inverse-rotated PTQ1 embedding with a single BF16 output
+rounding; added an artifact-owned codec, conversion recipe and independent numerical tests.
+
+T5 CUDA kernels
+===============
+Adapted from JGamboa/ninfer-4090-windows, commit e905787f067de89ef6ef28c52d65a2ce91d425ca
+https://github.com/JGamboa/ninfer-4090-windows (Apache License 2.0).
+Changes: RowSplit artifact integration, explicit existing Hadamard producer boundary,
+strided split-parent destinations, SM120 qualification, and independent codec/oracle tests.
+
+DFlash2 GGUF and NVFP4 draft projections
+======================================
+Adapted from melis2023/ninfer-kvmem-actkv, revision 664cb6daa8cba30dfe39b0d10113a72b20587853.
+Contributor: melis2023 <zhuangisme@gmail.com>.
+https://github.com/melis2023/ninfer-kvmem-actkv
+Changes here: preserved current NVFP4/INT8 dispatch and Blackwell scale handling;
+priced workspace for all admitted GGUF blocks; added native shape/conv oracles,
+exact artifact import checks and a bounded weight-only NVFP4 conversion method.
+
+CUDA Graph startup calibration
+==============================
+Adapted from melis2023/ninfer-kvmem-actkv, revision 664cb6daa8cba30dfe39b0d10113a72b20587853,
+including b4d8096 (probe) and 591537b (repeat above-floor measurement).
+Contributor: melis2023 <zhuangisme@gmail.com>.
+Changes here: automatic calibration for dense single-device MTP/DFlash2/ordinary execution, typed
+recoverable allocation fallback, fatal CUDA execution errors preserved, and regression tests.

@@ -15,6 +15,10 @@ class EncodedRows:
     codes: torch.Tensor
     scales: torch.Tensor
     weight_divisor: bytes | None = None
+    # Native Q2/Q8 may supply complete packed code rows instead of logical integer codes.
+    # Native PTQ1 packed rows contain 26-byte (24 base + 2 tail) records per 128-group;
+    # the binary16 scales remain in `scales`.
+    packed: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,15 +109,19 @@ def select_rows(
         ]
         first = pieces[0]
         if any(
-            (part.format, part.weight_divisor) != (first.format, first.weight_divisor)
+            (part.format, part.weight_divisor, part.packed) !=
+            (first.format, first.weight_divisor, first.packed)
             for part in pieces
         ):
             raise ValueError(f"{source.label}: incompatible encoded row groups")
+        if len(pieces) == 1:
+            return first
         return EncodedRows(
             first.format,
             torch.cat([p.codes for p in pieces]),
             torch.cat([p.scales for p in pieces]),
             first.weight_divisor,
+            first.packed,
         )
 
     return LogicalSource(

@@ -1,6 +1,7 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "ninfer/engine_options.h"
+#include "ninfer/model_enums.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -21,11 +22,17 @@ struct LoadOptions {
     bool embedding_q4   = false;
     bool embedding_q6   = false;
     bool mtp_experts_q4 = false;
+    ExpertResidency expert_residency = ExpertResidency::Device;
     // Execution selection carried with the instance: admit the integer small-T gate_up route at
     // verify widths (see execution::DenseParameters::verify_gate_up_policy).
     bool mlp_a8_decode = false;
     // Clearing this returns full prefill tiles to their A16 routes; see EngineOptions::prefill_a8.
     bool prefill_a8 = true;
+    // Admit the NVFP4 W4A8 (int8-activation) family; see EngineOptions::nvfp4_w4a8_int.
+    bool nvfp4_w4a8_int = false;
+    // Prefer the dequantising NVFP4 A16 routes over a native-FP4 card's A4 permission; see
+    // EngineOptions::nvfp4_w4a16.
+    bool nvfp4_w4a16 = false;
     // See EngineOptions::prefill_cublas: hands wide prefill GEMMs to cuBLAS, a further quality
     // trade on top of prefill_a8 and therefore off unless asked for.
     bool prefill_cublas = false;
@@ -42,14 +49,21 @@ struct LoadOptions {
     // embedding, proposal head and MTP layer in an evictable device tail that one encode window
     // may borrow. Resident whenever Vision is disabled.
     VisionResidency vision_residency = VisionResidency::Resident;
+    std::uint32_t cpu_vision_idle_seconds = 300; // 0: retain lazily loaded Qwen CPU Vision weights
     // How many devices the instance spans (`--devices`). One is the single-GPU route; more split
     // the layers into that many stages, each owning its layers' weights, KV cache and recurrent
     // state. The embedding, head and round state stay on the first device.
     std::size_t ranks = 1;
     // Layers per stage (`--stage-layers`), one count per device. Empty lets the engine choose.
     std::vector<std::uint32_t> stage_layers;
+    // The `ranks` devices share every layer instead (`--tensor-parallel`): each holds a share of
+    // the GDN heads and dense FFN rows, and the first one the rest.
+    bool tensor_parallel = false;
 
     bool operator==(const LoadOptions&) const = default;
+
+    // The tensor-parallel group size, one without tensor parallelism.
+    [[nodiscard]] std::size_t tensor_ranks() const noexcept { return tensor_parallel ? ranks : 1; }
 
     [[nodiscard]] bool speculative_enabled() const noexcept {
         return speculative != SpeculativeBackend::None;
@@ -118,16 +132,21 @@ struct LoadOptions {
             .embedding_q4   = options.embedding_q4,
             .embedding_q6   = options.embedding_q6,
             .mtp_experts_q4 = options.mtp_experts_q4,
+            .expert_residency = options.expert_residency,
             .mlp_a8_decode  = options.mlp_a8_decode,
             .prefill_a8     = options.prefill_a8,
+            .nvfp4_w4a8_int = options.nvfp4_w4a8_int,
+            .nvfp4_w4a16    = options.nvfp4_w4a16,
             .prefill_cublas = options.prefill_cublas,
             .prefill_cublas_projections = options.prefill_cublas_projections,
             .gdn_state_fp16 = options.gdn_state_fp16,
             .vision_max_merged_tokens = options.vision_max_merged_tokens,
             .vision_residency         = options.enable_vision ? options.vision_residency
                                                               : VisionResidency::Resident,
+            .cpu_vision_idle_seconds = options.cpu_vision_idle_seconds,
             .ranks = std::max<std::size_t>(options.devices.size(), 1),
-            .stage_layers = options.stage_layers};
+            .stage_layers = options.stage_layers,
+            .tensor_parallel = options.tensor_parallel};
 }
 
 } // namespace ninfer::models

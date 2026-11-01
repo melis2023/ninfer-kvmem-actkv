@@ -1,4 +1,5 @@
 #include "ops/linear_add/nvfp4/nvfp4_linear_add_a4_tma_launch.h"
+#include "ops/common/blackwell_routes.h"
 #include "ops/linear/nvfp4/nvfp4_a4_tma.cuh"
 
 namespace ninfer::ops::detail::unified {
@@ -13,6 +14,7 @@ void launch(const Nvfp4A4Operands& p, __nv_bfloat16* y, cudaStream_t stream) {
 
 void launch_nvfp4_a4_tma_linear_add(const Nvfp4A4Operands& p, __nv_bfloat16* residual,
                                     cudaStream_t stream) {
+    require_nvfp4_a4_card();
     if (p.k == 6144)
         launch<6144>(p, residual, stream);
     else if (p.k == 17408)

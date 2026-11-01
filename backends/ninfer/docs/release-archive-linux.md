@@ -1,112 +1,78 @@
-# NInfer for Linux (RTX 3090 build) — release archive
+# NInfer Linux archive
 
-This is the README that ships **inside** the Linux release archive, where every file sits in one
-directory. If you are reading it in a checkout instead, the launchers and downloaders it names live
-under `scripts/`, and
-[docs/rtx-3090-linux.md](https://github.com/iamwavecut/ninfer-all/blob/master/docs/rtx-3090-linux.md)
-is the guide to building from source. Links here are absolute on purpose: the archive ships no
-`docs/` directory.
+This archive contains prebuilt x64 binaries. Single-CUDA names record the Toolkit, GPU architectures and source commit.
+Universal names use `cuda12.9-13.4-<commit12>` and contain both backends. `BUILD-INFO.json` records the complete revision, compiler, build
+system and runtime requirements. `VERSION` is source metadata, not the archive identifier.
 
-Check `VERSION` for the release this archive was cut from, and `RELEASE_NOTES_*.md` for what
-changed.
+## Extract and verify
 
-## Requirements
-
-- x86-64 Linux with glibc 2.38 or newer (the binaries are built on Ubuntu 24.04)
-- GeForce RTX 3090 (or 3090 Ti) with a recent NVIDIA driver
-- The CUDA 12.8 runtime libraries, **including cuBLAS** (`libcudart.so.12`, `libcublas.so.12`,
-  `libcublasLt.so.12`). The cuBLAS prefill route links it, so the binaries need it even when you do
-  not turn that route on. From NVIDIA's CUDA repository: `sudo apt install cuda-libraries-12-8`
-- FFmpeg 6 shared libraries and libcurl (`sudo apt install ffmpeg libcurl4t64` on Ubuntu 24.04)
-- `curl` for the downloaders
-
-Model artifacts are **not** included — they are 17–21 GB each. The downloaders below fetch them.
-
-## Quick start
-
-From the directory you unpacked, two commands:
+Download every numbered volume and the matching `SHA256SUMS-*.txt` for one variant. For example,
+replace `<commit12>` below with the commit in the downloaded filenames:
 
 ```bash
-./download-model.sh qwen38-27b         # ~19 GB, resumable, verifies size and SHA256; the DFlash2 bundle, it also carries the MTP weights
-./run.sh qwen38-27b                    # serves on http://127.0.0.1:8080/v1
+name='ninfer-linux-x64-cuda12.9-13.4-<commit12>'
+sha256sum -c "SHA256SUMS-$name.txt"
+cat "$name".tar.gz.[0-9][0-9][0-9] | tar -xz
+cd "$name"
+sha256sum -c SHA256SUMS.txt
 ```
 
-The downloader writes into `models/` beside these files, which is where the launcher looks. Set
-`NINFER_MODEL_DIR` to keep artifacts elsewhere, or `NINFER_MODEL` to point the launcher at a single
-file.
+CUDA 12.9 packages contain `sm_70`, `sm_75`, `sm_80`, `sm_86` and `sm_89`.
+CUDA 13.4 packages contain `sm_75`, `sm_80`, `sm_86`, `sm_89` and `sm_120a`.
+The universal package selects CUDA 12 for Volta and CUDA 13 for consumer Blackwell. On overlapping
+targets it prefers CUDA 13 if the driver supports it, otherwise CUDA 12. Use `--cuda-backend 12`
+or `--cuda-backend 13` to require one backend. Every GPU in `--devices` must fit that backend.
+V100 plus Blackwell cannot share a process with these sets. Install a compatible NVIDIA driver
+on the host. The minimum Driver API family is 12.0 for CUDA 12 and 13.0 for CUDA 13. This is a
+compatibility admission check, not GPU qualification of every driver release.
+The CUDA 12 build applies a glibc 2.41 exception-declaration patch to NVIDIA headers;
+`BUILD-INFO.json` records it. Function bodies are not modified.
 
-That is the recommended profile: Qwen3.8-27B, one lane with all 262,144 tokens, DFlash2 speculation
-plus the draft head (fastest), `rk4v4` KV, cuBLAS prefill, and vision in overlay residency. Drop a
-context rung (229376 / 196608 / 163840 / 131072 / 98304) if startup refuses.
+## Debian runtime
 
-For the longest context shared by two lanes instead, `NINFER_SPEC=mtp ./run.sh qwen38-27b` runs the
-MTP profile at 262,144 tokens with a smaller prefill chunk and `--lm-head-q6`: slower decode, more
-context.
+CI builds on Debian 13 (glibc 2.41). CUDA runtime libraries are included under `backends/cuda12/` or `backends/cuda13/`, with NVIDIA's EULA. System libraries remain dynamically linked. Newer distributions must also provide the
+recorded FFmpeg and other library SONAMEs; newer glibc alone is insufficient. Local builds can use
+another Debian-family host; check `BUILD-INFO.json`.
 
-`./run.sh qwen38-27b int8` and `./run.sh qwen38-27b c8` are the older INT8 profiles — one user at
-65,536 tokens, and eight concurrent users at 8,192 each.
-
-For the Qwen3.6-35B-A3B MoE instead, which serves more lanes:
+On Debian 13, install the recorded system runtime packages:
 
 ```bash
-./download-model.sh qwen36-35b-a3b     # ~21 GB, resumable, verifies size and SHA256
-./run.sh qwen36-35b-a3b                # serves on http://127.0.0.1:8080/v1
+sudo apt-get update
+xargs -a packages/multi.txt sudo apt-get install -y ca-certificates curl
+./ninfer --help
+./ninfer-serve --help
+./ninfer_bench --help
 ```
 
-That profile runs three lanes, `rk4v4` KV, MTP3 speculation plus the draft head, and vision in
-overlay residency, with the lanes sharing one 262,144-token pool (any one request can use all of
-it). Three lanes start even beside a desktop, so a headless card has room to spare
-(`NINFER_CONCURRENCY=4` should fit there).
+This installs FFmpeg, libcurl and the other resolved system dependencies. It does not install a
+CUDA Toolkit or a driver. The build's temporary driver stub is never shipped. The executables load
+one private runtime from the selected backend directory. All commands share that backend's kernel
+images. Keep `backends/` and `help/` beside the executables when moving the installation.
+`--help` and `--version` work without a driver. NVIDIA libraries remain subject to the
+`NVIDIA-CUDA-EULA.txt` in their backend directory, separately from NInfer's Apache-2.0 licence.
 
-The endpoint is OpenAI-compatible, so anything that speaks `/v1/chat/completions` works. Leave the
-API key blank.
+## Docker without compilation
 
-## What is in the archive
+From an extracted **single-CUDA** Debian 13 archive (the universal archive has no Dockerfile):
 
-| file | what it is |
-|---|---|
-| `ninfer-serve` | the server: OpenAI- and Anthropic-compatible HTTP APIs |
-| `ninfer` | one-shot CLI generation, for smoke tests and scripting |
-| `ninfer_bench` | throughput benchmark against the public Engine route |
-| `download-model.sh` | pinned, resumable artifact downloads with verification |
-| `run.sh` | serving profiles: `run.sh <model> [profile]` |
-| `SHA256SUMS.txt` | checksums for every file in this directory |
+```bash
+docker build -t ninfer:local .
+docker run --rm --gpus all -p 8080:8080 -v ninfer-models:/models ninfer:local
+```
 
-## Overrides
+The included Dockerfile installs runtime packages and copies these binaries. It does not build
+NInfer again. The host needs NVIDIA Container Toolkit for GPU access. This image uses the same
+entrypoint commands, `run.sh` launcher and model profiles as the source tree. The Container image
+workflow packages both Native release archives as `cuda12.9` and `cuda13.4`, with matching
+`cuda12.9-<commit12>` and `cuda13.4-<commit12>` tags, without recompilation.
 
-Nothing here needs editing. `NINFER_SERVER`, `NINFER_MODEL_DIR`, `NINFER_MODEL`, `NINFER_HOST`,
-`NINFER_PORT` and `NINFER_CHAT_TEMPLATE` (a local Jinja file, passed to `--chat-template`,
-overriding the artifact's built-in template) work for every profile.
+## Start a model
 
-| profile | also reads |
-|---|---|
-| `run.sh <model>` (`tuned`) | `NINFER_CONTEXT`, `NINFER_CONCURRENCY`, `NINFER_KV_CAPACITY`, `NINFER_KV_DTYPE`, `NINFER_SPEC` (27B: `dflash2`, `mtp`, `none`; 35B: `mtp`, `none`), `NINFER_VISION`, `NINFER_VISION_RESIDENCY`, `NINFER_DRAFT_TOKENS`, `NINFER_PREFILL_CHUNK`, `NINFER_HOST_STATE_SLOTS`, `NINFER_FALLBACK` (`off` turns the automatic step-down off) |
-| `run.sh qwen38-27b int8`, `run.sh qwen38-27b c8` | nothing further; every serving flag is fixed |
-| `download-model.sh <model>` | `NINFER_MODEL_DIR`, `NINFER_SKIP_SHA256` |
+```bash
+./run.sh qwen38-27b
+```
 
-> `NINFER_HOST=0.0.0.0` exposes the server to your network **unauthenticated**. The launchers bind
-> `127.0.0.1` for that reason. If you set it, put something in front of it.
-
-## If startup refuses
-
-**The default profile handles this for you.** If `run.sh` is refused at startup for lack of GPU
-memory (a desktop, or another job, is holding VRAM), it steps down by itself -- an eighth of the
-context at a time, up to five times, and from the second step with a 2048 prefill chunk and fewer host state slots -- says what
-it did, and starts. It only does this for the defaults: a `NINFER_CONTEXT`, `NINFER_PREFILL_CHUNK`,
-`NINFER_HOST_STATE_SLOTS` or `NINFER_KV_CAPACITY` you set is honoured as given, and
-`NINFER_FALLBACK=off` turns it off.
-
-For those cases the message names the numbers. Drop a context rung first —
-`NINFER_CONTEXT=196608`, then 163840, 131072, 98304 (the launcher's own step-down starts from 262144 and
-takes an eighth off each rung, so begin lower only if it keeps refusing). Speculation is the next lever
-(`NINFER_SPEC=none`), worth about 992 MiB at the cost of decode speed. Drop vision last: in overlay
-residency it costs almost nothing resident, and an `evictable pool window exceeds the evictable
-tail` message means the reservation is already tight rather than that the context is too large.
-
-`--host-kv-mib 8192` behaves differently here than on Windows: on Linux it really does pin 8 GiB of
-host RAM. On Windows/WDDM a pinned host allocation is charged against the card, so the runtime
-clamps it hard. Same flag, different platform behaviour, by design.
-
-## Full documentation
-
-<https://github.com/iamwavecut/ninfer-all>
+The launcher downloads the selected model on first use. Set `NINFER_MODEL_DIR` to choose storage,
+`NINFER_MODEL` to use an existing artifact, and `NINFER_HOST`/`NINFER_PORT` for the server address.
+CI checks device images, dynamic dependencies and `--help`; it does not run GPU inference or
+measure performance. Verify the intended model and GPU before relying on a package for serving.

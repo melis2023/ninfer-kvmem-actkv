@@ -41,6 +41,8 @@ struct EvictableKVPool::Impl {
     std::vector<std::size_t> offsets;
     std::vector<std::size_t> sizes;
     std::vector<std::size_t> lent; // granule indices currently mapped at the overlay range
+    std::vector<unsigned char> released; // by piece: no physical piece (release_granules)
+    std::size_t released_count = 0;
     bool poisoned = false;
     bool backed   = false; // physical pieces exist and are mapped home or at the overlay
     // Test seam; see inject_lease_fault.
@@ -118,9 +120,6 @@ EvictableKVPool::EvictableKVPool(DeviceContext& device, const Config& config)
     if (config.lendable_prefix_bytes > config.arena_bytes) {
         throw std::invalid_argument("evictable KV lendable prefix exceeds the arena");
     }
-    if (config.window_capacity_bytes == 0) {
-        throw std::invalid_argument("evictable KV window capacity must be positive");
-    }
     vmm::ensure_driver_initialized();
     Impl& impl       = *impl_;
     impl.config      = config;
@@ -141,8 +140,10 @@ EvictableKVPool::EvictableKVPool(DeviceContext& device, const Config& config)
     }
 
     NINFER_CU_CHECK(cuMemAddressReserve(&impl.home, impl.arena_reserved, impl.granularity, 0, 0));
-    NINFER_CU_CHECK(
-        cuMemAddressReserve(&impl.overlay, impl.window_reserved, impl.granularity, 0, 0));
+    if (impl.window_reserved != 0) {
+        NINFER_CU_CHECK(
+            cuMemAddressReserve(&impl.overlay, impl.window_reserved, impl.granularity, 0, 0));
+    }
 
     std::size_t offset = 0;
     for (std::size_t granule = 0; granule < impl.lendable_granules; ++granule) {
@@ -158,6 +159,7 @@ EvictableKVPool::EvictableKVPool(DeviceContext& device, const Config& config)
     }
 
     impl.handles.resize(impl.offsets.size());
+    impl.released.assign(impl.offsets.size(), 0);
     restore_backing();
 }
 
@@ -169,6 +171,7 @@ EvictableKVPool::~EvictableKVPool() {
     }
     if (impl.backed) {
         for (std::size_t piece = 0; piece < impl.handles.size(); ++piece) {
+            if (impl.released[piece]) { continue; }
             const bool away =
                 std::find(impl.lent.begin(), impl.lent.end(), piece) != impl.lent.end();
             if (!away) { (void)cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]); }
@@ -176,7 +179,7 @@ EvictableKVPool::~EvictableKVPool() {
         }
     }
     (void)cuMemAddressFree(impl.home, impl.arena_reserved);
-    (void)cuMemAddressFree(impl.overlay, impl.window_reserved);
+    if (impl.overlay != 0) { (void)cuMemAddressFree(impl.overlay, impl.window_reserved); }
 }
 
 bool EvictableKVPool::backed() const noexcept { return impl_->backed; }
@@ -186,6 +189,9 @@ void EvictableKVPool::release_backing() {
     if (!impl.backed) { return; }
     if (!impl.lent.empty()) {
         throw std::logic_error("evictable KV pool cannot release its backing while a lease is open");
+    }
+    if (impl.released_count != 0) {
+        throw std::logic_error("evictable KV pool cannot release its backing while granules are released");
     }
     for (std::size_t piece = 0; piece < impl.handles.size(); ++piece) {
         (void)cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]);
@@ -266,6 +272,9 @@ EvictableKVPool::Transaction EvictableKVPool::lease(std::span<const std::size_t>
         if (granules[rank] >= impl.lendable_granules) {
             throw std::invalid_argument("evictable KV lease names a resident granule");
         }
+        if (impl.released[granules[rank]]) {
+            throw std::invalid_argument("evictable KV lease names a released granule");
+        }
         if (rank != 0 && granules[rank] <= granules[rank - 1]) {
             throw std::invalid_argument("evictable KV lease granules must strictly increase");
         }
@@ -299,6 +308,64 @@ EvictableKVPool::Transaction EvictableKVPool::lease(std::span<const std::size_t>
                        DeviceSpan{reinterpret_cast<void*>(impl.overlay),
                                   granules.size() * impl.granularity},
                        stream, seconds_since(start));
+}
+
+void EvictableKVPool::release_granules(std::span<const std::size_t> granules) {
+    Impl& impl = *impl_;
+    if (!impl.backed || !impl.lent.empty() || impl.poisoned) {
+        throw std::logic_error("evictable KV granules can be released only from a resident pool");
+    }
+    for (const std::size_t granule : granules) {
+        if (granule >= impl.lendable_granules || impl.released[granule]) {
+            throw std::invalid_argument("evictable KV release names a resident or released granule");
+        }
+    }
+    for (const std::size_t granule : granules) {
+        NINFER_CU_CHECK(cuMemUnmap(impl.home + impl.offsets[granule], impl.sizes[granule]));
+        NINFER_CU_CHECK(cuMemRelease(impl.handles[granule]));
+        impl.handles[granule]  = {};
+        impl.released[granule] = 1;
+        ++impl.released_count;
+    }
+}
+
+void EvictableKVPool::restore_granules(std::span<const std::size_t> granules) {
+    Impl& impl = *impl_;
+    for (const std::size_t granule : granules) {
+        if (granule >= impl.lendable_granules || !impl.released[granule]) {
+            throw std::invalid_argument("evictable KV restore names a granule that is not released");
+        }
+    }
+    std::size_t created = 0;
+    try {
+        for (; created < granules.size(); ++created) {
+            const std::size_t piece = granules[created];
+            impl.handles[piece] = vmm::create(impl.sizes[piece], impl.device.device);
+            try {
+                impl.map_home(piece);
+            } catch (...) {
+                (void)cuMemRelease(impl.handles[piece]);
+                impl.handles[piece] = {};
+                throw;
+            }
+        }
+    } catch (...) {
+        for (std::size_t done = 0; done < created; ++done) {
+            const std::size_t piece = granules[done];
+            (void)cuMemUnmap(impl.home + impl.offsets[piece], impl.sizes[piece]);
+            (void)cuMemRelease(impl.handles[piece]);
+            impl.handles[piece] = {};
+        }
+        throw;
+    }
+    for (const std::size_t granule : granules) { impl.released[granule] = 0; }
+    impl.released_count -= granules.size();
+}
+
+std::size_t EvictableKVPool::released_granules() const noexcept { return impl_->released_count; }
+
+bool EvictableKVPool::granule_released(std::size_t granule) const noexcept {
+    return granule < impl_->lendable_granules && impl_->released[granule] != 0;
 }
 
 void EvictableKVPool::inject_lease_fault(std::size_t rank, LeaseFault stage) noexcept {

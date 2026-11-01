@@ -56,7 +56,7 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, cuda
         }
         {
             launch_nvfp4_a16_mma<
-                Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>, 6144>>(
+                Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 1, 3>, 6144>>(
                 p, output, epilogue, stream);
             return;
         }
@@ -105,7 +105,7 @@ void launch_matrix(const Tensor& x, const Weight& weight, Tensor& residual, cuda
         }
         {
             launch_nvfp4_a16_mma<
-                Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 2, 2>, 17408>>(
+                Nvfp4ScheduleInstance<Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 1, 3>, 17408>>(
                 p, output, epilogue, stream);
             return;
         }

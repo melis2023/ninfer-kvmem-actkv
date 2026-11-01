@@ -34,6 +34,7 @@ add_library(ninfer_runtime_support STATIC
   engine/device_profile.cpp
   engine/device_profile_build_id.cpp
   ${CMAKE_CURRENT_BINARY_DIR}/engine/device_profiles_builtin.cpp
+  engine/host_memory.cpp
   engine/kv_capacity.cpp
   engine/public_types.cpp
   prefix_cache/block_hash.cpp
@@ -49,6 +50,8 @@ ninfer_stamp_build_id(ninfer_runtime_support)
 add_library(ninfer_engine STATIC
   engine/model_instance.cpp
   engine/qwen4_exp_core.cpp
+  engine/gemma4_core.cpp
+  engine/flint_core.cpp
   contract/sampling.cpp
   engine/engine.cpp
 )

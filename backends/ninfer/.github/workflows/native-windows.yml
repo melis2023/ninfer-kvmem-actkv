@@ -1,0 +1,235 @@
+name: Native Windows build
+
+on:
+  workflow_call:
+    inputs:
+      cuda:
+        type: string
+        required: true
+      archs:
+        type: string
+        required: true
+      packages:
+        type: string
+        required: true
+      phase:
+        type: string
+        required: true
+      shard:
+        type: number
+        default: 0
+      count:
+        type: number
+        default: 8
+    secrets:
+      HF_BUILD_CACHE_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 350
+    env:
+      HF_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
+      HF_BUILD_CACHE_SEED_REF: ${{ vars.HF_BUILD_CACHE_SEED_REF }}
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      HF_CACHE_FAMILY: native-windows-cuda-${{ inputs.cuda }}-host-v2${{ inputs.phase == 'objects' && format('-shard-{0}', inputs.shard) || '' }}
+      CCACHE_DIR: ${{ github.workspace }}/.cache/objects
+      CCACHE_MAXSIZE: 8Gi
+      CCACHE_COMPILERCHECK: content
+      CCACHE_DEPEND: "true"
+      CCACHE_COMPRESSLEVEL: "5"
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Reserve time for cache upload
+        run: '"BUILD_DEADLINE=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 19800)" >> $env:GITHUB_ENV'
+      - uses: actions/checkout@v7
+      - name: Parse PowerShell scripts
+        run: |
+          foreach ($path in 'scripts/package-release.ps1') {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Join-Path $pwd $path), [ref]$tokens, [ref]$errors)
+            if ($errors.Count) { throw ($errors | Out-String) }
+          }
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Install the official CUDA Toolkit
+        env:
+          CUDA_VERSION: ${{ inputs.cuda }}
+          CUDA_PACKAGES: ${{ inputs.packages }}
+        run: |
+          $short = ($env:CUDA_VERSION -split '\.')[0..1] -join '.'
+          $installer = Join-Path $env:RUNNER_TEMP 'cuda.exe'
+          $url = "https://developer.download.nvidia.com/compute/cuda/$env:CUDA_VERSION/network_installers/cuda_$($env:CUDA_VERSION)_windows_x86_64_network.exe"
+          Invoke-WebRequest -Uri $url -OutFile $installer
+          $packages = ($env:CUDA_PACKAGES | ConvertFrom-Json) | ForEach-Object { "${_}_$short" }
+          $process = Start-Process $installer -ArgumentList (@('-s') + $packages) -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "CUDA installer failed ($($process.ExitCode))" }
+          $cuda = "${env:ProgramFiles}\NVIDIA GPU Computing Toolkit\CUDA\v$short"
+          foreach ($file in 'bin\nvcc.exe', 'bin\cuobjdump.exe', 'bin\nvprune.exe', 'include\cuda_runtime.h', 'lib\x64\cublas.lib') {
+            if (-not (Test-Path (Join-Path $cuda $file))) { throw "Missing CUDA component: $file" }
+          }
+          python .github/scripts/fetch-cuda-license.py --version $env:CUDA_VERSION --output "$cuda/EULA.txt"
+          if ($LASTEXITCODE -ne 0) { throw 'CUDA licence extraction failed' }
+          "CUDA_PATH=$cuda" >> $env:GITHUB_ENV
+          "$cuda\bin" >> $env:GITHUB_PATH
+      - name: Import Visual Studio 2022 environment
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Visual Studio 2022 x64 tools are missing' }
+          $before = @{}
+          Get-ChildItem Env: | ForEach-Object { $before[$_.Name] = $_.Value }
+          $vars = cmd /c "`"$vs\VC\Auxiliary\Build\vcvars64.bat`" >nul && set"
+          if ($LASTEXITCODE -ne 0) { throw 'vcvars64 failed' }
+          $vars | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$' -and $Matches[1] -notin 'CUDA_PATH', 'VCPKG_ROOT') {
+              # GitHub prints exported variables in later step headers. Export only toolchain changes.
+              if ($before[$Matches[1]] -cne $Matches[2]) {
+                "$($Matches[1])=$($Matches[2])" >> $env:GITHUB_ENV
+              }
+            }
+          }
+      - id: compiler-cache
+        name: Install pinned object cache
+        run: python .github/scripts/install-compiler-cache.py
+      - name: Install HF bucket client
+        run: python -m pip install --disable-pip-version-check huggingface_hub==1.17.0
+      - name: Restore completed objects from HF
+        id: object-cache
+        timeout-minutes: 30
+        run: |
+          $fallback = @('--fallback-family', 'native-windows-cuda-${{ inputs.cuda }}')
+          if ('${{ inputs.phase }}' -eq 'objects') {
+            $fallback = @('--fallback-family', 'native-windows-cuda-${{ inputs.cuda }}-host-v2') + $fallback
+          }
+          python .github/scripts/hf-build-cache.py restore --directory .cache/objects --family $env:HF_CACHE_FAMILY @fallback
+          if ($LASTEXITCODE -ne 0) { throw 'Object cache restore failed' }
+          if ('${{ inputs.phase }}' -eq 'package') {
+            for ($shard = 0; $shard -lt ${{ inputs.count }}; $shard++) {
+              python .github/scripts/hf-build-cache.py restore --directory .cache/objects --family "native-windows-cuda-${{ inputs.cuda }}-host-v2-shard-$shard" --required
+              if ($LASTEXITCODE -ne 0) { throw "Shard $shard cache restore failed" }
+            }
+          }
+      - name: Verify object-cache reuse and CUDA invalidation
+        timeout-minutes: 10
+        env:
+          ARCHS: ${{ inputs.archs }}
+        run: |
+          python .github/scripts/check-compiler-cache.py
+          if ($LASTEXITCODE -ne 0) { throw 'Object cache probe failed' }
+          if ('${{ inputs.phase }}' -eq 'package') {
+            # Exercise a second invocation with every previous probe variant already cached.
+            python .github/scripts/check-compiler-cache.py
+            if ($LASTEXITCODE -ne 0) { throw 'Repeated object cache probe failed' }
+          }
+      - name: Resolve the pinned vcpkg revision
+        id: vcpkg
+        run: |
+          $baseline = (Get-Content vcpkg.json -Raw | ConvertFrom-Json).'builtin-baseline'
+          "baseline=$baseline" >> $env:GITHUB_OUTPUT
+      - uses: actions/checkout@v7
+        with:
+          repository: microsoft/vcpkg
+          ref: ${{ steps.vcpkg.outputs.baseline }}
+          path: .vcpkg
+      - name: Restore vcpkg packages from HF
+        id: dependency-cache
+        run: >-
+          python .github/scripts/hf-build-cache.py restore
+          --directory ~/AppData/Local/vcpkg/archives
+          --family vcpkg-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json') }}-${{ inputs.cuda }}
+          --legacy-prefix windows-release-vcpkg-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json') }}
+      - name: Configure with real FFmpeg and curl libraries
+        id: configure
+        env:
+          ARCHS: ${{ inputs.archs }}
+        run: |
+          & .\.vcpkg\bootstrap-vcpkg.bat -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg bootstrap failed' }
+          $dependencyFamily = ''
+          if (${{ inputs.shard }} -eq 0) { $dependencyFamily = 'vcpkg-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json') }}-${{ inputs.cuda }}' }
+          python .github/scripts/run-cached-build.py --deadline-env BUILD_DEADLINE `
+            --checkpoint-directory ~/AppData/Local/vcpkg/archives `
+            --checkpoint-family "$dependencyFamily" `
+            --log build-release/configure.log -- cmake -S . -B build-release -G Ninja -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_TOOLCHAIN_FILE=$pwd/.vcpkg/scripts/buildsystems/vcpkg.cmake" `
+            -DVCPKG_TARGET_TRIPLET=x64-windows -DVCPKG_HOST_TRIPLET=x64-windows `
+            "-DCMAKE_CUDA_COMPILER=$env:CUDA_PATH/bin/nvcc.exe" `
+            "-DCMAKE_CUDA_ARCHITECTURES=$env:ARCHS" -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl `
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache `
+            -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache `
+            -DNINFER_NVCC_SPLIT_COMPILE=2 -DNINFER_CUDA_PRUNE_PTX=ON -DNINFER_WINDOWS_KERNEL_DLL=ON -DNINFER_SHARED_RUNTIME=ON `
+            -DBUILD_TESTING=OFF -DNINFER_BUILD_BENCHMARKS=ON
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
+      # Keep completed vcpkg packages even if configuration or NInfer compilation fails.
+      - name: Save completed vcpkg packages to HF
+        if: always() && inputs.shard == 0 && steps.configure.outcome != 'skipped' && steps.dependency-cache.outcome == 'success'
+        timeout-minutes: 3
+        run: >-
+          python .github/scripts/hf-build-cache.py save
+          --directory ~/AppData/Local/vcpkg/archives
+          --family vcpkg-${{ steps.vcpkg.outputs.baseline }}-${{ hashFiles('vcpkg.json') }}-${{ inputs.cuda }}
+      - name: Build release products
+        id: build
+        timeout-minutes: 305
+        run: |
+          $kernelCommands = & ninja -C build-release -t commands ninfer_ggml_quants
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot inspect CUDA kernel compile commands' }
+          $kernelCommands | Set-Content build-release/ggml-commands.log
+          $kernelCommands | Select-Object -First 1
+          if ('${{ inputs.phase }}' -eq 'objects') {
+            $build = @('python', '.github/scripts/build-object-shard.py', '--shard', '${{ inputs.shard }}', '--count', '${{ inputs.count }}', '--jobs', '2')
+          } else {
+            $build = @('cmake', '--build', 'build-release', '-j', '2', '--target', 'ninfer', 'ninfer-serve', 'ninfer_bench', 'ninfer-calibrate', 'ninfer-perplexity', 'ninfer-ngram-profile', '--', '-k', '0')
+          }
+          python .github/scripts/run-cached-build.py --timeout-seconds 18000 --deadline-env BUILD_DEADLINE --log build-release/build.log --cache-stats build-release/cache-progress.jsonl -- @build
+          if ($LASTEXITCODE -ne 0) { throw 'Release compilation failed' }
+      - name: Prepare completed object cache for upload
+        timeout-minutes: 2
+        if: always() && steps.compiler-cache.outcome == 'success'
+        run: python .github/scripts/finish-compiler-cache.py --stats build-release/cache-stats.json
+      - name: Save completed objects even after cancellation
+        if: always() && steps.build.outcome != 'skipped' && steps.object-cache.outcome == 'success'
+        timeout-minutes: ${{ job.status == 'cancelled' && 3 || 20 }}
+        run: python .github/scripts/hf-build-cache.py save --directory .cache/objects --family $env:HF_CACHE_FAMILY
+      - name: Package, verify device images and test startup without Toolkit on PATH
+        if: inputs.phase == 'package'
+        run: |
+          $env:NINFER_BUILD_ROOT = "$pwd/build-release"
+          python .github/scripts/run-cached-build.py --checkpoint-family= --log build-release/package.log -- pwsh -NoProfile -File scripts/package-release.ps1
+      - uses: actions/upload-artifact@v7
+        if: inputs.phase == 'package'
+        with:
+          name: native-windows-cuda-${{ inputs.cuda }}
+          path: |
+            dist/*.7z.*
+            dist/SHA256SUMS-*.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+      - name: Preserve build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-logs-${{ inputs.cuda }}-${{ inputs.phase }}-${{ inputs.shard }}
+          include-hidden-files: true
+          path: |
+            build-cache-check/cache-stats.json
+            build-release/*.log
+            build-release/object-shard.json
+            build-release/cache-stats.json
+            build-release/cache-progress.jsonl
+            build-release/CMakeFiles/CMakeConfigureLog.yaml
+            build-release/vcpkg-manifest-install.log
+            .vcpkg/buildtrees/**/*.log
+            dist/*/BUILD-INFO.json
+          if-no-files-found: ignore
+          retention-days: 7

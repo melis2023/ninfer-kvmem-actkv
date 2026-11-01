@@ -2,7 +2,8 @@
 
 #include "models/qwen3_5/config.h"
 
-#include <ninfer/types.h>
+#include "ninfer/base.h"
+#include "ninfer/engine_options.h"
 
 #include <cstdint>
 #include <map>

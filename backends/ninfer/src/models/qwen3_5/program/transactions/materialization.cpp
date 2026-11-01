@@ -1,5 +1,6 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
+#include "models/qwen3_5/program/planning/prefill_service_work.h"
 #include "models/qwen3_5/program/context.h"
 
 #include <algorithm>
@@ -324,27 +325,34 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
         materialization_identity_.assign(prompt);
         materialization_prefix_digests_.assign(prompt);
 
-        const std::uint32_t initial_mtp_extent =
-            speculative_backend == SpeculativeBackend::Mtp
-                ? std::min({draft_window,
-                            request_plan.summary.effective_output_tokens > 1
-                                ? request_plan.summary.effective_output_tokens - 2
-                                : 0U,
-                            capacity - prompt_tokens > 0 ? capacity - prompt_tokens - 1 : 0U})
-                : 0U;
+        const auto initial_mtp_extent = initial_mtp_prefill_extent(
+            speculative_backend == SpeculativeBackend::Mtp ? draft_window : 0U,
+            request_plan.summary.effective_output_tokens, capacity, prompt_tokens);
+        const std::uint32_t prefill_base =
+            request_plan.reuse == ReusePath::Root ? 0U : request_plan.reuse_base;
+        // Without drafting, the drafter covers the prompt up to its deepest capture only.
+        std::optional<std::uint32_t> drafter_frontier;
+        if (!request_plan.drafting) {
+            std::uint32_t deepest = prefill_base;
+            for (const CaptureGroup& group : request_plan.capture_groups) {
+                deepest = std::max(deepest, group.frontier);
+            }
+            drafter_frontier = deepest;
+        }
         RequestControl::Prefill prefill{
             .prompt             = std::move(prompt),
             .vision_plan        = std::move(request_plan.vision),
             .vision             = nullptr,
             .capture_groups     = std::move(request_plan.capture_groups),
             // A root starts from an empty sequence; a disk-restorable prefix is seeded later.
-            .base                  = request_plan.reuse == ReusePath::Root ? 0U : request_plan.reuse_base,
-            .cursor                = request_plan.reuse == ReusePath::Root ? 0U : request_plan.reuse_base,
+            .base                  = prefill_base,
+            .cursor                = prefill_base,
             .disk_restore_frontier = request_plan.disk_restore_frontier,
             .memory_restore_frontier = request_plan.memory_restore_frontier,
             .memory_restore_generation = request_plan.memory_restore_generation,
             .prompt_tokens      = prompt_tokens,
             .initial_mtp_extent = initial_mtp_extent,
+            .drafter_frontier   = drafter_frontier,
             .elapsed_seconds    = 0.0,
             .prepare_mtp        = request_plan.prepare_mtp,
             .reuse              = request_plan.reuse,
@@ -625,9 +633,6 @@ void ProgramImpl::prepare_consumed_source(MaterializationTransaction& transactio
         source.mtp_kv_valid = backend_frontier_at(speculative_backend, details.reuse_base);
     } else if (is_masked_draft_backend(speculative_backend)) {
         source.dflash_context_frontier = details.reuse_base;
-        // The truncated source keeps its ring, not the decode capture that preceded the reuse.
-        source.dflash_pending_base  = details.reuse_base;
-        source.dflash_pending_valid = false;
     }
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
     refresh_state_views(source);

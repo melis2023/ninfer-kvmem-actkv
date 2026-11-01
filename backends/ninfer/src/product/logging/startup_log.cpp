@@ -1,5 +1,6 @@
 #include "product/logging/startup_log.h"
 
+#include "ninfer/observability/snapshot.h"
 #include "product/logging/logging.h"
 #include "product/logging/pretty_format.h"
 

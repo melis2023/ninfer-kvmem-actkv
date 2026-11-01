@@ -10,7 +10,7 @@
 // This is the state machine only: platform code delivers events with the current time, calls
 // expire() when the pending deadline passes, and supplies the console and process actions.
 
-#include "ninfer/types.h"
+#include "ninfer/engine_options.h"
 #include "serve/operational_log.h"
 
 #include <chrono>

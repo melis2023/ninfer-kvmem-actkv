@@ -1,13 +1,6 @@
 #include "kvmem/raw_kv_store.hpp"
 #include "kvmem/snapshot.hpp"
 #include "kvmem/snapshot_buffer.hpp"
-#if defined(_WIN32)
-// The POSIX implementation cannot be built on Windows; see the header.
-#include "kvmem/nvme_kv_tier_win.hpp"
-#else
-#include "kvmem/nvme_kv_tier.hpp"
-#endif
-
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -15,17 +8,6 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <utility>
-
-namespace {
-// steady_clock is the portable spelling of CLOCK_MONOTONIC: it never steps
-// backwards and ignores wall-clock adjustments. libstdc++ implements it as
-// clock_gettime(CLOCK_MONOTONIC) on Linux, so behaviour there is unchanged;
-// MSVC has neither clock_gettime nor CLOCK_MONOTONIC.
-uint64_t monotonic_ns() {
-    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count());
-}
-} // namespace
 
 namespace kvmem {
 namespace {
@@ -108,60 +90,9 @@ void unpack_f16(const uint16_t * src, float * dst, size_t n) {
 } // namespace
 
 RawKvStore::RawKvStore(RawKvStoreConfig cfg) : cfg_(std::move(cfg)),
-    payload_storage_(cfg_.payload_storage ? cfg_.payload_storage : std::make_shared<HostKvStorage>()) {
-    if (cfg_.nvme_bytes && payload_storage_->disk_capacity_bytes())
-        throw std::invalid_argument("raw KV cannot use legacy and shared SSD stores together");
-#if !KVMEM_ENABLE_NVME
-    if (cfg_.nvme_bytes) throw std::runtime_error("NVMe offload is disabled in this build");
-#endif
-    if (cfg_.nvme_bytes > 0 && !cfg_.nvme_dir.empty() && cfg_.block_tokens > 0) {
-        NvmeKvTierConfig ncfg;
-        ncfg.dir = cfg_.nvme_dir;
-        ncfg.file_name = cfg_.nvme_file.empty() ? "kvmem_raw_k.bin" : cfg_.nvme_file;
-        ncfg.total_bytes = cfg_.nvme_bytes;
-        ncfg.slot_bytes = std::max(k_slot_bytes(), v_slot_bytes());
-        if (cfg_.v_gpu_row_bytes) {
-            ncfg.slot_bytes = std::max(ncfg.slot_bytes, v_gpu_slot_bytes());
-        }
-        ncfg.drop_page_cache = true;
-        if (ncfg.slot_bytes == 0) {
-            return;
-        }
-        nvme_ = std::make_unique<NvmeKvTier>(ncfg);
-        if (nvme_->enabled()) {
-            std::fprintf(stderr,
-                         "KVMEM_RAW_NVME dir=%s file=%s bytes=%llu slots=%u slot_bytes=%llu\n",
-                         cfg_.nvme_dir.c_str(), ncfg.file_name.c_str(),
-                         (unsigned long long) cfg_.nvme_bytes,
-                         nvme_->slot_count(),
-                         (unsigned long long) ncfg.slot_bytes);
-            if (!io_sync_inline()) {
-                io_thread_ = std::thread([this] { io_loop(); });
-            }
-        }
-    }
-}
+    payload_storage_(cfg_.payload_storage ? cfg_.payload_storage : std::make_shared<HostKvStorage>()) {}
 
-RawKvStore::~RawKvStore() {
-    stop_io_.store(true, std::memory_order_release);
-    cv_.notify_all();
-    if (io_thread_.joinable()) {
-        io_thread_.join();
-    }
-}
-
-bool RawKvStore::io_sync_inline() const {
-    const char * e = std::getenv("KVMEM_HARVEST_SYNC");
-    return e && e[0] != '\0' && e[0] != '0';
-}
-
-bool RawKvStore::nvme_enabled() const {
-    return nvme_ && nvme_->enabled();
-}
-
-uint32_t RawKvStore::nvme_key(uint32_t block_id, uint32_t il, bool is_v) const {
-    return block_id * (cfg_.n_layer * 2u + 2u) + il * 2u + (is_v ? 1u : 0u);
-}
+RawKvStore::~RawKvStore() = default;
 
 uint64_t RawKvStore::k_row_bytes() const {
     return cfg_.k_row_bytes ? cfg_.k_row_bytes
@@ -170,18 +101,6 @@ uint64_t RawKvStore::k_row_bytes() const {
 
 bool RawKvStore::k_is_f16() const {
     return k_row_bytes() == static_cast<uint64_t>(cfg_.n_embd_k) * sizeof(uint16_t);
-}
-
-uint64_t RawKvStore::k_slot_bytes() const {
-    return static_cast<uint64_t>(cfg_.block_tokens) * k_row_bytes();
-}
-
-uint64_t RawKvStore::v_slot_bytes() const {
-    return static_cast<uint64_t>(cfg_.block_tokens) * cfg_.n_embd_v * sizeof(uint16_t);
-}
-
-uint64_t RawKvStore::v_gpu_slot_bytes() const {
-    return static_cast<uint64_t>(cfg_.block_tokens) * cfg_.v_gpu_row_bytes;
 }
 
 void RawKvStore::reserve_packed(uint32_t block_id, const std::vector<uint32_t> & layers) {
@@ -246,176 +165,6 @@ void RawKvStore::add_mean_f32(LayerBlk & lb, uint32_t off, uint32_t take,
     lb.mean_tokens = nt;
 }
 
-void RawKvStore::enqueue_flush(uint32_t key, const void * data,
-                               uint64_t bytes, uint32_t block_id, uint32_t il,
-                               bool is_v) {
-    if (io_error_) std::rethrow_exception(io_error_);
-    IoJob job;
-    job.slot = nvme_->place_block(key).slot;
-    if (job.slot < 0) throw std::runtime_error("NVMe KV tier is full");
-    job.block_id = block_id;
-    job.il = il;
-    job.is_v = is_v;
-    job.bytes = bytes;
-    job.data = static_cast<const uint8_t *>(data);
-    q_.push_back(job);
-    cv_.notify_one();
-}
-
-void RawKvStore::maybe_flush_k(uint32_t block_id, uint32_t il) {
-    if (!nvme_enabled() || block_id >= blocks_.size() || il >= cfg_.n_layer) {
-        return;
-    }
-    LayerBlk & lb = blocks_[block_id].layers[il];
-    if (lb.k_on_nvme || lb.k_flushing || lb.k.empty() ||
-        lb.n_tokens < cfg_.block_tokens) {
-        return;
-    }
-    const uint64_t nbytes = k_slot_bytes();
-    if (lb.k.size() < nbytes) {
-        return;
-    }
-    if (k_is_f16() && lb.k_sum.size() != cfg_.n_embd_k) {
-        capture_mean_f16(lb);
-    }
-    if (io_sync_inline() || !io_thread_.joinable()) {
-        const uint64_t t0 = monotonic_ns();
-        nvme_->write_block(nvme_key(block_id, il, false), lb.k.data(), nbytes);
-        nvme_wait_ns_ += monotonic_ns() - t0;
-        nvme_syscalls_ += 1;
-        nvme_k_bytes_ += nbytes;
-        lb.k.clear();
-        lb.k.shrink_to_fit();
-        lb.k_on_nvme = true;
-        return;
-    }
-    enqueue_flush(nvme_key(block_id, il, false), lb.k.data(), nbytes,
-                  block_id, il, false);
-    lb.k_flushing = true;
-}
-
-void RawKvStore::maybe_flush_v(uint32_t block_id, uint32_t il) {
-    if (!nvme_enabled() || block_id >= blocks_.size() || il >= cfg_.n_layer) {
-        return;
-    }
-    LayerBlk & lb = blocks_[block_id].layers[il];
-    if (lb.v_on_nvme || lb.v_flushing || lb.n_tokens < cfg_.block_tokens) {
-        return;
-    }
-    const bool gpu = lb.v_gpu_fmt && !lb.v_gpu.empty();
-    const uint64_t nbytes = gpu ? v_gpu_slot_bytes() : v_slot_bytes();
-    if (gpu) {
-        if (lb.v_gpu.size() < nbytes) {
-            return;
-        }
-    } else if (lb.v.empty() || lb.v.size() * sizeof(uint16_t) < nbytes) {
-        return;
-    }
-    const void * src = gpu ? static_cast<const void *>(lb.v_gpu.data())
-                           : static_cast<const void *>(lb.v.data());
-    if (io_sync_inline() || !io_thread_.joinable()) {
-        const uint64_t t0 = monotonic_ns();
-        nvme_->write_block(nvme_key(block_id, il, true), src, nbytes);
-        nvme_wait_ns_ += monotonic_ns() - t0;
-        nvme_syscalls_ += 1;
-        nvme_v_bytes_ += nbytes;
-        lb.v.clear();
-        lb.v.shrink_to_fit();
-        lb.v_gpu.reset();
-        lb.v_on_nvme = true;
-        return;
-    }
-    enqueue_flush(nvme_key(block_id, il, true), src, nbytes, block_id, il, true);
-    lb.v_flushing = true;
-}
-
-void RawKvStore::io_loop() {
-    while (true) {
-        std::vector<IoJob> batch;
-        std::exception_ptr failure;
-        {
-            std::unique_lock<std::mutex> lk(mu_);
-            cv_.wait(lk, [&] {
-                return stop_io_.load(std::memory_order_acquire) || !q_.empty();
-            });
-            if (q_.empty() && stop_io_.load(std::memory_order_acquire)) {
-                break;
-            }
-            batch.swap(q_);
-            inflight_ = batch.size();
-            failure = io_error_;
-        }
-        if (batch.empty()) {
-            continue;
-        }
-        NvmeBatchIoStats st;
-        const uint64_t t0 = monotonic_ns();
-        try {
-            if (failure) std::rethrow_exception(failure);
-            std::sort(batch.begin(), batch.end(), [](const IoJob & a, const IoJob & b) {
-                return a.slot < b.slot;
-            });
-            uint64_t slab_bytes = 0;
-            for (const auto & job : batch) {
-                if (job.bytes > SIZE_MAX - slab_bytes) throw std::length_error("NVMe batch is too large");
-                slab_bytes += job.bytes;
-            }
-            std::vector<uint8_t> slab(static_cast<size_t>(slab_bytes));
-            std::vector<NvmeIoSpan> spans;
-            spans.reserve(batch.size());
-            uint64_t off = 0;
-            for (const auto & job : batch) {
-                std::memcpy(slab.data() + off, job.data, static_cast<size_t>(job.bytes));
-                spans.push_back({job.slot, off, job.bytes});
-                off += job.bytes;
-            }
-            nvme_->write_spans(spans, slab.data(), slab.size(), &st);
-        } catch (...) {
-            failure = std::current_exception();
-        }
-        const uint64_t dt = monotonic_ns() - t0;
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            if (failure) io_error_ = failure;
-            nvme_wait_ns_ += st.duration_ns ? st.duration_ns : dt;
-            nvme_syscalls_ += st.syscalls ? st.syscalls : (failure ? 0 : batch.size());
-            for (auto & job : batch) {
-                if (job.block_id >= blocks_.size() || job.il >= cfg_.n_layer) {
-                    continue;
-                }
-                LayerBlk & lb = blocks_[job.block_id].layers[job.il];
-                if (job.is_v) {
-                    lb.v_flushing = false;
-                    if (!failure) {
-                        std::vector<uint16_t>().swap(lb.v);
-                        lb.v_gpu.reset();
-                        lb.v_on_nvme = true;
-                        nvme_v_bytes_ += job.bytes;
-                    }
-                } else {
-                    lb.k_flushing = false;
-                    if (!failure) {
-                        std::vector<uint8_t>().swap(lb.k);
-                        lb.k_on_nvme = true;
-                        nvme_k_bytes_ += job.bytes;
-                    }
-                }
-            }
-            inflight_ = 0;
-            cv_.notify_all();
-        }
-    }
-}
-
-void RawKvStore::wait_writes() {
-    if (!io_thread_.joinable()) {
-        return;
-    }
-    std::unique_lock<std::mutex> lk(mu_);
-    cv_.wait(lk, [&] { return q_.empty() && inflight_ == 0; });
-    if (io_error_) std::rethrow_exception(io_error_);
-}
-
 void RawKvStore::write_layer_tokens(uint32_t pos0, uint32_t n, uint32_t il,
                                     const float * k, const float * v) {
     std::unique_lock<std::mutex> lk(mu_);
@@ -430,24 +179,14 @@ void RawKvStore::write_layer_tokens(uint32_t pos0, uint32_t n, uint32_t il,
         const uint32_t off = pos % bt;
         const uint32_t take = std::min(n - done, bt - off);
         ensure_blocks(bid + 1);
-        if (k) {
-            cv_.wait(lk, [&] { return !blocks_[bid].layers[il].k_flushing; });
-        }
-        if (v) {
-            cv_.wait(lk, [&] { return !blocks_[bid].layers[il].v_flushing; });
-        }
+
         LayerBlk & lb = blocks_[bid].layers[il];
         if (k && k_is_f16()) {
             const uint64_t row = k_row_bytes();
             const size_t need = static_cast<size_t>(bt) * static_cast<size_t>(row);
             if (lb.k.size() < need) {
-                if (lb.k_on_nvme) {
-                    lb.k.assign(need, 0);
-                    load_k_nvme(bid, il, lb.k.data());
-                    lb.k_on_nvme = false;
-                } else {
-                    lb.k.assign(need, 0);
-                }
+                lb.k.assign(need, 0);
+
             }
             pack_f32(k + done * cfg_.n_embd_k,
                      reinterpret_cast<uint16_t *>(
@@ -457,18 +196,11 @@ void RawKvStore::write_layer_tokens(uint32_t pos0, uint32_t n, uint32_t il,
         }
         if (v) {
             lb.v_gpu.reset();
-            if (lb.v_on_nvme && lb.v_gpu_fmt) {
-                lb.v_on_nvme = false;
-            }
+
             const size_t need = static_cast<size_t>(bt) * cfg_.n_embd_v;
             if (lb.v.size() < need) {
-                if (lb.v_on_nvme) {
-                    lb.v.assign(need, 0);
-                    load_v_nvme(bid, il, lb.v.data());
-                    lb.v_on_nvme = false;
-                } else {
-                    lb.v.assign(need, 0);
-                }
+                lb.v.assign(need, 0);
+
             }
             pack_f32(v + done * cfg_.n_embd_v,
                      lb.v.data() + off * cfg_.n_embd_v,
@@ -476,8 +208,7 @@ void RawKvStore::write_layer_tokens(uint32_t pos0, uint32_t n, uint32_t il,
             lb.v_gpu_fmt = false;
         }
         lb.n_tokens = std::max(lb.n_tokens, off + take);
-        maybe_flush_k(bid, il);
-        maybe_flush_v(bid, il);
+
         done += take;
     }
 }
@@ -496,24 +227,14 @@ void RawKvStore::write_layer_tokens_f16(uint32_t pos0, uint32_t n, uint32_t il,
         const uint32_t off = pos % bt;
         const uint32_t take = std::min(n - done, bt - off);
         ensure_blocks(bid + 1);
-        if (k) {
-            cv_.wait(lk, [&] { return !blocks_[bid].layers[il].k_flushing; });
-        }
-        if (v) {
-            cv_.wait(lk, [&] { return !blocks_[bid].layers[il].v_flushing; });
-        }
+
         LayerBlk & lb = blocks_[bid].layers[il];
         if (k && k_is_f16()) {
             const uint64_t row = k_row_bytes();
             const size_t need = static_cast<size_t>(bt) * static_cast<size_t>(row);
             if (lb.k.size() < need) {
-                if (lb.k_on_nvme) {
-                    lb.k.assign(need, 0);
-                    load_k_nvme(bid, il, lb.k.data());
-                    lb.k_on_nvme = false;
-                } else {
-                    lb.k.assign(need, 0);
-                }
+                lb.k.assign(need, 0);
+
             }
             std::memcpy(lb.k.data() + static_cast<size_t>(off) * static_cast<size_t>(row),
                         k + done * cfg_.n_embd_k,
@@ -521,18 +242,11 @@ void RawKvStore::write_layer_tokens_f16(uint32_t pos0, uint32_t n, uint32_t il,
         }
         if (v) {
             lb.v_gpu.reset();
-            if (lb.v_on_nvme && lb.v_gpu_fmt) {
-                lb.v_on_nvme = false;
-            }
+
             const size_t need = static_cast<size_t>(bt) * cfg_.n_embd_v;
             if (lb.v.size() < need) {
-                if (lb.v_on_nvme) {
-                    lb.v.assign(need, 0);
-                    load_v_nvme(bid, il, lb.v.data());
-                    lb.v_on_nvme = false;
-                } else {
-                    lb.v.assign(need, 0);
-                }
+                lb.v.assign(need, 0);
+
             }
             std::memcpy(lb.v.data() + off * cfg_.n_embd_v,
                         v + done * cfg_.n_embd_v,
@@ -543,8 +257,7 @@ void RawKvStore::write_layer_tokens_f16(uint32_t pos0, uint32_t n, uint32_t il,
         if (k && k_is_f16()) {
             capture_mean_f16(lb);
         }
-        maybe_flush_k(bid, il);
-        maybe_flush_v(bid, il);
+
         done += take;
     }
 }
@@ -565,17 +278,12 @@ void RawKvStore::write_layer_k_rows(uint32_t pos0, uint32_t n, uint32_t il,
         const uint32_t off = pos % bt;
         const uint32_t take = std::min(n - done, bt - off);
         ensure_blocks(bid + 1);
-        cv_.wait(lk, [&] { return !blocks_[bid].layers[il].k_flushing; });
+
         LayerBlk & lb = blocks_[bid].layers[il];
         const size_t need = static_cast<size_t>(bt) * static_cast<size_t>(row);
         if (lb.k.size() < need) {
-            if (lb.k_on_nvme) {
-                lb.k.assign(need, 0);
-                load_k_nvme(bid, il, lb.k.data());
-                lb.k_on_nvme = false;
-            } else {
-                lb.k.assign(need, 0);
-            }
+            lb.k.assign(need, 0);
+
         }
         std::memcpy(lb.k.data() + static_cast<size_t>(off) * static_cast<size_t>(row),
                     k + static_cast<size_t>(done) * static_cast<size_t>(row),
@@ -584,7 +292,7 @@ void RawKvStore::write_layer_k_rows(uint32_t pos0, uint32_t n, uint32_t il,
             add_mean_f32(lb, off, take, k_f32 + done * cfg_.n_embd_k);
         }
         lb.n_tokens = std::max(lb.n_tokens, off + take);
-        maybe_flush_k(bid, il);
+
         done += take;
     }
 }
@@ -605,30 +313,21 @@ void RawKvStore::write_layer_v_gpu(uint32_t pos0, uint32_t n, uint32_t il,
         const uint32_t off = pos % bt;
         const uint32_t take = std::min(n - done, bt - off);
         ensure_blocks(bid + 1);
-        cv_.wait(lk, [&] { return !blocks_[bid].layers[il].v_flushing; });
+
         LayerBlk & lb = blocks_[bid].layers[il];
         lb.v.clear();
         const size_t need = static_cast<size_t>(bt) * static_cast<size_t>(row);
         const size_t nbytes = static_cast<size_t>(take) * static_cast<size_t>(row);
         const uint8_t * src = v + static_cast<size_t>(done) * static_cast<size_t>(row);
-        if (off == 0 && take == bt && !(lb.v_on_nvme && lb.v_gpu_fmt)) {
-            if (lb.v_on_nvme) {
-                lb.v_on_nvme = false;
-            }
+        if (off == 0 && take == bt) {
+
             if (lb.v_gpu.size() != need) lb.v_gpu = payload_storage_->allocate(need, src);
             else lb.v_gpu.write(0, src, need);
         } else {
             if (lb.v_gpu.size() < need) {
-                if (lb.v_on_nvme && lb.v_gpu_fmt) {
-                    lb.v_gpu = payload_storage_->allocate(need);
-                    load_v_gpu_nvme(bid, il, lb.v_gpu.writable_data());
-                    lb.v_on_nvme = false;
-                } else {
-                    if (lb.v_on_nvme) {
-                        lb.v_on_nvme = false;
-                    }
-                    lb.v_gpu = payload_storage_->allocate(need);
-                }
+
+                lb.v_gpu = payload_storage_->allocate(need);
+
             }
             std::memcpy(lb.v_gpu.writable_data() + static_cast<size_t>(off) * row, src, nbytes);
         }
@@ -636,7 +335,7 @@ void RawKvStore::write_layer_v_gpu(uint32_t pos0, uint32_t n, uint32_t il,
         lb.v_gpu_tokens = std::max(lb.v_gpu_tokens, off + take);
         lb.n_tokens = std::max(lb.n_tokens, off + take);
         if (lb.v_gpu_tokens == bt) lb.v_gpu.seal();
-        maybe_flush_v(bid, il);
+
         done += take;
     }
 }
@@ -733,7 +432,7 @@ bool RawKvStore::has_block(uint32_t block_id) const {
     }
     for (const auto & lb : blocks_[block_id].layers) {
         if (lb.n_tokens > 0 &&
-            (!lb.k.empty() || lb.k_on_nvme || lb.k_flushing || lb.k_gpu_fmt ||
+            (!lb.k.empty() || lb.k_gpu_fmt ||
              (lb.mean_tokens > 0 && !lb.k_sum.empty()))) {
             return true;
         }
@@ -747,7 +446,7 @@ bool RawKvStore::has_k(uint32_t block_id, uint32_t il) const {
         return false;
     }
     const LayerBlk & lb = blocks_[block_id].layers[il];
-    return !lb.k.empty() || lb.k_on_nvme || lb.k_flushing;
+    return !lb.k.empty();
 }
 
 bool RawKvStore::has_k_gpu(uint32_t block_id, uint32_t il, uint32_t n) const {
@@ -765,7 +464,7 @@ bool RawKvStore::has_v(uint32_t block_id, uint32_t il) const {
         return false;
     }
     const LayerBlk & lb = blocks_[block_id].layers[il];
-    return !lb.v.empty() || !lb.v_gpu.empty() || lb.v_on_nvme || lb.v_flushing;
+    return !lb.v.empty() || !lb.v_gpu.empty();
 }
 
 bool RawKvStore::has_v_gpu(uint32_t block_id, uint32_t il, uint32_t n) const {
@@ -789,137 +488,35 @@ uint32_t RawKvStore::n_tokens(uint32_t block_id) const {
     return n;
 }
 
-bool RawKvStore::load_k_nvme(uint32_t block_id, uint32_t il, uint8_t * dst) const {
-    if (!nvme_enabled() || !dst) {
-        return false;
-    }
-    try {
-        nvme_->read_block(nvme_key(block_id, il, false), dst, k_slot_bytes());
-        return true;
-    } catch (const std::exception &) {
-        return false;
-    }
-}
-
-bool RawKvStore::load_v_nvme(uint32_t block_id, uint32_t il, uint16_t * dst) const {
-    if (!nvme_enabled() || !dst) {
-        return false;
-    }
-    try {
-        nvme_->read_block(nvme_key(block_id, il, true), dst, v_slot_bytes());
-        return true;
-    } catch (const std::exception &) {
-        return false;
-    }
-}
-
-bool RawKvStore::load_v_gpu_nvme(uint32_t block_id, uint32_t il, uint8_t * dst) const {
-    if (!nvme_enabled() || !dst || cfg_.v_gpu_row_bytes == 0) {
-        return false;
-    }
-    try {
-        nvme_->read_block(nvme_key(block_id, il, true), dst, v_gpu_slot_bytes());
-        return true;
-    } catch (const std::exception &) {
-        return false;
-    }
-}
-
 bool RawKvStore::copy_k(uint32_t block_id, uint32_t il, float * out) const {
-    if (!out || !k_is_f16()) {
-        return false;
-    }
-    std::unique_lock<std::mutex> lk(mu_);
-    if (block_id >= blocks_.size() || il >= cfg_.n_layer) {
-        return false;
-    }
-    cv_.wait(lk, [&] {
-        const LayerBlk & x = blocks_[block_id].layers[il];
-        return !x.k_flushing;
-    });
-    const LayerBlk & lb = blocks_[block_id].layers[il];
-    if (lb.k.empty() && !lb.k_on_nvme) {
-        return false;
-    }
-    const uint32_t nt = lb.n_tokens;
-    const uint8_t * raw = nullptr;
-    if (!lb.k.empty()) {
-        raw = lb.k.data();
-    } else {
-        io8_.assign(static_cast<size_t>(k_slot_bytes()), 0);
-        if (!load_k_nvme(block_id, il, io8_.data())) {
-            return false;
-        }
-        raw = io8_.data();
-    }
-    unpack_f16(reinterpret_cast<const uint16_t *>(raw), out,
-               static_cast<size_t>(nt) * cfg_.n_embd_k);
+    if (!out || !k_is_f16()) return false;
+    std::lock_guard<std::mutex> lk(mu_);
+    if (block_id >= blocks_.size() || il >= cfg_.n_layer) return false;
+    const auto & lb = blocks_[block_id].layers[il];
+    if (lb.k.empty()) return false;
+    unpack_f16(reinterpret_cast<const uint16_t *>(lb.k.data()), out,
+               static_cast<size_t>(lb.n_tokens) * cfg_.n_embd_k);
     return true;
 }
 
 bool RawKvStore::copy_v(uint32_t block_id, uint32_t il, float * out) const {
-    if (!out) {
-        return false;
-    }
-    std::unique_lock<std::mutex> lk(mu_);
-    if (block_id >= blocks_.size() || il >= cfg_.n_layer) {
-        return false;
-    }
-    cv_.wait(lk, [&] {
-        const LayerBlk & x = blocks_[block_id].layers[il];
-        return !x.v_flushing;
-    });
-    const LayerBlk & lb = blocks_[block_id].layers[il];
-    if (lb.v_gpu_fmt && lb.v.empty()) {
-        return false;
-    }
-    if (lb.v.empty() && !lb.v_on_nvme) {
-        return false;
-    }
-    const uint32_t nt = lb.n_tokens;
-    const uint16_t * src = nullptr;
-    if (!lb.v.empty()) {
-        src = lb.v.data();
-    } else {
-        io_.assign(static_cast<size_t>(cfg_.block_tokens) * cfg_.n_embd_v, 0);
-        if (!load_v_nvme(block_id, il, io_.data())) {
-            return false;
-        }
-        src = io_.data();
-    }
-    unpack_f16(src, out, static_cast<size_t>(nt) * cfg_.n_embd_v);
+    if (!out) return false;
+    std::lock_guard<std::mutex> lk(mu_);
+    if (block_id >= blocks_.size() || il >= cfg_.n_layer) return false;
+    const auto & lb = blocks_[block_id].layers[il];
+    if (lb.v.empty()) return false;
+    unpack_f16(lb.v.data(), out, static_cast<size_t>(lb.n_tokens) * cfg_.n_embd_v);
     return true;
 }
 
 bool RawKvStore::copy_k_rows(uint32_t block_id, uint32_t il, uint8_t * out,
                              uint32_t n) const {
-    if (!out || n == 0 || k_row_bytes() == 0) {
-        return false;
-    }
-    std::unique_lock<std::mutex> lk(mu_);
-    if (block_id >= blocks_.size() || il >= cfg_.n_layer) {
-        return false;
-    }
-    cv_.wait(lk, [&] {
-        const LayerBlk & x = blocks_[block_id].layers[il];
-        return !x.k_flushing;
-    });
-    const LayerBlk & lb = blocks_[block_id].layers[il];
-    const uint64_t row = k_row_bytes();
-    const uint32_t nt = std::min(n, lb.n_tokens);
-    const uint8_t * src = nullptr;
-    if (!lb.k.empty()) {
-        src = lb.k.data();
-    } else if (lb.k_on_nvme) {
-        io8_.assign(static_cast<size_t>(k_slot_bytes()), 0);
-        if (!load_k_nvme(block_id, il, io8_.data())) {
-            return false;
-        }
-        src = io8_.data();
-    } else {
-        return false;
-    }
-    std::memcpy(out, src, static_cast<size_t>(nt) * static_cast<size_t>(row));
+    if (!out || n == 0 || k_row_bytes() == 0) return false;
+    std::lock_guard<std::mutex> lk(mu_);
+    if (block_id >= blocks_.size() || il >= cfg_.n_layer) return false;
+    const auto & lb = blocks_[block_id].layers[il];
+    if (lb.k.empty()) return false;
+    std::memcpy(out, lb.k.data(), static_cast<size_t>(std::min(n, lb.n_tokens)) * k_row_bytes());
     return true;
 }
 
@@ -947,112 +544,39 @@ bool RawKvStore::copy_k_gpu(uint32_t block_id, uint32_t il, uint8_t * out,
 
 bool RawKvStore::copy_v_gpu(uint32_t block_id, uint32_t il, uint8_t * out,
                             uint32_t n) const {
-    if (!out || n == 0 || cfg_.v_gpu_row_bytes == 0) {
-        return false;
-    }
-    std::unique_lock<std::mutex> lk(mu_);
-    if (block_id >= blocks_.size() || il >= cfg_.n_layer) {
-        return false;
-    }
-    cv_.wait(lk, [&] {
-        const LayerBlk & x = blocks_[block_id].layers[il];
-        return !x.v_flushing;
-    });
-    const LayerBlk & lb = blocks_[block_id].layers[il];
-    if (!lb.v_gpu_fmt || lb.v_gpu_tokens < n) {
-        return false;
-    }
-    const uint64_t row = cfg_.v_gpu_row_bytes;
-    const uint32_t nt = n;
-    const uint8_t * src = nullptr;
-    if (!lb.v_gpu.empty()) {
-        lb.v_gpu.read(0, out, static_cast<size_t>(nt) * static_cast<size_t>(row));
-        return true;
-    } else if (lb.v_on_nvme) {
-        io8_.assign(static_cast<size_t>(v_gpu_slot_bytes()), 0);
-        if (!load_v_gpu_nvme(block_id, il, io8_.data())) {
-            return false;
-        }
-        src = io8_.data();
-    } else {
-        return false;
-    }
-    std::memcpy(out, src, static_cast<size_t>(nt) * static_cast<size_t>(row));
+    if (!out || n == 0 || cfg_.v_gpu_row_bytes == 0) return false;
+    std::lock_guard<std::mutex> lk(mu_);
+    if (block_id >= blocks_.size() || il >= cfg_.n_layer) return false;
+    const auto & lb = blocks_[block_id].layers[il];
+    if (!lb.v_gpu_fmt || lb.v_gpu_tokens < n || lb.v_gpu.empty()) return false;
+    lb.v_gpu.read(0, out, static_cast<size_t>(n) * cfg_.v_gpu_row_bytes);
     return true;
 }
 
 void RawKvStore::mean_k(uint32_t block_id, uint32_t il, float * out) const {
-    if (!out) {
-        return;
-    }
-    std::unique_lock<std::mutex> lk(mu_);
-    if (block_id >= blocks_.size() || il >= cfg_.n_layer) {
-        std::fill_n(out, cfg_.n_embd_k, 0.0f);
-        return;
-    }
-    const auto normalize = [&](const LayerBlk & lb) {
-        if (lb.mean_tokens == 0 || lb.k_sum.size() != cfg_.n_embd_k) {
-            return false;
-        }
-        // Keep the same FP32 reciprocal and multiplication as the write path
-        // used for its cached mean. Never normalize the accumulator in place.
-        const float inv = 1.0f / static_cast<float>(lb.mean_tokens);
-        for (uint32_t d = 0; d < cfg_.n_embd_k; ++d) {
-            out[d] = lb.k_sum[d] * inv;
-        }
-        return true;
-    };
-    if (normalize(blocks_[block_id].layers[il])) {
-        return;
-    }
+    if (!out) return;
+    std::lock_guard<std::mutex> lk(mu_);
     std::fill_n(out, cfg_.n_embd_k, 0.0f);
-    if (!k_is_f16()) {
+    if (block_id >= blocks_.size() || il >= cfg_.n_layer) return;
+    const auto & lb = blocks_[block_id].layers[il];
+    if (lb.mean_tokens && lb.k_sum.size() == cfg_.n_embd_k) {
+        const float inv = 1.0f / static_cast<float>(lb.mean_tokens);
+        for (uint32_t d = 0; d < cfg_.n_embd_k; ++d) out[d] = lb.k_sum[d] * inv;
         return;
     }
-    cv_.wait(lk, [&] {
-        return block_id >= blocks_.size() || !blocks_[block_id].layers[il].k_flushing;
-    });
-    if (block_id >= blocks_.size()) {
-        return;
+    if (!k_is_f16() || lb.k.empty() || lb.n_tokens == 0 || cfg_.n_embd_k == 0) return;
+    const auto row = k_row_bytes();
+    for (uint32_t t = 0; t < lb.n_tokens; ++t) {
+        const auto * src = reinterpret_cast<const uint16_t *>(lb.k.data() + static_cast<size_t>(t) * row);
+        for (uint32_t d = 0; d < cfg_.n_embd_k; ++d) out[d] += f16_to_f32(src[d]);
     }
-    const LayerBlk & lb = blocks_[block_id].layers[il];
-    if (normalize(lb)) {
-        return;
-    }
-    const uint32_t nt = lb.n_tokens;
-    if (nt == 0 || cfg_.n_embd_k == 0) {
-        return;
-    }
-    const uint8_t * raw = nullptr;
-    if (!lb.k.empty()) {
-        raw = lb.k.data();
-    } else if (lb.k_on_nvme) {
-        io8_.assign(static_cast<size_t>(k_slot_bytes()), 0);
-        if (!load_k_nvme(block_id, il, io8_.data())) {
-            return;
-        }
-        raw = io8_.data();
-    } else {
-        return;
-    }
-    const uint64_t row = k_row_bytes();
-    std::fill(out, out + cfg_.n_embd_k, 0.0f);
-    for (uint32_t t = 0; t < nt; ++t) {
-        const auto * src = reinterpret_cast<const uint16_t *>(
-                raw + static_cast<size_t>(t) * static_cast<size_t>(row));
-        for (uint32_t d = 0; d < cfg_.n_embd_k; ++d) {
-            out[d] += f16_to_f32(src[d]);
-        }
-    }
-    const float inv = 1.0f / static_cast<float>(nt);
-    for (uint32_t d = 0; d < cfg_.n_embd_k; ++d) {
-        out[d] *= inv;
-    }
+    const float inv = 1.0f / static_cast<float>(lb.n_tokens);
+    for (uint32_t d = 0; d < cfg_.n_embd_k; ++d) out[d] *= inv;
 }
 
 size_t RawKvStore::bytes_k() const {
     std::lock_guard<std::mutex> lk(mu_);
-    size_t n = nvme_k_bytes_;
+    size_t n = 0;
     for (const auto & b : blocks_) {
         for (const auto & lb : b.layers) {
             n += lb.k.size();
@@ -1063,24 +587,9 @@ size_t RawKvStore::bytes_k() const {
     return n;
 }
 
-uint64_t RawKvStore::nvme_bytes_written() const {
-    std::lock_guard<std::mutex> lk(mu_);
-    return nvme_k_bytes_ + nvme_v_bytes_;
-}
-
-uint64_t RawKvStore::nvme_syscalls() const {
-    std::lock_guard<std::mutex> lk(mu_);
-    return nvme_syscalls_;
-}
-
-uint64_t RawKvStore::nvme_wait_ns() const {
-    std::lock_guard<std::mutex> lk(mu_);
-    return nvme_wait_ns_;
-}
-
 size_t RawKvStore::bytes_v() const {
     std::lock_guard<std::mutex> lk(mu_);
-    size_t n = nvme_v_bytes_;
+    size_t n = 0;
     for (const auto & b : blocks_) {
         for (const auto & lb : b.layers) {
             n += lb.v.size() * sizeof(uint16_t);
@@ -1091,7 +600,6 @@ size_t RawKvStore::bytes_v() const {
 }
 
 void RawKvStore::truncate_to(uint32_t token_pos) {
-    wait_writes();
     std::lock_guard<std::mutex> lk(mu_);
     if (token_pos == 0 || cfg_.block_tokens == 0) {
         blocks_.clear();
@@ -1112,11 +620,7 @@ void RawKvStore::truncate_to(uint32_t token_pos) {
                 lb.k_sum.clear();
                 lb.mean_tokens = 0;
                 if (k_is_f16()) {
-                    if (lb.k.empty() && lb.k_on_nvme) {
-                        lb.k.resize(k_slot_bytes());
-                        if (!load_k_nvme(keep - 1, il, lb.k.data())) lb.k.clear();
-                        lb.k_on_nvme = false;
-                    }
+
                     capture_mean_f16(lb);
                 }
             }
@@ -1125,7 +629,6 @@ void RawKvStore::truncate_to(uint32_t token_pos) {
 }
 
 void RawKvStore::invalidate_packed_from(uint32_t token_pos) {
-    wait_writes();
     std::lock_guard<std::mutex> lk(mu_);
     for (uint32_t bid = token_pos / cfg_.block_tokens; bid < blocks_.size(); ++bid) {
         const uint32_t keep = bid == token_pos / cfg_.block_tokens ? token_pos % cfg_.block_tokens : 0;
@@ -1173,16 +676,9 @@ void RawKvStore::restore_mean_checkpoint(uint32_t token_pos, const std::vector<f
 
 void RawKvStore::clear() {
     std::unique_lock<std::mutex> lk(mu_);
-    cv_.wait(lk, [&] { return q_.empty() && inflight_ == 0; });
+
     blocks_.clear();
-    io_error_ = nullptr;
-    nvme_k_bytes_ = 0;
-    nvme_v_bytes_ = 0;
-    nvme_syscalls_ = 0;
-    nvme_wait_ns_ = 0;
-    if (nvme_) {
-        nvme_->clear();
-    }
+
 }
 
 size_t RawKvStore::allocated_bytes() const {
@@ -1195,7 +691,7 @@ size_t RawKvStore::allocated_bytes() const {
             bytes += l.k_sum.capacity()*sizeof(float);
         }
     }
-    return bytes + io_.capacity()*2 + io8_.capacity();
+    return bytes;
 }
 
 uint64_t RawKvStore::capacity_bytes(uint32_t tokens, uint32_t populated_layers) const {
@@ -1221,9 +717,7 @@ uint64_t RawKvStore::payload_capacity_bytes(uint32_t tokens, uint32_t populated_
 }
 
 void RawKvStore::snapshot_buffers(std::vector<SnapshotBuffer> & buffers) {
-    wait_writes();
     std::lock_guard<std::mutex> lk(mu_);
-    if (nvme_) throw std::runtime_error("session snapshots require RAM raw stores");
     for (auto & b : blocks_) for (auto & l : b.layers) {
         // All lengths, token counts, formats and runtime identity stay in RAM.
         // Empty allocations can be reclaimed too, without serializing capacity.
@@ -1241,10 +735,29 @@ void RawKvStore::snapshot_buffers(std::vector<SnapshotBuffer> & buffers) {
     }
 }
 
-void RawKvStore::snapshot_write(SnapshotWriter & out) {
-    wait_writes();
+std::unique_ptr<RawKvStore> RawKvStore::fork_mean_prefix(uint32_t token_pos) const {
     std::lock_guard<std::mutex> lk(mu_);
-    if (nvme_) throw std::runtime_error("session snapshots require RAM raw stores");
+    const auto count = (uint64_t(token_pos) + cfg_.block_tokens - 1) / cfg_.block_tokens;
+    if (count > blocks_.size()) throw std::logic_error("mean-K fork exceeds the retained prefix");
+    auto fork = std::make_unique<RawKvStore>(cfg_);
+    fork->blocks_.resize(static_cast<size_t>(count));
+    for (size_t b = 0; b < count; ++b) {
+        auto & dest = fork->blocks_[b].layers;
+        dest.resize(cfg_.n_layer);
+        for (size_t i = 0; i < dest.size(); ++i) {
+            const auto & source = blocks_[b].layers.at(i);
+            if (!source.k.empty() || !source.v.empty() || source.k_gpu || source.v_gpu)
+                throw std::logic_error("mean-K fork cannot discard raw KV payload");
+            dest[i].n_tokens = source.n_tokens;
+            dest[i].mean_tokens = source.mean_tokens;
+            dest[i].k_sum = source.k_sum;
+        }
+    }
+    return fork;
+}
+
+void RawKvStore::snapshot_write(SnapshotWriter & out) {
+    std::lock_guard<std::mutex> lk(mu_);
     out.scalar(uint32_t(0x31564b52));
     out.scalar(cfg_.n_layer); out.scalar(cfg_.n_embd_k); out.scalar(cfg_.n_embd_v);
     out.scalar(cfg_.block_tokens); out.scalar(cfg_.k_row_bytes);
@@ -1279,7 +792,6 @@ void RawKvStore::snapshot_write(SnapshotWriter & out) {
 }
 
 void RawKvStore::snapshot_read(SnapshotReader & in, uint32_t max_blocks) {
-    if (nvme_) throw std::runtime_error("session snapshots require RAM raw stores");
     in.expect(uint32_t(0x31564b52));
     in.expect(cfg_.n_layer); in.expect(cfg_.n_embd_k); in.expect(cfg_.n_embd_v);
     in.expect(cfg_.block_tokens); in.expect(cfg_.k_row_bytes);
@@ -1322,7 +834,6 @@ void RawKvStore::snapshot_read(SnapshotReader & in, uint32_t max_blocks) {
         }
         if (before - in.remaining() != size) throw std::runtime_error("invalid snapshot block size");
     }
-    wait_writes();
     std::lock_guard<std::mutex> lk(mu_);
     blocks_.swap(blocks);
 }

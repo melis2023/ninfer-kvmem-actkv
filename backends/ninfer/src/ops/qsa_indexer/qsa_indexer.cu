@@ -5,13 +5,16 @@
 // key and two ordered passes that keep ties at the lower block index and write the blocks in
 // increasing order.
 #include "ninfer/ops/qsa_indexer.h"
+#include "ninfer/ops/rope.h"
 
 #include "core/device.h"
 #include "core/layout.h"
 #include "ops/common/math.h"
+#include "ops/common/pre_sm80.cuh"
 
 #include <cub/block/block_scan.cuh>
 #include <cuda_bf16.h>
+#include <mma.h>
 
 #include <cstdint>
 #include <stdexcept>
@@ -28,16 +31,35 @@ constexpr int kTopBlocks   = 512;
 constexpr int kProjection  = kHeads * kHeadDim + kHeadDim;
 constexpr int kThreads     = 512;
 constexpr int kScoreBlocks = 64; // blocks one scoring CTA covers
+constexpr int kMmaTokens   = 128;
 
 // fl32(1e7^(-2i/64)) for i < 32: the text RoPE frequencies of theta 1e7 over 64 rotary dims.
 __device__ __forceinline__ float rope_frequency(int pair) {
     return static_cast<float>(exp(-(2.0 * pair / 64.0) * 16.11809565095832)); // ln(1e7)
 }
 
+// YaRN's rotation: each pair's inverse frequency and the attention factor on cos and sin. A kernel
+// parameter, so a captured graph keeps it. The kernels take it as a template choice: their unscaled
+// instantiation is the original code, so it rounds as before.
+struct QsaRope {
+    float inverse_frequency[kRotaryPairs];
+    float attention_factor;
+    int scaled;
+};
+
+// cos and sin of pair `pair` at `position` under YaRN.
+__device__ __forceinline__ void yarn_sincos(const QsaRope& rope, int pair, int position,
+                                            float* sine, float* cosine) {
+    sincosf(static_cast<float>(position) * rope.inverse_frequency[pair], sine, cosine);
+    *sine *= rope.attention_factor;
+    *cosine *= rope.attention_factor;
+}
+
 // Zero-centred RMSNorm of a 128-vector held one value per thread of a 128-thread group, then the
 // rotate-half rotation of its first 64 dims at `position`. `values` is the group's shared row.
+template <bool Yarn>
 __device__ void norm_rope_row(float* values, const __nv_bfloat16* weight, float eps, int position,
-                              int lane128, float* reduce) {
+                              int lane128, float* reduce, const QsaRope& rope) {
     const float x = values[lane128];
     float square  = x * x;
 #pragma unroll
@@ -53,9 +75,13 @@ __device__ void norm_rope_row(float* values, const __nv_bfloat16* weight, float 
     values[lane128] = normed;
     __syncthreads();
     if (lane128 < kRotaryPairs) {
-        const float angle = static_cast<float>(position) * rope_frequency(lane128);
         float sine, cosine;
-        sincosf(angle, &sine, &cosine);
+        if constexpr (Yarn) {
+            yarn_sincos(rope, lane128, position, &sine, &cosine);
+        } else {
+            const float angle = static_cast<float>(position) * rope_frequency(lane128);
+            sincosf(angle, &sine, &cosine);
+        }
         const float x1 = values[lane128], x2 = values[lane128 + kRotaryPairs];
         values[lane128]                = x1 * cosine - x2 * sine;
         values[lane128 + kRotaryPairs] = x2 * cosine + x1 * sine;
@@ -66,10 +92,12 @@ __device__ void norm_rope_row(float* values, const __nv_bfloat16* weight, float 
 // One 128-thread CTA per block completing in the call: mean of its four raw keys (from the tail
 // or the projection), norm, rope at the block's first position. The grid covers every block a call
 // of `tokens` can complete; a CTA past the call's completed blocks has nothing to do.
+template <bool Yarn>
 __global__ void __launch_bounds__(kHeadDim)
     qsa_pool_kernel(const __nv_bfloat16* __restrict__ projection, const int* __restrict__ first,
                     int tokens, const __nv_bfloat16* __restrict__ key_norm, float eps,
-                    const float* __restrict__ tail, int capacity, float* __restrict__ pooled) {
+                    const float* __restrict__ tail, int capacity, float* __restrict__ pooled,
+                    const QsaRope rope) {
     __shared__ float row[kHeadDim];
     __shared__ float reduce[4];
     const int first_position = *first;
@@ -88,7 +116,7 @@ __global__ void __launch_bounds__(kHeadDim)
     }
     row[d] = sum * 0.25f;
     __syncthreads();
-    norm_rope_row(row, key_norm, eps, block * kBlock, d, reduce);
+    norm_rope_row<Yarn>(row, key_norm, eps, block * kBlock, d, reduce, rope);
     pooled[static_cast<std::int64_t>(block) * kHeadDim + d] = row[d];
 }
 
@@ -114,13 +142,133 @@ __device__ __forceinline__ unsigned order_key(float value) {
     return bits & 0x80000000u ? ~bits : bits | 0x80000000u;
 }
 
+// One query preparation per token, shared by every block tile. Keep the original FP32
+// normalization/reduction and angle boundaries; only its materialization location changes.
+template <bool Yarn>
+__global__ void __launch_bounds__(kThreads)
+    qsa_query_kernel(const __nv_bfloat16* projection, const int* first,
+                     const __nv_bfloat16* query_norm, float eps, float* queries,
+                     const QsaRope rope) {
+    __shared__ float row[kHeads * kHeadDim];
+    __shared__ float reduce[kHeads][4];
+    const int tid = threadIdx.x, head = tid / kHeadDim, lane = tid % kHeadDim;
+    const int t = blockIdx.x, position = *first + t;
+    if ((position + 1) / kBlock <= kTopBlocks) { return; }
+    row[tid] = __bfloat162float(projection[static_cast<std::int64_t>(t) * kProjection + tid]);
+    __syncthreads();
+    norm_rope_row<Yarn>(row + head * kHeadDim, query_norm, eps, position, lane, reduce[head], rope);
+    queries[static_cast<std::int64_t>(t) * kHeads * kHeadDim + tid] = row[tid];
+}
+
+// Four queries (sixteen heads) share each key tile. FP32 operands remain public; TF32 high
+// and residual components are private. Three products omit low*low; qualification checks
+// the resulting selection against the FP64 oracle without reducing stored pooled-key precision.
+__global__ void __launch_bounds__(128)
+    qsa_mma_score_kernel(const float* __restrict__ queries, const int* __restrict__ first,
+                        const float* __restrict__ pooled, unsigned* __restrict__ keys_workspace,
+                        int tokens, int capacity) {
+    namespace wmma = nvcuda::wmma;
+    __shared__ __align__(32) float q_hi[16 * 8], q_lo[16 * 8];
+    __shared__ __align__(32) float k_hi[4][16 * 8], k_lo[4][16 * 8];
+    __shared__ __align__(32) float dots[4][16 * 16];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int t0 = blockIdx.y * 4, b0 = blockIdx.x * 64;
+    const int start = *first;
+    const int blocks = min((start + min(t0 + 4, tokens)) / kBlock, capacity);
+    if (blocks <= kTopBlocks || b0 >= blocks) { return; }
+#if defined(NINFER_PRE_SM80_DEVICE)
+    // Volta and Turing have no TF32 tensor cores: each lane sums its eight dots of the warp's
+    // 16 x 16 tile in FP32 directly, the full product the three TF32 terms approximate.
+    float sum[8] = {};
+#else
+    wmma::fragment<wmma::accumulator, 16, 16, 8, float> sum;
+    wmma::fill_fragment(sum, 0.0f);
+#endif
+#pragma unroll
+    for (int base = 0; base < kHeadDim; base += 8) {
+        const int row = tid / 8, d = tid % 8;
+        const int t = t0 + row / kHeads;
+        const bool scored = t < tokens && (start + t + 1) / kBlock > kTopBlocks;
+        const float q = scored ? queries[(static_cast<std::int64_t>(t) * kHeads +
+                                         row % kHeads) * kHeadDim + base + d] : 0.0f;
+#if defined(NINFER_PRE_SM80_DEVICE)
+        q_hi[tid] = q;
+#    pragma unroll
+        for (int i = lane; i < 16 * 8; i += 32) {
+            const int b = b0 + warp * 16 + i / 8;
+            k_hi[warp][i] =
+                b < blocks ? pooled[static_cast<std::int64_t>(b) * kHeadDim + base + i % 8] : 0.0f;
+        }
+        __syncthreads();
+#    pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const int q_row = lane / 16 + 2 * i, key = lane % 16;
+#    pragma unroll
+            for (int dd = 0; dd < 8; ++dd) {
+                sum[i] = fmaf(q_hi[q_row * 8 + dd], k_hi[warp][key * 8 + dd], sum[i]);
+            }
+        }
+        __syncthreads();
+        (void)q_lo;
+        (void)k_lo;
+#else
+        const float high = wmma::__float_to_tf32(q);
+        q_hi[tid] = high;
+        q_lo[tid] = wmma::__float_to_tf32(q - high);
+#    pragma unroll
+        for (int i = lane; i < 16 * 8; i += 32) {
+            const int b = b0 + warp * 16 + i / 8;
+            const float k = b < blocks ? pooled[static_cast<std::int64_t>(b) * kHeadDim +
+                                                 base + i % 8] : 0.0f;
+            const float kh = wmma::__float_to_tf32(k);
+            k_hi[warp][i] = kh;
+            k_lo[warp][i] = wmma::__float_to_tf32(k - kh);
+        }
+        __syncthreads();
+        wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32, wmma::row_major> ah, al;
+        wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32, wmma::col_major> bh, bl;
+        wmma::load_matrix_sync(ah, q_hi, 8);
+        wmma::load_matrix_sync(al, q_lo, 8);
+        wmma::load_matrix_sync(bh, k_hi[warp], 8);
+        wmma::load_matrix_sync(bl, k_lo[warp], 8);
+        wmma::mma_sync(sum, ah, bh, sum);
+        wmma::mma_sync(sum, ah, bl, sum);
+        wmma::mma_sync(sum, al, bh, sum);
+        __syncthreads();
+#endif
+    }
+#if defined(NINFER_PRE_SM80_DEVICE)
+#    pragma unroll
+    for (int i = 0; i < 8; ++i) { dots[warp][(lane / 16 + 2 * i) * 16 + lane % 16] = sum[i]; }
+#else
+    wmma::store_matrix_sync(dots[warp], sum, 16, wmma::mem_row_major);
+#endif
+    __syncwarp();
+    const int column = lane % 16;
+    const int b = b0 + warp * 16 + column;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int local_t = lane / 16 + 2 * i, t = t0 + local_t;
+        const int visible = min((start + t + 1) / kBlock, capacity);
+        if (t < tokens && visible > kTopBlocks && b < visible) {
+            float score = 0.0f;
+#pragma unroll
+            for (int h = 0; h < kHeads; ++h) {
+                score += fmaxf(dots[warp][(local_t * kHeads + h) * 16 + column], 0.0f);
+            }
+            keys_workspace[static_cast<std::int64_t>(t) * capacity + b] = order_key(score);
+        }
+    }
+}
+
 // The scores of blocks [64 x, 64 x + 64) for query y (the 1/sqrt(128) scale does not change the
 // order), as orderable keys. A query that sees at most 512 blocks needs none.
+template <bool Yarn>
 __global__ void __launch_bounds__(kThreads)
     qsa_score_kernel(const __nv_bfloat16* __restrict__ projection, const int* __restrict__ first,
                      const __nv_bfloat16* __restrict__ query_norm, float eps,
                      const float* __restrict__ pooled, unsigned* __restrict__ keys_workspace,
-                     int capacity) {
+                     int capacity, const QsaRope rope) {
     __shared__ __align__(16) float query[kHeads * kHeadDim];
     __shared__ float reduce[kHeads][4];
     const int t        = blockIdx.y;
@@ -150,9 +298,13 @@ __global__ void __launch_bounds__(kThreads)
         row[lane] = normed;
         __syncthreads();
         if (lane < kRotaryPairs) {
-            const float angle = static_cast<float>(position) * rope_frequency(lane);
             float sine, cosine;
-            sincosf(angle, &sine, &cosine);
+            if constexpr (Yarn) {
+                yarn_sincos(rope, lane, position, &sine, &cosine);
+            } else {
+                const float angle = static_cast<float>(position) * rope_frequency(lane);
+                sincosf(angle, &sine, &cosine);
+            }
             const float x1 = row[lane], x2 = row[lane + kRotaryPairs];
             row[lane]                = x1 * cosine - x2 * sine;
             row[lane + kRotaryPairs] = x2 * cosine + x1 * sine;
@@ -289,11 +441,24 @@ void require_pooled(const Tensor& pooled) {
             "pooled must be contiguous FP32 [128, capacity]");
 }
 
+QsaRope make_rope(const RopeYarn& yarn) {
+    require(!(yarn.interpolation_factor > 1.0F), "linear position interpolation is not supported");
+    QsaRope rope{};
+    if (yarn.factor > 1.0F) {
+        const RopeYarnFrequencies f =
+            rope_yarn_frequencies(2 * kRotaryPairs, kRotaryPairs, 1.0e7F, yarn);
+        for (int i = 0; i < kRotaryPairs; ++i) rope.inverse_frequency[i] = f.inverse_frequency[i];
+        rope.attention_factor = f.attention_factor;
+        rope.scaled           = 1;
+    }
+    return rope;
+}
+
 } // namespace
 
 void qsa_indexer_append(const Tensor& projection, const Tensor& first_position,
-                        const QsaIndexerWeights& weights, float eps, Tensor& pooled, Tensor& tail,
-                        cudaStream_t stream) {
+                        const QsaIndexerWeights& weights, float eps, const RopeYarn& yarn,
+                        Tensor& pooled, Tensor& tail, cudaStream_t stream) {
     require_projection(projection);
     const int* first = require_position(first_position);
     require_norm(weights.key_norm, "key_norm must be BF16 [128]");
@@ -302,12 +467,15 @@ void qsa_indexer_append(const Tensor& projection, const Tensor& first_position,
     require(tail.dtype == DType::FP32 && tail.is_contiguous() && tail.data != nullptr &&
                 tail.ne[0] == kHeadDim && tail.ne[1] == kBlock - 1,
             "tail must be contiguous FP32 [128, 3]");
+    const QsaRope rope        = make_rope(yarn);
     const std::int32_t tokens = projection.ne[1];
     // A call of `tokens` positions completes at most tokens / 4 + 1 blocks, wherever it starts.
-    qsa_pool_kernel<<<tokens / kBlock + 1, kHeadDim, 0, stream>>>(
+    auto* const pool_kernel = rope.scaled ? qsa_pool_kernel<true> : qsa_pool_kernel<false>;
+    pool_kernel<<<tokens / kBlock + 1, kHeadDim, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(projection.data), first, tokens,
         static_cast<const __nv_bfloat16*>(weights.key_norm->data), eps,
-        static_cast<const float*>(tail.data), pooled.ne[1], static_cast<float*>(pooled.data));
+        static_cast<const float*>(tail.data), pooled.ne[1], static_cast<float*>(pooled.data),
+        rope);
     CUDA_CHECK(cudaGetLastError());
     qsa_tail_kernel<<<1, kHeadDim, 0, stream>>>(static_cast<const __nv_bfloat16*>(projection.data),
                                                 first, tokens, static_cast<float*>(tail.data));
@@ -318,18 +486,22 @@ std::size_t qsa_indexer_select_workspace_bytes(std::int32_t tokens, std::int32_t
     require(tokens > 0 && capacity > 0, "tokens and capacity must be positive");
     WorkspaceLayoutBuilder layout;
     (void)layout.alloc(DType::I32, {capacity, tokens});
+    if (tokens >= kMmaTokens && capacity > kTopBlocks) {
+        (void)layout.alloc(DType::FP32, {kHeads * kHeadDim, tokens});
+    }
     return layout.peak_bytes(1);
 }
 
 void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
-                        const QsaIndexerWeights& weights, float eps, const Tensor& pooled,
-                        WorkspaceArena& workspace, Tensor& selected, Tensor& counts,
-                        cudaStream_t stream) {
+                        const QsaIndexerWeights& weights, float eps, const RopeYarn& yarn,
+                        const Tensor& pooled, WorkspaceArena& workspace, Tensor& selected,
+                        Tensor& counts, cudaStream_t stream) {
     require_projection(projection);
     const int* first = require_position(first_position);
     require_norm(weights.query_norm, "query_norm must be BF16 [128]");
     require(eps > 0.0f, "eps must be positive");
     require_pooled(pooled);
+    const QsaRope rope = make_rope(yarn);
     const std::int32_t tokens = projection.ne[1];
     require(selected.dtype == DType::I32 && selected.is_contiguous() && selected.data != nullptr &&
                 selected.ne[0] == kTopBlocks && selected.ne[1] == tokens,
@@ -342,11 +514,30 @@ void qsa_indexer_select(const Tensor& projection, const Tensor& first_position,
     Tensor keys                 = workspace.alloc(DType::I32, {capacity, tokens});
     const dim3 score_grid(static_cast<unsigned>((capacity + kScoreBlocks - 1) / kScoreBlocks),
                           static_cast<unsigned>(tokens));
-    qsa_score_kernel<<<score_grid, kThreads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(projection.data), first,
-        static_cast<const __nv_bfloat16*>(weights.query_norm->data), eps,
-        static_cast<const float*>(pooled.data), static_cast<unsigned*>(keys.data), capacity);
-    CUDA_CHECK(cudaGetLastError());
+    if (capacity > kTopBlocks) {
+        if (tokens < kMmaTokens) {
+            auto* const score_kernel =
+                rope.scaled ? qsa_score_kernel<true> : qsa_score_kernel<false>;
+            score_kernel<<<score_grid, kThreads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(projection.data), first,
+                static_cast<const __nv_bfloat16*>(weights.query_norm->data), eps,
+                static_cast<const float*>(pooled.data), static_cast<unsigned*>(keys.data), capacity,
+                rope);
+        } else {
+            Tensor queries = workspace.alloc(DType::FP32, {kHeads * kHeadDim, tokens});
+            auto* const query_kernel =
+                rope.scaled ? qsa_query_kernel<true> : qsa_query_kernel<false>;
+            query_kernel<<<tokens, kThreads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(projection.data), first,
+                static_cast<const __nv_bfloat16*>(weights.query_norm->data), eps,
+                static_cast<float*>(queries.data), rope);
+            CUDA_CHECK(cudaGetLastError());
+            qsa_mma_score_kernel<<<dim3((capacity + 63) / 64, (tokens + 3) / 4), 128, 0, stream>>>(
+                static_cast<const float*>(queries.data), first, static_cast<const float*>(pooled.data),
+                static_cast<unsigned*>(keys.data), tokens, capacity);
+        }
+        CUDA_CHECK(cudaGetLastError());
+    }
     qsa_select_kernel<<<tokens, kThreads, 0, stream>>>(
         first, static_cast<const unsigned*>(keys.data), capacity, static_cast<int*>(selected.data),
         static_cast<int*>(counts.data));

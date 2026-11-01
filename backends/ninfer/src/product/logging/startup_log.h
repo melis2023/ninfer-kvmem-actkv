@@ -1,6 +1,7 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "ninfer/startup.h"
+#include "ninfer/types_fwd.h"
 
 #include <memory>
 

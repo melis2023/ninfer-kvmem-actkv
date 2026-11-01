@@ -2,8 +2,9 @@
 
 A black-box A/B benchmark of two `ninfer-serve` builds serving the same model on the same GPU,
 driven by a closed-loop replay of real agentic coding traffic over the OpenAI chat-completions
-API. The treatment runs this line's default checkpoint-catalog prefix cache; an optional third
-arm runs the same build on the hybrid prefix cache (`--use-alt-prefix-caching`). It produces a
+API. The treatment runs the checkpoint-catalog prefix cache (`--use-original-prefix-caching`);
+an optional third arm runs the same build on the hybrid prefix cache (`--use-alt-prefix-caching`),
+this line's default. It produces a
 README-style comparison table covering:
 
 - **prefix-cache hits** (tokens served from cache, continuing turns that had to re-prefill);

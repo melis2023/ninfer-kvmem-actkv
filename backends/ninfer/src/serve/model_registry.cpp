@@ -1,6 +1,7 @@
 #include "serve/model_registry.h"
 
 #include <algorithm>
+#include <exception>
 #include <stdexcept>
 #include <utility>
 

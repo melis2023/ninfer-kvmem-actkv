@@ -122,6 +122,8 @@ int main() {
     failures += run(7, false, false, 9201u);
     failures += run(8, true, false, 9206u);
     failures += run(33, true, false, 9202u);
+    failures += run(64, false, false, 9207u);
+    failures += run(1024, false, true, 9208u);
     failures += run(3, true, true, 9203u);
     failures += run(5, true, false, 9204u, 256);
     failures += run(2, false, true, 9205u, 256);

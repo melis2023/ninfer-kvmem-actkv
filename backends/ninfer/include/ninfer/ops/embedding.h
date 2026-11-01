@@ -14,7 +14,7 @@ namespace ninfer::ops {
  *
  * `ids` is contiguous I32 [T], `out` is contiguous BF16 [D,T], and every id is in
  * [0,vocab). `table` has logical shape [vocab,D] and is contiguous BF16, Q4_G64_FP16 or
- * Q6_G64_FP16 RowSplit, Q8_G32_FP16 RowSplit, or FP8_E4M3FN_ROW_BF16 RowScale. Dense BF16 values
+ * Q6_G64_FP16 RowSplit, Q8_G32_FP16 RowSplit, FP8_E4M3FN_ROW_BF16 RowScale, or T5_G128_FP16 RowSplit. Dense BF16 values
  * are copied bit-exactly. For quantized tables, the oracle independently decodes each code and
  * multiplies it by the exact stored scale in FP64; the BF16 output is promoted and compared
  * directly with that ideal. Final output storage rounding belongs to the quantized embedding
@@ -22,7 +22,8 @@ namespace ninfer::ops {
  * Q6 `[248320,5120]` or `[248320,2048]`, Q8 `[248320,2048]` or `[248320,5120]`, and FP8
  * `[248320,5120]`. Q4/Q6/Q8 scales are FP16; FP8 has one BF16 multiplier per
  * row and requires 4-byte-aligned output storage. `out` must not overlap `ids` or any table plane.
- * There is no workspace or persistent state side effect.
+ * T5 admits positive vocab and D divisible by 1024, with FP16 group-128 scales and no
+ * activation quantization during gather. There is no workspace or persistent state side effect.
  */
 void embedding(const Tensor& ids, const Weight& table, Tensor& out, cudaStream_t stream);
 

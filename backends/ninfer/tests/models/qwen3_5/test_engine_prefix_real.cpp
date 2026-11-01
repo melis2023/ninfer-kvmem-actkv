@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -1666,6 +1667,260 @@ ninfer::PromptInput slot_conversation(const std::vector<std::string>& turns) {
     return prompt;
 }
 
+// Conversations recorded from a ninfer-serve run against qwen3_8_27b: one large conversation and
+// three small ones with different system prompts, each reply replayed verbatim as the next turn's
+// assistant message, visited round-robin. A client that replays a reply exactly is what makes every
+// follow-up reuse the previous endpoint; replies produced by another artifact would not match, so
+// the scenario checks that it reached endpoint reuse instead of passing without exercising the bug.
+struct RecordedTurn {
+    ninfer::ChatRole role;
+    std::string_view text;
+};
+
+const std::vector<RecordedTurn>& recorded_lineage_0() {
+    static const std::vector<RecordedTurn> turns{
+        {ninfer::ChatRole::System, R"FX(You are the big agent. Answer tersely.)FX"},
+        {ninfer::ChatRole::User,
+         R"FX(Agent 0 visit 0. Review this log and summarise the faults in one line.
+impeller nut engine quill housing idler fulcrum hinge trunnion bracket nozzle gasket idler bearing bracket eccentric.
+pawl anchor fulcrum rotor orifice outrigger gasket union bearing bearing bearing trunnion linkage anchor bracket nozzle.
+eccentric bearing knuckle orifice fulcrum idler mandrel orifice washer orifice orifice governor spindle bearing detent mandrel.
+trunnion gasket lever sprocket spindle housing valve jib eccentric jib manifold tappet spindle outrigger idler jib.
+coupling outrigger cable hinge piston coupling detent lever yoke mandrel yoke flange fulcrum jib gasket keeper.
+knuckle coupling yoke idler bearing hinge cable tappet ratchet outrigger outrigger coupling trunnion keeper keeper jib.
+orifice anchor manifold linkage mandrel orifice coupling jib washer nut washer governor rotor mandrel pawl anchor.
+bracket jib impeller knuckle mandrel nozzle eccentric damper hinge yoke nut mandrel manifold jib detent idler.
+washer detent washer anchor linkage linkage ratchet ratchet valve governor pawl bearing orifice sprocket lever mandrel.
+outrigger lever flange mandrel quill cable engine flange bearing fulcrum anchor rotor piston rotor housing ratchet.
+lever washer spindle engine keeper keeper quill knuckle keeper rotor trunnion spindle governor union idler hinge.
+housing bearing tappet bracket valve detent manifold quill gasket quill jib nozzle pawl eccentric bearing orifice.
+bearing coupling journal cable keeper fulcrum jib eccentric linkage orifice sprocket knuckle fulcrum orifice knuckle trunnion.
+bearing coupling nut union sprocket eccentric damper tappet impeller nozzle damper tappet engine engine tappet tappet.
+keeper detent nut quill impeller anchor mandrel cable outrigger nozzle nut governor keeper ratchet jib cable.
+bracket manifold washer gasket nozzle nut eccentric outrigger manifold idler gasket bracket spindle jib idler bearing.
+union ratchet coupling spindle bearing keeper manifold union nut impeller valve eccentric nozzle rotor gasket bracket.
+mandrel washer linkage idler linkage piston engine cable flange impeller keeper keeper linkage nozzle rotor valve.
+pawl jib quill yoke valve valve housing spindle piston pawl idler impeller.)FX"},
+        {ninfer::ChatRole::Assistant,
+         R"FX(The log contains no faults, as it consists solely of a list of mechanical component)FX"},
+        {ninfer::ChatRole::User,
+         R"FX(Agent 0 visit 1. Review this log and summarise the faults in one line.
+outrigger mandrel gasket union cable detent engine bracket journal impeller valve housing ratchet outrigger bracket engine.
+nut mandrel orifice nut flange rotor yoke spindle nut linkage housing governor rotor gasket cable spindle.
+anchor ratchet anchor flange detent housing cable manifold.)FX"},
+    };
+    return turns;
+}
+
+const std::vector<RecordedTurn>& recorded_lineage_1() {
+    static const std::vector<RecordedTurn> turns{
+        {ninfer::ChatRole::System, R"FX(You are small agent 1. Tersely.)FX"},
+        {ninfer::ChatRole::User,
+         R"FX(Agent 1 visit 0. Review this log and summarise the faults in one line.
+journal governor governor lever coupling washer eccentric jib housing linkage housing flange governor quill damper trunnion.
+nozzle valve orifice tappet nozzle lever journal manifold washer yoke sprocket detent nozzle coupling governor mandrel.
+rotor bracket keeper trunnion sprocket housing lever anchor pawl coupling journal nut keeper manifold keeper bearing.
+piston fulcrum.)FX"},
+        {ninfer::ChatRole::Assistant,
+         R"FX(The log lists only component names without any recorded errors, failures, or operational data)FX"},
+        {ninfer::ChatRole::User,
+         R"FX(Agent 1 visit 1. Review this log and summarise the faults in one line.
+sprocket bracket impeller ratchet mandrel damper pawl piston ratchet jib spindle outrigger valve knuckle valve linkage.
+yoke hinge coupling damper.)FX"},
+        {ninfer::ChatRole::Assistant,
+         R"FX(The log contains only a list of component names with no recorded faults or errors.)FX"},
+        {ninfer::ChatRole::User,
+         R"FX(Agent 1 visit 2. Review this log and summarise the faults in one line.
+gasket tappet trunnion eccentric quill piston eccentric jib idler outrigger quill journal damper outrigger union keeper.
+damper rotor housing damper.)FX"},
+        {ninfer::ChatRole::Assistant,
+         R"FX(The log lists only component names with no recorded faults or errors.)FX"},
+        {ninfer::ChatRole::User,
+         R"FX(Agent 1 visit 3. Review this log and summarise the faults in one line.
+pawl orifice tappet knuckle ratchet nozzle trunnion nut washer valve governor anchor housing hinge manifold knuckle.
+housing pawl nozzle cable.)FX"},
+        {ninfer::ChatRole::Assistant,
+         R"FX(The log lists only component names with no recorded faults or errors.)FX"},
+        {ninfer::ChatRole::User,
+         R"FX(Agent 1 visit 4. Review this log and summarise the faults in one line.
+bracket gasket coupling journal ratchet trunnion hinge linkage cable fulcrum keeper damper hinge damper manifold piston.
+keeper gasket cable impeller.)FX"},
+    };
+    return turns;
+}
+
+const std::vector<RecordedTurn>& recorded_lineage_2() {
+    static const std::vector<RecordedTurn> turns{
+        {ninfer::ChatRole::System, R"FX(You are small agent 2. Tersely.)FX"},
+        {ninfer::ChatRole::User,
+         R"FX(Agent 2 visit 0. Review this log and summarise the faults in one line.
+outrigger manifold linkage washer governor damper jib nozzle pawl orifice spindle idler nozzle valve fulcrum engine.
+quill manifold keeper flange fulcrum linkage yoke manifold hinge union piston sprocket coupling eccentric nozzle engine.
+eccentric governor tappet nozzle housing trunnion ratchet valve rotor coupling bracket orifice eccentric engine coupling detent.
+anchor governor.)FX"},
+        {ninfer::ChatRole::Assistant,
+         R"FX(The log contains no faults, only a list of mechanical component names.)FX"},
+        {ninfer::ChatRole::User,
+         R"FX(Agent 2 visit 1. Review this log and summarise the faults in one line.
+nozzle linkage gasket washer bearing yoke yoke anchor quill nut journal cable eccentric lever rotor engine.
+journal coupling yoke trunnion.)FX"},
+        {ninfer::ChatRole::Assistant,
+         R"FX(The log contains no faults, only a list of mechanical component names.)FX"},
+        {ninfer::ChatRole::User,
+         R"FX(Agent 2 visit 2. Review this log and summarise the faults in one line.
+nut hinge keeper idler jib tappet lever knuckle anchor flange engine cable nut washer linkage fulcrum.
+housing ratchet pawl governor.)FX"},
+        {ninfer::ChatRole::Assistant,
+         R"FX(The log contains no faults, only a list of mechanical component names.)FX"},
+        {ninfer::ChatRole::User,
+         R"FX(Agent 2 visit 3. Review this log and summarise the faults in one line.
+sprocket impeller lever manifold mandrel fulcrum impeller flange journal tappet valve bracket engine damper mandrel mandrel.
+washer governor damper manifold.)FX"},
+        {ninfer::ChatRole::Assistant,
+         R"FX(The log contains no faults, only a list of mechanical component names.)FX"},
+        {ninfer::ChatRole::User,
+         R"FX(Agent 2 visit 4. Review this log and summarise the faults in one line.
+rotor union flange rotor journal quill governor nozzle eccentric housing knuckle union piston gasket rotor trunnion.
+lever anchor anchor sprocket.)FX"},
+    };
+    return turns;
+}
+
+const std::vector<RecordedTurn>& recorded_lineage_3() {
+    static const std::vector<RecordedTurn> turns{
+        {ninfer::ChatRole::System, R"FX(You are small agent 3. Tersely.)FX"},
+        {ninfer::ChatRole::User,
+         R"FX(Agent 3 visit 0. Review this log and summarise the faults in one line.
+journal ratchet washer keeper mandrel pawl lever bracket spindle ratchet eccentric nut outrigger cable knuckle linkage.
+ratchet knuckle lever bracket fulcrum orifice jib impeller flange damper lever pawl nut fulcrum jib orifice.
+knuckle knuckle journal idler ratchet detent sprocket hinge engine piston ratchet flange valve bracket manifold jib.
+eccentric pawl.)FX"},
+        {ninfer::ChatRole::Assistant,
+         R"FX(Recurring faults involve ratchets, levers, brackets, and knuckles)FX"},
+        {ninfer::ChatRole::User,
+         R"FX(Agent 3 visit 1. Review this log and summarise the faults in one line.
+eccentric coupling impeller keeper yoke nozzle engine outrigger piston sprocket spindle eccentric impeller mandrel ratchet fulcrum.
+rotor union sprocket hinge.)FX"},
+        {ninfer::ChatRole::Assistant,
+         R"FX(Faults center on eccentrics, impellers, sprockets, and)FX"},
+        {ninfer::ChatRole::User,
+         R"FX(Agent 3 visit 2. Review this log and summarise the faults in one line.
+sprocket linkage fulcrum sprocket jib nozzle coupling piston nozzle pawl outrigger linkage ratchet keeper linkage yoke.
+knuckle damper coupling housing.)FX"},
+        {ninfer::ChatRole::Assistant, R"FX(Faults involve sprockets, linkages, nozzles)FX"},
+        {ninfer::ChatRole::User,
+         R"FX(Agent 3 visit 3. Review this log and summarise the faults in one line.
+hinge lever tappet engine knuckle bracket quill detent lever nozzle union fulcrum manifold keeper orifice knuckle.
+detent impeller journal pawl.)FX"},
+    };
+    return turns;
+}
+
+// (lineage, number of leading turns sent), in request order.
+constexpr std::array<std::pair<std::uint8_t, std::uint8_t>, 16> kRecordedSchedule{{{0, 2},
+                                                                                   {1, 2},
+                                                                                   {2, 2},
+                                                                                   {3, 2},
+                                                                                   {1, 4},
+                                                                                   {2, 4},
+                                                                                   {3, 4},
+                                                                                   {1, 6},
+                                                                                   {2, 6},
+                                                                                   {3, 6},
+                                                                                   {0, 4},
+                                                                                   {1, 8},
+                                                                                   {2, 8},
+                                                                                   {3, 8},
+                                                                                   {1, 10},
+                                                                                   {2, 10}}};
+
+// A consumed endpoint carries its lineage's long anchors with it. An anchor that aliases another
+// owner's StateImage (the automatic anchor after the leading system message lands on the structural
+// shared-prefix frontier) is not exclusive when the request is planned; if the pressure target then
+// evicts that owner, the anchor becomes exclusive to the consumed lineage and must be part of its
+// active entitlement. The projection missed it, so the committed sequence owned more StateImages
+// than it had reserved and the Engine reported a worker failure ("materialized sequence does not
+// match its active entitlement" / "sequence StateImage entitlement is inconsistent"), dropping the
+// whole context cache with it. The recorded visits run under a tiny state and Host KV budget, so
+// every follow-up consumes an endpoint while its neighbours are demoted or evicted. Each follow-up
+// sends the replies this artifact actually generated in place of the recorded ones, which another
+// artifact or route set would not reproduce token for token, so its prompt extends the endpoint.
+int exercise_endpoint_adopts_unaliased_anchor(const char* artifact) {
+    ninfer::EngineOptions options;
+    options.artifact_path                    = artifact;
+    options.max_context                      = 2048;
+    options.kv_capacity                      = ninfer::KvCapacityPolicy::explicit_capacity(2048);
+    options.kv_cache                         = ninfer::KvCacheStorage::RotatedLloyd4KeyInt4Value;
+    options.max_concurrency                  = 2;
+    options.max_pending_requests             = 2;
+    options.context_cache.device_state_slots = 2;
+    options.context_cache.host_state_slots   = 6;
+    options.context_cache.host_kv_capacity_bytes            = std::size_t{8} << 20U;
+    options.context_cache.max_private_continuations         = 6;
+    options.context_cache.max_shared_prefixes               = 4;
+    options.context_cache.max_long_anchors_per_continuation = 2;
+    options.context_cache.automatic_long_anchors            = true;
+    ninfer::Engine engine(std::move(options));
+
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 16;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = true;
+    request.stop.include_model_defaults       = false;
+
+    const std::array<const std::vector<RecordedTurn>*, 4> lineages{
+        &recorded_lineage_0(), &recorded_lineage_1(), &recorded_lineage_2(), &recorded_lineage_3()};
+    std::array<std::vector<std::string>, 4> replies;
+    std::uint32_t endpoint_reuses = 0;
+    for (std::size_t number = 0; number < kRecordedSchedule.size(); ++number) {
+        const auto [lineage, turn_count] = kRecordedSchedule[number];
+        ninfer::PromptInput prompt;
+        std::size_t reply = 0;
+        for (std::size_t turn = 0; turn < turn_count; ++turn) {
+            ninfer::ChatMessage message;
+            message.role = (*lineages[lineage])[turn].role;
+            const bool generated =
+                message.role == ninfer::ChatRole::Assistant && reply < replies[lineage].size();
+            message.parts.push_back(ninfer::MessagePart{
+                .kind  = ninfer::MessagePartKind::Text,
+                .text  = generated ? replies[lineage][reply]
+                                   : std::string((*lineages[lineage])[turn].text),
+                .media = {}});
+            if (message.role == ninfer::ChatRole::Assistant) { ++reply; }
+            prompt.messages.push_back(std::move(message));
+        }
+        prompt.options.enable_thinking = false;
+        try {
+            const ninfer::GenerationResult result =
+                engine.generate(engine.prepare(std::move(prompt)), request);
+            if (result.prefix_reuse_path == ninfer::PrefixReusePath::PrivateEndpoint) {
+                ++endpoint_reuses;
+            }
+            replies[lineage].push_back(result.content);
+        } catch (const std::exception& error) {
+            std::cerr << "anchor-adoption request " << number + 1U << " of "
+                      << kRecordedSchedule.size() << " failed: " << error.what() << '\n';
+            return 1;
+        }
+        if (!engine.is_available()) {
+            std::cerr << "Engine became unavailable at anchor-adoption request " << number + 1U
+                      << '\n';
+            return 1;
+        }
+    }
+    const ninfer::RuntimeStats stats = engine.runtime_stats();
+    if (endpoint_reuses < 8 ||
+        stats.pressure_private_owners_degraded + stats.pressure_private_owners_evicted == 0) {
+        std::cerr << "anchor-adoption scenario did not exercise endpoint reuse under pressure: "
+                     "endpoint_reuses="
+                  << endpoint_reuses
+                  << " private_degraded=" << stats.pressure_private_owners_degraded
+                  << " private_evicted=" << stats.pressure_private_owners_evicted << '\n';
+        return 1;
+    }
+    return 0;
+}
+
 // A saved session restored into a fresh Engine must behave exactly like the warm session it was
 // saved from: the continuation reuses the restored prefix, and greedy output matches a control
 // Engine that never evicted it token for token. Digest preconditions, corrupt files, and the
@@ -2263,6 +2518,145 @@ int exercise_endpoint_anchor_sibling(const char* artifact) {
     return 0;
 }
 
+// Cancels the request once its prefill has reached `cancel_at` prompt tokens.
+class CancelAtProgressSink final : public ninfer::OutputSink {
+public:
+    explicit CancelAtProgressSink(std::uint32_t cancel_at) : cancel_at_(cancel_at) {}
+
+    void start(ninfer::GenerationStart) override {}
+
+    void progress(ninfer::PromptProgress progress) override {
+        if (progress.processed_prompt_tokens + progress.reused_prompt_tokens >= cancel_at_) {
+            reached_.store(true, std::memory_order_release);
+        }
+    }
+
+    void timing(ninfer::GenerationTimingObservation) override {}
+
+    void publish(ninfer::OutputDelta) override {}
+
+    [[nodiscard]] bool reached() const noexcept { return reached_.load(std::memory_order_acquire); }
+
+private:
+    std::uint32_t cancel_at_;
+    std::atomic<bool> reached_{false};
+};
+
+ninfer::PromptInput progress_anchor_prompt() {
+    // One long user message: no interior message boundary exists, so only the progress anchors
+    // give the prefill anywhere to keep what it computed.
+    std::string text = "Read the following log and answer the question at the end.";
+    for (int line = 0; line < 160; ++line) {
+        text += " Entry " + std::to_string(line) + ": the pump on line " +
+                std::to_string(line % 17) + " reported " + std::to_string(line * 37 % 1013) +
+                " kPa and the operator noted nothing unusual.";
+    }
+    text += " Question: which line reported the highest pressure?";
+    ninfer::ChatMessage message;
+    message.role = ninfer::ChatRole::User;
+    message.parts.push_back(
+        ninfer::MessagePart{.kind = ninfer::MessagePartKind::Text, .text = text, .media = {}});
+    ninfer::PromptInput prompt;
+    prompt.messages.push_back(std::move(message));
+    prompt.options.enable_thinking = false;
+    return prompt;
+}
+
+// A client that times out part way through a long prompt and retries must not start over. Under
+// MTP a prefill cut before its last chunk cannot be salvaged as an endpoint, so the cancelled
+// prefill publishes the progress anchors it captured, the identical retry restores the deepest
+// one, and greedy output matches a request that was never cancelled. With progress anchors off
+// the same cancel leaves nothing behind, which pins that the saving comes from them.
+int exercise_cancelled_prefill_progress(const char* artifact) {
+    constexpr std::uint32_t kStride = 512;
+    ninfer::RequestOptions request;
+    request.execution.requested_output_tokens = 8;
+    request.execution.sampling.temperature    = 0.0F;
+    request.execution.allow_prefix_reuse      = true;
+    request.stop.include_model_defaults       = false;
+
+    const auto options = [&](std::uint32_t stride) {
+        ninfer::EngineOptions engine_options =
+            automatic_anchor_engine_options(artifact, 4, 4, 0, false);
+        engine_options.max_context = 8192;
+        engine_options.kv_capacity = ninfer::KvCapacityPolicy::explicit_capacity(8192);
+        engine_options.context_cache.progress_anchor_tokens = stride;
+        return engine_options;
+    };
+
+    ninfer::GenerationResult control;
+    {
+        ninfer::Engine engine(options(0));
+        control = engine.generate(engine.prepare(progress_anchor_prompt()), request);
+    }
+    const std::uint32_t prompt_tokens = control.prompt.prompt_tokens;
+    if (control.generated_token_ids.size() != 8 || prompt_tokens < 6U * kStride) {
+        std::cerr << "progress-anchor prompt is too short or did not generate: tokens="
+                  << prompt_tokens << '\n';
+        return 1;
+    }
+    const std::uint32_t cancel_at = prompt_tokens * 2U / 5U;
+
+    const auto cancel_then_retry = [&](std::uint32_t stride, ninfer::GenerationResult& retried,
+                                       ninfer::FinishReason& cancelled_reason,
+                                       std::uint64_t& salvaged) {
+        ninfer::Engine engine(options(stride));
+        CancelAtProgressSink sink(cancel_at);
+        ninfer::GenerationHandle handle =
+            engine.submit(engine.prepare(progress_anchor_prompt()), request,
+                          ninfer::OutputConsumerMode::Streaming,
+                          ninfer::GenerationObservationOptions{.prompt_progress = true});
+        const ninfer::GenerationResult cancelled =
+            handle.wait(&sink, ninfer::CancellationView([&sink] { return sink.reached(); }));
+        cancelled_reason = cancelled.finish_reason;
+        salvaged         = engine.runtime_stats().cancelled_prefills_salvaged;
+        retried          = engine.generate(engine.prepare(progress_anchor_prompt()), request);
+        return engine.is_available();
+    };
+
+    ninfer::GenerationResult kept;
+    ninfer::GenerationResult dropped;
+    ninfer::FinishReason kept_reason    = ninfer::FinishReason::None;
+    ninfer::FinishReason dropped_reason = ninfer::FinishReason::None;
+    std::uint64_t kept_salvaged         = 0;
+    std::uint64_t dropped_salvaged      = 0;
+    if (!cancel_then_retry(kStride, kept, kept_reason, kept_salvaged) ||
+        !cancel_then_retry(0, dropped, dropped_reason, dropped_salvaged)) {
+        std::cerr << "engine latched unavailable after a cancelled prefill\n";
+        return 1;
+    }
+    std::cout << "cancelled-prefill-progress: prompt=" << prompt_tokens
+              << " cancel_at=" << cancel_at
+              << " kept_path=" << static_cast<int>(kept.prefix_reuse_path)
+              << " kept_reused=" << kept.reused_prompt_tokens << " kept_salvaged=" << kept_salvaged
+              << " dropped_reused=" << dropped.reused_prompt_tokens
+              << " dropped_salvaged=" << dropped_salvaged << '\n';
+    if (kept_reason != ninfer::FinishReason::Cancelled ||
+        dropped_reason != ninfer::FinishReason::Cancelled) {
+        std::cerr << "prefill finished before the cancel landed; the prompt is too short for this "
+                     "GPU\n";
+        return 1;
+    }
+    if (kept_salvaged != 1 ||
+        kept.prefix_reuse_path != ninfer::PrefixReusePath::PrivateLongAnchor ||
+        kept.reused_prompt_tokens < 2U * kStride || kept.reused_prompt_tokens % kStride != 0 ||
+        kept.reused_prompt_tokens >= prompt_tokens ||
+        kept.reused_prompt_tokens > cancel_at + 2048U) {
+        std::cerr << "the retry did not resume from a progress anchor\n";
+        return 1;
+    }
+    if (dropped_salvaged != 0 || dropped.reused_prompt_tokens != 0) {
+        std::cerr << "a cancelled MTP prefill without progress anchors left reusable state\n";
+        return 1;
+    }
+    if (kept.generated_token_ids != control.generated_token_ids ||
+        dropped.generated_token_ids != control.generated_token_ids) {
+        std::cerr << "output after a cancelled prefill differs from an uncancelled request\n";
+        return 1;
+    }
+    return 0;
+}
+
 int exercise_salvage_mid_prefill(const char* artifact) {
     ninfer::Engine engine(salvage_mid_prefill_engine_options(artifact));
 
@@ -2798,7 +3192,14 @@ int exercise_vision(ninfer::Engine& engine) {
     if (stopped.finish_reason != ninfer::FinishReason::StopToken ||
         stopped.generated_token_ids.empty() || stopped.speculative.rounds == 0 ||
         stopped.generated_token_ids.back() != stop_options.stop.token_ids.front()) {
-        std::cerr << "multimodal custom stop did not terminate at the selected token\n";
+        std::cerr << "multimodal custom stop did not terminate at the selected token: finish="
+                  << static_cast<int>(stopped.finish_reason)
+                  << " rounds=" << stopped.speculative.rounds
+                  << " reused=" << stopped.reused_prompt_tokens << " tokens";
+        for (const auto token : stopped.generated_token_ids) { std::cerr << ' ' << token; }
+        std::cerr << " baseline";
+        for (const auto token : mtp_baseline.generated_token_ids) { std::cerr << ' ' << token; }
+        std::cerr << '\n';
         return 1;
     }
     const ninfer::GenerationResult stopped_reuse =
@@ -4248,6 +4649,8 @@ int run() {
             result = exercise_engine_automatic_long_anchor_capture(artifact);
         } else if (scenario == "endpoint-anchor") {
             result = exercise_endpoint_anchor_sibling(artifact);
+        } else if (scenario == "cancelled-prefill-progress") {
+            result = exercise_cancelled_prefill_progress(artifact);
         } else if (scenario == "salvage-mid-prefill") {
             result = exercise_salvage_mid_prefill(artifact);
         } else if (scenario == "rewrite-checkpoint-shared") {
@@ -4289,6 +4692,8 @@ int run() {
             result = exercise_shared_anchor_entitlement(artifact);
         } else if (scenario == "automatic-private-anchors") {
             result = exercise_automatic_private_anchors(artifact);
+        } else if (scenario == "endpoint-anchor-adoption") {
+            result = exercise_endpoint_adopts_unaliased_anchor(artifact);
         } else if (scenario == "slot-persistence") {
             result = exercise_slot_persistence(artifact);
         } else if (scenario == "worker-failure-recovery") {

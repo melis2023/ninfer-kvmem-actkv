@@ -6,7 +6,10 @@
 // matrix followed by 256 zero bytes, which the matrix kernel's last K step of a 640-value down row
 // reads) take the matrix kernel wherever the block type has one (IQ1_M stays on the vector
 // kernel), with one or several column tiles per expert, and the same calls over banks that are not
-// declared device resident take the vector kernel.
+// declared device resident take the vector kernel. Where the CPU has the bank's block types, the
+// decode form's second stage also comes from CPU products (gguf_expert_cpu, its automatically
+// selected backend), as a miss service with a CPU share supplies it, and the sum must equal the
+// GPU's bit for bit.
 
 #include "core/arena.h"
 #include "core/tensor.h"
@@ -14,6 +17,7 @@
 #include "ninfer/ops/moe_experts.h"
 #include "ops/linear/gguf/ggml_bridge.h"
 #include "ops/linear/gguf/gguf_linear.h"
+#include "ops/moe_experts/gguf_expert_cpu.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -34,6 +38,19 @@ namespace {
 using namespace ninfer;
 
 constexpr int kHidden = 2560, kWidth = 640, kExperts = 512, kTopK = 10;
+
+// Independent stored Q2_0 decoder: binary16 multiplier and four adjacent 2-bit codes per byte.
+// Do not use the production GPU decoder to construct this format's mathematical oracle.
+float exact_q2_0(const std::uint8_t* block, int element) {
+    const std::uint16_t scale = std::uint16_t(block[0]) | (std::uint16_t(block[1]) << 8U);
+    const int exponent = (scale >> 10U) & 31, fraction = scale & 1023;
+    if (exponent == 31) { throw std::runtime_error("nonfinite Q2_0 scale in fixture"); }
+    const double magnitude = exponent ? std::ldexp(1024.0 + fraction, exponent - 25)
+                                      : std::ldexp(double(fraction), -24);
+    const double multiplier = scale & 0x8000 ? -magnitude : magnitude;
+    const int code = (block[2 + element / 4] >> (2 * (element % 4))) & 3;
+    return float(multiplier * (code - 1));
+}
 
 void check(cudaError_t status, const char* what) {
     if (status != cudaSuccess) {
@@ -104,6 +121,7 @@ struct Bank {
     std::vector<DeviceBuffer> matrices;
     DeviceBuffer table;
     std::vector<std::vector<float>> exact; // [distinct][rows * k]
+    std::vector<std::vector<std::uint8_t>> host; // [distinct] stored blocks
     int distinct = 1;
 
     Bank(QType q, int rows, int k, int count, int experts, std::mt19937& rng)
@@ -116,12 +134,20 @@ struct Bank {
             matrices.emplace_back(bytes.size() + kTail);
             check(cudaMemset(matrices.back().p, 0, bytes.size() + kTail), "zero a bank");
             matrices.back().copy_from_host(bytes.data(), bytes.size());
-            DeviceBuffer values(std::size_t(rows) * k * sizeof(float));
-            ops::gguf::dequantize_rows(ops::detail::gguf_type(q), matrices.back().p, row_bytes, k,
-                                       nullptr, rows, static_cast<float*>(values.p), k, nullptr);
-            check(cudaDeviceSynchronize(), "dequantize");
+            host.push_back(bytes);
             exact.emplace_back(std::size_t(rows) * k);
-            values.copy_to_host(exact.back().data(), exact.back().size() * sizeof(float));
+            if (q == QType::GGUF_Q2_0) {
+                for (std::size_t element = 0; element < exact.back().size(); ++element) {
+                    exact.back()[element] = exact_q2_0(bytes.data() + (element / 64) * 18,
+                                                       int(element % 64));
+                }
+            } else {
+                DeviceBuffer values(std::size_t(rows) * k * sizeof(float));
+                ops::gguf::dequantize_rows(ops::detail::gguf_type(q), matrices.back().p, row_bytes, k,
+                                           nullptr, rows, static_cast<float*>(values.p), k, nullptr);
+                check(cudaDeviceSynchronize(), "dequantize");
+                values.copy_to_host(exact.back().data(), exact.back().size() * sizeof(float));
+            }
         }
         for (int e = 0; e < experts; ++e) { pointers[e] = matrices[e % count].p; }
         table.copy_from_host(pointers.data(), pointers.size() * sizeof(void*));
@@ -135,6 +161,28 @@ struct Bank {
 };
 
 double silu(double x) { return x / (1.0 + std::exp(-x)); }
+
+// One expert's product for one token (BF16 words) on the CPU, as the miss service computes it.
+std::vector<float> cpu_expert(const Bank& gate, const Bank& up, const Bank& down, int expert,
+                              const std::uint16_t* x) {
+    const auto matrix = [&](const Bank& bank, int rows, int k) {
+        return ops::GgufCpuMatrix{bank.format, bank.host[expert % bank.distinct].data(),
+                                  bank.row_bytes, rows, k};
+    };
+    constexpr auto backend = ops::GgufCpuBackend::Automatic;
+    ops::GgufCpuActivation in(1, kHidden), in_up(1, kHidden), middle(1, kWidth);
+    in.prepare_bf16(gate.format, x, kHidden, 1);
+    in_up.prepare_bf16(up.format, x, kHidden, 1);
+    std::vector<float> g(kWidth), u(kWidth), y(kHidden);
+    ops::gguf_cpu_rows(matrix(gate, kWidth, kHidden), in, 0, kWidth, g.data(), kWidth, backend);
+    ops::gguf_cpu_rows(matrix(up, kWidth, kHidden), in_up, 0, kWidth, u.data(), kWidth, backend);
+    std::vector<std::uint16_t> m(kWidth);
+    ops::gguf_cpu_swiglu_bf16(g.data(), u.data(), kWidth, m.data(), backend);
+    middle.prepare_bf16(down.format, m.data(), kWidth, 1);
+    ops::gguf_cpu_rows(matrix(down, kHidden, kWidth), middle, 0, kHidden, y.data(), kHidden,
+                       backend);
+    return y;
+}
 
 // down . (silu(gate . x) * (up . x)) in FP64.
 std::vector<double> expert_output(const float* gate, const float* up, const float* down,
@@ -228,6 +276,125 @@ int run_case(const Case& c, std::uint32_t seed) {
                       << (device_resident ? " matrix" : " vector") << ": a repeat differs\n";
             ++failures;
         }
+        if (ops::moe_experts_gguf_decode_supported(banks, tokens)) {
+            // The decode form must equal the separate kernels bit for bit, whole and split into a
+            // first stage and a second (the even and odd pairs) as missing experts are served.
+            const auto compare = [&](const char* what) {
+                check(cudaDeviceSynchronize(), what);
+                std::vector<float> other(got.size());
+                d_y.copy_to_host(other.data(), other.size() * 4);
+                if (std::memcmp(got.data(), other.data(), got.size() * 4) != 0) {
+                    std::cerr << "FAIL " << c.name << " T=" << tokens << ": " << what
+                              << " differs from the decode form\n";
+                    ++failures;
+                }
+            };
+            {
+                auto scope       = workspace.scope();
+                const auto stage = ops::moe_experts_gguf_begin(t_m, workspace, nullptr);
+                ops::moe_experts_gguf_add(stage, t_m, t_ids, t_w, &t_s, banks, workspace, nullptr);
+                ops::moe_experts_gguf_finish(stage, t_y, nullptr);
+            }
+            compare("the separate kernels");
+            std::vector<std::int32_t> first(ids.size()), second(ids.size());
+            for (std::size_t p = 0; p < ids.size(); ++p) {
+                const bool odd = ids[p] % 2 != 0;
+                first[p]       = odd ? -1 : ids[p];
+                second[p]      = odd ? ids[p] : -1;
+            }
+            DeviceBuffer d_first(ids.size() * 4), d_second(ids.size() * 4);
+            d_first.copy_from_host(first.data(), first.size() * 4);
+            d_second.copy_from_host(second.data(), second.size() * 4);
+            const Tensor t_first(d_first.p, DType::I32, {kTopK, tokens});
+            const Tensor t_second(d_second.p, DType::I32, {kTopK, tokens});
+            {
+                auto scope       = workspace.scope();
+                const auto state = ops::moe_experts_gguf_decode_begin(t_m, t_first, t_s, banks,
+                                                                      workspace, nullptr);
+                ops::moe_experts_gguf_decode_missing(state, t_m, t_second, banks, nullptr);
+                ops::moe_experts_gguf_decode_finish(state, t_first, &t_second, t_w, banks, &banks,
+                                                    nullptr, nullptr, nullptr, t_y, nullptr);
+            }
+            compare("the two-stage decode form");
+            {
+                // The shared expert on a side stream, joined before the sum is read.
+                ops::GgufMoeSide side;
+                check(cudaStreamCreateWithFlags(&side.stream, cudaStreamNonBlocking), "side stream");
+                check(cudaEventCreateWithFlags(&side.fork, cudaEventDisableTiming), "fork event");
+                check(cudaEventCreateWithFlags(&side.join, cudaEventDisableTiming), "join event");
+                {
+                    auto scope       = workspace.scope();
+                    const auto state = ops::moe_experts_gguf_decode_begin(
+                        t_m, t_first, t_s, banks, workspace, nullptr, &side);
+                    ops::moe_experts_gguf_decode_missing(state, t_m, t_second, banks, nullptr);
+                    ops::moe_experts_gguf_decode_finish(state, t_first, &t_second, t_w, banks,
+                                                        &banks, nullptr, nullptr, nullptr, t_y,
+                                                        nullptr);
+                }
+                compare("the decode form with a side stream");
+                check(cudaEventDestroy(side.fork), "fork event");
+                check(cudaEventDestroy(side.join), "join event");
+                check(cudaStreamDestroy(side.stream), "side stream");
+            }
+            {
+                auto scope       = workspace.scope();
+                const auto stage = ops::moe_experts_gguf_begin(t_m, workspace, nullptr);
+                ops::moe_experts_gguf_add(stage, t_m, t_first, t_w, &t_s, banks, workspace, nullptr);
+                ops::moe_experts_gguf_add(stage, t_m, t_second, t_w, nullptr, banks, workspace,
+                                          nullptr);
+                ops::moe_experts_gguf_finish(stage, t_y, nullptr);
+            }
+            compare("the two-stage separate kernels");
+            if (ops::gguf_cpu_supported(c.gate) && ops::gguf_cpu_supported(c.up) &&
+                ops::gguf_cpu_supported(c.down)) {
+                // The second stage's pairs as CPU products, the GPU running only the first.
+                std::vector<float> products;
+                std::vector<std::int32_t> pairs;
+                for (std::size_t p = 0; p < ids.size(); ++p) {
+                    if (second[p] < 0) { continue; }
+                    const auto* x = reinterpret_cast<const std::uint16_t*>(m.data()) +
+                                    (p / kTopK) * std::size_t(kHidden);
+                    const auto y = cpu_expert(gate, up, down, second[p], x);
+                    products.insert(products.end(), y.begin(), y.end());
+                    pairs.push_back(std::int32_t(p));
+                }
+                const std::int32_t count = std::int32_t(pairs.size());
+                const std::vector<std::int32_t> none(ids.size(), -1);
+                DeviceBuffer d_products(std::max<std::size_t>(products.size(), 1) * 4),
+                    d_pairs(std::max<std::size_t>(pairs.size(), 1) * 4), d_count(4),
+                    d_none(ids.size() * 4);
+                if (count > 0) {
+                    d_products.copy_from_host(products.data(), products.size() * 4);
+                    d_pairs.copy_from_host(pairs.data(), pairs.size() * 4);
+                }
+                d_count.copy_from_host(&count, 4);
+                d_none.copy_from_host(none.data(), none.size() * 4);
+                const Tensor t_none(d_none.p, DType::I32, {kTopK, tokens});
+                {
+                    auto scope       = workspace.scope();
+                    const auto state = ops::moe_experts_gguf_decode_begin(t_m, t_first, t_s, banks,
+                                                                          workspace, nullptr);
+                    ops::moe_experts_gguf_decode_missing(state, t_m, t_none, banks, nullptr);
+                    ops::moe_experts_gguf_decode_finish(
+                        state, t_first, &t_none, t_w, banks, &banks,
+                        static_cast<const float*>(d_products.p),
+                        static_cast<const std::int32_t*>(d_pairs.p),
+                        static_cast<const std::int32_t*>(d_count.p), t_y, nullptr);
+                }
+                check(cudaDeviceSynchronize(), "the decode form with CPU products");
+                std::vector<float> hybrid(got.size());
+                d_y.copy_to_host(hybrid.data(), hybrid.size() * 4);
+                std::size_t differ = 0;
+                for (std::size_t i = 0; i < got.size(); ++i) {
+                    differ += std::memcmp(&hybrid[i], &got[i], 4) != 0 ? 1 : 0;
+                }
+                std::cout << (differ == 0 ? "OK   " : "FAIL ") << c.name << " T=" << tokens
+                          << " with " << count << " CPU products ("
+                          << ops::gguf_cpu_backend_name(ops::GgufCpuBackend::Automatic)
+                          << "): " << differ << " of " << got.size() << " outputs differ from the GPU's\n";
+                failures += differ == 0 ? 0 : 1;
+            }
+        }
         double num = 0, den = 0, worst = 0, scale = 0;
         for (int t = 0; t < tokens; ++t) {
             std::vector<float> x(kHidden);
@@ -287,7 +454,7 @@ int main() {
              Q::GGUF_Q3_K,
              Q::GGUF_Q5_0,
              8,
-             {1, 2, 3, 8, 40},
+             {1, 2, 3, 8, 9, 16, 24, 40, 48},
              kExperts},
             // Experts concentrated on a few ids: several columns per pass (chunks 4 and 8).
             {"q2_0 dense routing",
@@ -311,6 +478,17 @@ int main() {
              4,
              {1, 5, 24},
              kExperts},
+            // IQ2_S's two half-slice factors on the decode form, against the CPU's products.
+            {"iq2_s bank",
+             Q::GGUF_IQ2_S,
+             Q::GGUF_IQ2_S,
+             Q::GGUF_Q8_0,
+             Q::GGUF_IQ4_XS,
+             Q::GGUF_IQ4_XS,
+             Q::GGUF_IQ4_NL,
+             4,
+             {1, 2, 8},
+             kExperts},
             {"iq1_m/iq3_xxs",
              Q::GGUF_IQ1_M,
              Q::GGUF_IQ1_M,
@@ -332,7 +510,7 @@ int main() {
              Q::GGUF_Q6_K,
              Q::GGUF_IQ4_NL,
              4,
-             {9, 24},
+             {1, 8, 9, 24},
              kExperts},
             {"iq3_xxs dense routing",
              Q::GGUF_IQ3_XXS,
@@ -342,7 +520,7 @@ int main() {
              Q::GGUF_Q4_K,
              Q::GGUF_IQ4_NL,
              2,
-             {24, 160},
+             {3, 24, 160},
              12},
             {"iq4_xs dense routing",
              Q::GGUF_IQ4_XS,
@@ -352,7 +530,7 @@ int main() {
              Q::GGUF_Q5_K,
              Q::GGUF_IQ4_NL,
              2,
-             {24},
+             {8, 24},
              12},
         };
         int failures       = 0;

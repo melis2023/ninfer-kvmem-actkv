@@ -163,16 +163,6 @@ void require_neutral_controls(const Json& body) {
                         control.key, std::string(control.key) + "_not_supported");
         }
     }
-    if (present(body, "grammar")) {
-        const Json& grammar = body.at("grammar");
-        if (!grammar.is_string()) { bad_request("grammar must be a string", "grammar"); }
-        if (!grammar.get_ref<const std::string&>().empty()) {
-            bad_request(
-                "grammar requests constrained decoding by a GBNF grammar, which NInfer does "
-                "not provide; use json_schema or response_format",
-                "grammar", "constrained_decoding_not_supported");
-        }
-    }
     if (present(body, "lora")) {
         const Json& lora = body.at("lora");
         if (!lora.is_array()) { bad_request("lora must be an array", "lora"); }
@@ -256,18 +246,21 @@ void parse_structured_output_fields(const Json& body, TextCompletionDialect dial
         output.structured_output =
             parse_structured_output(body.at("response_format"), true, "response_format");
     }
-    if (dialect != TextCompletionDialect::LlamaCpp || !present(body, "json_schema")) { return; }
-    if (output.structured_output.kind != StructuredOutputKind::None) {
-        bad_request("json_schema and response_format are exclusive", "json_schema");
+    if (dialect == TextCompletionDialect::LlamaCpp && present(body, "json_schema")) {
+        if (output.structured_output.kind != StructuredOutputKind::None) {
+            bad_request("json_schema and response_format are exclusive", "json_schema");
+        }
+        // llama.cpp's json_schema is the bare schema; an empty one admits any JSON object.
+        const Json& schema = body.at("json_schema");
+        const Json format =
+            schema.is_object() && schema.empty()
+                ? Json{{"type", "json_object"}}
+                : Json{{"type", "json_schema"},
+                       {"json_schema", Json{{"name", "json_schema"}, {"schema", schema}}}};
+        output.structured_output       = parse_structured_output(format, true, "json_schema");
+        output.structured_output_param = "json_schema";
     }
-    // llama.cpp's json_schema is the bare schema; an empty one admits any JSON object.
-    const Json& schema = body.at("json_schema");
-    const Json format =
-        schema.is_object() && schema.empty()
-            ? Json{{"type", "json_object"}}
-            : Json{{"type", "json_schema"},
-                   {"json_schema", Json{{"name", "json_schema"}, {"schema", schema}}}};
-    output.structured_output = parse_structured_output(format, true, "json_schema");
+    parse_constrained_decoding_extensions(body, output);
 }
 
 std::vector<std::string> parse_response_fields(const Json& body) {

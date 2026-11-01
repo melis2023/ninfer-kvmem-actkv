@@ -2,6 +2,7 @@
 
 #include "serve/generation_service.h"
 #include "serve/openai_common.h"
+#include "serve/kvmem_metrics.h"
 
 #include <nlohmann/json.hpp>
 
@@ -53,13 +54,13 @@ double tokens_per_second(std::uint32_t tokens, double milliseconds) {
     return milliseconds > 0.0 ? 1000.0 * static_cast<double>(tokens) / milliseconds : 0.0;
 }
 
-CompletionTimings make_completion_timings(std::uint32_t prompt_tokens, std::uint32_t cached_tokens,
+CompletionTimings make_completion_timings(std::uint32_t computed_tokens, std::uint32_t cached_tokens,
                                           std::uint32_t generated_tokens, double prompt_ms,
                                           double generation_ms, std::uint64_t draft_tokens = 0,
                                           std::uint64_t accepted_draft_tokens = 0) {
     CompletionTimings timings;
-    timings.cache_n             = std::min(cached_tokens, prompt_tokens);
-    timings.prompt_n            = prompt_tokens - timings.cache_n;
+    timings.cache_n             = cached_tokens;
+    timings.prompt_n            = computed_tokens;
     timings.prompt_ms           = finite_nonnegative(prompt_ms);
     timings.prompt_per_token_ms = milliseconds_per_token(timings.prompt_n, timings.prompt_ms);
     timings.prompt_per_second   = tokens_per_second(timings.prompt_n, timings.prompt_ms);
@@ -93,8 +94,7 @@ Json timings_json(const CompletionTimings& timings) {
 
 CompletionTimings outcome_timings(const GenerationOutcome& outcome) {
     return make_completion_timings(
-        static_cast<std::uint32_t>(std::max(0, outcome.prompt_tokens)),
-        outcome.metrics.prefix_cache_hit_tokens,
+        outcome.metrics.computed_prefill_tokens, outcome.metrics.prefix_cache_hit_tokens,
         static_cast<std::uint32_t>(std::max(0, outcome.completion_tokens)),
         outcome.metrics.prompt_wall_seconds * 1000.0,
         outcome.metrics.generation_wall_seconds * 1000.0, outcome.metrics.speculative_draft_tokens,
@@ -104,8 +104,10 @@ CompletionTimings outcome_timings(const GenerationOutcome& outcome) {
 CompletionTimings observation_timings(std::uint32_t prompt_tokens, std::uint32_t cached_tokens,
                                       const ninfer::GenerationTimingObservation& observation) {
     constexpr double kNanosecondsToMilliseconds = 1.0e-6;
+    // Output timing observations start only after the complete prompt has been accepted.
+    cached_tokens = std::min(cached_tokens, prompt_tokens);
     return make_completion_timings(
-        prompt_tokens, cached_tokens, observation.generated_tokens,
+        prompt_tokens - cached_tokens, cached_tokens, observation.generated_tokens,
         static_cast<double>(observation.prompt_elapsed_ns) * kNanosecondsToMilliseconds,
         static_cast<double>(observation.generation_elapsed_ns) * kNanosecondsToMilliseconds);
 }
@@ -155,10 +157,6 @@ materialize_tool_calls(const std::vector<ninfer::GeneratedToolCall>& generated) 
     std::vector<ToolCall> calls;
     calls.reserve(generated.size());
     for (const ninfer::GeneratedToolCall& call : generated) {
-        // A model that decides to call a tool but emits an empty argument object
-        // cannot satisfy any real schema. Drop it so the client never executes an
-        // empty call and never turns it into a ToolArgsError.
-        if (call.arguments_json.empty() || call.arguments_json == "{}") { continue; }
         calls.push_back(ToolCall{.id             = new_openai_chat_tool_call_id(),
                                  .name           = call.name,
                                  .arguments_json = call.arguments_json});
@@ -239,6 +237,7 @@ std::string chunk(const OpenAIChatResponseIdentity& identity, Json delta, Json f
     if (include_usage) { payload["usage"] = nullptr; }
     if (!timings.is_null()) { payload["timings"] = std::move(timings); }
     add_slot_identity(payload, slot_identity);
+    if (slot_identity) payload["kvmem"] = kvmem_generation_metrics(*slot_identity);
     return event(std::move(payload));
 }
 
@@ -249,6 +248,7 @@ std::string usage_chunk(const OpenAIChatResponseIdentity& identity, const Comple
     payload["usage"]   = usage_json(usage);
     payload["timings"] = std::move(timings);
     add_slot_identity(payload, &outcome);
+    payload["kvmem"] = kvmem_generation_metrics(outcome);
     return event(std::move(payload));
 }
 
@@ -293,11 +293,11 @@ std::string make_chat_completion_response(const OpenAIChatResponseIdentity& iden
                                           const GenerationOutcome& outcome,
                                           std::optional<int> top_logprobs) {
     Json message = {{"role", "assistant"}, {"content", outcome.text}, {"refusal", nullptr}};
-    const std::vector<ToolCall> calls = materialize_tool_calls(outcome.tool_calls);
-    const bool has_tool_calls = !calls.empty();
+    const bool has_tool_calls = !outcome.tool_calls.empty();
     // vLLM/SGLang-compatible reasoning_content preserves the Engine's Reasoning/Content split.
     if (!outcome.reasoning.empty()) { message["reasoning_content"] = outcome.reasoning; }
     if (has_tool_calls) {
+        const std::vector<ToolCall> calls = materialize_tool_calls(outcome.tool_calls);
         message["content"]    = outcome.text.empty() ? Json(nullptr) : Json(outcome.text);
         message["tool_calls"] = tool_calls_json(calls, false);
     }
@@ -312,6 +312,7 @@ std::string make_chat_completion_response(const OpenAIChatResponseIdentity& iden
     payload["usage"]   = usage_json(usage_from(outcome));
     payload["timings"] = timings_json(outcome_timings(outcome));
     add_slot_identity(payload, &outcome);
+    payload["kvmem"] = kvmem_generation_metrics(outcome);
     return payload.dump();
 }
 
@@ -448,8 +449,8 @@ std::vector<std::string> OpenAIChatStream::finish(const GenerationOutcome& outco
                                include_usage_, output_timings));
     }
 
-    const std::vector<ToolCall> calls = materialize_tool_calls(outcome.tool_calls);
-    if (!calls.empty()) {
+    if (!outcome.tool_calls.empty()) {
+        const std::vector<ToolCall> calls = materialize_tool_calls(outcome.tool_calls);
         events.push_back(chunk(identity_, Json{{"tool_calls", tool_calls_json(calls, true)}},
                                nullptr, include_usage_, output_timings));
         events.push_back(chunk(identity_, Json::object(), "tool_calls", include_usage_,

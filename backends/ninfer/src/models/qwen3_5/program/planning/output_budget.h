@@ -5,7 +5,7 @@
 // request planner and the concurrent-budget query use exactly one formula.
 
 #include "core/paged_kv_cache.h"
-#include "ninfer/types.h"
+#include "ninfer/model_enums.h"
 
 #include <algorithm>
 #include <cstdint>

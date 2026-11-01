@@ -1,24 +1,30 @@
 #pragma once
-#include "models/qwen3_5/program/speculative/mtp_adaptive.h"
+#include "kvmem/query_policy.hpp"
+#include "runtime/contract/grammar_masks.h"
+#include "runtime/contract/mtp_adaptive.h"
 #include "models/qwen3_5/program/internal.h"
 
 #include "core/arena.h"
 #include "core/device_snapshot.h"
 #include "core/vmm.h"
 #include "kvmem/memory_contract.hpp"
+#include "kvmem/prefix_checkpoint.hpp"
+#include "kvmem/checkpoint_policy.hpp"
+#include "kvmem/checkpoint_image.hpp"
 #include "kvmem/raw_kv_store.hpp"
 #include "kvmem/kvmem_store.hpp"
 #include "kvmem/mean_key_retrieval.hpp"
 #include "kvmem/graph_recall.hpp"
-#include "kvmem/checkpoint_policy.hpp"
 #include "kvmem/page_softmax_cuda.hpp"
 #include "kvmem/spill_io.hpp"
 #include "core/disk_kv_bridge.h"
 #include "core/gdn_replay_records.h"
 #include "core/host_kv_arena.h"
+#include "core/kv_expert_loan.h"
 #include "ninfer/ops/gdn_replay.h"
 #include "ninfer/ops/sampling.h"
 #include "core/decode_graph.h"
+#include "models/qwen3_5/execution/expert_runtime.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/graft_injection.h"
 
@@ -26,6 +32,7 @@
 #include "models/qwen3_5/program/storage/draft_context.h"
 #include "models/qwen3_5/program/storage/host_kv_store.h"
 #include "models/qwen3_5/program/storage/kv_store.h"
+#include "models/qwen3_5/program/storage/checkpoint_buffer_pool.h"
 #include "models/qwen3_5/program/storage/state_store.h"
 #include "models/qwen3_5/program/prefix/hybrid_cache.h"
 #include "models/qwen3_5/program/prefix_identity.h"
@@ -60,6 +67,8 @@
 
 namespace ninfer::models::qwen3_5::detail {
 
+using runtime::MtpAdaptiveBatchController;
+using runtime::MtpAdaptiveSignal;
 using PreparedPromptData    = qwen3_5::PreparedPromptData;
 using RewriteCheckpointKind = qwen3_5::RewriteCheckpointKind;
 using RewriteCheckpointSpec = qwen3_5::RewriteCheckpointSpec;
@@ -210,6 +219,19 @@ struct CaptureAssessmentImpl {
     PhysicalResources capacity_preparation_removed;
 };
 
+// The most tokens a branched read's branches extend its prompt by; zero without branches.
+[[nodiscard]] inline std::uint32_t
+branch_extent(const std::vector<runtime::ReadBranch>* branches) noexcept {
+    std::size_t extent = 0;
+    if (branches != nullptr) {
+        for (const runtime::ReadBranch& branch : *branches) {
+            extent = std::max(extent, branch.tokens.size());
+        }
+    }
+    return static_cast<std::uint32_t>(
+        std::min<std::size_t>(extent, std::numeric_limits<std::uint32_t>::max()));
+}
+
 struct RequestBasePlanImpl {
     std::uint64_t memory_payload_reservation = 0, publication_order = 0;
     runtime::RequestPlanSummary summary;
@@ -219,8 +241,17 @@ struct RequestBasePlanImpl {
     qwen3_5::PreparedContextCache context_cache;
     ops::SamplingConfig sampling;
     std::shared_ptr<text::GrammarState> grammar;
+    std::optional<TokenId> suppressed_tool_open;
     // The request asked for each generated token's log probability.
     bool logprobs = false;
+    // With logprobs: the token ids read out exactly on the first generated token.
+    std::vector<TokenId> readout_tokens;
+    // A branched read's branches (runtime::ResolvedExecutionOptions::branches), or null.
+    std::shared_ptr<const std::vector<runtime::ReadBranch>> branches;
+    // The speculative drafter serves this request (ExecutionOptions::speculative_drafting, or a
+    // Program without one). Without it, the drafter's prompt work stops at the deepest cache entry
+    // the request publishes.
+    bool drafting                             = true;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const qwen3_5::VisionControlPlan> vision_control_plan;
@@ -288,7 +319,11 @@ struct AdmissionCandidateImpl : ResourceCandidateState {
     std::vector<CaptureGroup> shared_candidates;
     ops::SamplingConfig sampling;
     std::shared_ptr<text::GrammarState> grammar;
+    std::optional<TokenId> suppressed_tool_open;
     bool logprobs                             = false;
+    std::vector<TokenId> readout_tokens;
+    std::shared_ptr<const std::vector<runtime::ReadBranch>> branches;
+    bool drafting                             = true;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     runtime::LaneId destination{};
@@ -312,6 +347,12 @@ struct CapturePressureCandidateImpl : ResourceCandidateState {};
 struct HybridQuoteImpl {
     runtime::RequestPlanSummary summary;
     ops::SamplingConfig sampling;
+    std::shared_ptr<text::GrammarState> grammar;
+    std::optional<TokenId> suppressed_tool_open;
+    bool logprobs                             = false;
+    std::vector<TokenId> readout_tokens;
+    std::shared_ptr<const std::vector<runtime::ReadBranch>> branches;
+    bool drafting                             = true;
     std::uint32_t text_kv_page_entitlement    = 0;
     std::uint32_t backend_kv_page_entitlement = 0;
     std::shared_ptr<const qwen3_5::VisionControlPlan> vision_control_plan;
@@ -339,6 +380,8 @@ struct HybridPendingTap {
 struct HybridLaneState {
     bool active  = false;
     bool publish = false;
+    // PreparedTapHints::disposable: the snapshot it resumed from is never superseded.
+    bool disposable = false;
     // Root path of full blocks this sequence pins, in prompt order. Blocks past the reuse
     // frontier are appended as the sequence commits them.
     std::vector<runtime::prefix_cache::NodeRef> path;
@@ -472,8 +515,6 @@ struct DecodeGraphFamily {
 // output, sampling, and round-control state.
 struct KvmemPrefixCheckpoint {
     kvmem::LrfuState history;
-    // 0.19 Query replay restores the exact scoring state at the query boundary:
-    // mean-K tail, attention graph and feedback samples must travel together.
     kvmem::GraphSnapshot graph;
     kvmem::AttentionFeedbackSnapshot feedback;
     kvmem::OutputSampleState attention_scope;
@@ -481,34 +522,47 @@ struct KvmemPrefixCheckpoint {
     std::vector<TokenId> prefix;
     ResidentPrefixIdentity prefix_identity;
     std::vector<std::uint64_t> resident_pages;
-    std::vector<std::uint32_t> pinned_pages;
-    std::vector<std::uint32_t> demoted_pages;
-    std::vector<std::uint32_t> system_pages;
-    std::vector<std::uint32_t> tool_pages;
-    std::vector<std::uint32_t> brief_pages;
     std::vector<float> mean_tail;
     std::shared_ptr<PinnedHostBuffer> state;
-    // Idle-only attachment in the same disk account as native KV. Active
-    // checkpoints use the existing pinned representation and GPU copy path.
+    // Native images share the KV disk account. Spread also demotes inactive
+    // records within the active history; execution leases stay pinned.
     kvmem::SpillExtent cold_state;
-    std::uint64_t state_bytes() const noexcept { return state ? state->size() : cold_state.size(); }
-    kvmem::CoverageInfo checkpoint_info() const noexcept {
-        return {prefix.size(), state_bytes(), 0,
-                state ? static_cast<const void*>(state->data()) : nullptr,
-                kvmem::CoveragePurpose::Periodic, 0};
+    std::uint64_t cold_tag = 0, cold_payload_bytes = 0;
+    static std::uint64_t identity_bytes(const kvmem::CheckpointIdentity& value) noexcept {
+        return value.backend.backend.capacity() + value.backend.revision.capacity() +
+            value.backend.model.capacity() + value.backend.state_schema.capacity() +
+            value.layout.format.capacity() + 5 + value.layout.planes.capacity()*sizeof(kvmem::PayloadPlane);
+    }
+    std::uint64_t metadata_bytes() const noexcept {
+        return sizeof(*this) + identity_bytes(identity) + prefix_identity.allocated_bytes() +
+            prefix.capacity()*sizeof(TokenId) + resident_pages.capacity()*sizeof(uint64_t) +
+            mean_tail.capacity()*sizeof(float) + history.scores->capacity()*sizeof(double) + graph.bytes() + feedback.bytes();
+    }
+    std::uint64_t state_bytes() const noexcept { return state ? state->size() : cold_tag ? cold_payload_bytes : cold_state.size(); }
+    void read_state(void* destination, size_t bytes) const {
+        if (bytes != state_bytes()) throw std::logic_error("checkpoint state size mismatch");
+        if (cold_tag) kvmem::read_checkpoint_image(cold_state, cold_tag, {{destination, bytes}});
+        else cold_state.read(0, destination, bytes);
     }
 };
 
-enum class KvmemCheckpointKind : std::uint8_t { Base, Endpoint, InputFallback, Reconstruction };
+struct KvmemCheckpointRecord {
+    kvmem::CheckpointPurpose purposes = kvmem::CheckpointPurpose::None;
+    std::shared_ptr<KvmemPrefixCheckpoint> data;
+    kvmem::CheckpointInfo checkpoint_info() const {
+        return {data ? data->prefix.size() : 0, purposes, data.get(),
+                data ? data->state_bytes() + data->metadata_bytes() : 0};
+    }
+};
+enum class KvmemCheckpointKind : std::uint16_t { Base, Endpoint, InputFallback, Reconstruction, ReuseAnchor, CoverageBegin = 16 };
 // Lookup priority for equal frontiers.
 inline constexpr std::array kKvmemCheckpointKinds{
     KvmemCheckpointKind::Endpoint, KvmemCheckpointKind::Reconstruction,
-    KvmemCheckpointKind::InputFallback, KvmemCheckpointKind::Base};
+    KvmemCheckpointKind::InputFallback, KvmemCheckpointKind::Base, KvmemCheckpointKind::ReuseAnchor};
 struct KvmemHistoryMatch {
     std::size_t history;
     KvmemCheckpointKind kind;
     std::uint32_t frontier;
-    const KvmemPrefixCheckpoint* periodic = nullptr;
 };
 
 using KvmemHostRecord = kvmem::HostKvRecord;
@@ -532,6 +586,7 @@ struct KvmemAppendPreparation {
 struct KvmemHistoryPreparation {
     struct Work {
         kvmem::SpillExtent state_source;
+        uint64_t state_tag = 0, state_payload_bytes = 0;
         KvmemHostRecord state;
         std::vector<std::uint32_t> ids;
         std::vector<kvmem::HostKvSource> sources;
@@ -554,6 +609,7 @@ struct KvmemIdleTransfer {
         kvmem::SpillExtent destination;
         const void* data = nullptr;
         std::size_t bytes = 0;
+        std::uint64_t tag = 0;
     };
     // Only the engine owns this CUDA host allocation. A worker borrows its
     // immutable bytes; this owner survives history eviction until completion.
@@ -565,10 +621,19 @@ struct KvmemIdleTransfer {
     KvmemCheckpointKind kind = KvmemCheckpointKind::Base;
 };
 
+inline qwen3_5::TokenSpan bounded_memory_query(const PreparedPromptData& prompt, uint32_t limit,
+                                               const qwen3_5::TokenSpan* source_span = nullptr) {
+    const auto source = source_span && source_span->count
+                            ? *source_span
+                            : prompt.memory_query.value_or(qwen3_5::TokenSpan{});
+    auto bounded=kvmem::bounded_query(source.begin,source.count,prompt.token_ids.size(),limit);
+    for(const auto& item:prompt.vision_items) for(const auto& span:item.token_spans)
+        if(span.begin<=bounded.begin && bounded.begin<span.begin+span.count)
+            bounded.begin=std::min(bounded.end,span.begin+span.count);
+    return {bounded.begin,bounded.end-bounded.begin};
+}
+
 struct KvmemWindowState {
-    std::vector<TokenId> history_input;
-    ResidentPrefixIdentity history_input_identity;
-    std::vector<kvmem::LrfuPoint> history_points;
     std::optional<PreparedSessionKey> session_key;
     std::uint64_t publication_order = 0;
     bool update_session_index = true;
@@ -576,22 +641,15 @@ struct KvmemWindowState {
     // packed data AND scales. They never contain a second allocation of device KV.
     std::vector<std::uint32_t> pages;
     std::vector<std::uint32_t> media_pages;
-    // Logical page ids of the last response's non-thinking tail (final answer and tool-call
-    // payload) and of fully-thinking pages. Pinned pages join the mandatory set; demoted pages
-    // stay retrieved only as a last resort. Both survive history retention and checkpoints.
+    // Structural pins: the system preamble, declared tool definitions and the
+    // first real user brief. They are kept separate from the current task so
+    // answer/task growth can never evict the schema/brief.
     std::vector<std::uint32_t> pinned_pages;
     std::vector<std::uint32_t> demoted_pages;
-    // Structural pins: the system preamble, declared tool definitions and the
-    // first real user brief. They are kept separate from answer pins so answer
-    // growth can never evict the schema/brief.
     std::vector<std::uint32_t> system_pages;
     std::vector<std::uint32_t> tool_pages;
     std::vector<std::uint32_t> brief_pages;
-    // Keep-on only: actual page spans for the prompt's leading structure and the newest
-    // message window. Set from PreparedPromptData so the sink/recent reservation follows the
-    // real content instead of a fixed token count. Empty falls back to the fixed options.
     std::vector<std::uint32_t> dynamic_sink_pages;
-    std::vector<std::uint32_t> dynamic_recent_pages;
     std::vector<KvmemHostRecord> archive;
     std::vector<std::uint64_t> host_versions;
     kvmem::MemoryStamp stamp;
@@ -601,44 +659,51 @@ struct KvmemWindowState {
     std::uint32_t swaps = 0;
     std::unique_ptr<kvmem::RawKvStore> statistics;
     std::unique_ptr<kvmem::KvMemStore> selector;
-    // Accepted prompt Query rows, one `query_width` row per layer and token.
     std::vector<std::vector<float>> query_rows;
-    // Periodic 0.19 checkpoint archive: spread restore points across a long
-    // prefix, bounded by count and bytes.
-    kvmem::CheckpointArchive<KvmemPrefixCheckpoint> periodic_checkpoints;
-    // Native attention feedback, current request's consumed-token scope and the
-    // thought-token ids that mark which accepted rows count as output.
+    // Mean-Q keeps the chronological FP32 sum instead of retaining token rows.
+    // The per-step device accumulator is always reseeded from this accepted state.
+    std::vector<float> query_sums;
     kvmem::GraphSnapshot graph;
     kvmem::AttentionFeedback feedback;
     kvmem::OutputSampleState attention_scope;
-    std::uint32_t output_begin = 0;
-    std::int32_t think_open = -1, think_close = -1;
+    std::uint32_t output_begin=0;
+    std::shared_ptr<const std::vector<kvmem::GraphMessageSpan>> request_messages;
+    std::int32_t think_open=-1,think_close=-1;
     std::uint32_t statistics_frontier = 0;
     std::uint32_t query_tokens = 0;
     std::uint32_t query_begin = 0, query_end = 0;
-    // Query admission is frozen before a resident view is restored; the native
-    // restore path only consumes these ids.
-    std::vector<std::uint32_t> query_selected;
-    std::vector<std::uint32_t> query_required;
     // Long prompts retain the pre-query boundary for selection/replay; short prompts
     // retain the input prefix before its final token for request-to-request reuse.
-    std::unique_ptr<KvmemPrefixCheckpoint> prefix_checkpoint;
-    std::unique_ptr<KvmemPrefixCheckpoint> endpoint_checkpoint;
-    // An input fallback survives generated reconstruction captures: a caller may
-    // discard/replace the output while appending to the exact earlier input.
-    std::unique_ptr<KvmemPrefixCheckpoint> input_checkpoint;
-    std::unique_ptr<KvmemPrefixCheckpoint> reconstruction_checkpoint;
+    kvmem::CheckpointCatalog<KvmemCheckpointRecord> checkpoints{kvmem::CheckpointLimits{5}};
+    kvmem::CheckpointArchive<KvmemCheckpointRecord> coverage;
+    kvmem::CheckpointCapturePlan capture_plan;
+    std::uint32_t reuse_anchor = 0;
     std::uint32_t reconstruction_frontier = 0;
     bool query_replayed = false;
-    // True only while an admitted Query is being replayed, so prefill feedback
-    // sampling does not run twice over the same rows.
+    bool query_capture = false;
     bool query_replay_active = false;
+    std::uint32_t query_probe_swaps = 0;
+    std::vector<std::uint32_t> query_selected;
+    std::vector<std::uint32_t> query_required;
     std::uint32_t pending_window_begin = 0, pending_window_end = 0;
     std::uint64_t pending_io_epoch = 0;
     std::unique_ptr<KvmemAppendPreparation> pending_append;
     kvmem::StorageTicket pending_window_io;
     // Last member: abort/drain the transaction before its source archive dies.
     std::unique_ptr<kvmem::MemorySession> pending_window;
+};
+inline std::vector<KvmemCheckpointKind> checkpoint_kinds(const KvmemWindowState& window) {
+    std::vector<KvmemCheckpointKind> result(kKvmemCheckpointKinds.begin(), kKvmemCheckpointKinds.end());
+    for (size_t i=0; i<window.coverage.slots(); ++i) if (window.coverage.at(i) && window.coverage.at(i)->record.data)
+        result.push_back(KvmemCheckpointKind(unsigned(KvmemCheckpointKind::CoverageBegin)+i));
+    return result;
+}
+struct KvmemCoverageTransfer {
+    std::shared_ptr<KvmemPrefixCheckpoint> checkpoint;
+    std::shared_ptr<PinnedHostBuffer> source;
+    kvmem::SpillExtent destination;
+    kvmem::StorageTicket ticket;
+    ~KvmemCoverageTransfer() { ticket.cancel(); try { ticket.wait(); } catch (...) {} }
 };
 
 struct SequenceState {
@@ -660,26 +725,12 @@ struct SequenceState {
     std::uint32_t text_kv_valid           = 0;
     std::uint32_t mtp_kv_valid            = 0;
     std::uint32_t dflash_context_frontier = 0;
-    // Logical position of pending_features column 0, i.e. the frontier the capture round
-    // verified from. The next append must start here; anything else would write target hidden
-    // rows under the wrong ring positions. Only valid while dflash_pending_valid is set: every
-    // consumer clears it, and a non-decode frontier rewrite (restore, reuse, reset) resets it.
-    std::uint32_t dflash_pending_base = 0;
-    bool dflash_pending_valid         = false;
-    // Physical StateImage slot the masked-draft ring last wrote to. A state fork (checkpoint
-    // capture between prefill chunks, or a Begin-boundary rewrite) moves the write slot; the
-    // ring then follows with save_rewrite_checkpoint before the next append.
-    std::int32_t dflash_state_slot = -1;
-    // Masked-draft conditioning floor: the smallest logical position whose feature is still
-    // guaranteed live in the DFlash2 cyclic ring. A KVMem reselection/compaction swaps selected
-    // blocks except the trailing recent pages, so this rises to the start of that trailing
-    // continuous segment; rounds mask older ring slots so stitched history cannot poison the
-    // draft. DFlash's Full pool is unaffected.
-    // Invariant: dflash_context_floor <= dflash_context_frontier (see
-    // clamp_masked_draft_floor).
+    // Logical lower bound of the continuous DFlash2 conditioning suffix.
     std::uint32_t dflash_context_floor = 0;
     std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> mtp_drafts{};
     std::uint32_t mtp_draft_count = 0;
+    // The initial drafts are still on their way from the device (settle_initial_drafts).
+    bool mtp_drafts_pending       = false;
     bool tail_hidden_valid        = false;
     bool endpoint_valid           = false;
     RewriteCheckpoint rewrite_checkpoint;
@@ -731,20 +782,21 @@ struct RequestControl {
     PendingCandidate pending;
     ops::SamplingConfig sampling_host;
     std::shared_ptr<text::GrammarState> grammar;
+    std::optional<TokenId> suppressed_tool_open;
+    // An ordinary decoder's next mask computed ahead at its committed ledger frontier.
+    std::shared_ptr<runtime::GrammarMaskJob> next_mask;
+    std::uint32_t next_mask_frontier = 0;
+    std::chrono::steady_clock::time_point next_mask_started;
     bool logprobs = false;
+    // The typed readout's token ids; read on the sequence's first generated token only.
+    std::vector<TokenId> readout_tokens;
+    // A branched read: after the prompt, each branch runs as a block over it and its first
+    // generated token is read (runtime::ResolvedExecutionOptions::branches); null otherwise.
+    std::shared_ptr<const std::vector<runtime::ReadBranch>> branches;
     GenerationTimings timings;
     SpeculativeStats speculative_stats;
-    // DFlash/DFlash2 auto-bypass: consecutive neural rounds that accepted zero drafts switch the
-    // request to the ordinary decode path for its remaining rounds. Copy (ngram) rounds are not
-    // evidence either way, and an accepted neural draft clears the streak.
-    std::uint8_t draft_bypass_strikes = 0;
-    bool draft_bypass                = false;
     // Adaptive MTP: how far this request's drafts survive.
     MtpAdaptiveSignal mtp_signal;
-    // Copy rounds compete with the neural drafter for the next round. The signal keeps the
-    // measured committed tokens per drafted token so a short or stale match cannot outrank a
-    // drafter that still repays its cost.
-    NgramCopySignal ngram_signal;
     detail::PhysicalResources active_resources;
     detail::PhysicalResources optional_resources;
     bool publish_continuation = true;
@@ -782,20 +834,50 @@ struct RequestControl {
         std::uint32_t hidden_replay_tokens  = 0;
         std::uint32_t prompt_tokens         = 0;
         std::uint32_t initial_mtp_extent    = 0;
+        // A request without drafting runs the drafter's prompt work (the MTP bridge and KV, the
+        // DFlash context) only below this frontier, the deepest cache entry it may publish; every
+        // prefill pass lies wholly below or above it. Empty: over the whole prompt.
+        std::optional<std::uint32_t> drafter_frontier;
         double elapsed_seconds              = 0.0;
         bool prepare_mtp                    = false;
         ReusePath reuse                     = ReusePath::Root;
         PrefixReusePath reported_reuse_path  = PrefixReusePath::Root;
         MtpBridgeMode mtp_bridge            = MtpBridgeMode::None;
+        // Set once a batched pass (advance_prefill_batch) has computed the rest of the prompt:
+        // the KV and state reach the prompt frontier, and the sampled token waits here for the
+        // lane's next advance_prefill, which completes the step without device work.
+        struct Batched {
+            TokenId token = 0;
+            runtime::RawTokenLogprob logprob;
+            std::uint32_t processed_prompt_tokens = 0;
+            // False when a branched read still has branches to run: the step reports the
+            // prompt tokens the pass computed and stays incomplete.
+            bool complete = true;
+        };
+        std::optional<Batched> batched;
+        // A branched read: the next branch a pass computes, and the records of those computed.
+        // Its prompt ends without sampling; the branches then run in one pass or several.
+        std::size_t next_branch = 0;
+        std::vector<runtime::RawTokenLogprob> branch_records;
+        // A pass computed the prompt's last column, so the tail hidden is the prompt frontier's.
+        bool branch_tail = false;
     };
 
     std::optional<Prefill> prefill;
 
-    // Returns the request slot to Empty once its lane's resources have been released.
+    // Snapshot completed prefill work before normal completion or cancellation retires it.
+    void snapshot_prefill_timings() noexcept;
+
+    // Returns the request slot to Empty once its lane's resources have been released. Nothing of
+    // the request survives into the lane's next one: its grammar, its tool-open ban, and its
+    // logprob switch belong to the request, whichever admission path installs the next.
     void retire() noexcept {
         prefill.reset();
         lifecycle            = Lifecycle::Empty;
         pending              = {};
+        next_mask_frontier   = 0;
+        logprobs             = false;
+        branches.reset();
         active_resources     = {};
         optional_resources   = {};
         publish_continuation = true;
@@ -806,6 +888,9 @@ struct RequestControl {
         lease_space_limited  = false;
         lease_minimum_target = {};
         lease_ceiling        = 0;
+        grammar.reset();
+        suppressed_tool_open.reset();
+        next_mask.reset();
     }
 };
 
@@ -844,7 +929,8 @@ public:
     };
 
     ProgramImpl(const execution::Parameters& parameters, const SequencePlanImpl& plan,
-                DeviceContext& device, const StartupObserver& startup_observer);
+                DeviceContext& device, const StartupObserver& startup_observer,
+                std::unique_ptr<execution::NativeExpertRuntime> experts);
     ~ProgramImpl() noexcept;
 
     [[nodiscard]] RequestBasePlan plan_request(const PreparedPromptData& prompt,
@@ -898,6 +984,8 @@ public:
     DeviceSnapshot::Stats resume_device_state(DeviceSnapshot& snapshot);
     [[nodiscard]] std::vector<DeviceSnapshot::Range> live_persistent_ranges() const;
     void release_device_state_backing();
+    // Loans the free KV pages no reservation needs to the elastic expert cache (KvExpertLoan).
+    void lend_kv_to_experts();
     void restore_device_state_backing();
     [[nodiscard]] bool has_context_transaction() const noexcept;
     // True while this sequence waits for a media item submitted to a concurrent overlay window:
@@ -909,11 +997,19 @@ public:
     [[nodiscard]] bool prepare_control_memory(SequenceHandle sequence, std::uint32_t tokens);
     [[nodiscard]] bool cancel_memory_ready(SequenceHandle sequence) noexcept;
     void update_sampling(SequenceHandle sequence, const ResolvedSamplingParameters& sampling);
+    [[nodiscard]] StructuredReadiness structured_readiness(SequenceHandle sequence);
     [[nodiscard]] bool wait_context_transfer() noexcept;
     [[nodiscard]] bool try_claim_seal_window() noexcept;
     void release_seal_window() noexcept;
     [[nodiscard]] PrefillProgress advance_prefill(SequenceHandle sequence,
                                                   runtime::ExecutionTiming* failed_timing);
+    // The sequence's share of a batched pass (advance_prefill_batch), or empty.
+    [[nodiscard]] std::optional<PrefillBatchUnit>
+    prefill_batch_unit(SequenceHandle sequence) const noexcept;
+    [[nodiscard]] std::uint32_t pending_branch_tokens(SequenceHandle sequence) const noexcept;
+    [[nodiscard]] runtime::ExecutionTiming
+    prefill_batch(std::span<const SequenceHandle> sequences,
+                  runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] CaptureAssessment
     inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle* exact_shared,
                     const SharedPrefixHandle* replacement,
@@ -952,9 +1048,6 @@ public:
                                       runtime::CommitObservation observation,
                                       runtime::ExecutionTiming* failed_timing);
     [[nodiscard]] DiscardResult abort_pending(PendingBatch&& pending) noexcept;
-    void retain_prompt_spans(SequenceState& sequence, const PreparedPromptData& prompt) noexcept;
-    void retain_generated_spans(SequenceHandle sequence, std::uint32_t generated_begin,
-                                std::uint32_t thinking_end) noexcept;
     [[nodiscard]] FinishResult finish(SequenceHandle sequence) noexcept;
     [[nodiscard]] AbortResult abort(SequenceHandle sequence) noexcept;
     [[nodiscard]] ReleaseResult release_continuation(ContinuationHandle&& continuation) noexcept;
@@ -1096,8 +1189,9 @@ public:
     const std::size_t kv_payload_bytes;
     const std::size_t graph_allowance_bytes;
     // Free device memory CUDA Graph preparation consumed at startup (instantiate, upload and one
-    // launch of every executable), for comparison with graph_allowance_bytes.
-    std::size_t graph_measured_bytes = 0;
+    // launch of every executable), for comparison with graph_allowance_bytes; empty when no free
+    // memory was left to measure it by.
+    std::optional<std::size_t> graph_measured_bytes = 0;
     const WorkspacePlan workspace_plan;
 
     // Overlay Vision residency only: the persistent arena is VMM-backed so free KV granules can be
@@ -1161,12 +1255,13 @@ public:
     Tensor prefill_hidden;
     std::optional<execution::MemoryStatistics> memory_statistics;
     std::optional<execution::MemoryStatistics> memory_candidate_statistics;
-    std::unique_ptr<kvmem::PageSoftmaxCuda> memory_query_scorer;
-    // Parent account for every lane's graph and feedback snapshots.
-    std::shared_ptr<kvmem::GraphStatisticsBudget> memory_graph_budget =
-        std::make_shared<kvmem::GraphStatisticsBudget>(256u << 20);
     std::unique_ptr<PinnedHostBuffer> memory_candidate_host;
     std::unique_ptr<PinnedHostBuffer> memory_statistics_host;
+    std::shared_ptr<KvmemCheckpointBufferPool> memory_checkpoint_pool =
+        std::make_shared<KvmemCheckpointBufferPool>();
+    std::unique_ptr<kvmem::PageSoftmaxCuda> memory_query_scorer;
+    std::shared_ptr<kvmem::GraphStatisticsBudget> memory_graph_budget=
+        std::make_shared<kvmem::GraphStatisticsBudget>(256u<<20);
     // Reused transfer staging is bounded by the physical window. Durable history
     // uses ordinary host RAM, so pinned allocation count does not grow with H.
     std::unique_ptr<PinnedHostBuffer> memory_kv_staging;
@@ -1187,6 +1282,9 @@ public:
     Tensor sampling_config;
     Tensor token_counts;
     std::unique_ptr<qwen3_5::StructuredRound> structured_round;
+    // One allow-mask shared by every default-none request. Built on the first such request.
+    DeviceBuffer suppressed_tool_open_mask;
+    std::optional<TokenId> suppressed_tool_open_id;
 
     std::vector<SequenceState> continuation_states;
     std::vector<ContinuationSlot> continuation_slots;
@@ -1206,13 +1304,15 @@ public:
     std::array<RequestControl, kMaximumConcurrency> requests;
     std::array<std::uint64_t, kMaximumConcurrency> lane_epochs{};
 
+    // Declared before Graphs so all graph users die before the delivery tables and service.
+    std::unique_ptr<execution::NativeExpertRuntime> experts;
+    ExpertDeliveryStats expert_startup_stats;
+    // One device with host or disk experts: free KV pages fund the elastic expert cache. Declared
+    // after the arena, the decoder's pools and the experts, whose recall hooks it clears first.
+    std::unique_ptr<KvExpertLoan> kv_expert_loan;
     DecodeGraphFamily ordinary_graphs;
     DecodeGraphFamily mtp_graphs;
     DecodeGraphFamily dflash_graphs;
-    // Bypassed (draftless) rounds verify the anchor alone at width two. They get their own family:
-    // a different width installs a different executable in the same topology slot, so sharing the
-    // neural family would make consecutive neural and draftless rounds evict each other's graphs.
-    DecodeGraphFamily draftless_graphs;
     DecodeGraphFamily ngram_graphs;
 
     std::optional<PinnedHostBuffer> round_host;
@@ -1228,6 +1328,19 @@ public:
         round_logprobs{};
     std::optional<PinnedHostBuffer> logprobs_host;
     std::optional<bool> logprobs_armed;
+    // The host copy of a prefill's typed readout (io.readout_values).
+    std::optional<PinnedHostBuffer> readout_host;
+    // A prompt's first token leaves the device ahead of the drafter's work on the prompt's end:
+    // `first_token_ready` follows its copies, and each lane's initial drafts land in its row of
+    // `initial_drafts_host` behind `initial_drafts_ready[lane]`. Made on first use.
+    std::optional<CudaCompletionEvent> first_token_ready;
+    std::vector<CudaCompletionEvent> initial_drafts_ready;
+    std::optional<PinnedHostBuffer> initial_drafts_host;
+    // A batched prefill's outputs (execution::PrefillBatchHost), kMaximumPrefillSegments rows.
+    std::optional<PinnedHostBuffer> prefill_batch_host;
+    // A completed branched read's records; its returned round's branches span points here until
+    // the step is wrapped.
+    std::vector<runtime::RawTokenLogprob> branch_round;
 
     std::optional<PinnedHostBuffer> ordinary_host;
     qwen3_5::OrdinaryDecodeIngress* ordinary_host_ingress = nullptr;
@@ -1889,23 +2002,6 @@ private:
         std::span<const qwen3_5::detail::PressureDecision> shared_pressure_options,
         std::vector<HostKVPageReplicaRelease>* released_host_pages) const;
     void refresh_state_views(SequenceState& sequence);
-    // The masked-draft conditioning floor must never exceed the context frontier: a floor above
-    // it masks every ring row and collapses acceptance with no diagnostic. The frontier has many
-    // writers while only a few sites raise the floor, and the truncating reuse paths (hybrid
-    // prefix reuse, materialization, prefill anchors) rewrite only the frontier, so the floor is
-    // re-clamped after every such transition. decode_dflash_batch re-clamps each round as a
-    // backstop.
-    void clamp_masked_draft_floor(SequenceState& sequence) noexcept;
-    // The DFlash2 conditioning ring lags one round behind the target: decode_dflash_batch
-    // records the committed features in pending_features and the next round appends them. A
-    // checkpoint captured at that boundary would otherwise store an incomplete ring while
-    // claiming the full frontier. This appends the gap (when it fits the last round's feature
-    // window) before the StateImage snapshot is taken.
-    void sync_masked_draft_frontier(SequenceState& sequence);
-    // Capacity of the masked-draft conditioning ring (`draft.sliding_window`). Ring rows live in
-    // their own device allocation and are appended every round, so paged-block eviction cannot
-    // stale a row and the floor only has to stay within the ring.
-    [[nodiscard]] std::uint32_t masked_draft_ring_capacity() const noexcept;
     void reserve_state_entitlement(SequenceState& sequence, std::uint32_t slots);
     void settle_state_fork(SequenceState& sequence);
     bool publish_active_continuation(SequenceState& state, RequestControl& request,
@@ -1913,6 +2009,13 @@ private:
                                      qwen3_5::ContinuationSummary& summary) noexcept;
     bool salvage_continuation(SequenceState& state, RequestControl& request, std::uint32_t lane,
                               std::uint32_t continuation_index, qwen3_5::AbortResult& out) noexcept;
+    // Keeps the checkpoints a cancelled prefill has already captured when its live state cannot
+    // be salvaged as an endpoint: they are published as a continuation without one, truncated to
+    // the deepest checkpoint. Declines, leaving the lane untouched for the strict clear, unless
+    // the lane holds a retained checkpoint and a settled exclusive writer.
+    bool retain_prefill_progress(SequenceState& state, RequestControl& request, std::uint32_t lane,
+                                 std::uint32_t continuation_index,
+                                 qwen3_5::AbortResult& out) noexcept;
     [[nodiscard]] detail::PhysicalResources
     release_checkpoint_reference(StateImageHandle checkpoint) noexcept;
     [[nodiscard]] bool can_release_shared_prefix_state(std::uint32_t index,
@@ -1938,6 +2041,7 @@ private:
     void prepare_graphs();
     void install_sampling(SequenceState& sequence, RequestControl& request,
                           const ops::SamplingConfig& config);
+    void ensure_suppressed_tool_open_mask(TokenId token);
     void set_device_i32(Tensor& tensor, std::int32_t value);
     // Enables the device logprob gather for the next round when one of its rows asked for it.
     void arm_logprobs(bool any);
@@ -1945,8 +2049,18 @@ private:
     void fetch_logprobs(std::int32_t rows);
     // The fetched record of gather row `row`, for the token that row produced.
     [[nodiscard]] runtime::RawTokenLogprob fetched_logprob(std::int32_t row, TokenId token) const;
+    // Uploads a request's readout token ids ahead of its prefill and returns their count.
+    std::int32_t arm_readout(std::span<const TokenId> ids);
+    // Copies the first `count` readout values to the host, ordered after the enqueued prefill.
+    void fetch_readout(std::int32_t count);
+    // Attaches the fetched readout values of batched prefill row `row` to its token's record.
+    void attach_readout(runtime::RawTokenLogprob& record, std::int32_t count,
+                        std::int32_t row = 0) const;
     void copy_tail(SequenceState& sequence, const Tensor& source);
     void copy_round_token();
+    void make_early_token_resources();
+    // Waits for a lane's initial drafts if they are still landing and takes them.
+    void settle_initial_drafts(SequenceState& sequence);
     void
     commit_generated_prefix_identity(SequenceState& sequence, std::uint32_t base_ledger_frontier,
                                      std::span<const TokenId> accepted_tokens,
@@ -1959,10 +2073,34 @@ private:
     [[nodiscard]] runtime::PrefillStepResult
     advance_prefill(SequenceState& sequence, RequestControl& request,
                     runtime::ExecutionTiming* failed_timing);
+    // The lane's share of one pass shared with others: the rest of its prompt, or a branched
+    // read's prompt part and the branches that fit after it.
+    [[nodiscard]] std::optional<PrefillBatchUnit> prefill_batch_unit(std::uint32_t lane) const;
+    // One pass computing each lane's unit (every lane prefill_batch_unit admits, together within
+    // one prefill chunk and kMaximumPrefillSegments segments): the rest of a prompt and its first
+    // token, or a branched read's prompt part and next branches' first tokens; each lane's next
+    // advance_prefill returns its step.
+    [[nodiscard]] runtime::ExecutionTiming
+    advance_prefill_batch(std::span<const std::uint32_t> lanes,
+                          runtime::ExecutionTiming* failed_timing);
+    // The bookkeeping of a step that sampled the lane's first token, host_tokens[0] (and with
+    // logprobs round_logprobs[0]): the ledger, the Begin candidate and the step result.
+    [[nodiscard]] runtime::PrefillStepResult
+    complete_prefill_step(SequenceState& sequence, RequestControl& request,
+                          const runtime::BeginSummary& summary,
+                          std::uint32_t processed_prompt_tokens,
+                          std::span<const TokenId> initial_drafts, bool drafts_pending,
+                          runtime::ExecutionTimingRecorder& timing);
     void enqueue_dflash_context_append(std::span<const std::uint32_t> lanes,
                                        std::span<const std::uint32_t> starts,
                                        std::span<const std::uint32_t> counts);
     void validate_licensed_tokens(std::span<const TokenId> tokens) const;
+    // The lane's next mask computed ahead (structured_readiness), handed to the round when it
+    // verifies no drafts; otherwise none and the round starts the lane's masks itself.
+    [[nodiscard]] std::shared_ptr<runtime::GrammarMaskJob>
+    take_next_mask(RequestControl& request, const SequenceState& sequence, std::uint32_t extent);
+    // After a round: rethrows a mask job's error before tokens can be published.
+    void check_masks();
     void mark_workspace_usage(std::size_t phase_bytes) noexcept;
     [[nodiscard]] std::vector<NgramProposer::Match>
     propose_ngram(std::span<const std::uint32_t> lanes,
@@ -1994,49 +2132,61 @@ private:
     bool prepare_window(SequenceState& sequence, std::uint32_t begin, std::uint32_t end,
                         bool force_selection = false, bool allow_pending = false,
                         kvmem::SelectionReason reason = kvmem::SelectionReason::PrefillPressure);
+    void retain_prompt_spans(SequenceState& sequence, const PreparedPromptData& prompt) noexcept;
     void archive_memory_window(SequenceState& sequence);
+    qwen3_5::TokenSpan memory_query_span(const PreparedPromptData& prompt) const {
+        if (kvmem_options.query_source != KvmemQuerySource::User && prompt.action_query &&
+            prompt.action_query->count != 0) {
+            return bounded_memory_query(prompt, kvmem_options.query_max_tokens,
+                                        &*prompt.action_query);
+        }
+        return bounded_memory_query(prompt, kvmem_options.query_max_tokens);
+    }
     bool memory_query_probe(const SequenceState& sequence, std::uint32_t prompt_tokens) const;
-    void reset_memory_attention(KvmemWindowState& window, std::uint32_t frontier);
-    qwen3_5::TokenSpan bounded_memory_query(const PreparedPromptData& prompt) const;
     [[nodiscard]] std::uint32_t memory_checkpoint_frontier(const SequenceState& sequence,
         std::uint32_t prompt_tokens, bool allow_reuse) const;
     void capture_memory_prefix(SequenceState& sequence, std::uint32_t chunk_tokens);
-    std::unique_ptr<KvmemPrefixCheckpoint> capture_memory_checkpoint(SequenceState& sequence);
+    std::unique_ptr<KvmemPrefixCheckpoint> capture_memory_checkpoint(SequenceState& sequence, bool optional = false);
+    void capture_memory_coverage(SequenceState& sequence, uint32_t chunk_tokens) noexcept;
+    bool skip_memory_coverage(const SequenceState& sequence) const;
+    void progress_checkpoint_coverage(KvmemWindowState& window, bool force = false);
+    void checkpoint_memory_room(KvmemWindowState& window, size_t bytes, bool optional = false);
+    std::unique_ptr<KvmemCoverageTransfer> memory_coverage_transfer;
     void capture_memory_endpoint(SequenceState& sequence, const RequestControl& request) noexcept;
     void capture_memory_rewrite(SequenceState& sequence, KvmemCheckpointKind kind) noexcept;
     void capture_memory_reconstruction_if_ready(SequenceState& sequence);
-    std::unique_ptr<KvmemPrefixCheckpoint>& memory_checkpoint_slot(KvmemWindowState& window,
+    std::shared_ptr<KvmemPrefixCheckpoint>& memory_checkpoint_slot(KvmemWindowState& window,
                                                                 KvmemCheckpointKind kind);
     const KvmemPrefixCheckpoint* memory_checkpoint(const KvmemWindowState& window,
                                                    KvmemCheckpointKind kind) const;
-    bool memory_same_query(const KvmemWindowState& window, const PreparedPromptData& prompt,
-                           std::uint32_t frontier) const;
-    void rewind_memory_query(SequenceState& sequence);
+    bool memory_user_already_evaluated(const PreparedPromptData& prompt, std::uint32_t frontier) const;
+    bool rewind_memory_query(SequenceState& sequence);
     void restore_memory_prefix(SequenceState& sequence, const KvmemPrefixCheckpoint& checkpoint,
                                bool preserve_view = false, bool allow_pending = false, bool resident_native = false);
     bool prepare_memory_materialization(MaterializationTransaction& transaction);
     bool progress_memory_storage();
     bool memory_maintenance_pending() const noexcept;
     std::optional<KvmemHistoryMatch> memory_restorable_history(const PreparedPromptData& prompt) const;
+    std::uint32_t memory_observed_prefix(const PreparedPromptData& prompt) const;
+    std::uint32_t memory_reuse_anchor(const PreparedPromptData& prompt, std::uint32_t base,
+                                     std::uint32_t observed) const;
+    void capture_memory_anchor(SequenceState& sequence, std::uint32_t chunk_tokens) noexcept;
     void reserve_memory_history(SequenceState& sequence, RequestControl& request,
                                 const PreparedPromptData& prompt);
     bool restore_memory_history(SequenceState& sequence, RequestControl::Prefill& staged);
     void retain_memory_history(SequenceState& sequence, const RequestControl& request) noexcept;
     void prepare_memory_statistics(SequenceState& sequence, std::uint32_t query_begin,
-                                   std::uint32_t query_end);
+                                   std::uint32_t query_end, std::uint32_t prompt_tokens);
     void commit_memory_statistics(SequenceState& sequence, std::uint32_t begin,
                                  std::uint32_t end);
     void commit_memory_candidates(SequenceState& sequence, std::uint32_t begin,
                                   std::uint32_t end, std::uint32_t first_column,
                                   std::uint32_t row_width);
     void read_memory_candidates();
-    // `prefix` scores against a Query-replay checkpoint (mean tail + graph). A null
-    // prefix scores the live statistics frontier.
-    std::vector<double> score_memory_query(SequenceState& sequence,
-                                           const std::vector<std::uint32_t>& mandatory,
-                                           const KvmemPrefixCheckpoint* prefix = nullptr);
-    void observe_memory_attention(SequenceState& sequence, std::uint32_t begin, std::uint32_t end,
-                                  std::uint32_t first_column, std::uint32_t row_width, bool prefill);
+    void score_memory_query(SequenceState&, const std::vector<std::uint32_t>& mandatory,
+                            const KvmemPrefixCheckpoint* prefix = nullptr);
+    void observe_memory_attention(SequenceState&, std::uint32_t begin, std::uint32_t end,
+        std::uint32_t first_column, std::uint32_t row_width, bool prefill);
     [[nodiscard]] std::vector<std::uint32_t> memory_image_pages(const PreparedPromptData& prompt) const;
 
     [[nodiscard]] std::uint32_t compact_position(const SequenceState& sequence,
@@ -2088,17 +2238,6 @@ private:
     [[nodiscard]] qwen3_5::PagedKVCache* backend_kv_cache() noexcept;
     [[nodiscard]] const qwen3_5::PagedKVCache* backend_kv_cache() const noexcept;
     [[nodiscard]] std::uint32_t backend_kv_valid(const SequenceState& sequence) const noexcept;
-    // Writes the backend (draft) KV frontier through the same definition backend_kv_valid()
-    // reads: mtp_kv_valid for MTP, dflash_context_frontier for DFlash. Writing mtp_kv_valid
-    // directly is wrong for a masked draft backend and leaves its conditioning KV stale.
-    void set_backend_kv_valid(SequenceState& sequence, std::uint32_t frontier) noexcept;
-    // KVMem-local variant of the pair above. backend_kv_valid() reports 0 for DFlash2 because
-    // the standard context cache does not reuse a DFlash2 backend frontier; the KVMem window
-    // still captures and restores that page pool, so it needs the frontier DFlash2 actually
-    // maintains (dflash_context_frontier). Keep every backend-frontier read/write inside
-    // kvmem_window.cpp on this pair so the standard path keeps its contract.
-    [[nodiscard]] std::uint32_t kvmem_backend_frontier(const SequenceState& sequence) const noexcept;
-    void kvmem_set_backend_frontier(SequenceState& sequence, std::uint32_t frontier) noexcept;
     [[nodiscard]] qwen3_5::PagedKVCacheView text_kv_view(const SequenceState& sequence) const;
     [[nodiscard]] qwen3_5::PagedKVCacheView mtp_kv_view(const SequenceState& sequence) const;
 };

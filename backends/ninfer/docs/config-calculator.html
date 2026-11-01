@@ -422,8 +422,8 @@
     Single-lane serving only. Concurrency changes the picture: <code>--kv-capacity</code> is a
     shared pool while <code>--max-context</code> is a per-request cap, so a second lane does not
     cost twice the memory unless you also want twice the per-request context. Vision in overlay
-    residency costs no resident capacity. Prefill throughput, time-to-first-token and multi-GPU
-    expert offload are all out of scope here &mdash; see <code>docs/performance.md</code>.
+    residency costs no resident capacity. Prefill throughput, time-to-first-token and pipeline stages
+    over several GPUs are all out of scope here &mdash; see <code>docs/performance.md</code>.
   </p>
   <p>
     <strong>Speculative modes are now modelled per mode, and cross-checked against the engine.</strong>
@@ -614,7 +614,7 @@ function modelOf() { return DATA.models[$("model").value]; }
 /* Per-token resident cost: the cache itself plus the non-KV sequence state that scales with it. */
 /* Per-token resident cost: the cache itself plus the non-KV sequence state that scales with it.
    Both move with the speculation mode, and the two speculative backends move them differently --
-   which is why TODO.md section 2b's "one constant multiplier" only ever fit MTP.
+   which is why one constant multiplier only ever fit MTP.
      MTP buffers extra draft tokens *in the KV format*, so its cost is multiplicative and identical
    across formats: +6.2988% per token on the 27B, +10.078% on the 35B (both confirmed against a
    second format, nvfp4, to within page rounding).
@@ -845,7 +845,7 @@ function render() {
     (specKey !== "none"
       ? "Startup memory above already includes this mode's own extra resident weights, CUDA " +
         "graph allowance and any extra KV pages -- each measured against the engine's own " +
-        "reported terms rather than borrowed from the no-speculation figure. See TODO.md §1.3."
+        "reported terms rather than borrowed from the no-speculation figure."
       : "");
   $("ctx-hint").textContent = haveKv
     ? fmtGiB(kvBytes + ovhBytes) + " of sequence memory at " + fmtInt(ctx) + " tokens."

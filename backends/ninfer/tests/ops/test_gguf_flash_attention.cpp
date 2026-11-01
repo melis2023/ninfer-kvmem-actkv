@@ -1,7 +1,8 @@
 // llama.cpp's tensor-core flash attention behind the GGUF bridge (ops/linear/gguf/ggml_fattn.h),
 // the prompt attention of Gemma 4's sliding-window (width 256) and full-attention (width 512)
-// blocks: FP32 queries against an F16 key/value cache under an F16 additive mask, at Gemma 4's head
-// groups (16 query heads over 8 key/value heads at width 256, over 2 at width 512). Each width
+// blocks and of Flint's blocks (width 128 with a learned sink per query head): FP32 queries against
+// an F16 key/value cache under an F16 additive mask, at their head groups (16 query heads over 8
+// key/value heads at width 256, over 2 at widths 128 and 512). Each width
 // launches the tile that the build's device code has and its shared memory holds, so this also
 // checks that both tiles run at all on the build's target. Each row is held against an FP64 softmax
 // of the unrounded inputs, at query counts inside one tile, across tile boundaries and past one
@@ -39,7 +40,7 @@ constexpr double kPointwise   = 2e-2;
 constexpr int kReruns = 8;
 
 int run(int head_dim, int kv_heads, int tokens, int base, std::mt19937& rng,
-        int slots = 512, bool limit_kv = false) {
+        int slots = 512, bool limit_kv = false, bool sinks = false) {
     const int group = kQueryHeads / kv_heads;
     std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
     std::vector<float> q(std::size_t(tokens) * kQueryHeads * head_dim);
@@ -57,9 +58,13 @@ int run(int head_dim, int kv_heads, int tokens, int base, std::mt19937& rng,
         }
     }
     const float scale = 1.0f / std::sqrt(float(head_dim)) * 2.0f;
+    // Sink logits around the scores' scale, some above every score of a row.
+    std::vector<float> sink(kQueryHeads);
+    for (float& value : sink) { value = 3.0f * unit(rng); }
 
     DeviceBuffer d_q(q.size() * 4), d_k(k.size() * 2), d_v(v.size() * 2), d_mask(mask.size() * 2);
-    DeviceBuffer d_out(q.size() * 4);
+    DeviceBuffer d_out(q.size() * 4), d_sinks(sink.size() * 4);
+    d_sinks.copy_from_host(sink.data(), sink.size() * 4);
     d_q.copy_from_host(q.data(), q.size() * 4);
     d_k.copy_from_host(k.data(), k.size() * 2);
     d_v.copy_from_host(v.data(), v.size() * 2);
@@ -93,6 +98,7 @@ int run(int head_dim, int kv_heads, int tokens, int base, std::mt19937& rng,
     args.out             = static_cast<float*>(d_out.p);
     args.scale           = scale;
     args.kv_max          = limit_kv ? static_cast<const int*>(d_kv_max.p) : nullptr;
+    args.sinks           = sinks ? static_cast<const float*>(d_sinks.p) : nullptr;
     gguf::flash_attention(args, workspace.p, workspace.bytes, nullptr);
     if (const cudaError_t status = cudaDeviceSynchronize(); status != cudaSuccess) {
         throw std::runtime_error(std::string("flash attention: ") + cudaGetErrorString(status));
@@ -132,7 +138,8 @@ int run(int head_dim, int kv_heads, int tokens, int base, std::mt19937& rng,
                 scores[s] = dot * scale;
                 peak      = std::max(peak, scores[s]);
             }
-            double sum = 0.0;
+            if (sinks) { peak = std::max(peak, double(sink[h])); }
+            double sum = sinks ? std::exp(double(sink[h]) - peak) : 0.0;
             std::fill(want.begin(), want.end(), 0.0);
             for (int s = 0; s < visible; ++s) {
                 const double p      = std::exp(scores[s] - peak);
@@ -163,7 +170,8 @@ int run(int head_dim, int kv_heads, int tokens, int base, std::mt19937& rng,
     const bool ok = failures == 0 && reruns_differing == 0;
     std::cout << (ok ? "OK" : "FAIL") << " width " << head_dim << ", " << kv_heads << " KV heads, "
               << tokens << " queries after " << base << ", " << slots << " slots, kv_max="
-              << limit_kv << ", tile_rows=" << tile_rows << ": worst row error " << worst_relative
+              << limit_kv << ", sinks=" << sinks << ", tile_rows=" << tile_rows
+              << ": worst row error " << worst_relative
               << ", worst point " << worst_point << " (" << failures << " rows over, "
               << reruns_differing << " of " << kReruns << " reruns differ)\n";
     return ok ? 0 : 1;
@@ -192,13 +200,17 @@ int main(int argc, char** argv) {
                     failures += run(256, 8, tokens, 253, rng);
                     failures += run(512, 2, tokens, 253, rng);
                     failures += run(512, 2, tokens, 253, rng, 1024, true);
+                    failures += run(128, 2, tokens, 253, rng, 1024, true, true);
                 }
                 return failures == 0 ? 0 : 1;
             }
             for (const int tokens : {1, 3, 4, 5, 9, 33, 130}) {
                 failures += run(256, 8, tokens, 300, rng);
                 failures += run(512, 2, tokens, 300, rng);
+                failures += run(128, 2, tokens, 300, rng, 512, false, true);
             }
+            failures += run(128, 2, 64, 0, rng);
+            failures += run(128, 2, 64, 0, rng, 512, false, true);
             failures += run(512, 2, 64, 0, rng);
             // Cross the 256-slot mask boundary and exercise the combine loop at long contexts.
             // Both the full scan and kv_max must match the independent softmax, including tile tails.
@@ -206,6 +218,7 @@ int main(int argc, char** argv) {
                 for (const bool limit_kv : {false, true}) {
                     failures += run(512, 2, 5, slots - 9, rng, slots, limit_kv);
                     failures += run(512, 2, 3, 253, rng, slots, limit_kv);
+                    failures += run(128, 2, 5, slots - 9, rng, slots, limit_kv, true);
                 }
             }
             std::cout << (failures == 0 ? "OK" : "FAIL") << " GGUF flash attention\n";

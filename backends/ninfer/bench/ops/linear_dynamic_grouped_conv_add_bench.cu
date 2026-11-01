@@ -92,7 +92,8 @@ void run_profile(std::int32_t input_rows, const Options& options, DeviceBuffer& 
     PackedQuantizedWeight packed =
         make_row_split_weight(QType::Q8_G32_FP16, kHidden, input_rows, input_rows);
     const std::size_t capacity =
-        ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(input_rows, 2, 16, 1, 8);
+        ops::linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
+            QType::Q8_G32_FP16, input_rows, 2, 16, 1, 8);
     WorkspaceArena workspace(std::max<std::size_t>(capacity, 256));
     Tensor base_kernel(base.p, DType::BF16, {kHidden, kTaps, kSides});
 

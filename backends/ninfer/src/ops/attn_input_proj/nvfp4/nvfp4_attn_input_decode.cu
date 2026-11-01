@@ -41,7 +41,7 @@ struct Nvfp4AttentionInputOutput {
 
 using DecodeGeometry = Nvfp4N14336K5120;
 using DecodeSchedule =
-    Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 2>;
+    Nvfp4GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Default, 4>;
 
 // Fused Offset-RMSNorm + GEMV for exactly one token. The norm prologue deliberately reuses the
 // D=5120 RMSNorm launcher's pair ownership (256 threads x 10 pairs), accumulation order,
@@ -118,8 +118,11 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void rmsnorm_nv
 
     float accumulators[Schedule::kRowsPerWarp][Schedule::kAccumulatorChains] = {};
     compute_nvfp4_rows<Geometry, Schedule>(reinterpret_cast<const __nv_bfloat16*>(staged), codes,
-                                           scales, gemv_shared, inverse_weight_divisor, parent_rows,
-                                           flat_row0, lane, accumulators);
+                                           scales, gemv_shared,
+                                           inverse_weight_divisor * 32768.0F,
+                                           // folds the decoder's 2^14 rescale and the table's
+                                           // half scale (bit-exact)
+                                           parent_rows, flat_row0, lane, accumulators);
 
 #pragma unroll
     for (int local_row = 0; local_row < Schedule::kRowsPerWarp; ++local_row) {

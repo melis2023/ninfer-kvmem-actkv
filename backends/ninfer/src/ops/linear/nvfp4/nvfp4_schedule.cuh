@@ -1,4 +1,5 @@
 #pragma once
+#include "ops/common/device_limits.h"
 #include "ops/linear/nvfp4/nvfp4_layout.h"
 #include "ops/common/memory.cuh"
 #include <cuda.h>
@@ -123,7 +124,7 @@ struct Nvfp4A4MmaSchedule {
         Stages * (BlockTokens + BlockRows) * (BlockK / 2 + BlockK / 16);
     static constexpr int kOutputBytes = BlockTokens * (BlockRows + 8) * 2;
     static constexpr int kSharedBytes = kStagingBytes > kOutputBytes ? kStagingBytes : kOutputBytes;
-    static_assert(kThreads <= 1024 && kSharedBytes <= 99 * 1024);
+    static_assert(kThreads <= 1024 && kSharedBytes <= kMaxSharedBytesPerBlockSm8x);
     static_assert((kSegmentsPerRow & (kSegmentsPerRow - 1)) == 0);
 };
 
@@ -210,7 +211,7 @@ struct Nvfp4A16MmaSchedule {
     static_assert(kActivationStages == 1 || kActivationStages == 2);
     static_assert(kMinBlocksPerSm > 0);
     static_assert(kWarps >= 1 && kThreads <= 1024);
-    static_assert(kSharedBytes <= 99 * 1024);
+    static_assert(kSharedBytes <= kMaxSharedBytesPerBlockSm8x);
 };
 
 enum class Nvfp4ActivationStage : std::uint8_t { ActiveOnly, PaddedZero };
@@ -243,7 +244,7 @@ struct Nvfp4A16SlicedKMmaSchedule {
     static constexpr int kPartialBytes = KWarps * (TileTokens / 8) * 32 * 4 * 4;
     static constexpr int kSharedBytes =
         kStagingBytes > kPartialBytes ? kStagingBytes : kPartialBytes;
-    static_assert(kSharedBytes <= 99 * 1024);
+    static_assert(kSharedBytes <= kMaxSharedBytesPerBlockSm8x);
 };
 
 // Shape instances retain measured compile-time K and token extents; the templates also

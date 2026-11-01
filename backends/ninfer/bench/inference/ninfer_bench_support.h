@@ -3,7 +3,13 @@
 // Host-only support for the product throughput benchmark. The benchmark itself drives only the
 // public ninfer::Engine API; this file owns its CLI, matrix, statistics, and report schema.
 
-#include "ninfer/types.h"
+#include "ninfer/base.h"
+#include "ninfer/engine_options.h"
+#include "ninfer/kv_cache_storage.h"
+#include "ninfer/model_enums.h"
+#include "ninfer/observability/execution.h"
+#include "ninfer/observability/resources.h"
+#include "ninfer/observability/snapshot.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -15,7 +21,7 @@
 
 namespace ninfer::bench {
 
-inline constexpr int kSchemaVersion                   = 17;
+inline constexpr int kSchemaVersion                   = 18;
 inline constexpr std::string_view kArtifactType       = "ninfer_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath  = "bench/fixtures/bench_corpus.ids";
 inline constexpr int kDecodeSeedTokens                = 1;
@@ -62,9 +68,13 @@ struct BenchOptions {
     std::optional<std::uint32_t> max_context;
     float rope_yarn_factor      = 1.0F;
     bool fast_prefill_kernel    = false;
-    std::uint32_t prefill_chunk = kDefaultPrefillChunk;
+    std::uint32_t prefill_chunk = 0; // 0: the Engine's automatic chunk
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
+    KvmemOptions kvmem;
     SpeculativeOptions speculative;
+    ExpertResidency expert_residency = ExpertResidency::Device;
+    std::optional<std::uint64_t> expert_cache_bytes;
+    HybridExpertOptions hybrid_experts; // --expert-dma-share, --expert-cpu-threads
     int device            = 0;
     bool use_cuda_graph   = true;
     bool prefill_a8       = true;
@@ -80,6 +90,7 @@ struct RepTiming {
     GenerationTimings timings;
     SpeculativeStats speculative;
     std::uint32_t generated_output_tokens = 0;
+    std::vector<TokenId> generated_token_ids;
 };
 
 struct TestResult {
@@ -108,10 +119,13 @@ struct BenchEnvironment {
 
     std::uint32_t max_context   = 0;
     float rope_yarn_factor      = 1.0F;
-    std::uint32_t prefill_chunk = kDefaultPrefillChunk;
+    std::uint32_t prefill_chunk = 0;
     bool fast_prefill_kernel    = false;
     KvCacheStorage kv_cache     = KvCacheStorage::BFloat16;
     SpeculativeOptions speculative;
+    ExpertResidency expert_residency = ExpertResidency::Device;
+    // Routed-expert delivery counters over the whole run (warmups included), host/disk only.
+    ExpertResidencyStats experts;
     bool use_cuda_graph                            = true;
     bool decode_graph_primed                       = false;
     std::uint32_t decode_graph_prime_output_tokens = 0;
@@ -152,6 +166,7 @@ std::string format_csv(const BenchEnvironment& env, const std::vector<TestResult
 
 std::string json_escape(std::string_view value);
 std::string kv_cache_name(KvCacheStorage storage);
+std::string expert_residency_name(ExpertResidency residency);
 std::string proposal_head_name(ProposalHead head);
 std::uint64_t file_size_or_zero(const std::string& path);
 

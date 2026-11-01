@@ -1174,6 +1174,11 @@ CompiledGrammar GrammarCompilerSub::MultiThreadCompileGrammar(Grammar grammar_un
     thread_pool->Join();
   }
 
+  // NInfer: decide most tokens in the body of a counted repetition from its budget.
+  PopulateRepeatMasks(
+      compiled_grammar_impl->grammar, tokenizer_info_, &compiled_grammar_impl->adaptive_token_mask_cache
+  );
+
   return CompiledGrammar(compiled_grammar_impl);
 }
 

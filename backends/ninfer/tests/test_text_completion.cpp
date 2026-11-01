@@ -94,9 +94,22 @@ void controls() {
            "mirostat is refused");
     expect(refusal(R"({"prompt": "x", "n_probs": 5})") == "n_probs_not_supported",
            "per-token probabilities are refused");
-    expect(refusal(R"({"prompt": "x", "grammar": "root ::= \"a\""})") ==
-               "constrained_decoding_not_supported",
-           "a GBNF grammar is refused");
+    const auto grammar = parse(R"({"prompt": "x", "grammar": "root ::= \"a\""})");
+    expect(grammar.generation.structured_output.kind == ninfer::StructuredOutputKind::Grammar &&
+               grammar.generation.structured_output.grammar == "root ::= \"a\"" &&
+               grammar.generation.structured_output_param == "grammar",
+           "a GBNF grammar constrains the completion");
+    expect(refusal(R"({"prompt": "x", "grammar": "root ::= \"a\"", "json_schema": {}})") ==
+               "invalid_response_format",
+           "a grammar beside json_schema is refused");
+    expect(refusal(R"({"prompt": "x", "grammar": "root ::= nothing"})") ==
+               "invalid_response_format",
+           "a malformed grammar is refused");
+    const auto guided =
+        parse(R"({"prompt": "x", "guided_regex": "[0-9]+"})", TextCompletionDialect::OpenAI);
+    expect(guided.generation.structured_output.kind == ninfer::StructuredOutputKind::Regex &&
+               guided.generation.structured_output.grammar == "[0-9]+",
+           "vLLM's guided_regex constrains an OpenAI completion");
 
     const auto sampling = parse(R"({"prompt": "x", "temperature": -1, "top_k": -1, "seed": -1,
                                    "min_p": 0.1})");
@@ -148,6 +161,7 @@ GenerationOutcome outcome() {
     out.completion_tokens               = 3;
     out.finish_reason                   = ninfer::FinishReason::StopString;
     out.matched_stop_string             = "###";
+    out.metrics.computed_prefill_tokens = 3;
     out.metrics.prefix_cache_hit_tokens = 2;
     out.metrics.prompt_wall_seconds     = 0.01;
     out.metrics.generation_wall_seconds = 0.02;

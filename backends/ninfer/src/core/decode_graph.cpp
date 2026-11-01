@@ -125,14 +125,21 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
 
     cudaGraphExecUpdateResultInfo result{};
     const cudaError_t err = cudaGraphExecUpdate(exec_, definition.graph_, &result);
-    // Strict startup may retry a CUDA allocation failure, but a topology incompatibility is
-    // still fatal. Preserve the original combined error on the driver-default route.
-    if (err != cudaSuccess && core::current_resident_memory()) { CUDA_CHECK(err); }
-    if (err != cudaSuccess || result.result != cudaGraphExecUpdateSuccess) {
-        throw std::runtime_error(
-            "CUDA Graph executable update failed: " + std::string(cudaGetErrorName(err)) +
-            " (update result " + std::to_string(static_cast<int>(result.result)) + ")");
+    if (err == cudaSuccess && result.result == cudaGraphExecUpdateSuccess) { return; }
+    // A definition whose nodes differ from the executable's cannot be installed in place. Profiles
+    // share an executable when their planned launches match, but a library call can still capture
+    // other kernels than the planner foresaw (cuBLAS chooses its kernels per call, which sm_70's wide
+    // projections use), so the executable is instantiated from the definition instead. The failed
+    // update leaves the executable as it was and its error is not sticky.
+    if (err != cudaSuccess && err != cudaErrorGraphExecUpdateFailure && core::current_resident_memory()) { CUDA_CHECK(err); }
+    if (err == cudaErrorGraphExecUpdateFailure) {
+        (void)cudaGetLastError();
+        instantiate(definition);
+        return;
     }
+    throw std::runtime_error("CUDA Graph executable update failed: " +
+                             std::string(cudaGetErrorName(err)) + " (update result " +
+                             std::to_string(static_cast<int>(result.result)) + ")");
 }
 
 void DecodeGraphExecutable::upload(cudaStream_t stream) {

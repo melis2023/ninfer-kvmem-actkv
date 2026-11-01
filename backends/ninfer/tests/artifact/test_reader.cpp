@@ -84,6 +84,18 @@ void geometry_and_views() {
                 std::to_integer<int>(planes.scales[1]) == 0x40,
             "row view selected the wrong represented values");
 
+    std::array<std::byte, 264> q2_bytes{};
+    WeightParent q2_parent{weight_geometry(QType::Q2_G64_FP16, QuantLayout::RowSplit,
+                                           std::array<std::uint64_t, 2>{2, 65}),
+                           q2_bytes.data()};
+    const WeightView q2_row{{1, 65}, {{&q2_parent, 65, 130}}};
+    const auto q2 = native_weight(q2_row);
+    require(q2_parent.geometry.bytes == q2_bytes.size() &&
+                q2_parent.geometry.code_bytes == 64 && q2_parent.geometry.scale_offset == 256 &&
+                q2.qdata == q2_bytes.data() + 32 && q2.scales == q2_bytes.data() + 260 &&
+                q2.qhigh == nullptr && q2.padded_shape[1] == 128 && q2.group_size == 64,
+            "Q2 row view lost its offset-code or scale plane");
+
     std::vector<std::byte> fp8(16896);
     WeightParent fp8_parent{weight_geometry(QType::FP8_E4M3FN_ROW_BF16, QuantLayout::RowScale,
                                             std::array<std::uint64_t, 2>{256, 64}),
@@ -93,6 +105,25 @@ void geometry_and_views() {
             "FP8 view recomputed the parent scale base");
     rejects<std::invalid_argument>([&] { (void)native_weight(fp8_rows); },
                                    "complete-parent ABI accepted an FP8 submatrix");
+
+    std::array<std::byte, 486> interleaved{};
+    WeightParent row_parent{weight_geometry(QType::FP8_E4M3FN_ROW_FP16,
+                                            QuantLayout::RowInterleaved,
+                                            std::array<std::uint64_t, 2>{3, 160}),
+                            interleaved.data()};
+    const WeightView row_view{{2, 160}, {{&row_parent, 160, 480}}};
+    const auto row_fp8 = native_weight(row_view);
+    require(row_parent.geometry.bytes == interleaved.size() &&
+                row_parent.geometry.code_bytes == 480 && row_parent.geometry.scale_bytes == 6 &&
+                weight_scale_offset(row_parent.geometry, 2, 0) == 484 &&
+                row_fp8.qdata == interleaved.data() + 162 &&
+                row_fp8.scales == interleaved.data() + 322 &&
+                row_fp8.scale_dtype == DType::FP16 && row_fp8.scale_nb[0] == 162,
+            "interleaved FP8 row view lost its row stride or FP16 scale");
+    rejects<std::invalid_argument>([&] {
+        (void)weight_geometry(QType::FP8_E4M3FN_ROW_FP16, QuantLayout::RowScale,
+                              std::array<std::uint64_t, 2>{3, 160});
+    }, "FP16 row scales admitted in the BF16 plane layout");
 
     std::vector<std::byte> nvfp4(4612);
     WeightParent nv_parent{weight_geometry(QType::NVFP4, QuantLayout::BlockScaleK16M128x4,
@@ -130,6 +161,18 @@ void invalid_directories() {
     bad([](Json& root) { root["components"] = Json::object(); });
     rejects([] { (void)parse_json("{\"a\":{\"x\":1,\"x\":2}}", "duplicate"); },
             "duplicate JSON key accepted");
+    rejects([] { (void)parse_json("{\"x\":1,\"x\":2}", "duplicate"); },
+            "duplicate root key accepted");
+    rejects([] { (void)parse_json("[{\"x\":1,\"\\u0078\":2}]", "duplicate"); },
+            "escaped duplicate in an array accepted");
+    rejects([] { (void)parse_json("{\"x\":1} {\"y\":2}", "trailing"); },
+            "trailing JSON value accepted");
+    const auto siblings = parse_json("{\"a\":[{\"x\":1},{\"x\":2}],\"x\":3}", "siblings");
+    require(siblings["a"][1]["x"] == 2 && siblings["x"] == 3,
+            "keys in separate objects must remain independent");
+    Json wide = Json::object();
+    for (int i = 0; i < 32000; ++i) { wide["expert-" + std::to_string(i)] = {{"object", i}}; }
+    require(parse_json(wide.dump(), "wide") == wide, "wide binding map changed in parsing");
     fixture.write();
     {
         std::fstream file(fixture.entry, std::ios::binary | std::ios::in | std::ios::out);

@@ -43,6 +43,7 @@ int main() {
                       "request log accepted the model artifact as its output path");
 
     ServeOptions options;
+    options.build_version                  = "0.12.0-test+v0.12.0-test-3-gabc1234";
     options.artifact_path                  = "/models/qwen3_6_27b.ninfer";
     options.host                           = "127.0.0.1";
     options.port                           = 8123;
@@ -61,6 +62,7 @@ int main() {
     options.allow_prefix_reuse             = true;
     options.preserve_thinking              = true;
     options.default_thinking_budget        = 512;
+    options.reasoning_loop                 = ninfer::ReasoningLoopAction::Conclude;
     options.sampling_overrides.temperature = 0.6F;
     options.startup_argv = {"ninfer-serve", options.artifact_path, "--api-key", "<redacted>"};
 
@@ -100,6 +102,7 @@ int main() {
     load.peak_staging_bytes   = 128;
     load.device_object_count  = 42;
     load.host_object_count    = 6;
+    load.rope.native_context  = 262144;
     load.context_cost         = {
                 .transfer_source   = ninfer::ContextCostPresetSource::External,
                 .prefill_source    = ninfer::ContextCostPresetSource::CompiledDefault,
@@ -164,6 +167,8 @@ int main() {
     failures += check(server.at("schema_version") == kRequestLogSchemaVersion,
                       "server record schema mismatch");
     failures += check(server.at("event") == "server_start", "server event mismatch");
+    failures += check(server.at("version") == "0.12.0-test+v0.12.0-test-3-gabc1234",
+                      "server_start must record the build version");
     failures += check(server.at("server").at("public_model_id") == "deployment-alias",
                       "resolved public model id missing");
     failures += check(server.at("artifact").at("architecture") == "Qwen3_5ForCausalLM",
@@ -184,6 +189,8 @@ int main() {
                       "request log path missing");
     failures += check(server.at("server").at("default_thinking_budget") == 512,
                       "server thinking budget missing");
+    failures += check(server.at("server").at("reasoning_loop") == "conclude",
+                      "server reasoning-loop guard missing");
     failures += check(server.at("engine").at("kv_cache") == "fp8-e4m3-row256", "KV type missing");
     options.kv_cache        = ninfer::KvCacheStorage::Nvfp4Group16;
     engine_options.kv_cache = options.kv_cache;
@@ -245,6 +252,37 @@ int main() {
               "Vision workspace layout missing");
     failures += check(server.at("memory").at("cuda_graph_measured_bytes") == 450,
                       "server_start memory does not report the measured CUDA Graph bytes");
+    ninfer::MemorySummary saturated = memory;
+    saturated.cuda_graph_measured_bytes.reset();
+    const Json saturated_server = Json::parse(format_server_start_json(
+        "serve-test", 1000, options, engine_options, sampling_defaults, "deployment-alias", load,
+        saturated, environment, std::uint64_t{123456}));
+    failures += check(saturated_server.at("memory").at("cuda_graph_measured_bytes").is_null(),
+                      "CUDA Graph bytes measured with no free memory left are not reported null");
+    failures += check(server.at("engine").at("rope") ==
+                          Json{{"type", "none"}, {"factor", 1.0}, {"native_context", 262144}},
+                      "server_start does not report the unscaled rotation");
+    ninfer::LoadSummary yarn_load = load;
+    yarn_load.rope = ninfer::RopeScalingSummary{.type           = ninfer::RopeScalingType::Yarn,
+                                                .factor         = 2.25F,
+                                                .native_context = 262144};
+    const Json yarn_server = Json::parse(format_server_start_json(
+        "serve-test", 1000, options, engine_options, sampling_defaults, "deployment-alias",
+        yarn_load, memory, environment, std::uint64_t{123456}));
+    failures += check(yarn_server.at("engine").at("rope") ==
+                          Json{{"type", "yarn"}, {"factor", 2.25}, {"native_context", 262144}},
+                      "server_start does not report the resolved YaRN rotation");
+    ninfer::LoadSummary interpolated_load = load;
+    interpolated_load.rope =
+        ninfer::RopeScalingSummary{.type           = ninfer::RopeScalingType::Interpolation,
+                                   .factor         = 8.0F,
+                                   .native_context = 131072};
+    const Json interpolated_server = Json::parse(format_server_start_json(
+        "serve-test", 1000, options, engine_options, sampling_defaults, "deployment-alias",
+        interpolated_load, memory, environment, std::uint64_t{123456}));
+    failures += check(interpolated_server.at("engine").at("rope") ==
+                          Json{{"type", "interpolation"}, {"factor", 8.0}, {"native_context", 131072}},
+                      "server_start does not report the resolved position interpolation");
     failures += check(server.at("memory").at("cuda_graph_allowance_bytes") == 600,
                       "CUDA Graph allowance missing");
     failures += check(server.at("memory").at("runtime_reservation_bytes") == 1600 &&
@@ -421,6 +459,7 @@ int main() {
     outcome.metrics.prefill_seconds         = 0.2345678901234;
     outcome.metrics.decode_seconds          = 5.3456789012345;
     outcome.metrics.total_seconds           = 5.7037035803702;
+    outcome.metrics.computed_prefill_tokens = 300;
     outcome.metrics.prefix_cache_hit_tokens = 101;
     outcome.metrics.prefix_reuse_path       = ninfer::PrefixReusePath::PrivateTurnClosure;
     outcome.metrics.engine_timing           = {
@@ -504,6 +543,35 @@ int main() {
                           done.at("result").at("thinking_control_tokens") == 19 &&
                           done.at("result").at("thinking_control_applied") == true,
                       "thinking-control result accounting missing");
+    failures += check(done.at("result").at("reasoning_loop_detected") == false &&
+                          done.at("result").at("reasoning_loop_thinking_tokens") == 0 &&
+                          render_request_done(context, outcome).message.find("reasoning loop") ==
+                              std::string::npos,
+                      "an unfired reasoning-loop guard was reported");
+    {
+        // No budget: the guard concluded after 2,048 thinking tokens at 40 % coverage.
+        auto looped     = outcome;
+        looped.thinking = ninfer::ThinkingBudgetStats{.model_thinking_tokens = 2048,
+                                                      .injected_tokens       = 19,
+                                                      .applied               = true,
+                                                      .loop_detected         = true,
+                                                      .loop_thinking_tokens  = 2048,
+                                                      .loop_coverage         = 0.4F};
+        const Json looped_done =
+            Json::parse(format_request_done_json("serve-test", 3001, context, looped));
+        failures += check(
+            looped_done.at("result").at("thinking_budget").is_null() &&
+                looped_done.at("result").at("model_thinking_tokens") == 2048 &&
+                looped_done.at("result").at("reasoning_loop_detected") == true &&
+                looped_done.at("result").at("reasoning_loop_thinking_tokens") == 2048 &&
+                std::abs(looped_done.at("result").at("reasoning_loop_coverage").get<double>() -
+                         0.4) < 1.0e-6,
+            "done JSON log did not record the reasoning-loop firing");
+        failures += check(render_request_done(context, looped)
+                                  .message.find("reasoning loop after 2,048 thinking tokens (40% "
+                                                "repeated), concluded") != std::string::npos,
+                          "operational done log did not show the reasoning-loop firing");
+    }
     failures +=
         check(done.at("result").at("tool_call_parse").at("marker_seen") == false &&
                   done.at("result").at("tool_call_parse").at("structured_call_count") == 0 &&
@@ -560,6 +628,27 @@ int main() {
             "gen 3, 12 sources | thinking 256/256, control 19",
         "pretty request-done record mismatch");
 
+    // A 6,400-token input cancelled after frontier 6,144, with 4,224 reused.
+    // The unexecuted 256-token tail must not inflate either log's prefill rate.
+    for (const bool admitted : {false, true}) {
+        GenerationOutcome cancelled;
+        cancelled.prompt_tokens = 6400;
+        cancelled.finish_reason = ninfer::FinishReason::Cancelled;
+        cancelled.metrics.computed_prefill_tokens = admitted ? 1920 : 0;
+        cancelled.metrics.prefix_cache_hit_tokens = admitted ? 4224 : 0;
+        cancelled.metrics.prefix_reuse_path = admitted ? ninfer::PrefixReusePath::PrivateTurnClosure
+                                                      : ninfer::PrefixReusePath::Root;
+        cancelled.metrics.prefill_seconds = 2.0;
+        const Json record = Json::parse(format_request_done_json("serve-test", 3001, context, cancelled));
+        failures += check(record["result"]["prompt_tokens"] == 6400 &&
+                              record["result"]["computed_prefill_tokens"] == (admitted ? 1920 : 0) &&
+                              record["result"]["prefix_cache_hit_tokens"] == (admitted ? 4224 : 0),
+                          "cancelled request must report only completed prefill work");
+        failures += check(render_request_done(context, cancelled).message.find(
+                              admitted ? "prefill 960.0 tok/s" : "prefill 0.0 tok/s") != std::string::npos,
+                          "cancelled request operational rate includes unexecuted prompt tokens");
+    }
+
     GenerationOutcome normalized_tool_outcome = outcome;
     normalized_tool_outcome.tool_calls.push_back(
         ninfer::GeneratedToolCall{.name = "Edit", .arguments_json = R"({"file_path":"x"})"});
@@ -606,6 +695,24 @@ int main() {
         fallback_warning && fallback_warning->severity == OperationalSeverity::Warning &&
             fallback_warning->message == "req#7 tool markup returned as text | duplicate parameter",
         "tool-call text fallback warning is absent or exposes raw content");
+
+    GenerationOutcome stranded_outcome = outcome;
+    stranded_outcome.tool_call_parse   = {
+        .marker_seen              = true,
+        .structured_call_count    = 2,
+        .recovered_from_reasoning = true,
+    };
+    const Json stranded_done =
+        Json::parse(format_request_done_json("serve-test", 3004, context, stranded_outcome));
+    const std::optional<OperationalRecord> stranded_note =
+        render_tool_call_fallback(context, stranded_outcome);
+    failures += check(
+        stranded_done.at("result").at("tool_call_parse").at("recovered_from_reasoning") == true &&
+            fallback_done.at("result").at("tool_call_parse").at("recovered_from_reasoning") ==
+                false &&
+            stranded_note && stranded_note->severity == OperationalSeverity::Info &&
+            stranded_note->message == "req#7 tool calls recovered from unclosed thinking | calls=2",
+        "calls recovered from unclosed thinking are missing from the logs");
 
     const Json error =
         Json::parse(format_request_error_json("serve-test", 4000, context, "generation failed"));

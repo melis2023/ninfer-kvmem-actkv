@@ -109,17 +109,22 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a16_
         }
     };
     const auto widen_codes = [&]() {
-        const int half = lane >> 4, half_lane = lane & 15;
-        for (int pair = warp * 2; pair < BM; pair += Schedule::kWarps * 2) {
-            const int row = pair + half;
-#pragma unroll
-            for (int col32 = 0; col32 < BK; col32 += 32) {
-                const int col = col32 + half_lane * 2;
-                const unsigned widened =
-                    nvfp4_scaled_pair_bf16(code_shared[row * (BK / 2) + col / 2],
-                                           scale_shared[row * (BK / 16) + col / 16]);
-                store_vec(weight_shared + row * BK + nvfp4_a16_shared_col_64(row, col), widened);
-            }
+        // Eight columns per lane: one 32-bit code read, one scale byte and one 16-byte store. The
+        // column permutation is a multiple of eight, so the eight widened columns stay one
+        // contiguous 16-byte block and the store keeps its natural width.
+        constexpr int kColBlocks = BK / 8;
+        constexpr int kSlots     = BM * kColBlocks;
+        static_assert((BK % 8) == 0, "the widening pass stores eight columns at a time");
+        static_assert((kColBlocks & (kColBlocks - 1)) == 0, "column blocks index by a shift");
+        for (int slot = warp * 32 + lane; slot < kSlots; slot += Schedule::kWarps * 32) {
+            const int row = slot / kColBlocks;
+            const int col = (slot & (kColBlocks - 1)) * 8;
+            const unsigned codes =
+                *reinterpret_cast<const unsigned*>(code_shared + row * (BK / 2) + col / 2);
+            unsigned widened[4];
+            nvfp4_scaled_quad_bf16(codes, scale_shared[row * (BK / 16) + col / 16], widened);
+            store_vec(weight_shared + row * BK + nvfp4_a16_shared_col_64(row, col),
+                      uint4{widened[0], widened[1], widened[2], widened[3]});
         }
     };
 

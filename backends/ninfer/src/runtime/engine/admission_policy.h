@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "ninfer/base.h"
 #include "runtime/contract/resources.h"
 
 #include <array>

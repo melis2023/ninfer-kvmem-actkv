@@ -100,8 +100,8 @@ BAT_MAX_CONTEXT = "220000"
 # --prefill-chunk 2048 / --ngram-min-match 12; edit here to benchmark your own
 # configuration. The treatment uses all of them; the control uses the subset its
 # --help supports (flags it does not know are dropped automatically). --request-log-jsonl
-# is appended by build_args(). --use-original-prefix-caching selects the checkpoint catalog,
-# this line's default, explicitly.
+# is appended by build_args(). --use-original-prefix-caching selects the checkpoint catalog in
+# place of the hybrid prefix cache, this line's default.
 BAT_FLAGS = [
     ("--host", HOST), ("--port", str(PORT)),
     ("--use-original-prefix-caching", None),

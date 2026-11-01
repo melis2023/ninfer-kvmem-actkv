@@ -1,0 +1,22 @@
+#include <cstdio>
+#include <cstring>
+#include <exception>
+#include "ninfer_build_id.h"
+#ifdef _WIN32
+#define NINFER_ENTRY extern "C" __declspec(dllexport)
+#else
+#define NINFER_ENTRY extern "C" __attribute__((visibility("default")))
+#endif
+@declarations@
+NINFER_ENTRY const char* ninfer_backend_build_id_v1() { return NINFER_BUILD_ID; }
+NINFER_ENTRY int ninfer_backend_main_v1(const char* command, int argc, char** argv) {
+  try {
+@entries@
+    std::fprintf(stderr, "Unknown NInfer command: %s\n", command);
+  } catch (const std::exception& error) {
+    std::fprintf(stderr, "%s: %s\n", command, error.what());
+  } catch (...) {
+    std::fprintf(stderr, "%s: backend failed with an unknown exception\n", command);
+  }
+  return 1;
+}

@@ -1,0 +1,58 @@
+#include "ops/linear/nvfp4/nvfp4_shapes_unified.h"
+#include "ops/linear/nvfp4/nvfp4_launch_unified.cuh"
+#include "ops/linear/nvfp4/nvfp4_instances.cuh"
+
+// A geometry outside the 27B artifact's set, registered to carry the plain int8 route's admission
+// contract: this file is the whole cost of adding one -- the Geometry alias, one A16 selection,
+// one A4 selection and the table row below. No kernel changes for it.
+namespace ninfer::ops::detail::unified {
+namespace {
+using Geometry = Nvfp4Geometry<8192, 4096>;
+using Gemv =
+    Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Streaming, 4>;
+using C2      = Nvfp4A16SimtSchedule<4, 1, 2, 16, 2, 1, Nvfp4SimtActivationAccess::TokenPacked,
+                                     Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Streaming, 1,
+                                     Nvfp4SimtBlockOrder::RowsContiguous, 1>;
+using T32R64  = Nvfp4A4MmaSchedule<32, 64, 256, 2, 4, 2, 2>;
+using T32R128 = Nvfp4A4MmaSchedule<32, 128, 256, 2, 4, 2, 1>;
+using T64R128 = Nvfp4A4MmaSchedule<64, 128, 256, 4, 2, 2, 1>;
+using T128R128Pipelined = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 2, 1>;
+using T128R128Resident  = Nvfp4A4MmaSchedule<128, 128, 256, 4, 2, 1, 2>;
+
+Nvfp4Launch select_a16(int tokens) {
+    if (tokens == 1) return nvfp4_linear_a16_gemv<Geometry, Gemv>;
+    if (tokens <= 2) return nvfp4_linear_a16_simt<Geometry, 2, C2, true>;
+    if (tokens <= 8) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<8, 8, 2>>;
+    if (tokens <= 16) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<16, 8, 2>>;
+    if (tokens <= 32) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<32, 4, 2>>;
+    if (tokens <= 64) return nvfp4_linear_a16_sliced_k<Geometry, Nvfp4SlicedInstance<64, 2, 2>>;
+    if (tokens <= 128)
+        return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 64, 128, 32, 16, 2, 1>>;
+    return nvfp4_linear_a16_mma<Geometry, Nvfp4A16MmaSchedule<64, 128, 64, 64, 16, 1, 3>>;
+}
+
+void launch_a16(const Tensor& x, const Weight& w, Tensor& y, cudaStream_t stream) {
+    select_a16(x.ne[1])(x, w, y, stream);
+}
+
+// No tiled-256 (TMA) A4 route is built for this geometry -- that route is keyed by a
+// Nvfp4GeometryId the 27B artifact's shapes enumerate -- so the whole A4 band stays on the MMA
+// route.
+Nvfp4A4Route select_a4(std::int32_t tokens) {
+    if (tokens <= 64) return nvfp4_a4_mma_route<Geometry, T32R64>();
+    if (tokens <= 128) return nvfp4_a4_mma_route<Geometry, T32R128>();
+    if (tokens <= 192) return nvfp4_a4_mma_route<Geometry, T64R128>();
+    if (tokens <= 512) return nvfp4_a4_mma_route<Geometry, T128R128Pipelined>();
+    return nvfp4_a4_mma_route<Geometry, T128R128Resident>();
+}
+
+// The A4 band is served by the MMA route at every width (see select_a4), so an AllowA4 call of any
+// width takes it -- same contract as the 27B shapes.
+bool uses_a4(std::int32_t, std::int32_t) { return true; }
+} // namespace
+
+const Nvfp4LinearShape kNvfp4N8192K4096{8192, 4096, launch_a16, launch_nvfp4_a4<select_a4>,
+                                        uses_a4,
+                                        nvfp4_linear_int8_grouped_launch,
+                                        nvfp4_linear_int8_tokens_supported};
+} // namespace ninfer::ops::detail::unified

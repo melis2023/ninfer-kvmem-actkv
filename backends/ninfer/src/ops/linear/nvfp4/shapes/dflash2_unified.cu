@@ -53,17 +53,17 @@ bool dflash2_uses_a4(std::int32_t, std::int32_t) { return false; }
 } // namespace
 
 const Nvfp4LinearShape kNvfp4DFlash2Feature{25600, 5120, DFlash2Routes<25600, 5120>::launch,
-                                            nullptr, dflash2_uses_a4};
+                                            nullptr, dflash2_uses_a4, nullptr, nullptr};
 // The artifact stores the feature expansion as [hidden, 5*hidden]; this route covers
 // that ordering (the one above covers the transposed [5*hidden, hidden] form).
 const Nvfp4LinearShape kNvfp4DFlash2FeatureT{5120, 25600, DFlash2Routes<5120, 25600>::launch,
-                                            nullptr, dflash2_uses_a4};
+                                            nullptr, dflash2_uses_a4, nullptr, nullptr};
 const Nvfp4LinearShape kNvfp4DFlash2Qkv{6144, 5120, DFlash2Routes<6144, 5120>::launch, nullptr,
                                         dflash2_uses_a4};
 const Nvfp4LinearShape kNvfp4DFlash2AttnOut{5120, 4096, DFlash2Routes<5120, 4096>::launch, nullptr,
                                             dflash2_uses_a4};
 const Nvfp4LinearShape kNvfp4DFlash2ConvProj{1280, 5120, DFlash2Routes<1280, 5120>::launch,
-                                             nullptr, dflash2_uses_a4};
+                                             nullptr, dflash2_uses_a4, nullptr, nullptr};
 const Nvfp4LinearShape kNvfp4DFlash2Selector{256, 5120, DFlash2Routes<256, 5120>::launch, nullptr,
                                              dflash2_uses_a4};
 

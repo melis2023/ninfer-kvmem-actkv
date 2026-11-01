@@ -21,6 +21,7 @@ Python tools are independent of CMake; there is no `NINFER_BUILD_TOOLS` option.
 | Run benchmark matrices | [`bench/`](bench/README.md) |
 | Reference measurements against a running server (the suites behind the [reference tables](../docs/performance/reference-2026-09.md)) | [`bench/refbench.py`](bench/README.md#reference-measurements-refbenchpy) |
 | FP64 reference forward of Qwen3.8-Flash-Next for golden tensors | [`reference/qwen4_exp.py`](reference/qwen4_exp.py) |
+| FP64 reference forward of Gemma 4 26B-A4B over its GGUF: golden tensors, per-token NLL and the assistant's drafts | [`reference/gemma4.py`](reference/gemma4.py) |
 | Measure external Serve TTFT | [`bench/ttft/`](bench/ttft/README.md) |
 | Watch a resident server: dashboard, and restart on a wedge | [`monitor/`](monitor/README.md) |
 | Check long-context recall, cold prefill against a cached prefix | [`longctx_recall_probe.py`](longctx_recall_probe.py) |

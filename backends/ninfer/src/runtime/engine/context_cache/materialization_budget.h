@@ -1,6 +1,6 @@
 #pragma once
 
-#include "ninfer/types.h"
+#include "ninfer/observability/execution.h"
 
 #include <algorithm>
 #include <atomic>

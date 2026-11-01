@@ -1,6 +1,11 @@
 #include "models/qwen3_5/load/bindings.h"
 
+#include "artifact/permute_row_split.h"
+
+#include <span>
 #include <stdexcept>
+#include <string>
+#include <unordered_map>
 #include <variant>
 
 namespace ninfer::models::qwen3_5::loading {
@@ -48,6 +53,89 @@ void apply_storage_trades(Bindings& bindings, const Config& config, const ModelW
                 (void)bindings.transcode(expert.gate, QType::Q4_G64_FP16, "--mtp-experts-q4");
                 (void)bindings.transcode(expert.up, QType::Q4_G64_FP16, "--mtp-experts-q4");
                 (void)bindings.transcode(expert.down, QType::Q6_G64_FP16, "--mtp-experts-q4");
+            }
+        }
+    }
+}
+
+void apply_device_layouts(Bindings& bindings, const ModelWeights& weights,
+                          std::span<const ops::DeviceTier> rank_tiers) {
+    if constexpr (!ops::kBuildVolta) {
+        (void)bindings;
+        (void)weights;
+        (void)rank_tiers;
+        return;
+    }
+    // sm_70's projection routes (ops/linear/sm70) read row-split codes in the panel layout, where
+    // one 128-byte line holds a k-group's records of four rows: row-major records cost the decode
+    // reads 10 to 40% of the card's bandwidth. The text layers' attention, GDN and dense MLP
+    // projections and the MTP input projection take it in the formats those routes read in every
+    // Op that consumes them (T2, Q2, Q4, Q5, Q6; Q8 also reaches an Op without them), on a rank
+    // whose device runs Volta's code. Experts, heads, embeddings, the MTP attention and drafter
+    // weights keep the stored layout, and so does an object another parameter also binds.
+    const auto volta_rank = [&](std::size_t rank) {
+        if (rank >= rank_tiers.size()) {
+            throw std::logic_error("device layouts: no device tier for pipeline rank " +
+                                   std::to_string(rank));
+        }
+        return rank_tiers[rank] == ops::DeviceTier::Volta;
+    };
+    std::vector<bool> selected(bindings.weights.size(), false);
+    std::vector<WeightId> projections;
+    const auto take = [&](WeightId id) {
+        if (id.index < selected.size() && !selected[id.index]) {
+            selected[id.index] = true;
+            projections.push_back(id);
+        }
+    };
+    const auto dense = [&](const DenseWeights& d) {
+        take(d.gate);
+        take(d.up);
+        take(d.down);
+    };
+    const auto ffn = [&](const BlockWeights& block) {
+        if (const auto* d = std::get_if<DenseWeights>(&block.ffn)) {
+            dense(*d);
+        } else {
+            dense(std::get<MoeWeights>(block.ffn).shared);
+        }
+    };
+    for (const auto& block : weights.text.layers) {
+        if (const auto* a = std::get_if<AttentionWeights>(&block.mixer)) {
+            for (const WeightId id : {a->query, a->key, a->gate, a->value, a->output}) { take(id); }
+        } else {
+            const auto& g = std::get<GdnWeights>(block.mixer);
+            for (const WeightId id : {g.query, g.key, g.value, g.z, g.output}) { take(id); }
+        }
+        ffn(block);
+    }
+    if (weights.mtp) {
+        take(weights.mtp->input_projection);
+        ffn(weights.mtp->layer);
+    }
+    std::unordered_map<std::size_t, bool> only_projections;
+    for (std::size_t i = 0; i < bindings.weights.size(); ++i) {
+        for (const auto& part : bindings.weights[i].reference.binding.parts) {
+            const auto [entry, inserted] = only_projections.emplace(part.object.index, selected[i]);
+            if (!inserted) { entry->second = entry->second && selected[i]; }
+        }
+    }
+    for (const WeightId id : projections) {
+        const auto& parameter = bindings.at(id);
+        if (parameter.reference.residency != artifact::Residency::Device ||
+            !volta_rank(bindings.weights.at(id.index).rank)) {
+            continue;
+        }
+        for (const auto& part : parameter.reference.binding.parts) {
+            const auto geometry = bindings.binder.geometry(part.object);
+            const bool format =
+                geometry.format == QType::T2_G128_FP16 || geometry.format == QType::Q2_G64_FP16 ||
+                geometry.format == QType::Q4_G64_FP16 || geometry.format == QType::Q5_G64_FP16 ||
+                geometry.format == QType::Q6_G64_FP16;
+            if (format && only_projections.at(part.object.index) &&
+                geometry.layout == QuantLayout::RowSplit &&
+                artifact::row_split_panel_supported(geometry)) {
+                bindings.binder.panel_device(part.object);
             }
         }
     }

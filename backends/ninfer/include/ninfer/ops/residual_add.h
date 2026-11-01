@@ -11,9 +11,9 @@ namespace ninfer::ops {
  *
  *   ideal[i] = x[i] + y[i].
  *
- * `y` and `x` are non-overlapping, same-shaped contiguous BF16 tensors. The Op updates all of x
+ * `y` and `x` are non-overlapping, same-shaped contiguous tensors, both BF16 or both FP32. The Op updates all of x
  * in place and leaves y unchanged. The oracle evaluates `ideal` in FP64 from the represented
- * inputs. The updated BF16 x is promoted and compared directly with that result; output storage
+ * inputs. The updated x is promoted and compared directly with that result; output storage
  * rounding belongs to the Op's numerical criterion, not the oracle. Private kernel arithmetic is
  * implementation-defined. The Op uses no workspace or other persistent state.
  */

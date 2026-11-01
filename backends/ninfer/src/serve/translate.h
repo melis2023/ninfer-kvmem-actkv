@@ -2,7 +2,7 @@
 
 // Adapter between the wire-independent protocol request and the public engine API.
 
-#include "ninfer/types.h"
+#include "ninfer/request.h"
 #include "serve/request.h"
 #include "serve/serve_options.h"
 

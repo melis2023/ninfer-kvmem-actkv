@@ -1,5 +1,6 @@
 #include "calibration/route_catalog.h"
 #include "ops/common/device_route.h"
+#include "ops/linear/common/route_table.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/device_profile.h"
 #include "runtime/engine/device_profiles_builtin.h"
@@ -115,16 +116,27 @@ void test_compiled_table_parses() {
     }
 }
 
-// The compiled table may only name, for a key calibration measures, schedules calibration knows: a
-// schedule the catalog dropped or renamed would silently keep the compiled route.
+// The code tier a compiled entry's card runs (its hardware class ends in its compute capability).
+ninfer::ops::DeviceTier compiled_entry_tier(const std::string& hardware_class) {
+    using ninfer::ops::DeviceTier;
+    if (hardware_class.ends_with("-sm70")) { return DeviceTier::Volta; }
+    if (hardware_class.ends_with("-sm75")) { return DeviceTier::Turing; }
+    if (hardware_class.ends_with("-sm120")) { return DeviceTier::Blackwell; }
+    return DeviceTier::Ampere;
+}
+
+// The compiled table may only name, for a key calibration measures, schedules calibration knows on
+// the entry's card: a schedule the catalog dropped or renamed would silently keep the compiled
+// route.
 void test_compiled_table_names_catalog_schedules() {
     const auto compiled = ninfer::runtime::parse_device_route_profiles(
         ninfer::runtime::compiled_device_route_profiles_json(), "compiled");
     for (const auto& entry : compiled) {
+        const auto& catalog = ninfer::calibration::calibration_route_catalog(
+            compiled_entry_tier(entry.profile.hardware_class));
         for (const auto& [key, bands] : entry.profile.routes) {
-            const auto& catalog = ninfer::calibration::calibration_route_catalog();
-            const auto found    = std::find_if(catalog.begin(), catalog.end(),
-                                               [&](const auto& item) { return item.key == key; });
+            const auto found = std::find_if(catalog.begin(), catalog.end(),
+                                            [&](const auto& item) { return item.key == key; });
             if (found == catalog.end()) { continue; }
             for (const auto& band : bands) {
                 const bool known =
@@ -138,9 +150,24 @@ void test_compiled_table_names_catalog_schedules() {
             }
         }
     }
-    const std::string& digest = ninfer::calibration::calibration_route_catalog_digest();
-    expect(digest.size() == 16 && digest.find_first_not_of("0123456789abcdef") == std::string::npos,
-           "the route catalog digest is 16 hex digits");
+    using ninfer::ops::DeviceTier;
+    for (const DeviceTier tier :
+         {DeviceTier::Volta, DeviceTier::Turing, DeviceTier::Ampere, DeviceTier::Blackwell}) {
+        const std::string& digest = ninfer::calibration::calibration_route_catalog_digest(tier);
+        expect(digest.size() == 16 &&
+                   digest.find_first_not_of("0123456789abcdef") == std::string::npos,
+               "the route catalog digest is 16 hex digits");
+    }
+    // A 12.0 card runs Blackwell's code from a build with 120a and Ampere's from one without; a
+    // profile it calibrated under either applies under the other.
+    expect(ninfer::calibration::calibration_route_catalog_digest(DeviceTier::Ampere) ==
+               ninfer::calibration::calibration_route_catalog_digest(DeviceTier::Blackwell),
+           "a 12.0 card has one route catalog whichever tier runs it");
+    expect(ninfer::calibration::calibration_route_catalog_digest(DeviceTier::Turing) !=
+                   ninfer::calibration::calibration_route_catalog_digest(DeviceTier::Ampere) &&
+               ninfer::calibration::calibration_route_catalog_digest(DeviceTier::Volta) !=
+                   ninfer::calibration::calibration_route_catalog_digest(DeviceTier::Turing),
+           "the Volta, Turing and Ampere catalogs differ");
 }
 
 // The cards that ship a measured profile, by the name and compute capability the driver reports, so
@@ -160,6 +187,47 @@ void test_builtin_parts() {
         {"NVIDIA RTX PRO 6000 Blackwell Workstation Edition", 12, 0, 188},
         {"NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition", 12, 0, 188},
         {"NVIDIA RTX PRO 6000 Blackwell Server Edition", 12, 0, 188},
+        {"Tesla V100-SXM2-16GB", 7, 0, 80},
+        {"Tesla V100-SXM2-32GB", 7, 0, 80},
+        {"NVIDIA GeForce RTX 5060 Ti", 12, 0, 36},
+        {"NVIDIA GeForce RTX 5070", 12, 0, 48},
+        {"NVIDIA GeForce RTX 5070 Ti", 12, 0, 70},
+        {"NVIDIA GeForce RTX 5080", 12, 0, 84},
+        {"NVIDIA GeForce RTX 5090 D v2", 12, 0, 170},
+        {"NVIDIA RTX PRO 4000 Blackwell", 12, 0, 70},
+        {"NVIDIA RTX PRO 4500 Blackwell", 12, 0, 82},
+        {"NVIDIA RTX PRO 4500 Blackwell Server Edition", 12, 0, 82},
+        {"NVIDIA RTX PRO 5000 Blackwell", 12, 0, 110},
+        {"NVIDIA GeForce RTX 4060 Ti", 8, 9, 34},
+        {"NVIDIA GeForce RTX 4070", 8, 9, 46},
+        {"NVIDIA GeForce RTX 4070 Ti", 8, 9, 60},
+        {"NVIDIA GeForce RTX 4070 Ti SUPER", 8, 9, 66},
+        {"NVIDIA GeForce RTX 4080", 8, 9, 76},
+        {"NVIDIA GeForce RTX 4080 SUPER", 8, 9, 80},
+        {"NVIDIA L4", 8, 9, 58},
+        {"NVIDIA L40S", 8, 9, 142},
+        {"NVIDIA RTX 4000 Ada Generation", 8, 9, 48},
+        {"NVIDIA RTX 5000 Ada Generation", 8, 9, 100},
+        {"NVIDIA RTX 6000 Ada Generation", 8, 9, 142},
+        {"NVIDIA A10", 8, 6, 72},
+        {"NVIDIA A40", 8, 6, 84},
+        {"NVIDIA GeForce RTX 3060", 8, 6, 28},
+        {"NVIDIA GeForce RTX 3060 Ti", 8, 6, 38},
+        {"NVIDIA GeForce RTX 3070", 8, 6, 46},
+        {"NVIDIA GeForce RTX 3080", 8, 6, 68},
+        {"NVIDIA GeForce RTX 3080 Ti", 8, 6, 80},
+        {"NVIDIA RTX A5000", 8, 6, 64},
+        {"NVIDIA A100 80GB PCIe", 8, 0, 108},
+        {"NVIDIA A100-PCIE-40GB", 8, 0, 108},
+        {"NVIDIA A100-SXM4-40GB", 8, 0, 108},
+        {"NVIDIA A100-SXM4-80GB", 8, 0, 108},
+        {"NVIDIA GeForce RTX 2060 SUPER", 7, 5, 34},
+        {"NVIDIA GeForce RTX 2070", 7, 5, 36},
+        {"NVIDIA GeForce RTX 2070 SUPER", 7, 5, 40},
+        {"NVIDIA GeForce RTX 2080 Ti", 7, 5, 68},
+        {"Quadro RTX 6000", 7, 5, 72},
+        {"Quadro RTX 8000", 7, 5, 72},
+        {"Tesla T4", 7, 5, 40},
     };
     for (const Part& part : parts) {
         const auto found = ninfer::runtime::find_device_route_profile(
@@ -304,6 +372,60 @@ void test_bands_and_force() {
     expect(device_route_schedule("attn_pv_f16", 1).empty(), "removing the profile restores the tables");
 }
 
+// Past the widths the route bands were measured at, a call takes the table its Op names for wide
+// calls unless a profile band reaches the width; FP8 A16 calls name the unified one.
+void test_wide_tables() {
+    using ninfer::ops::detail::fused_route_table;
+    using ninfer::ops::detail::kRouteBandsMeasuredTo;
+    using ninfer::ops::detail::LinearRouteFamily;
+    using ninfer::ops::detail::linear_route_table;
+    using ninfer::ops::detail::LinearRouteTable;
+    using ninfer::ops::detail::fp8_wide_route_table;
+    using ninfer::ops::LinearPolicy;
+    expect(fp8_wide_route_table(LinearPolicy::A16Only) == LinearRouteTable::Unified &&
+               fp8_wide_route_table(LinearPolicy::AllowA8Int) == LinearRouteTable::Unified &&
+               fp8_wide_route_table(LinearPolicy::AllowA8) == LinearRouteTable::Legacy,
+           "an FP8 A16 call names the unified table for wide calls, an A8 call the legacy one");
+    if (!ninfer::ops::detail::unified_linear_routes_here()) {
+        expect(linear_route_table(LinearRouteFamily::Fp8, 4096, LinearRouteTable::Unified) ==
+                   LinearRouteTable::Legacy,
+               "a card without the unified table takes the legacy one at every width");
+        return;
+    }
+    constexpr auto kUnified = LinearRouteTable::Unified;
+    constexpr auto kLegacy  = LinearRouteTable::Legacy;
+    const std::int32_t past = kRouteBandsMeasuredTo + 1;
+    expect(linear_route_table(LinearRouteFamily::Fp8, past, kUnified) == kUnified &&
+               linear_route_table(LinearRouteFamily::Fp8, 1 << 20, kUnified) == kUnified,
+           "a wide FP8 width takes the table named for wide calls");
+    expect(linear_route_table(LinearRouteFamily::Fp8, past) == kLegacy &&
+               linear_route_table(LinearRouteFamily::Q4, 4096) == kLegacy,
+           "a wide width takes the legacy table by default");
+
+    ninfer::ops::DeviceRouteProfile profile = sample_profile();
+    profile.routes["unified/fp8_linear_add"] = {{4, ""}, {1024, "unified"}};
+    profile.routes["unified/measured_wide"]  = {{8192, ""}};
+    ninfer::ops::install_device_route_profile(
+        std::make_shared<const ninfer::ops::DeviceRouteProfile>(profile));
+    expect(fused_route_table("unified/fp8_linear_add", 2, kUnified) == kLegacy &&
+               fused_route_table("unified/fp8_linear_add", 1024, kUnified) == kUnified,
+           "a width in a profile band takes the band's table");
+    expect(fused_route_table("unified/fp8_linear_add", past) == kLegacy &&
+               fused_route_table("unified/fp8_linear_add", past, kUnified) == kUnified,
+           "a width past the profile's bands takes the table named for wide calls");
+    expect(fused_route_table("unified/missing", 512, kUnified) == kLegacy &&
+               fused_route_table("unified/missing", 4096, kUnified) == kUnified,
+           "a key the profile lacks keeps the legacy table up to the measured widths only");
+    expect(fused_route_table("unified/measured_wide", 4096, kUnified) == kLegacy,
+           "a profile band that reaches a wide width answers for it");
+    {
+        const ninfer::ops::DeviceRouteForce force("unified/missing", "");
+        expect(fused_route_table("unified/missing", 4096, kUnified) == kLegacy,
+               "a forced route answers at any width");
+    }
+    ninfer::ops::install_device_route_profile(nullptr);
+}
+
 } // namespace
 
 int main() {
@@ -317,6 +439,7 @@ int main() {
     test_file_layers_over_builtin();
     test_schema_versions_on_disk();
     test_bands_and_force();
+    test_wide_tables();
     if (failures != 0) {
         std::cerr << failures << " device profile check(s) failed\n";
         return 1;

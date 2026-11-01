@@ -242,6 +242,94 @@ void test_segmented_roundtrip(bool dflash, ninfer::DeviceContext& device, bool d
     (void)contiguous.release(*handle);
 }
 
+// Tensor parallelism: two shards hold one half of every layer's channels and heads each. A host
+// image keeps each layer's halves side by side in part order and restores each half to its shard.
+void test_parted_roundtrip() {
+    const int ids[] = {0, 0};
+    ninfer::DeviceContext device(std::span<const int>(ids, 2));
+    const q36::StateImageSpec spec{
+        .linear =
+            {
+                .layers         = 3,
+                .conv_channels  = 6,
+                .conv_width     = 3,
+                .value_heads    = 2,
+                .value_head_dim = 4,
+                .key_head_dim   = 3,
+                .slot_count     = 2,
+                .conv_dtype     = ninfer::DType::BF16,
+            },
+        .hidden = 7,
+    };
+    ninfer::LayoutBuilder first, second;
+    ninfer::LayoutBuilder* builders[] = {&first, &second};
+    const q36::StateImageShard shards[] = {
+        {.rank = 0, .first_layer = 0, .layers = 3, .part = 0, .parts = 2},
+        {.rank = 1, .first_layer = 0, .layers = 3, .part = 1, .parts = 2}};
+    const q36::StateImageDeviceLayout layout =
+        q36::plan_state_image_device_pool(builders, shards, spec);
+    ninfer::DeviceArena arena0(first.finish(256)), arena1(second.finish(256));
+    const ninfer::DeviceSpan backings[] = {{arena0.base(), arena0.capacity()},
+                                           {arena1.base(), arena1.capacity()}};
+    q36::StateImageDevicePool pool(backings, layout);
+    expect(pool.shard_count() == 2 && pool.linear(0).layer_count() == 3 &&
+               pool.linear(1).conv_slot(0, 0).ne[0] == 3,
+           "each part holds every layer with half of its channels");
+    const auto fill = [&](std::int32_t slot, unsigned char base) {
+        for (std::size_t part = 0; part < 2; ++part) {
+            for (std::uint32_t layer = 0; layer < 3; ++layer) {
+                const auto mark = static_cast<unsigned char>(base + 0x10 * part + layer);
+                set_bytes(pool.linear(part).conv_slot(layer, slot), mark);
+                set_bytes(pool.linear(part).recurrent_slot(layer, slot),
+                          static_cast<unsigned char>(mark + 0x40));
+            }
+        }
+        set_bytes(pool.continuation_hidden_slot(slot), static_cast<unsigned char>(base + 0x80));
+    };
+    fill(0, 0x01);
+    fill(1, 0x00);
+    q36::HostStatePool host(layout.host, 1);
+    const auto handle = host.allocate();
+    const ninfer::RankStreams streams = ninfer::RankStreams::compute(device);
+    pool.copy_to_host(0, host.writable_view(*handle), streams);
+    device.synchronize();
+    const std::byte* image = host.view(*handle).data;
+    const std::size_t conv = pool.linear(0).conv_slot(0, 0).bytes();
+    bool laid_out          = true;
+    for (std::uint32_t layer = 0; layer < 3; ++layer) {
+        for (std::size_t part = 0; part < 2; ++part) {
+            const std::size_t offset =
+                layout.host.linear_conv.offset + layer * layout.host.linear_conv_layer_bytes +
+                part * conv;
+            laid_out = laid_out &&
+                       image[offset] == std::byte(0x01 + 0x10 * part + layer) &&
+                       image[offset + conv - 1] == std::byte(0x01 + 0x10 * part + layer);
+        }
+    }
+    expect(laid_out && 2 * conv == layout.host.linear_conv_layer_bytes,
+           "a host image keeps a layer's parts side by side");
+    pool.copy_from_host(host.view(*handle), 1, streams);
+    device.synchronize();
+    for (std::size_t part = 0; part < 2; ++part) {
+        for (std::uint32_t layer = 0; layer < 3; ++layer) {
+            const auto mark = static_cast<unsigned char>(0x01 + 0x10 * part + layer);
+            expect_bytes(pool.linear(part).conv_slot(layer, 1), mark, "parted conv restore");
+            expect_bytes(pool.linear(part).recurrent_slot(layer, 1),
+                         static_cast<unsigned char>(mark + 0x40), "parted recurrent restore");
+        }
+    }
+    const q36::StateImageShard incomplete[] = {
+        {.rank = 0, .first_layer = 0, .layers = 3, .part = 0, .parts = 2}};
+    ninfer::LayoutBuilder unused;
+    ninfer::LayoutBuilder* one[] = {&unused};
+    bool refused                 = false;
+    try {
+        (void)q36::plan_state_image_device_pool(one, incomplete, spec);
+    } catch (const std::invalid_argument&) { refused = true; }
+    expect(refused, "a run of layers missing a part was accepted");
+    (void)host.release(*handle);
+}
+
 } // namespace
 
 int main() {
@@ -288,6 +376,7 @@ int main() {
     test_host_roundtrip(true, device, true);
     test_segmented_roundtrip(false, device);
     test_segmented_roundtrip(true, device);
+    test_parted_roundtrip();
     test_segmented_roundtrip(true, device, true);
 
     return failures == 0 ? 0 : 1;

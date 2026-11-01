@@ -1,4 +1,4 @@
-"""Q4/Q5/Q6/Q8 bit planes and exact row_split_k128_v1 layout transforms."""
+"""Grouped integer bit planes and exact row_split_k128_v1 layout transforms."""
 
 from __future__ import annotations
 
@@ -87,9 +87,15 @@ def _unpack_two_bit(packed: torch.Tensor, group_size: int) -> torch.Tensor:
 def _pack_codes(
     codes: torch.Tensor, spec: QuantFormat
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if spec.name == "t5_g128_fp16":
+        from .t5 import pack
+        return pack(codes), torch.empty((codes.shape[0], 0), dtype=torch.uint8, device=codes.device)
+    if spec.name == "ptq1_g128_fp16":
+        from .ptq1 import pack
+        return pack(codes)
     if spec.bits == 2:
         return (
-            _pack_two_bit(codes),
+            _pack_two_bit(codes + spec.code_bias),
             torch.empty((codes.shape[0], 0), dtype=torch.uint8, device=codes.device),
         )
     if spec.bits == 8:
@@ -131,6 +137,10 @@ def encode_row_split(
         raise TypeError(f"scales must be float16 with shape {expected_scales}")
     if codes.device != scales.device:
         raise ValueError("codes and scales must be on the same device")
+    if spec.code_bias and bool(((codes < spec.qmin) | (codes > spec.qmax)).any()):
+        raise ValueError("Q2 codes must be in [-1, 2]")
+    if (spec.code_bias or spec.name in ("ptq1_g128_fp16", "t5_g128_fp16")) and not bool(torch.isfinite(scales).all()):
+        raise ValueError("grouped scales must be finite binary16 words")
     grouped = codes.reshape(-1, spec.group_size)
     base, high = _pack_codes(grouped, spec)
     planes = RowPlanes(
@@ -400,6 +410,13 @@ def _unpack_codes(
     scales = planes.scale.view(torch.float16).reshape(
         geometry.n, geometry.groups_per_row
     )
+    if spec.name == "t5_g128_fp16":
+        from .t5 import unpack
+        return scales, unpack(planes.base).reshape(geometry.n, geometry.groups_per_row, spec.group_size)
+    if spec.name == "ptq1_g128_fp16":
+        from .ptq1 import unpack
+        return scales, unpack(planes.base, planes.high).reshape(
+            geometry.n, geometry.groups_per_row, spec.group_size)
     if spec.bits == 8:
         codes = planes.base.view(torch.int8).reshape(
             geometry.n, geometry.groups_per_row, spec.group_size
@@ -408,7 +425,8 @@ def _unpack_codes(
     packed = planes.base.reshape(groups, geometry.base_bytes_per_group).to(torch.int16)
     if spec.bits == 2:
         unsigned = _unpack_two_bit(packed, spec.group_size)
-        codes = torch.where((unsigned & 2) != 0, unsigned - 4, unsigned)
+        codes = (unsigned - spec.code_bias if spec.code_bias else
+                 torch.where((unsigned & 2) != 0, unsigned - 4, unsigned))
         return scales, codes.to(torch.int8).reshape(
             geometry.n, geometry.groups_per_row, spec.group_size
         )
@@ -477,6 +495,12 @@ def _dequant2(base, _high, scale, _byte_indices, _shifts):
     return (codes * scales).to(torch.bfloat16)
 
 
+def _dequant_q2_g64(base, _high, scale, _byte_indices, _shifts):
+    scales = _scales(scale)
+    unsigned = _unpack_two_bit(base.reshape(scales.numel(), 16).to(torch.int16), 64)
+    return ((unsigned.float() - 1.0) * scales).to(torch.bfloat16)
+
+
 def _dequant4(base, _high, scale, _byte_indices, _shifts):
     scales = _scales(scale)
     unsigned = _low_g64(base, scales.numel())
@@ -513,6 +537,7 @@ def _dequant8(base, _high, scale, _byte_indices, _shifts):
 
 
 _EAGER_DEQUANTIZERS = {
+    "q2_g64_fp16": _dequant_q2_g64,
     2: _dequant2,
     4: _dequant4,
     5: _dequant5,
@@ -521,9 +546,9 @@ _EAGER_DEQUANTIZERS = {
 }
 
 
-@lru_cache(maxsize=4)
-def _compiled_dequantizer(bits: int):
-    return torch.compile(_EAGER_DEQUANTIZERS[bits], dynamic=True, fullgraph=True)
+@lru_cache(maxsize=6)
+def _compiled_dequantizer(key: int | str):
+    return torch.compile(_EAGER_DEQUANTIZERS[key], dynamic=True, fullgraph=True)
 
 
 def dequantize_row_split(
@@ -545,14 +570,15 @@ def dequantize_row_split(
     geometry = row_split_geometry(spec, shape)
     target = torch.device(device)
     planes = _planes_on_device(source, geometry, target)
-    if dtype == torch.bfloat16:
+    if dtype == torch.bfloat16 and spec.name not in ("ptq1_g128_fp16", "t5_g128_fp16"):
         byte_indices, shifts = _high_indices(
             target.type, target.index, spec.bits, spec.group_size
         )
+        key = spec.name if spec.code_bias else spec.bits
         function = (
-            _compiled_dequantizer(spec.bits)
+            _compiled_dequantizer(key)
             if compiled and target.type == "cuda"
-            else _EAGER_DEQUANTIZERS[spec.bits]
+            else _EAGER_DEQUANTIZERS[key]
         )
         assert isinstance(planes.base, torch.Tensor)
         assert isinstance(planes.high, torch.Tensor)

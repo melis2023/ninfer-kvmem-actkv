@@ -58,8 +58,13 @@ __global__ void store_descriptor_words(const DescriptorWords<Words> source,
     for (std::size_t word = threadIdx.x; word < Words; word += blockDim.x) {
         destination[word] = source.words[word];
     }
-    // The consumer's tensor-map acquire pairs with this release.
+    // The consumer's tensor-map acquire pairs with this release. An image without TMA (a build of
+    // several architectures compiles this kernel into every image) is never launched here.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+    __trap();
+#else
     asm volatile("fence.proxy.tensormap::generic.release.gpu;" : : : "memory");
+#endif
 }
 
 } // namespace tma_staging_detail
@@ -68,10 +73,15 @@ __global__ void store_descriptor_words(const DescriptorWords<Words> source,
 // kernel through the generic proxy) visible to the TMA proxy. Call once per tensor map, in the
 // thread that issues cp.async.bulk.tensor with it, before its first use.
 __device__ __forceinline__ void acquire_staged_tensor_map(const void* tensor_map) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+    (void)tensor_map;
+    __trap();
+#else
     asm volatile("fence.proxy.tensormap::generic.acquire.gpu [%0], 128;"
                  :
                  : "l"(tensor_map)
                  : "memory");
+#endif
 }
 
 template <class Descriptor>

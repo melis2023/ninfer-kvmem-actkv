@@ -1,4 +1,5 @@
 #include "ops/linear_add/fp8/fp8_linear_add_plan_unified.h"
+#include "ops/common/blackwell_routes.h"
 #include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "ops/linear/fp8/fp8_instances.cuh"
 
@@ -82,6 +83,7 @@ std::size_t fp8_linear_add_partial_capacity_bytes(std::int32_t k, std::int32_t m
 
 void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                               WorkspaceArena& workspace, cudaStream_t stream) {
+    require_fp8_a8_card();
     auto scope         = workspace.scope();
     const auto scratch = allocate_fp8_a8_workspace(
         workspace, x.ne[1], weight.k, fp8_linear_add_partial_capacity_bytes(weight.k, x.ne[1]));

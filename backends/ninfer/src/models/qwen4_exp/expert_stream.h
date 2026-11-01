@@ -18,6 +18,7 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace ninfer::models::qwen4_exp {
@@ -52,6 +53,8 @@ public:
     // the copies that read it finish.
     void prepare(std::size_t layer, std::span<const std::int32_t> ids);
     [[nodiscard]] ExpertStreamStats stats() const noexcept;
+    // The device memory of `rank`'s slots: a table entry inside it is a resident expert.
+    [[nodiscard]] std::pair<std::uintptr_t, std::uintptr_t> storage(std::size_t rank) const;
 
 private:
     struct Impl;

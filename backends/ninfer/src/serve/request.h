@@ -2,7 +2,8 @@
 
 #include "product/media_acquire/source.h"
 
-#include <ninfer/types.h>
+#include "ninfer/base.h"
+#include "ninfer/request.h"
 
 // Internal, wire-format-independent representation of a generation request.
 //
@@ -53,6 +54,9 @@ struct RequestLimits {
     // Responses input: assistant message content or reasoning after function_call Items joins
     // the run's assistant turn instead of failing (--lenient-assistant-history).
     bool lenient_assistant_history = false;
+    // An image detail other than auto, low or high is read as auto instead of failing
+    // (--lenient-image-detail).
+    bool lenient_image_detail = false;
 };
 
 enum class ContentKind {
@@ -81,8 +85,32 @@ struct ContentPart {
     std::string type_raw; // original wire "type" string for diagnostics
     ninfer::product::media_acquire::Source source;
     ninfer::ImageResizePolicy image_resize_policy = ninfer::ImageResizePolicy::Downsize;
+    ninfer::ImageDetail image_detail              = ninfer::ImageDetail::Auto;
+    // A detail value outside auto, low and high, read as auto until settle_image_details accepts
+    // or refuses it.
+    std::optional<std::string> unknown_image_detail;
     std::optional<CacheBoundary> cache_boundary_after;
 };
+
+// OpenAI's image detail values; empty for any other (see settle_image_details).
+[[nodiscard]] inline std::optional<ninfer::ImageDetail> parse_image_detail(std::string_view value) {
+    if (value == "auto") { return ninfer::ImageDetail::Auto; }
+    if (value == "low") { return ninfer::ImageDetail::Low; }
+    if (value == "high") { return ninfer::ImageDetail::High; }
+    return std::nullopt;
+}
+
+[[nodiscard]] inline const char* image_detail_name(ninfer::ImageDetail detail) noexcept {
+    switch (detail) {
+    case ninfer::ImageDetail::Auto:
+        return "auto";
+    case ninfer::ImageDetail::Low:
+        return "low";
+    case ninfer::ImageDetail::High:
+        return "high";
+    }
+    return "auto";
+}
 
 struct ToolDefinition {
     std::string name;
@@ -107,8 +135,6 @@ struct ToolChoice : ninfer::ToolChoice {
     std::string forced_name;
 };
 
-enum class RequestedReasoningEffort : std::uint8_t;
-
 struct ChatTurn {
     ChatRole role = ChatRole::User;
     std::vector<ContentPart> content; // ordered parts; may be empty when wire content is empty
@@ -118,10 +144,6 @@ struct ChatTurn {
     // the function identified by tool_call_id before the Engine sees the history.
     std::optional<std::string> tool_result_name;
     bool tool_result_is_error = false;
-    // A tool result may carry the thinking level the next assistant turn should use.
-    // It only applies when the request itself omits reasoning_effort, so an explicit
-    // request field always wins over a tool suggestion.
-    std::optional<RequestedReasoningEffort> reasoning_effort;
     std::string reasoning_content; // assistant thinking carried across turns (round-tripped to the
                                    // template)
     std::optional<CacheBoundary> cache_boundary_after;
@@ -235,10 +257,6 @@ struct GenerationRequest {
     std::optional<bool> enable_thinking;      // unset => use the server default
     std::optional<std::uint32_t> thinking_budget;
     std::optional<RequestedReasoningEffort> reasoning_effort;
-    // pi-ai clients (DeepSeek Harness) express "off" by omitting reasoning_effort entirely;
-    // their adapter has no wire value for it. Mark such a request so the translator treats
-    // the omission as an explicit off instead of falling back to the server default.
-    bool omitted_effort_means_off = false;
     std::optional<bool> preserve_thinking;
     std::string chat_template_kwargs_json;
     // NInfer extension: name of a phantom-kv graft loaded with --graft. Unset => use the server's
@@ -255,10 +273,18 @@ struct GenerationRequest {
     // Sampling from the token after the reasoning block closes (a `post_thinking` object).
     std::optional<SamplingParams> post_thinking;
     StructuredOutputOptions structured_output;
+    // The request field that asked for structured_output, named by errors about it.
+    std::string structured_output_param = "response_format";
     // Each generated content token's log probability, with `top_logprobs` (0 to
     // kMaximumTokenLogprobs) of its most likely alternatives in the response.
     bool logprobs    = false;
     int top_logprobs = 0;
+    // With logprobs: token ids whose exact log probabilities the first content token's record
+    // carries (ninfer::ExecutionOptions::readout_tokens), the typed decisions' label readout.
+    std::vector<ninfer::TokenId> readout_tokens;
+    // ninfer::ExecutionOptions::speculative_drafting: false keeps --spec's drafter off a one-token
+    // read (the typed decisions).
+    bool speculative_drafting = true;
 
     // The alternatives each reported token carries, absent unless the request asked for logprobs.
     [[nodiscard]] std::optional<int> reported_top_logprobs() const noexcept {

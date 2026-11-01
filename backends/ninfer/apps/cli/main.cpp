@@ -183,7 +183,8 @@ private:
 
 void print_generation_summary(const ninfer::GenerationResult& result,
                               const ninfer::ResolvedSamplingParameters& sampling,
-                              const ninfer::MemorySummary& memory) {
+                              const ninfer::MemorySummary& memory,
+                              const ninfer::RuntimeStats& stats) {
     print_stage("prepare", "render/preprocess", result.timings.prepare_seconds);
     print_stage("generate", "vision", result.timings.vision_seconds);
     print_stage("generate", "text prefill", result.timings.prefill_seconds);
@@ -210,6 +211,13 @@ void print_generation_summary(const ninfer::GenerationResult& result,
                      std::to_string(result.thinking.model_thinking_tokens));
         print_metric("thinking control tokens", std::to_string(result.thinking.injected_tokens));
         print_metric("thinking control", result.thinking.applied ? "applied" : "not applied");
+    }
+    if (result.thinking.loop_detected) {
+        print_metric(
+            "reasoning loop",
+            "after " + std::to_string(result.thinking.loop_thinking_tokens) + " thinking tokens (" +
+                std::to_string(static_cast<int>(result.thinking.loop_coverage * 100.0F + 0.5F)) +
+                "% repeated), " + (result.thinking.applied ? "concluded" : "stopped"));
     }
     print_metric("model elapsed", format_seconds(model_seconds));
     print_metric("prefill speed", format_rate(static_cast<double>(result.prompt.prompt_tokens),
@@ -238,7 +246,9 @@ void print_generation_summary(const ninfer::GenerationResult& result,
     print_metric("KV capacity headroom", format_bytes(memory.kv_capacity_headroom_bytes));
     print_metric("planned slack", format_bytes(memory.planned_slack_bytes));
     print_metric("CUDA Graph allowance", format_bytes(memory.cuda_graph_allowance_bytes));
-    print_metric("CUDA Graph used", format_bytes(memory.cuda_graph_measured_bytes));
+    print_metric("CUDA Graph used", memory.cuda_graph_measured_bytes
+                                        ? format_bytes(*memory.cuda_graph_measured_bytes)
+                                        : std::string("unmeasured (no free device memory left)"));
     print_metric("planned device total", format_bytes(reserved));
     if (memory.expert_cache_bytes != 0) {
         print_metric("gpu expert cache", format_bytes(memory.expert_cache_bytes));
@@ -281,6 +291,34 @@ void print_generation_summary(const ninfer::GenerationResult& result,
             print_metric(backend + " accepted by pos", positions.str());
         }
     }
+
+    // Qwen3.8-Flash-Next's n-gram table reads since startup (warm-up included).
+    const ninfer::NgramTableStats& rows = stats.ngram_table;
+    if (rows.rows != 0) {
+        std::ostringstream pass, stall;
+        pass << std::fixed << std::setprecision(1)
+             << 1e6 * rows.read_seconds /
+                    static_cast<double>(std::max<std::uint64_t>(rows.batches, 1))
+             << " us over " << rows.batches << " passes";
+        stall << rows.stalls << " (" << std::fixed << std::setprecision(2)
+              << 1e3 * rows.stall_seconds << " ms)";
+        print_metric("ngram rows read", std::to_string(rows.rows));
+        print_metric("ngram rows from RAM", format_percent(rows.resident_rows, rows.rows));
+        print_metric("ngram read per pass", pass.str());
+        print_metric("ngram stalls", stall.str());
+    }
+    const ninfer::ExpertResidencyStats& experts = stats.experts;
+    if (experts.routes != 0) {
+        std::ostringstream moved;
+        moved << std::fixed << std::setprecision(1) << double(experts.transferred_bytes) / 1048576.0
+              << " MiB, " << experts.admitted << " admitted";
+        print_metric("expert slots", std::to_string(experts.slots));
+        print_metric("expert hits", format_percent(experts.hits, experts.routes));
+        if (experts.cpu_routes != 0) {
+            print_metric("expert CPU routes", format_percent(experts.cpu_routes, experts.routes));
+        }
+        print_metric("expert transfers", moved.str());
+    }
 }
 
 } // namespace
@@ -293,6 +331,10 @@ int main(int argc, char** argv) {
         std::cerr << "error: " << error.what() << '\n';
         std::cerr << ninfer::cli::usage_text(argv[0]);
         return 1;
+    }
+    if (cli.version_requested) {
+        std::cout << "ninfer " << NINFER_VERSION << '+' << NINFER_BUILD_ID << '\n';
+        return 0;
     }
     if (cli.help_requested) {
         std::cout << ninfer::cli::usage_text(argv[0]);
@@ -323,6 +365,7 @@ int main(int argc, char** argv) {
         request.execution.structured_output       = cli.structured_output;
         request.execution.requested_output_tokens = cli.max_new;
         request.execution.thinking.budget         = cli.thinking_budget;
+        request.execution.thinking.loop           = cli.reasoning_loop;
         request.stop.token_ids                    = cli.stop_token_ids;
         request.stop.strings                      = cli.stop_strings;
         request.output.raw                        = cli.raw_output;
@@ -333,9 +376,12 @@ int main(int argc, char** argv) {
         engine_options.device                   = cli.device;
         engine_options.devices                  = cli.devices;
         engine_options.stage_layers             = cli.stage_layers;
+        engine_options.tensor_parallel          = cli.tensor_parallel;
         engine_options.expert_residency              = cli.expert_residency;
         engine_options.ngram_table                   = cli.ngram_table;
+        engine_options.kv_resident_positions         = cli.kv_resident_positions;
         engine_options.expert_cache_bytes            = cli.expert_cache_bytes;
+        engine_options.hybrid_experts                = cli.hybrid_experts;
         engine_options.max_context              = cli.max_context;
         engine_options.kv_capacity              = cli.kv_capacity;
         engine_options.prefill_chunk            = cli.prefill_chunk;
@@ -343,8 +389,10 @@ int main(int argc, char** argv) {
         engine_options.speculative              = cli.speculative;
         engine_options.enable_vision            = cli.enable_vision;
         engine_options.vision_residency         = cli.vision_residency;
+        engine_options.cpu_vision_idle_seconds   = cli.cpu_vision_idle_seconds;
         engine_options.vision_max_merged_tokens = cli.vision_max_merged_tokens;
         engine_options.use_cuda_graph           = cli.use_cuda_graph;
+        engine_options.gpu_clock_floor_mhz      = cli.gpu_clock_floor_mhz;
         engine_options.lm_head_q4               = cli.lm_head_q4;
         engine_options.lm_head_q6               = cli.lm_head_q6;
         engine_options.embedding_q4             = cli.embedding_q4;
@@ -363,6 +411,8 @@ int main(int argc, char** argv) {
         engine_options.cuda_memory_probe_step_bytes = cli.cuda_memory_probe_step_bytes;
         engine_options.mlp_a8_decode            = cli.mlp_a8_decode;
         engine_options.prefill_a8               = cli.prefill_a8;
+        engine_options.nvfp4_w4a8_int           = cli.nvfp4_w4a8_int;
+        engine_options.nvfp4_w4a16              = cli.nvfp4_w4a16;
         engine_options.prefill_cublas           = cli.prefill_cublas;
         engine_options.prefill_cublas_projections = cli.prefill_cublas_projections;
         // One CLI invocation owns exactly one request, so retained cross-request context has no
@@ -406,7 +456,7 @@ int main(int argc, char** argv) {
             }
             std::cerr << '\n';
         }
-        print_generation_summary(result, sampling, engine.memory_summary());
+        print_generation_summary(result, sampling, engine.memory_summary(), engine.runtime_stats());
         return 0;
     } catch (const std::exception& error) {
         logger->error("{}", ninfer::product::format_pretty_text(error.what()));

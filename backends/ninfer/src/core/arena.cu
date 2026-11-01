@@ -3,28 +3,7 @@
 
 #include <cuda_runtime.h>
 
-#if defined(_WIN32) && defined(NINFER_D3D12_RESIDENCY) && NINFER_D3D12_RESIDENCY
-#    define NINFER_WDDM_RESIDENCY 1
-#    ifndef WIN32_LEAN_AND_MEAN
-#        define WIN32_LEAN_AND_MEAN
-#    endif
-#    ifndef NOMINMAX
-#        define NOMINMAX
-#    endif
-#    include <windows.h>
-#    include <d3d12.h>
-#    include <dxgi1_6.h>
-#    include <wrl/client.h>
-
-#    include <algorithm>
-#    include <atomic>
-#    include <cstring>
-#    include <mutex>
-#    include <vector>
-#else
-#    define NINFER_WDDM_RESIDENCY 0
-#endif
-
+#include <atomic>
 #include <cstdio>
 #include <limits>
 #include <new>
@@ -75,221 +54,25 @@ void free_pinned(void*& ptr) noexcept {
     }
 }
 
-#if NINFER_WDDM_RESIDENCY
-// A D3D12 heap imported into CUDA, after UDPSendToFailed/ninfer-4090 (a35acf6a and its follow-ups).
-// It lives as long as the arena it backs: free_arena releases the mapping, the external memory and
-// the heap together.
-struct D3D12ResidentHeap {
-    Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
-    Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
-    Microsoft::WRL::ComPtr<ID3D12Device3> device;
-    Microsoft::WRL::ComPtr<ID3D12Heap> heap;
-    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
-    cudaExternalMemory_t memory = nullptr;
-    void* pointer               = nullptr;
-};
-
-std::atomic<bool> g_wddm_residency_lock{false};
-std::mutex g_resident_heaps_mutex;
-std::vector<D3D12ResidentHeap> g_resident_heaps;
-
-// WDDM keeps this much of the adapter for the desktop compositor's scanout.
-constexpr UINT64 kDwmScanoutFloor          = 512ULL * 1024ULL * 1024ULL;
-constexpr DWORD kResidencyWaitMilliseconds = 10000;
-
-void release_mapping(void* pointer, cudaExternalMemory_t memory) noexcept {
-    if (pointer != nullptr) { (void)cudaFree(pointer); }
-    if (memory != nullptr) { (void)cudaDestroyExternalMemory(memory); }
-    (void)cudaGetLastError();
-}
-
-// Allocate the arena from a D3D12 heap on the adapter of the current CUDA device, resident at the
-// maximum priority and denied over-budget paging, and imported into CUDA. Any failure returns
-// null and leaves the CUDA context clean, so the caller falls back to cudaMalloc.
-void* allocate_resident_heap(std::size_t capacity_bytes) {
-    D3D12ResidentHeap heap;
-    if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&heap.factory)))) { return nullptr; }
-
-    int device_id = 0;
-    cudaDeviceProp properties{};
-    if (cudaGetDevice(&device_id) != cudaSuccess ||
-        cudaGetDeviceProperties(&properties, device_id) != cudaSuccess) {
-        (void)cudaGetLastError();
-        return nullptr;
-    }
-    LUID cuda_luid{};
-    std::memcpy(&cuda_luid, properties.luid, sizeof(LUID));
-    Microsoft::WRL::ComPtr<IDXGIAdapter1> candidate;
-    for (UINT i = 0; heap.factory->EnumAdapters1(i, &candidate) != DXGI_ERROR_NOT_FOUND; ++i) {
-        DXGI_ADAPTER_DESC1 description{};
-        candidate->GetDesc1(&description);
-        if (description.AdapterLuid.LowPart == cuda_luid.LowPart &&
-            description.AdapterLuid.HighPart == cuda_luid.HighPart) {
-            heap.adapter = candidate;
-            break;
-        }
-    }
-    if (!heap.adapter) { return nullptr; }
-
-    Microsoft::WRL::ComPtr<ID3D12Device> base_device;
-    if (FAILED(D3D12CreateDevice(heap.adapter.Get(), D3D_FEATURE_LEVEL_11_0,
-                                 IID_PPV_ARGS(&base_device))) ||
-        FAILED(base_device.As(&heap.device))) {
-        return nullptr;
-    }
-
-    constexpr std::size_t kHeapAlignment = 64 * 1024;
-    const std::size_t heap_bytes =
-        (capacity_bytes + kHeapAlignment - 1) / kHeapAlignment * kHeapAlignment;
-    // Never import more than the adapter can back: an unbacked heap faults inside CUDA, and the
-    // sticky fault would also break the cudaMalloc fallback.
-    DXGI_ADAPTER_DESC1 adapter_description{};
-    if (SUCCEEDED(heap.adapter->GetDesc1(&adapter_description))) {
-        const UINT64 usable = adapter_description.DedicatedVideoMemory > kDwmScanoutFloor
-                                  ? adapter_description.DedicatedVideoMemory - kDwmScanoutFloor
-                                  : 0;
-        Microsoft::WRL::ComPtr<IDXGIAdapter3> adapter3;
-        DXGI_QUERY_VIDEO_MEMORY_INFO memory_info{};
-        if (SUCCEEDED(heap.adapter.As(&adapter3)) &&
-            SUCCEEDED(
-                adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memory_info)) &&
-            memory_info.CurrentUsage + heap_bytes > usable) {
-            return nullptr;
-        }
-    }
-
-    D3D12_HEAP_DESC description{};
-    description.SizeInBytes                     = heap_bytes;
-    description.Properties.Type                 = D3D12_HEAP_TYPE_DEFAULT;
-    description.Properties.CPUPageProperty      = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
-    description.Properties.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
-    description.Alignment                       = D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT;
-    description.Flags                           = D3D12_HEAP_FLAG_SHARED;
-    if (FAILED(heap.device->CreateHeap(&description, IID_PPV_ARGS(&heap.heap)))) { return nullptr; }
-
-    ID3D12Pageable* pageable                = heap.heap.Get();
-    const D3D12_RESIDENCY_PRIORITY priority = D3D12_RESIDENCY_PRIORITY_MAXIMUM;
-    (void)heap.device->SetResidencyPriority(1, &pageable, &priority);
-    if (FAILED(heap.device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&heap.fence))) ||
-        FAILED(heap.device->EnqueueMakeResident(D3D12_RESIDENCY_FLAG_DENY_OVERBUDGET, 1, &pageable,
-                                                heap.fence.Get(), 1))) {
-        return nullptr;
-    }
-    // Residency completes asynchronously; touching the heap before the fence signals would write
-    // into pages that are not yet backed.
-    if (heap.fence->GetCompletedValue() < 1) {
-        HANDLE event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-        if (event == nullptr) { return nullptr; }
-        const bool resident =
-            SUCCEEDED(heap.fence->SetEventOnCompletion(1, event)) &&
-            WaitForSingleObject(event, kResidencyWaitMilliseconds) == WAIT_OBJECT_0;
-        CloseHandle(event);
-        if (!resident) { return nullptr; }
-    }
-
-    HANDLE shared = nullptr;
-    if (FAILED(heap.device->CreateSharedHandle(heap.heap.Get(), nullptr, GENERIC_ALL, nullptr,
-                                               &shared))) {
-        return nullptr;
-    }
-    cudaExternalMemoryHandleDesc handle{};
-    handle.type                = cudaExternalMemoryHandleTypeD3D12Heap;
-    handle.handle.win32.handle = shared;
-    handle.size                = heap_bytes;
-    handle.flags               = 0; // a heap is suballocatable, not a dedicated resource
-    const cudaError_t imported = cudaImportExternalMemory(&heap.memory, &handle);
-    CloseHandle(shared);
-    if (imported != cudaSuccess) {
-        (void)cudaGetLastError();
-        return nullptr;
-    }
-
-    cudaExternalMemoryBufferDesc buffer{};
-    buffer.offset = 0;
-    buffer.size   = capacity_bytes;
-    buffer.flags  = 0;
-    void* pointer = nullptr;
-    if (cudaExternalMemoryGetMappedBuffer(&pointer, heap.memory, &buffer) != cudaSuccess) {
-        release_mapping(nullptr, heap.memory);
-        return nullptr;
-    }
-
-    // Commit every page now and check that the mapping round-trips: a heap can import cleanly and
-    // still read back wrong, which downstream is silent output corruption rather than an error.
-    constexpr std::size_t kProbeBytes = 4096;
-    const std::size_t probe           = capacity_bytes < kProbeBytes ? capacity_bytes : kProbeBytes;
-    std::vector<unsigned char> pattern(probe);
-    for (std::size_t i = 0; i < probe; ++i) { pattern[i] = static_cast<unsigned char>(i * 31 + 7); }
-    std::vector<unsigned char> readback(probe, 0);
-    auto* bytes            = static_cast<unsigned char*>(pointer);
-    const std::size_t tail = capacity_bytes - probe;
-    const bool coherent =
-        cudaMemset(pointer, 0, capacity_bytes) == cudaSuccess &&
-        cudaMemcpy(bytes + tail, pattern.data(), probe, cudaMemcpyHostToDevice) == cudaSuccess &&
-        cudaDeviceSynchronize() == cudaSuccess &&
-        cudaMemcpy(readback.data(), bytes + tail, probe, cudaMemcpyDeviceToHost) == cudaSuccess &&
-        std::memcmp(pattern.data(), readback.data(), probe) == 0 &&
-        cudaMemset(pointer, 0, capacity_bytes) == cudaSuccess &&
-        // The fill runs on the legacy default stream, which does not order against the
-        // non-blocking load stream: without this wait a weight upload could land before it.
-        cudaDeviceSynchronize() == cudaSuccess;
-    if (!coherent) {
-        std::fprintf(stderr,
-                     "D3D12 resident arena of %zu bytes failed its read-back check; "
-                     "using cudaMalloc\n",
-                     capacity_bytes);
-        release_mapping(pointer, heap.memory);
-        return nullptr;
-    }
-
-    heap.pointer = pointer;
-    std::lock_guard lock(g_resident_heaps_mutex);
-    g_resident_heaps.push_back(std::move(heap));
-    return pointer;
-}
-#endif
-
-// Free an owning arena's storage, with the D3D12 heap behind it when it came from one.
-void free_arena(void*& ptr) noexcept {
-#if NINFER_WDDM_RESIDENCY
-    if (ptr != nullptr) {
-        std::lock_guard lock(g_resident_heaps_mutex);
-        const auto found =
-            std::find_if(g_resident_heaps.begin(), g_resident_heaps.end(),
-                         [ptr](const D3D12ResidentHeap& heap) { return heap.pointer == ptr; });
-        if (found != g_resident_heaps.end()) {
-            release_mapping(found->pointer, found->memory);
-            g_resident_heaps.erase(found);
-            ptr = nullptr;
-            return;
-        }
-    }
-#endif
-    free_device(ptr);
-}
+std::atomic<bool> g_wddm_evictable_budget{false};
 
 } // namespace
 
 namespace core {
 
-#if NINFER_WDDM_RESIDENCY
-void set_wddm_residency_lock_enabled(bool enabled) {
-    g_wddm_residency_lock.store(enabled, std::memory_order_relaxed);
-}
-
-bool wddm_residency_lock_enabled() noexcept {
-    return g_wddm_residency_lock.load(std::memory_order_relaxed);
-}
+void set_wddm_evictable_budget(bool enabled) {
+#if defined(_WIN32)
+    g_wddm_evictable_budget.store(enabled, std::memory_order_relaxed);
 #else
-void set_wddm_residency_lock_enabled(bool enabled) {
     if (enabled) {
-        throw std::invalid_argument(
-            "--wddm-evictable-budget needs a Windows build with NINFER_D3D12_RESIDENCY=ON");
+        throw std::invalid_argument("--wddm-evictable-budget needs a Windows build");
     }
+#endif
 }
 
-bool wddm_residency_lock_enabled() noexcept { return false; }
-#endif
+bool wddm_evictable_budget() noexcept {
+    return g_wddm_evictable_budget.load(std::memory_order_relaxed);
+}
 
 } // namespace core
 
@@ -440,27 +223,20 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
         cap_ = capacity_bytes;
         return;
     }
-    void* ptr = nullptr;
-#if NINFER_WDDM_RESIDENCY
-    if (core::wddm_residency_lock_enabled()) { ptr = allocate_resident_heap(capacity_bytes); }
-#endif
-    if (ptr == nullptr) {
-        const cudaError_t err = cudaMalloc(&ptr, capacity_bytes);
-        if (err != cudaSuccess) {
-            throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
+    void* ptr             = nullptr;
+    const cudaError_t err = cudaMalloc(&ptr, capacity_bytes);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaMalloc failed", err));
+    }
+    // Under the evictable budget, commit the pages now so WDDM makes room at startup; the wait
+    // orders the fill before uploads on the non-blocking load stream.
+    if (core::wddm_evictable_budget()) {
+        const cudaError_t fill = cudaMemset(ptr, 0, capacity_bytes);
+        const cudaError_t done = fill == cudaSuccess ? cudaDeviceSynchronize() : fill;
+        if (done != cudaSuccess) {
+            log_cuda_error("cudaFree", cudaFree(ptr));
+            throw std::runtime_error(cuda_error_message("cudaMemset failed", done));
         }
-#if NINFER_WDDM_RESIDENCY
-        // Under the evictable budget, commit the pages now so WDDM makes room at startup; the wait
-        // orders the fill before uploads on the non-blocking load stream.
-        if (core::wddm_residency_lock_enabled()) {
-            const cudaError_t fill = cudaMemset(ptr, 0, capacity_bytes);
-            const cudaError_t done = fill == cudaSuccess ? cudaDeviceSynchronize() : fill;
-            if (done != cudaSuccess) {
-                log_cuda_error("cudaFree", cudaFree(ptr));
-                throw std::runtime_error(cuda_error_message("cudaMemset failed", done));
-            }
-        }
-#endif
     }
 
     base_       = ptr;
@@ -479,7 +255,7 @@ DeviceArena::DeviceArena(DeviceSpan storage)
 DeviceArena::~DeviceArena() {
     if (owns_) {
         if (resident_session_) { resident_session_->free_device(owned_base_); }
-        else { free_arena(owned_base_); }
+        else { free_device(owned_base_); }
     }
 }
 
@@ -503,7 +279,7 @@ DeviceArena& DeviceArena::operator=(DeviceArena&& other) noexcept {
 
     if (owns_) {
         if (resident_session_) { resident_session_->free_device(owned_base_); }
-        else { free_arena(owned_base_); }
+        else { free_device(owned_base_); }
     }
     resident_session_ = std::move(other.resident_session_);
     base_       = other.base_;
@@ -717,6 +493,18 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
 PinnedHostBuffer::~PinnedHostBuffer() {
     if (resident_session_) { resident_session_->free_host(data_); }
     else { free_pinned(data_); }
+}
+
+HostMemoryRegistration::HostMemoryRegistration(void* data, std::size_t bytes) {
+    if (!data || !bytes) { throw std::invalid_argument("host registration needs a nonempty allocation"); }
+    const cudaError_t error = cudaHostRegister(data, bytes, cudaHostRegisterPortable);
+    if (error != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message("cudaHostRegister failed", error));
+    }
+    data_ = data;
+}
+HostMemoryRegistration::~HostMemoryRegistration() {
+    if (data_) { log_cuda_error("cudaHostUnregister", cudaHostUnregister(data_)); }
 }
 
 PinnedHostBuffer::PinnedHostBuffer(PinnedHostBuffer&& other) noexcept

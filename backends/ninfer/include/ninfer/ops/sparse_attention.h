@@ -23,7 +23,9 @@ namespace ninfer::ops {
  * whatever position the word holds; `selected` I32 [512, tokens] and `counts` I32 [tokens] are the
  * indexer's blocks; `cache` is the sequence's paged KV layer (2 heads of 256) holding every
  * selected and tail position, its block table covering every position the caller reaches, in any
- * storage kv_cache_append writes (BF16, the INT8 family, FP8 rows, NVFP4, K8V4); `out` is BF16
+ * storage kv_cache_append writes (BF16, the INT8 family, FP8 rows, NVFP4, K8V4), in pages of 64
+ * positions or, for a streamed layer, its device pool of 4-position pages after kv_stream_resolve
+ * made every block the call reads resident (kv_stream.h); `out` is BF16
  * [256, 24, tokens]. The oracle evaluates the softmax and the weighted sum in FP64 from the
  * represented cache and queries: a quantized cache's decoded keys lie in the rotated basis
  * kv_cache_append stores them in, against the query under the same normalized Hadamard transform,

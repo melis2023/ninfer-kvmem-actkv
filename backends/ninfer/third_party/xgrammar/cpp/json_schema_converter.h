@@ -478,6 +478,8 @@ class JSONSchemaConverter {
   static const std::string kBasicStringSub;
 
  protected:
+  // NInfer: the rule of one JSON-encoded Unicode scalar that length-bounded strings repeat.
+  std::optional<int32_t> json_string_scalar_rule_id_;
   GenerateCacheManager rule_cache_manager_;
 
  private:

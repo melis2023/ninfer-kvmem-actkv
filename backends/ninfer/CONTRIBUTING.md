@@ -1,6 +1,6 @@
-# Contributing to NInfer
+# Contributing to NInfer-all
 
-NInfer welcomes precise problem reports, reproducible performance evidence, and carefully scoped
+NInfer-all welcomes precise problem reports, reproducible performance evidence, and carefully scoped
 code contributions. The most useful first contribution is often an Issue that establishes what is
 happening and why it matters. A pull request is an implementation of an agreed change, not the
 place to ask the maintainer to discover the problem, choose its semantics, or redesign its core
@@ -8,7 +8,7 @@ approach.
 
 ## Project scope and decisions
 
-NInfer is an intentionally focused inference engine. Contributions are evaluated against the
+NInfer-all is an intentionally focused inference engine. Contributions are evaluated against the
 supported product described in [`README.md`](README.md), the public documentation map in
 [`docs/README.md`](docs/README.md), and the applicable architecture documents. Broader
 compatibility or generality is not a benefit by itself when it adds a product contract or
@@ -89,7 +89,17 @@ There is no mechanical line-count or file-count limit. A necessary solution may 
 files, but every changed part must belong to the same contract and be reviewable and verifiable as
 one unit. A large change that combines independent decisions, crosses ownership boundaries without
 prior agreement, or requires the maintainer to reconstruct its design is not maintainable and will
-not be accepted. Use the Issue, not a draft implementation, to resolve architecture and scope.
+not be accepted. Use the Issue, not a draft implementation, to resolve architecture and scope; a
+Draft PR is welcome for early measurement and testing once that direction is agreed.
+
+Changes that move numbers or serving behavior (memory residency, KV storage, speculative decoding,
+CUDA Graphs, kernels and their routes, quantization, scheduling) start opt-in behind a flag unless
+the Issue agreed a new default with the evidence for it.
+
+Work ported from a fork or from upstream keeps its author: port it as the original commits or with
+the author recorded, name the source repository and commit, and say whether the change is a clean
+cherry-pick or adapted to this tree. When the same change is still under review upstream, let it
+settle there before porting it.
 
 ## Engineering and verification
 
@@ -147,7 +157,7 @@ Choose the verification details relevant to your change:
 | Bug fix | The trigger, expected behavior, and verification of the fix. |
 | Recipe or conversion method | The source, target representation, conversion command, and which stages were actually verified: conversion, loading, or execution. |
 | New Op or shape | Supported inputs, independent numerical verification, and relevant boundaries. Follow [Op development](docs/maintainer/op-development.md). |
-| Performance tuning | Correctness evidence and a final performance report. Linear tuning follows the [existing report format](docs/maintainer/linear-tuning.md#4-report-format) and [Q4 example](docs/maintainer/examples/q4-linear.md). |
+| Performance tuning | Correctness evidence and measurements at the claimed scope on the cards it affects: an Op benchmark for an Op claim, a whole request for an end-to-end claim. A route or schedule change states which [device profiles](docs/device-profiles.md) it changes. |
 | Runtime or interface change | Reproduction and verification of the affected behavior. |
 | Documentation, build, or tooling | Checks relevant to the change, such as links, affected build targets, or tool invocations. |
 

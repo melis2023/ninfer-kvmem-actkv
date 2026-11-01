@@ -369,7 +369,7 @@ class DraftSource:
         def encoded(begin: int, end: int) -> EncodedRows:
             blocks = self.gguf.read_blocks(info.name, begin, end)
             return EncodedRows(
-                format, torch.from_numpy(np.ascontiguousarray(blocks)), _EMPTY_SCALES
+                format, torch.from_numpy(np.array(blocks, copy=True, order="C")), _EMPTY_SCALES
             )
 
         return LogicalSource(

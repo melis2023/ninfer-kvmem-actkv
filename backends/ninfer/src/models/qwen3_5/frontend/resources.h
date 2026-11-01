@@ -17,6 +17,8 @@ struct FrontendResources {
     std::string_view generation_config_json;
     std::string_view preprocessor_config_json;
     std::string_view video_preprocessor_config_json;
+    // Gemma 4: the release's processor_config.json (its image and video processors).
+    std::string_view processor_config_json;
     std::shared_ptr<const frontend::Tokenizer> tokenizer;
     std::uint32_t public_token_count = 0;
 };

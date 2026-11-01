@@ -47,17 +47,9 @@ void launch_variant(const Tensor& x, const Weight& weight, Tensor& residual, cud
     const Bf16LinearAddMmaOutput output{static_cast<__nv_bfloat16*>(residual.data),
                                         Geometry::kOutputRows};
 
-    if constexpr (Schedule::kSharedBytes > 48 * 1024) {
-        configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(
-                bf16_gemm_mma_kernel<Geometry, Schedule, FullTokens, Bf16LinearAddMmaOutput>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
-        });
-    }
-    bf16_gemm_mma_kernel<Geometry, Schedule, FullTokens>
-        <<<blocks, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(
-            static_cast<const __nv_bfloat16*>(x.data),
-            static_cast<const __nv_bfloat16*>(weight.qdata), output, x.ne[1]);
+    launch_bf16_gemm_mma<Geometry, Schedule, FullTokens>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const __nv_bfloat16*>(weight.qdata),
+        output, static_cast<std::int32_t>(x.ne[1]), blocks, stream);
     CUDA_CHECK(cudaGetLastError());
 }
 

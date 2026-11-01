@@ -29,12 +29,12 @@ See [`configs/capability-suite.yaml`](configs/capability-suite.yaml) for the ini
 AIME26, GPQA-Diamond, and BFCL-v4 suites, and [`configs/mock-suite.yaml`](configs/mock-suite.yaml)
 for a network-free example.
 
-The published Qwen3.6 reasoning runs retain their exact configurations in
+Recorded reasoning runs keep their exact configurations beside these:
 [`configs/qwen3_6_27b_reasoning.yaml`](configs/qwen3_6_27b_reasoning.yaml),
-[`configs/qwen3_6_35b_aime.yaml`](configs/qwen3_6_35b_aime.yaml), and
-[`configs/qwen3_6_35b_gpqa.yaml`](configs/qwen3_6_35b_gpqa.yaml). The Qwen3.8 groupwise-int,
-NVFP4 and GSQ-RCO IQ3_S campaigns use their format-specific reasoning configurations and managed
-scripts documented below.
+[`configs/qwen3_6_35b_aime.yaml`](configs/qwen3_6_35b_aime.yaml) and
+[`configs/qwen3_6_35b_gpqa.yaml`](configs/qwen3_6_35b_gpqa.yaml) for Qwen3.6, the
+`qwen3_8_27b_*` configurations with their managed scripts below, and
+[`configs/qwen3_8_flash_next_reasoning.yaml`](configs/qwen3_8_flash_next_reasoning.yaml).
 
 [`configs/qwen3_6_35b_needle_haystack.yaml`](configs/qwen3_6_35b_needle_haystack.yaml)
 defines the 35B-A3B Needle-in-a-Haystack profiles separately: `standard` preserves EvalScope's
@@ -163,66 +163,24 @@ only by each EvalScope request. The target and ordinary jobs use concurrency two
 at concurrency one so its 245,760-token output budget can accommodate the observed long tail. AIME
 uses 122,880 output tokens per request, while IFBench and both multimodal datasets use 65,536.
 
-The completed formal run recorded these scores (run directories `eval/runs/20260818T132336Z-c16a8902`
-and `eval/runs/20260818T223812Z-da6cdbce`):
-
-| Benchmark | Accuracy | Correct / total |
-|---|---:|---:|
-| IFBench (prompt-level strict) | 77.00% | 231 / 300 |
-| AIME 2025 | 96.67% | 29 / 30 |
-| AIME 2026 | 96.67% | 29 / 30 |
-| GPQA-Diamond | 90.40% | 179 / 198 |
-| ERQA | 66.25% | 265 / 400 |
-| RealWorldQA | 83.53% | 639 / 765 |
-
 The Qwen3.8-27B groupwise-int profile runs the same protocol through
-`eval/run_qwen3_8_27b_groupwise_reasoning.sh`. Its 16.96 GiB artifact leaves more GPU memory, so the
-text step uses the full 262,144-token context and both steps run at concurrency four (run
-directories `eval/runs/20260819T031655Z-078bd8e0` and `eval/runs/20260819T141750Z-531a236a`; the
-multimodal step was resumed with `ninfer_eval resume` after a local proxy change interrupted
-RealWorldQA at 618/765 samples):
+`eval/run_qwen3_8_27b_groupwise_reasoning.sh`. Its smaller artifact leaves more GPU memory, so the
+text step uses the full 262,144-token context and both steps run at concurrency four.
+`eval/run_qwen3_8_27b_gsq_rco_reasoning.sh` runs the text step for the GSQ-RCO IQ3_S artifact with
+the full context, concurrency four and GPQA-Diamond at one.
 
-| Benchmark | Accuracy | Correct / total |
-|---|---:|---:|
-| IFBench (prompt-level strict) | 77.67% | 233 / 300 |
-| AIME 2025 | 96.67% | 29 / 30 |
-| AIME 2026 | 96.67% | 29 / 30 |
-| GPQA-Diamond | 87.37% | 173 / 198 |
-| ERQA | 66.25% | 265 / 400 |
-| RealWorldQA | 82.22% | 629 / 765 |
+Where the scores are recorded:
 
-The GSQ-RCO IQ3_S artifact (3.5 bits per weight, [GGUF block formats](../docs/gguf.md)) ran the text
-step of the same protocol through `eval/run_qwen3_8_27b_gsq_rco_reasoning.sh` on an RTX 5090: the
-full 262,144-token context, concurrency four and GPQA-Diamond at one (run directory
-`eval/runs/20260925T190041Z-078bd8e0`). The multimodal step was not run.
+| Artifact | Scores |
+|---|---|
+| official Qwen3.6 and Qwen3.8 artifacts | their Hugging Face cards (runs of upstream NInfer on an RTX 5090) |
+| Qwen3.8-27B GSQ-RCO IQ3_S, with the official groupwise-int artifact beside it | [GGUF block formats](../docs/gguf.md#measurements) |
+| Qwen3.8-Flash-Next GSQ-RCO Q2_0 | [Qwen3.8-Flash-Next](../docs/qwen3-8-flash-next.md#reasoning-benchmarks) |
 
-| Benchmark | Accuracy | Correct / total |
-|---|---:|---:|
-| IFBench (prompt-level strict) | 80.33% | 241 / 300 |
-| AIME 2025 | 100.00% | 30 / 30 |
-| AIME 2026 | 100.00% | 30 / 30 |
-| GPQA-Diamond | 88.38% | 175 / 198 |
-
-Qwen3.8-Flash-Next's GSQ-RCO Q2_0 release ([Qwen3.8-Flash-Next](../docs/qwen3-8-flash-next.md)) ran
-AIME 2025 and GPQA-Diamond from `eval/configs/qwen3_8_flash_next_reasoning.yaml`, with the same
-sampling, against a server on two RTX 5090s (`ninfer-serve <model> --ngram-table <table> --devices
-0,1 --max-context 110000 --max-concurrency 6`): concurrency six and at most 106,000 output tokens an
-answer, what six sequences hold there beside the weights (run directory
-`eval/runs/20261005T165416Z-8e096a79`).
-
-| Benchmark | Accuracy | Correct / total |
-|---|---:|---:|
-| AIME 2025 | 93.33% | 28 / 30 |
-| GPQA-Diamond | 84.34% | 167 / 198 |
-
-One AIME answer and ten GPQA answers reached the limit without answering. Each was continued from
-where it stopped up to this protocol's budget, 122,880 and 245,760 output tokens: a raw-prompt
-completion (`/v1/completions`) of the request's rendered chat prompt (`/apply-template`) followed by
-the reasoning so far, with the same sampling, scored by EvalScope's own answer extraction. Four of
-the ten GPQA answers came out right and four wrong, and two ran out without an answer (one still
-reasoning at 245,760 tokens, one repeating a codon of its question's DNA sequence); the AIME answer
-reached 122,880 tokens still calculating. With those budgets the run scores 93.33% (28 / 30) on AIME
-2025 and 86.36% (171 / 198) on GPQA-Diamond.
+An answer that reaches its output limit without answering counts as wrong. To continue one from
+where it stopped, send the request's rendered chat prompt (`/apply-template`) followed by the
+reasoning so far as a raw-prompt completion (`/v1/completions`) with the same sampling, and score
+the result with EvalScope's own answer extraction; the Flash-Next run did this for its cut answers.
 
 Prepare and inspect Needle-in-a-Haystack without issuing model requests:
 
@@ -280,32 +238,6 @@ Every run is stored below `eval/runs/<timestamp>-<config-hash>/`:
 
 The sample-retention policy is recorded in the manifest. API keys and known secret values are
 redacted from coordinator events and task snapshots.
-
-## Historical Qwen3.6-27B reasoning profile
-
-The published Qwen3.6-27B scores and per-dataset correct/total counts are recorded in the
-[groupwise-int model card](../model-cards/Qwen3.6-27B-NInfer/README.md#evaluation) and
-[NVFP4 model card](../model-cards/Qwen3.6-27B-nvfp4-NInfer/README.md#evaluation).
-Those runs used EvalScope 1.9.0, one sample per problem, and the sampling settings recorded on
-the cards. The current pinned evaluation environment is newer; rerunning the commands below
-reproduces the workload on the selected environment, not the historical score automatically.
-
-The NVFP4 serving command was:
-
-```bash
-build/apps/ninfer-serve out/qwen3_6_27b_nvfp4.ninfer \
-  --host 127.0.0.1 --port 18080 \
-  --max-context 262144 --prefill-chunk 1024 --kv-dtype int8 \
-  --spec mtp --draft-tokens 3 --lm-head-draft
-```
-
-Run the configured reasoning suite in a separate shell using the evaluation environment above:
-
-```bash
-PYTHONPATH=eval eval/.venv/bin/python -m ninfer_eval run \
-  --config eval/configs/qwen3_6_27b_reasoning.yaml \
-  --suite reasoning_full
-```
 
 ## Scores
 

@@ -2,7 +2,7 @@ ninfer_add_test(ninfer_bench_support_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_ninfer_bench_support.cpp"
           ${PROJECT_SOURCE_DIR}/bench/inference/ninfer_bench_support.cpp
   NEEDS_SOURCE_DIR
-  LIBRARIES ninfer_engine ninfer::json)
+  LIBRARIES ninfer_engine ninfer::json kvmem)
 
 target_include_directories(ninfer_bench_support_test PRIVATE ${PROJECT_SOURCE_DIR}/bench/inference)
 

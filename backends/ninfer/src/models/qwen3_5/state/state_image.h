@@ -24,6 +24,9 @@ struct DFlashLocalStateSpec {
     std::uint32_t capacity = 0;
     std::int32_t kv_heads  = 0;
     std::int32_t head_dim  = 0;
+    // Draft ring storage follows the target's --kv-dtype so draft q and target p are built
+    // from the same KV precision.
+    KvCacheStorage storage = KvCacheStorage::BFloat16;
 };
 
 struct StateImageSpec {
@@ -41,7 +44,10 @@ struct StateImageHostLayout {
     LayoutRegion continuation_hidden;
     std::optional<LayoutRegion> dflash_local_k;
     std::optional<LayoutRegion> dflash_local_v;
-    std::size_t dflash_local_layer_bytes = 0;
+    std::optional<LayoutRegion> dflash_local_k_scales;
+    std::optional<LayoutRegion> dflash_local_v_scales;
+    std::size_t dflash_local_layer_bytes       = 0;
+    std::size_t dflash_local_scale_layer_bytes = 0;
     std::size_t image_bytes              = 0;
 };
 
@@ -51,6 +57,11 @@ struct StateImageShard {
     std::size_t rank          = 0;
     std::uint32_t first_layer = 0;
     std::uint32_t layers      = 0;
+    // Tensor parallelism: the shard holds the `part`-th of `parts` equal head groups of each of its
+    // layers' state, and the shards of one run of layers follow each other in part order. A host
+    // image keeps a layer's parts side by side, in part order.
+    std::uint32_t part  = 0;
+    std::uint32_t parts = 1;
 };
 
 struct StateImageDeviceLayout {
@@ -69,7 +80,8 @@ struct StateImageDeviceLayout {
 // Every Linear Attention layer in one shard on rank 0.
 [[nodiscard]] StateImageDeviceLayout plan_state_image_device_pool(LayoutBuilder& builder,
                                                                   const StateImageSpec& spec);
-// `shards` must cover spec.linear.layers exactly, in order; each is laid out in its rank's builder.
+// `shards` must cover spec.linear.layers exactly, in order, every run of layers in all of its parts;
+// each is laid out in its rank's builder.
 [[nodiscard]] StateImageDeviceLayout
 plan_state_image_device_pool(std::span<LayoutBuilder* const> builders,
                              std::span<const StateImageShard> shards, const StateImageSpec& spec);

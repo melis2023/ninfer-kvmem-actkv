@@ -1,0 +1,33 @@
+name: Linux cache bootstrap
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-cache-bootstrap-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    uses: ./.github/workflows/build-workflow-checks.yml
+  linux:
+    needs: checks
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - cuda: '12.9.2'
+            archs: '70;75;80;86;89'
+          - cuda: '13.4.3'
+            archs: '75;80;86;89;120a'
+    uses: ./.github/workflows/native-linux.yml
+    with:
+      cuda: ${{ matrix.cuda }}
+      archs: ${{ matrix.archs }}
+      runner: ninfer-native-debian13
+      jobs: 32
+    secrets: inherit

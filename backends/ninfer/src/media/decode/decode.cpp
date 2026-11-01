@@ -457,10 +457,19 @@ int count_frames(std::span<const std::uint8_t> input, const Policy& policy) {
 }
 
 std::vector<int> sample_indices(int total, double source_fps, double target_fps, int min_frames,
-                                int max_frames) {
+                                int max_frames, FrameSpacing spacing) {
     if (total <= 0 || source_fps <= 0.0 || target_fps <= 0.0 || min_frames <= 0 ||
         max_frames < min_frames) {
         throw std::invalid_argument("invalid video sampling configuration");
+    }
+    if (spacing == FrameSpacing::Floor) {
+        const int count = std::min(max_frames, total);
+        std::vector<int> indices(static_cast<std::size_t>(count));
+        for (int i = 0; i < count; ++i) {
+            indices[static_cast<std::size_t>(i)] =
+                static_cast<int>(static_cast<std::int64_t>(i) * total / count);
+        }
+        return indices;
     }
     int count = static_cast<int>(static_cast<double>(total) / source_fps * target_fps);
     count     = std::min({std::max(count, min_frames), max_frames, total});
@@ -486,7 +495,8 @@ struct VideoPlan {
 };
 
 VideoPlan make_video_plan(std::span<const std::uint8_t> bytes, const Policy& policy,
-                          double target_fps, int min_frames, int max_frames) {
+                          double target_fps, int min_frames, int max_frames,
+                          FrameSpacing spacing) {
     Decoder probe(bytes, policy.max_decoded_pixels);
     VideoPlan plan;
     plan.fps          = fps_of(probe.stream());
@@ -506,7 +516,8 @@ VideoPlan make_video_plan(std::span<const std::uint8_t> bytes, const Policy& pol
     if (plan.total_frames > policy.max_video_source_frames) {
         throw Error(ErrorKind::BudgetExceeded, "video source frame count exceeds processor limit");
     }
-    plan.indices = sample_indices(plan.total_frames, plan.fps, target_fps, min_frames, max_frames);
+    plan.indices =
+        sample_indices(plan.total_frames, plan.fps, target_fps, min_frames, max_frames, spacing);
     const std::uint64_t coded_pixels =
         static_cast<std::uint64_t>(std::max(probe.stream()->codecpar->width, 0)) *
         static_cast<std::uint64_t>(std::max(probe.stream()->codecpar->height, 0));
@@ -673,10 +684,11 @@ ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& polic
 }
 
 VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& policy,
-                        double target_fps, int min_frames, int max_frames) {
+                        double target_fps, int min_frames, int max_frames, FrameSpacing spacing) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
-    VideoPlan plan       = make_video_plan(bytes, policy, target_fps, min_frames, max_frames);
+    VideoPlan plan =
+        make_video_plan(bytes, policy, target_fps, min_frames, max_frames, spacing);
     const VideoScan scan = scan_video(bytes, policy, plan, [](Decoder&, const AVFrame*, int) {});
     VideoInfo out;
     out.width          = scan.first_frame.width;
@@ -719,10 +731,10 @@ Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
 }
 
 Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, double target_fps,
-                   int min_frames, int max_frames) {
+                   int min_frames, int max_frames, FrameSpacing spacing) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
-    VideoPlan plan = make_video_plan(bytes, policy, target_fps, min_frames, max_frames);
+    VideoPlan plan = make_video_plan(bytes, policy, target_fps, min_frames, max_frames, spacing);
     Video out;
     out.total_frames = plan.total_frames;
     out.fps          = plan.fps;

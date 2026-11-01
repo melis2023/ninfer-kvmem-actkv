@@ -107,10 +107,7 @@ void speculative_overlay_copy_proposals(const Tensor& copy_rows, const Tensor& c
  * Logical shapes:
  *   All Tensor storage is contiguous. target_tokens/licensed_tokens are I32 [K+1,B], drafts is
  *   I32 [K,B], logits is BF16 [physical_rows,K+1,B], and current_extents/lengths/anchors/
- *   licensed_counts/accepted are I32 [B]. With column_starts (device I32 [B]) the rows are packed
- *   at their own widths instead: target_tokens is I32 [columns] and logits BF16
- *   [physical_rows,columns], row b's column i at column_starts[b]+i for i<=current_extents[b];
- *   licensed_tokens stays [K+1,B]. token_domain is in [1,physical_rows], K>=1, B>=1, and
+ *   licensed_counts/accepted are I32 [B]. token_domain is in [1,physical_rows], K>=1, B>=1, and
  *   configs points to a device-resident SamplingConfig[B]. Tensor arguments, configs, and
  *   configs[b].token_counts do not overlap except for the explicitly mutated objects.
  *
@@ -138,8 +135,7 @@ void speculative_accept_coupled_drafts(const Tensor& target_tokens, const Tensor
                                        Tensor& lengths, Tensor& anchors, Tensor& licensed_tokens,
                                        Tensor& licensed_counts, Tensor& accepted,
                                        std::int32_t token_domain, const SamplingConfig* configs,
-                                       WorkspaceArena& workspace, cudaStream_t stream,
-                                       const Tensor* column_starts = nullptr);
+                                       WorkspaceArena& workspace, cudaStream_t stream);
 
 // Caller-owned transient capacity over the inclusive draft-count and batch intervals.
 // The raw-greedy execution envelope requires no workspace.

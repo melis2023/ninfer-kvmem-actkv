@@ -1143,11 +1143,10 @@ static void test_lrfu_round_and_restore() {
     CHECK(store.retrieval_checkpoint().scores->empty()); // Preview is not a committed update.
     CHECK(store.commit_retrieval_round());
     const auto first = store.retrieval_checkpoint();
-    // ActKV LRFU with lambda=0.5: 0.5*0.8 + 0.1 = 0.5, 0.5*0.6 + 0.4 = 0.7.
-    store.begin_retrieval_round(); scores[2] = 0.1; scores[3] = 0.4;
+    store.begin_retrieval_round(); scores[2] = 0.1; scores[3] = 0.3;
     store.set_retrieval_scores(scores); store.set_retrieval_scores(scores);
     CHECK(std::abs(store.selection_score(2) - 0.5) < 1e-12);
-    CHECK(std::abs(store.selection_score(3) - 0.7) < 1e-12);
+    CHECK(std::abs(store.selection_score(3) - 0.6) < 1e-12);
     CHECK(store.commit_retrieval_round());
     scores[2] = 100; store.set_retrieval_scores(scores);
     const auto second = store.retrieval_checkpoint();
@@ -1176,11 +1175,45 @@ static void test_lrfu_round_and_restore() {
     scores[3] = 100; store.set_retrieval_scores(scores);
     CHECK(store.pick_topk_blocks() == chosen); // Restored committed round cannot be rewarded twice.
     store.register_append(64); CHECK(store.selection_score(6) == 0);
-    kvmem::LrfuHistory half(0, 0.5); half.begin_round(); half.preview({-3, -2, -1, -1}); half.commit();
-    CHECK(half.score(0) == 0 && half.score(1) == 0 && half.score(2) == -1 && half.score(3) == -1);
+    kvmem::LrfuHistory half(0, 0.5); half.begin_round(); half.preview({-.8, -.6, -.2, -.2}); half.commit();
+    CHECK(half.score(0) == -.8 && half.score(1) == -.6 && half.score(2) == -.2 && half.score(3) == -.2);
+}
+
+static void test_lrfu_signed_hit_order() {
+    // Equal prior history must never prefer a lower current relevance solely
+    // because top-fraction omitted its update. Cover negative, mixed and zero ties.
+    for (const auto& input : {std::vector<double>{-.8,-.6,-.2,-.2},
+                              std::vector<double>{-.8,-.2,0,.2,.6,.8},
+                              std::vector<double>{-.8,0,0,0},
+                              std::vector<double>{0,.2,.6,.8}}) {
+        for (double fraction : {.1,.5,.9,1.}) {
+            kvmem::LrfuHistory history(0,fraction);history.begin_round();history.preview(input);
+            for(size_t i=0;i<input.size();++i) {
+                if(input[i]<0 || fraction==1) CHECK(history.score(i)==input[i]);
+                if(i) CHECK(history.score(i)>=history.score(i-1));
+            }
+        }
+    }
+    // Existing nonnegative hit behavior and decay are unchanged; negative
+    // evidence applies even outside the positive hit set.
+    kvmem::LrfuHistory history(.5,.5);history.begin_round();history.preview({.1,.2,.6,.8});
+    CHECK(history.score(0)==0 && history.score(1)==0 && history.score(2)==.6 && history.score(3)==.8);
+    CHECK(history.commit());const auto checkpoint=history.checkpoint();
+    history.begin_round();history.preview({-.8,-.2,.4,.8});history.preview({-.8,-.2,.4,.8});
+    CHECK(std::abs(history.score(0)+.8)<1e-12 && std::abs(history.score(1)+.2)<1e-12);
+    CHECK(std::abs(history.score(2)-.7)<1e-12 && std::abs(history.score(3)-1.2)<1e-12);
+    CHECK(history.commit() && !history.commit());history.restore(checkpoint);
+    CHECK(history.score(0)==0 && history.score(2)==.6);
+
+    KvMemStoreConfig cfg;cfg.block_tokens=64;cfg.select_budget=128;cfg.sink_blocks=0;cfg.recent_blocks=0;
+    cfg.lrfu=true;cfg.lrfu_lambda=0;cfg.lrfu_top_fraction=.5;
+    KvMemStore store(cfg);store.register_append(256);store.begin_retrieval_round();
+    store.set_retrieval_scores({-.8,-.6,-.2,-.1});
+    CHECK(store.pick_topk_blocks()==std::vector<uint32_t>({2,3}));
 }
 
 int main() {
+    test_lrfu_signed_hit_order();
     test_lrfu_round_and_restore();
     test_media_suffix_over_budget();
     test_media_groups_with_shared_boundary();

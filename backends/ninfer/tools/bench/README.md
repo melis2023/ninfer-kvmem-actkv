@@ -7,10 +7,10 @@ runners, and the external Serve TTFT client. Correctness is owned by the affecte
 ## Interleaved A/B between two builds
 
 `run_interleaved_ab.py` compares two executables by alternating them **inside** each repetition.
-Use it for any before/after claim on this hardware. The card drifts 3-5% between processes as it
-heats and the power cap clamps, which is larger than most effects worth measuring here, so
-"all of arm A, then all of arm B" cannot separate a real change from the ramp -- two comparisons
-in TODO's history came out with opposite-signed drift on code paths that had not changed.
+Use it for any before/after claim. A power-capped card drifts 3-5% between processes as it heats
+and the cap clamps, which is larger than most effects worth measuring, so "all of arm A, then all
+of arm B" cannot separate a real change from the ramp: two earlier comparisons came out with
+opposite-signed drift on code paths that had not changed.
 
 ```bash
 python tools/bench/run_interleaved_ab.py \
@@ -22,8 +22,8 @@ python tools/bench/run_interleaved_ab.py \
 ```
 
 It reports the **paired median** -- the median of per-repetition ratios -- and how many pairs came
-out positive. That is deliberately not the ratio of the two medians: on this box the two statistics
-disagree by more than the effects being measured.
+out positive. That is deliberately not the ratio of the two medians: on a power-capped RTX 3090 the
+two statistics disagreed by more than the effects being measured.
 
 `--control` names a configuration whose code path is **identical in both arms**, so any ratio it
 shows is pure drift; the tool divides it out per repetition and prints a `normalised` column. In the
@@ -191,20 +191,19 @@ selected local inputs; it does not make repository state part of report validity
 
 ## Serving corpus benchmark
 
-[Published coverage and model results](../../docs/performance.md) identify the recorded runs.
-The [serving methodology](../../docs/performance/methodology.md) owns workload definitions,
-metric boundaries, aggregation, comparison rules, and publication format. This section describes
-runner usage and output files.
+The [serving corpus methodology](../../docs/performance/methodology.md) owns workload definitions,
+metric boundaries, aggregation and comparison rules. This section describes runner usage and output
+files.
 
 `run_serve_corpus.py` accepts explicit `--artifact LABEL=PATH` entries. Labels identify report groups;
 the selected artifact supplies the architecture, public name and weight bindings.
 Omitting `--mode` selects MTP0 and MTP3; repeat `--mode` to select a subset. Use `dflash7` for
 Qwen3.6-35B-A3B DFlash K=7 and `dflash2_7` for Qwen3.8-27B DFlash2 K=7, with companion weights
 in the selected artifact. `--sampling greedy` selects exact argmax; the default is stochastic.
-Run commands with a selected Python 3.11 interpreter, as in the model-page reproduction entries.
+Run commands with a selected Python 3.11 interpreter.
 Both serving runners accept every `ninfer-serve --kv-dtype` value (`bf16`, `int8`, `fp8`, `rk8v4`,
 `rk4v4`, `rk4v4-e8`, `rk2v4-e8`, `nvfp4`, `k8v4`; default `int8`). Specify it explicitly when
-recording a new campaign; the launcher profiles choose `rk4v4` or `int8`. The runner verifies the loaded KV representation and records the selection in
+recording a run; the launcher profiles choose `rk4v4` or `int8`. The runner verifies the loaded KV representation and records the selection in
 its results. A serial run cannot resume records collected with a different KV dtype.
 
 The serial runner writes `run.jsonl`, `summary.csv`, `summary.md`, and per-server logs under
@@ -255,24 +254,22 @@ python3 tools/bench/run_chat_decode.py \
   --arm base=/path/to/baseline/ninfer-serve --arm new=./build/apps/ninfer-serve
 ```
 
-The prompt file is one JSON object per line with a `prompt` string; the comparisons in
-[docs/performance.md](../../docs/performance.md#small-t-tensor-core-kernels-for-verify-and-cohort-decode)
-use the eight thinking-off prompts of syv-ai/qwen38-27b-rtx3090's `bench/prompts_real.jsonl`, which
+The prompt file is one JSON object per line with a `prompt` string; the RTX 3090 chat measurements
+used the eight thinking-off prompts of syv-ai/qwen38-27b-rtx3090's `bench/prompts_real.jsonl`, which
 is that project's file and is not vendored here.
 
 ## Concurrent serving benchmark
 
 `run_serve_concurrency.py` selects `--suite decode-saturation` or `--suite corpus-makespan`.
 Their distinct time boundaries and workload dispatch are defined in the
-[serving methodology](../../docs/performance/methodology.md#workloads-and-measurement-boundaries).
+[serving corpus methodology](../../docs/performance/methodology.md#workloads-and-measurement-boundaries).
 Repeat `--concurrency` to select C points; each point starts a fresh server. The point report
 records the actual Engine configuration, automatic KV capacity, shuffle seed where applicable,
 dispatch method, and per-request positions.
 
 Schema-v4 outputs include `points/*.json`, `server/*.jsonl`, and combined `summary.json`, `summary.csv`, and
 `summary.md`. C=1 corpus runs also write complete responses in `corpus/<point>/results.jsonl` and
-per-request phase summaries in that directory; older campaigns may have only point reports and
-server logs. Historical model pages identify the report directory associated with each table.
+per-request phase summaries in that directory.
 
 ```bash
 python3 tools/bench/run_serve_concurrency.py \
@@ -302,7 +299,7 @@ by default beside a drafter.
 Steady decode tok/s is rounds per second times accepted tokens per round, and acceptance depends on
 the sampled text: two builds sample different text from the same seeds, so one seed set can differ
 by several percent in acceptance alone. `--seed-set N` selects another set of saturation seeds (set
-0 is the published one); compare builds on the decode rounds per second of the same point, or
+0 is the default); compare builds on the decode rounds per second of the same point, or
 average several seed sets. Run the builds under comparison back to back and alternate their order:
 the same build measured hours apart drifted by 2-3 % on the RTX 5090 used for this suite.
 

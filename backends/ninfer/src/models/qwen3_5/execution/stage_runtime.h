@@ -4,10 +4,13 @@
 #include "core/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
 #include "core/stage_link.h"
+#include "core/tensor_parallel.h"
+#include "models/qwen3_5/config.h"
 
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <utility>
 #include <vector>
@@ -83,6 +86,22 @@ struct StageRuntime {
 
     // Alternates per forward pass so consecutive passes use different slots of every link.
     std::uint32_t next_slot = 0;
+
+    // Tensor parallelism (`--tensor-parallel`) instead of stages: every rank runs a share of each
+    // layer's GDN heads and dense FFN rows, and the ranks add their output projections' FP32
+    // partials into identical replicas of the residual through `exchange`. Attention, the KV cache,
+    // the embedding, the head and MTP stay on rank 0, whose attention output reaches the other
+    // replicas through the same exchange. `state[r]` and `replay[r]` are rank r's shares of every
+    // GDN layer, `control[r - 1]` and `forward[r - 1]` carry the control tensors and the incoming
+    // residual from rank 0 to rank r, and `back` is absent.
+    struct TensorParallel {
+        // A rank's share of the model: the GDN heads and dense FFN rows divided by the ranks.
+        TextConfig shard;
+        std::unique_ptr<TensorParallelExchange> exchange;
+        // joined[r - 1] joins rank r's stream back into rank 0's at the end of a pass.
+        std::vector<CudaCompletionEvent> joined;
+    };
+    std::optional<TensorParallel> tensor_parallel;
 };
 
 } // namespace ninfer::models::qwen3_5::execution

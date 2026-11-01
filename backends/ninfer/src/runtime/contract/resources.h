@@ -3,6 +3,7 @@
 #include "runtime/contract/request.h"
 #include "core/transfer_work.h"
 #include "core/wide_math.h"
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -287,8 +288,13 @@ struct PressureCheckpointRecoveryImpact {
     bool survives = true;
 
     [[nodiscard]] friend constexpr bool
-    operator==(const PressureCheckpointRecoveryImpact&,
-               const PressureCheckpointRecoveryImpact&) noexcept = default;
+    operator==(const PressureCheckpointRecoveryImpact& left,
+               const PressureCheckpointRecoveryImpact& right) noexcept {
+        return left.owner == right.owner && left.checkpoint == right.checkpoint &&
+               left.survives == right.survives &&
+               std::equal(left.target_recovery_work.begin(), left.target_recovery_work.end(),
+                          right.target_recovery_work.begin(), right.target_recovery_work.end());
+    }
 };
 
 struct PressureCheckpointOutcome {

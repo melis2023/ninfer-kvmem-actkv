@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <iostream>
 #include <map>
@@ -62,6 +63,8 @@ using ninfer::runtime::FinishDisposition;
 using ninfer::runtime::LaneId;
 using ninfer::runtime::MaterializationMachineWork;
 using ninfer::runtime::PrefillWork;
+using ninfer::runtime::SharedCandidateRank;
+using ninfer::runtime::strongest_shared_candidates;
 using ninfer::runtime::PlanningCandidateId;
 using ninfer::runtime::PlanningOwnerId;
 using ninfer::runtime::PrivateSourceMode;
@@ -2824,16 +2827,16 @@ void test_endpoint_anchor_frontier_keeps_a_matched_endpoint_far_above_its_anchor
     FakeManager near_manager = make_manager(1, 2);
     FakeProgram near_program;
     near_program.finish_long_anchor_frontiers = {4096 - kEndpointAnchorMinimumGainTokens + 1};
-    const ActiveRequest near_request = start_active(near_manager, near_program, 7, make_base(7), 1);
-    (void)finish_active(near_manager, near_program, near_request, 4096);
-    near_program.matched_tokens[near_request.sequence.id] = 4200;
+    const ActiveRequest nearby = start_active(near_manager, near_program, 7, make_base(7), 1);
+    (void)finish_active(near_manager, near_program, nearby, 4096);
+    near_program.matched_tokens[nearby.sequence.id] = 4200;
     require(!near_manager.endpoint_anchor_frontier(near_program, prompt),
             "an endpoint within the minimum gain of an anchor was anchored again");
     near_program.finish_long_anchor_frontiers = {4096 - kEndpointAnchorMinimumGainTokens};
     FakeManager far_manager = make_manager(1, 2);
-    const ActiveRequest far_request = start_active(far_manager, near_program, 7, make_base(7), 1);
-    (void)finish_active(far_manager, near_program, far_request, 4096);
-    near_program.matched_tokens[far_request.sequence.id] = 4200;
+    const ActiveRequest distant = start_active(far_manager, near_program, 7, make_base(7), 1);
+    (void)finish_active(far_manager, near_program, distant, 4096);
+    near_program.matched_tokens[distant.sequence.id] = 4200;
     require(far_manager.endpoint_anchor_frontier(near_program, prompt) == 4096U,
             "an endpoint a full minimum gain above an anchor was not anchored");
 }
@@ -4023,6 +4026,72 @@ void test_shared_fanout_keeps_owner_edges_live_across_summary_refresh() {
             "shared fanout did not release both logical owner edges");
 }
 
+// A long prompt carries more shared boundaries than the projection can search exhaustively: the
+// prefix grid alone proposes kPrefixGridCandidates, and the structural and client boundaries come
+// on top. Planning must narrow them instead of failing the Engine's admission unit, which fails
+// every running lane with the request.
+void test_more_shared_boundaries_than_the_subset_search_still_plan() {
+    FakeManager manager = make_manager(1, 4, 8);
+    FakeProgram program;
+    FakeRequestBasePlan base = make_base(51);
+    for (std::uint32_t index = 1; index <= ninfer::kPrefixGridCandidates + 1U; ++index) {
+        base.cache.opportunities.push_back(FakeContextCache::Opportunity{
+            .kind     = ninfer::PromptCacheMarkerKind::SharedStablePrefix,
+            .evidence = ninfer::SharedCandidateEvidence::ExplicitBoundary,
+            .frontier = 4U * index,
+        });
+    }
+    const ActiveRequest active = start_active(manager, program, 51, base, 1);
+    (void)finish_active(manager, program, active);
+}
+
+// Narrowing ranks by distinct reuse domains. One session asking for a prefix again and again is a
+// single domain however many demand records it leaves; two independent callers are the evidence
+// that a prefix is shared and must outrank it.
+void test_candidate_narrowing_ranks_distinct_reuse_domains() {
+    constexpr std::size_t kLimit = 7;
+    const auto rank = [](bool pressure, std::uint32_t domains, std::uint64_t rebuild_ns = 100) {
+        return SharedCandidateRank{
+            .pressure_capable = pressure, .reuse_domains = domains, .rebuild_ns = rebuild_ns};
+    };
+
+    // Seven candidates two independent callers asked for, one a single session asked for (however
+    // often), and one three callers asked for: with one slot short, the single-session candidate
+    // goes, never a cross-domain one.
+    std::vector<SharedCandidateRank> ranks(7, rank(true, 2));
+    ranks.push_back(
+        rank(true, 1, 1'000'000));  // index 7: one session, the most expensive to rebuild
+    ranks.push_back(rank(true, 3)); // index 8: three independent callers
+    const std::vector<std::size_t> kept = strongest_shared_candidates(ranks, kLimit);
+    require(kept.size() == kLimit, "narrowing did not keep exactly the search limit");
+    require(std::find(kept.begin(), kept.end(), std::size_t{7}) == kept.end(),
+            "a single-session candidate outranked cross-domain demand");
+    require(std::find(kept.begin(), kept.end(), std::size_t{8}) != kept.end(),
+            "a three-domain candidate was dropped");
+    require(std::is_sorted(kept.begin(), kept.end()), "narrowing reordered the candidates");
+
+    // A candidate that can force an eviction outranks any amount of surplus-only demand.
+    std::vector<SharedCandidateRank> pressure(8, rank(false, 5));
+    pressure[3]                                  = rank(true, 1);
+    const std::vector<std::size_t> pressure_kept = strongest_shared_candidates(pressure, kLimit);
+    require(std::find(pressure_kept.begin(), pressure_kept.end(), std::size_t{3}) !=
+                pressure_kept.end(),
+            "a pressure-capable candidate lost to surplus-only demand");
+
+    // Equal demand falls back to the work a hit saves, then to the earlier candidate.
+    std::vector<SharedCandidateRank> equal(8, rank(true, 2, 100));
+    equal[5]                                  = rank(true, 2, 50);
+    const std::vector<std::size_t> equal_kept = strongest_shared_candidates(equal, kLimit);
+    require(std::find(equal_kept.begin(), equal_kept.end(), std::size_t{5}) == equal_kept.end(),
+            "the candidate saving the least rebuild work was kept over equal demand");
+
+    // At or under the limit nothing is dropped.
+    require(strongest_shared_candidates(std::span<const SharedCandidateRank>(ranks).first(kLimit),
+                                        kLimit)
+                    .size() == kLimit,
+            "narrowing dropped candidates within the search limit");
+}
+
 void test_shared_capture_combines_two_pressure_owners() {
     FakeManager manager = make_manager(1, 4, 1);
     FakeProgram program;
@@ -4973,6 +5042,46 @@ void test_escape_hatch_ranks_shared_prefixes_with_private_owners() {
             "rung destroyed a shared prefix whose eviction the admission did not need");
 }
 
+// NINFER_MAT_DEBUG on or off for the admission inspections that follow.
+void set_materialization_trace(bool on) {
+#ifdef _WIN32
+    _putenv_s("NINFER_MAT_DEBUG", on ? "1" : "");
+#else
+    if (on) {
+        setenv("NINFER_MAT_DEBUG", "1", 1);
+    } else {
+        unsetenv("NINFER_MAT_DEBUG");
+    }
+#endif
+}
+
+void test_mismatching_shared_prefixes_beyond_the_private_catalog() {
+    // A shared prefix-index entry's slot numbers the shared catalog. With more shared slots than
+    // private ones, a prompt whose key differs from every catalogued shared prefix must be
+    // admitted without consulting the private catalog at those slots, traced or not (issue #39:
+    // an access violation on admission). The test target checks container bounds.
+    FakeManager manager = make_manager(1, 1, 4);
+    FakeProgram program;
+    std::uint64_t order = 1;
+    for (const std::uint32_t digest : {71U, 72U, 73U}) {
+        publish_shared_prefix(manager, program, digest, order++, digest,
+                              ninfer::SharedCandidateEvidence::DefaultAutomatic);
+    }
+    for (const bool trace : {false, true}) {
+        set_materialization_trace(trace);
+        auto inspection =
+            manager.inspect(program, FakePreparedPrompt{99}, make_base(99), order);
+        require(inspection.choice.has_value(),
+                "a prompt matching no shared prefix produced no admission choice");
+        require(inspection.choice->summary().prefix_reuse_path !=
+                    PrefixReusePath::SharedStablePrefix,
+                "a prompt reused a shared prefix whose key it does not match");
+    }
+    set_materialization_trace(false);
+    require_shared_reuse(manager, program, 72, order, true,
+                         "a matching prompt no longer reuses its shared prefix");
+}
+
 void test_automatic_shared_capture_reclaims_oldest_catalog_entry() {
     FakeManager manager = make_manager(1, 4, 2);
     FakeProgram program;
@@ -5549,6 +5658,10 @@ int main() {
              test_shared_fanout_keeps_owner_edges_live_across_summary_refresh);
     run_test("shared capture multi-owner pressure",
              test_shared_capture_combines_two_pressure_owners);
+    run_test("shared boundaries beyond the subset search",
+             test_more_shared_boundaries_than_the_subset_search_still_plan);
+    run_test("shared candidate narrowing ranks reuse domains",
+             test_candidate_narrowing_ranks_distinct_reuse_domains);
     run_test("infeasible shared capture may reclaim without pressure evidence",
              test_infeasible_shared_capture_may_reclaim_without_pressure_evidence);
     run_test("aborted shared capture logical rollback",
@@ -5596,6 +5709,8 @@ int main() {
              test_escape_hatch_sacrifices_oldest_first_and_demotes_the_rest);
     run_test("escape hatch ranks shared prefixes with private owners",
              test_escape_hatch_ranks_shared_prefixes_with_private_owners);
+    run_test("mismatching shared prefixes beyond the private catalog",
+             test_mismatching_shared_prefixes_beyond_the_private_catalog);
     run_test("shared capture seal failure skips instead of throwing",
              test_shared_capture_seal_failure_skips_instead_of_throwing);
     run_test("automatic reclaim picks the least recently used entry",

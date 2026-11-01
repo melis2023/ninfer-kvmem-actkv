@@ -30,15 +30,7 @@ struct CausalAttentionExecutionEnvelope {
     // row block, so a few query rows over a long context leave most SMs idle; small-T splits the
     // keys across CTAs instead. Workspace planning and execution must use the same hint.
     bool small_prefill = false;
-    // Invariant attention: a nonzero multiple of the page size fixes every split's key range to
-    // [s * segment_keys, (s + 1) * segment_keys), so a column's partials and output are the same
-    // bytes at any decode width, verification window or batch. Zero keeps the tuned splits.
-    std::uint32_t invariant_segment_keys = 0;
 };
-
-// The fewest keys (a multiple of the page size) that keep max_context within the small-T split
-// capacity, so every launch of one engine uses the same segments.
-std::uint32_t causal_attention_invariant_segment_keys(std::uint32_t max_context);
 
 struct ContextAttentionExecutionEnvelope {
     std::uint32_t min_context = 0;
@@ -147,7 +139,8 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
 /**
  * Append K/V for B independent rows and compute causal grouped-query attention.
  *
- * The registered profiles are [D,Hq,Hkv]=[256,24,4] (group 6) and [256,16,2] (group 8), with
+ * The registered profiles are [D,Hq,Hkv]=[256,24,4] (group 6), [256,16,2] (group 8),
+ * [256,8,2] and [256,16,4] (group 4), with
  * scale=1/sqrt(256). q/out are contiguous BF16 [D,Hq,W,B], k/v are contiguous BF16
  * [D,Hkv,W,B], positions are contiguous device I32 [W,B], kv_table_rows is contiguous device I32
  * [B], and the cache is BF16, INT8-G64, row-scaled FP8-E4M3FN, NVFP4-G16, or K8V4. valid_columns is
@@ -170,6 +163,9 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * The caller guarantees that the maximum p+1 over live rows lies within envelope. The envelope is
  * a host launch/workspace resource promise over that batch maximum, not a mask and not persistent
  * state. A masked physical width may exceed max_visible_keys when its live prefix is shorter.
+ * A row's KV work partition is determined by its first position, its physical width and the
+ * envelope, not by valid_columns, so a live column's result is bit-identical however many trailing
+ * columns are masked; no key past the last live position is read.
  * Inputs, output, every cache plane/table, and live workspace suballocations are pairwise
  * non-overlapping. The Op overwrites every addressed cache row but owns no cache allocation,
  * frontier, request identity, or commit authority.

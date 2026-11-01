@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "ops/common/blackwell_routes.h"
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan.h"
 
 #include "core/device.h"
@@ -33,12 +34,10 @@ void launch_mma(const Weight& weight, Tensor& out, Fp8A8Workspace workspace, std
     const Fp8SwiGluOutput output{static_cast<__nv_bfloat16*>(out.data), kIntermediate};
 
     if constexpr (Schedule::kSharedBytes > 48 * 1024) {
-        configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(
-                fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8IdentityEpilogue, Fp8SwiGluOutput,
-                               Rows, true>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
-        });
+        raise_dynamic_shared_memory(
+            fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8IdentityEpilogue, Fp8SwiGluOutput,
+                           Rows, true>,
+            Schedule::kSharedBytes);
     }
     fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8IdentityEpilogue, Fp8SwiGluOutput, Rows, true>
         <<<blocks, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(
@@ -52,6 +51,7 @@ void launch_mma(const Weight& weight, Tensor& out, Fp8A8Workspace workspace, std
 
 void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                  WorkspaceArena& workspace, cudaStream_t stream) {
+    require_fp8_a8_card();
     auto scope = workspace.scope();
     const Fp8A8Workspace scratch =
         allocate_fp8_a8_workspace(workspace, x.ne[1], Geometry::kInputRows);

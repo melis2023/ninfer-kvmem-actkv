@@ -6,7 +6,7 @@ namespace ninfer::ops::detail::unified {
 void nvfp4_linear_swiglu_decode_launch(const Tensor& x, const Weight& w, Tensor& y,
                                        cudaStream_t stream) {
     using S = Nvfp4ScheduleInstance<
-        Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::Direct, Nvfp4CodeCache::Default, 2>,
+        Nvfp4A16GemvSchedule<8, 2, 16, 4, Nvfp4ScaleAccess::StagedRaw, Nvfp4CodeCache::Streaming, 4>,
         5120>;
     launch_nvfp4_a16_gemv<S>(nvfp4_a16_operands(x, w),
                              LinearBf16Output{static_cast<__nv_bfloat16*>(y.data), w.n / 2},

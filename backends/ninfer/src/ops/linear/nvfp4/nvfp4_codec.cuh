@@ -2,6 +2,7 @@
 
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
+#include "ops/linear/nvfp4/nvfp4_e4m3_scale.h"
 
 #include <cuda_bf16.h>
 #include <cuda_fp4.h>
@@ -11,10 +12,35 @@
 
 namespace ninfer::ops::detail {
 
+// The ue4m3 scale table for the A16 group coefficient, expanded from the same list the int8 routes
+// use (nvfp4_e4m3_scale.h) and read as a 1KB constant table. Over the reachable domain 0x00..0x7E
+// every entry is exactly half the vendor __nv_fp8x2_e4m3 value; the coefficient folds 2^15 to
+// compensate, so the product stays bit-identical.
+__device__ constexpr float kNvfp4E4M3ScaleA16[256] = {
+    NINFER_E4M3_SCALE_LIST(NINFER_E4M3_SCALE_VALUE)};
+
+// E2M1 pair -> FP32 without the vendor conversion, which ptxas outlines on sm_86/sm_89 into a call
+// with BSSY/BSYNC bookkeeping. This form builds both halves as FP16 bit patterns and converts: the
+// FP16 pattern carries the e2m1 significand in [11:9] and the sign in [15], and FP16 subnormals
+// line the exp==0 codes up on a common 2^-14 factor, so the conversion yields e2m1 * 2^-14 exactly
+// and the trailing *2^14 rescale below is a power of two.
+__device__ __forceinline__ float2 decode_nvfp4_e2m1x2_raw(std::uint8_t storage) {
+    const unsigned v = static_cast<unsigned>(storage) | (static_cast<unsigned>(storage) << 12);
+    const unsigned r = ((v << 9) & 0x0E000E00u) | ((v & 0x00080008u) << 12);
+    __half2 packed;
+    packed.x = __ushort_as_half(static_cast<unsigned short>(r & 0xFFFFu));
+    packed.y = __ushort_as_half(static_cast<unsigned short>(r >> 16));
+    return __half22float2(packed);
+}
+
+// The same expansion without the 2^14 rescale: callers whose group coefficient is a free scalar
+// fold that power of two into the coefficient instead of paying one FMUL per code.
 __device__ __forceinline__ float2 decode_nvfp4_e2m1x2(std::uint8_t storage) {
-    __nv_fp4x2_e2m1 value;
-    value.__x = storage;
-    return static_cast<float2>(value);
+    const float2 raw = decode_nvfp4_e2m1x2_raw(storage);
+    float2 result;
+    result.x = raw.x * 16384.0F;
+    result.y = raw.y * 16384.0F;
+    return result;
 }
 
 __device__ __forceinline__ float decode_nvfp4_e4m3(std::uint8_t storage) {
@@ -74,6 +100,12 @@ pack_nvfp4_e2m1x16(const float2 (&values)[8], std::uint32_t& codes_lo, std::uint
 // two neighbouring lanes so that every thread of the block takes part.
 __device__ __forceinline__ std::uint32_t pack_nvfp4_e2m1x8(const float2 (&values)[4]) {
     std::uint32_t codes = 0;
+#if defined(NINFER_PRE_BLACKWELL_DEVICE)
+    // Blackwell's FP4 conversion; an image of another architecture in a build of several never
+    // runs the routes that call it.
+    codes = 0;
+    __trap();
+#else
     asm volatile("{\n"
                  ".reg .b8 b0;\n"
                  ".reg .b8 b1;\n"
@@ -88,6 +120,7 @@ __device__ __forceinline__ std::uint32_t pack_nvfp4_e2m1x8(const float2 (&values
                  : "=r"(codes)
                  : "f"(values[0].x), "f"(values[0].y), "f"(values[1].x), "f"(values[1].y),
                    "f"(values[2].x), "f"(values[2].y), "f"(values[3].x), "f"(values[3].y));
+#endif
     return codes;
 }
 

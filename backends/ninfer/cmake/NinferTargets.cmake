@@ -17,6 +17,25 @@ if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
   list(APPEND NINFER_CUDA_FATBIN_OPTIONS "-compress-mode=size")
 endif()
 
+if(NINFER_CUDA_PRUNE_PTX)
+  get_filename_component(_ninfer_cuda_bin "${CMAKE_CUDA_COMPILER}" DIRECTORY)
+  find_program(NINFER_NVPRUNE nvprune HINTS "${_ninfer_cuda_bin}" REQUIRED)
+endif()
+
+function(ninfer_prune_cuda_ptx target)
+  get_target_property(_ninfer_library_type ${target} TYPE)
+  if(NINFER_CUDA_PRUNE_PTX AND _ninfer_library_type STREQUAL "STATIC_LIBRARY")
+    # Archive-only processing preserves compiler-cache entries and all selected GPU targets.
+    add_custom_command(TARGET ${target} POST_BUILD
+      COMMAND ${CMAKE_COMMAND}
+        "-DNVPRUNE=${NINFER_NVPRUNE}"
+        "-DARCHIVE=$<TARGET_FILE:${target}>"
+        "-DARCHITECTURES=$<TARGET_PROPERTY:${target},CUDA_ARCHITECTURES>"
+        -P "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/PruneCudaPtx.cmake"
+      VERBATIM)
+  endif()
+endfunction()
+
 # Whole-program device code: every device symbol is defined and used in one translation unit (no
 # extern __device__ or __constant__, no cross-unit device calls), and relocatable device code made
 # ptxas assume external linkage, lower computed-lane shuffles to out-of-line calls and give up
@@ -27,6 +46,7 @@ function(ninfer_cuda_archive target)
   endif()
   target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
     "$<$<COMPILE_LANGUAGE:CUDA>:${NINFER_CUDA_FATBIN_OPTIONS}>")
+  ninfer_prune_cuda_ptx(${target})
 endfunction()
 
 function(ninfer_cuda_non_rdc_archive target)
@@ -38,6 +58,7 @@ function(ninfer_cuda_non_rdc_archive target)
   endif()
   target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-lineinfo>
     "$<$<COMPILE_LANGUAGE:CUDA>:${NINFER_CUDA_FATBIN_OPTIONS}>")
+  ninfer_prune_cuda_ptx(${target})
 endfunction()
 
 # Runtime DLL staging for the apps and tests.
@@ -54,6 +75,9 @@ endfunction()
 # Collect the FFMPEG + libcurl runtime DLLs from the vcpkg bin tree into <out_var>.
 function(ninfer_runtime_dll_list out_var)
   set(_list "")
+  if(WIN32 AND NINFER_WINDOWS_KERNEL_DLL AND TARGET ninfer_ggml_quants_dll)
+    list(APPEND _list "$<TARGET_FILE:ninfer_ggml_quants_dll>")
+  endif()
   if(WIN32 AND DEFINED FFMPEG_VCPKG_TREE)
     foreach(_ninfer_dll_glob
       "avutil-*.dll" "avcodec-*.dll" "avformat-*.dll" "swscale-*.dll"
@@ -86,7 +110,7 @@ endfunction()
 # exes share a single per-config runtime directory, so one copy serves every one of
 # them (anchored on any always-built test target for the directory).
 function(ninfer_stage_test_runtime_dlls anchor_target)
-  if(NOT WIN32 OR NOT DEFINED FFMPEG_VCPKG_TREE)
+  if(NOT WIN32)
     return()
   endif()
   ninfer_runtime_dll_list(_ninfer_test_rt_dlls)

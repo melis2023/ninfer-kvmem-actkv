@@ -12,12 +12,13 @@
 // whose reduction then takes the transform back.
 #include "ninfer/ops/sparse_attention.h"
 
+#include "ninfer/ops/kv_stream.h"
+
 #include "core/device.h"
 #include "core/layout.h"
 #include "core/paged_kv_storage.h"
 #include "ops/common/math.h"
 #include "ops/common/memory.cuh"
-#include "ops/kernel/paged_kv_address.cuh"
 #include "ops/kv_cache/fp8_e4m3_row_codec.cuh"
 #include "ops/kv_cache/hadamard_d256.cuh"
 #include "ops/kv_cache/int8_g64_codec.cuh"
@@ -50,6 +51,8 @@ constexpr int kMaxPositions   = 4 * kTopBlocks + 3; // the selected blocks and t
 constexpr int kSplits         = (kMaxPositions + kSplitPositions - 1) / kSplitPositions;
 constexpr int kPartialFloats  = kHeadDim + 2; // unnormalised output, running max, running sum
 
+static_assert(kPagedKVPageSize == 1 << 6 && kKvStreamPageTokens == 1 << 2);
+
 constexpr int kChunk         = 16; // dimensions a thread decodes at once from a quantized row
 constexpr int kChunks        = kHeadDim / kChunk;
 constexpr int kWordsPerChunk = kChunk / 2;
@@ -67,11 +70,14 @@ struct KvPlanes {
 };
 
 // Element offset of `leading` in the row of position `p` and KV head `head`, for a plane whose
-// rows are `Leading` elements wide.
-template <int Leading>
+// rows are `Leading` elements wide and whose pages hold 2^Shift positions: 64 for a paged layer,
+// 4 for a streamed layer's pool (kv_stream.h).
+template <int Leading, int Shift>
 __device__ __forceinline__ std::int64_t plane_offset(const std::int32_t* table, int head, int p,
                                                      int leading) {
-    return paged_kv_element_offset<Leading, kKvHeads>(table, head, p, leading);
+    const std::int64_t page = table[p >> Shift];
+    return static_cast<std::int64_t>(Leading) * ((page * kKvHeads + head) << Shift) +
+           static_cast<std::int64_t>(Leading) * (p & ((1 << Shift) - 1)) + leading;
 }
 
 __device__ __forceinline__ float scale_at(const void* plane, std::int64_t offset) {
@@ -108,7 +114,7 @@ __device__ __forceinline__ void halves_to_words(int4 low, int4 high,
 }
 
 // Key dimensions [16 c, 16 c + 16) of one row, in the rotated basis, as FP16 pairs.
-template <KvCacheStorage Storage>
+template <KvCacheStorage Storage, int Shift>
 __device__ __forceinline__ void decode_key(const KvPlanes& planes, const std::int32_t* table,
                                            int head, int p, int c,
                                            unsigned (&out)[kWordsPerChunk]) {
@@ -116,76 +122,76 @@ __device__ __forceinline__ void decode_key(const KvPlanes& planes, const std::in
     if constexpr (Storage == KvCacheStorage::Int8Group64 ||
                   Storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64) {
         const auto* codes =
-            static_cast<const std::int8_t*>(planes.k) + plane_offset<256>(table, head, p, d);
+            static_cast<const std::int8_t*>(planes.k) + plane_offset<256, Shift>(table, head, p, d);
         codes_to_half(load_vec<int4>(codes),
-                      scale_at(planes.k_scale, plane_offset<4>(table, head, p, d / 64)), out);
+                      scale_at(planes.k_scale, plane_offset<4, Shift>(table, head, p, d / 64)), out);
     } else if constexpr (Storage == KvCacheStorage::RotatedLloyd4KeyInt4Value ||
                          Storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8) {
         const auto* bytes =
-            static_cast<const std::uint8_t*>(planes.k) + plane_offset<128>(table, head, p, d / 2);
+            static_cast<const std::uint8_t*>(planes.k) + plane_offset<128, Shift>(table, head, p, d / 2);
         const uint2 packed = load_vec<uint2>(bytes);
         const int4 codes   = Storage == KvCacheStorage::RotatedLloyd4KeyInt4Value
                                  ? kv_cache_lloyd4_expand16(packed)
                                  : kv_cache_int4_unpack_i8x16(packed);
-        codes_to_half(codes, scale_at(planes.k_scale, plane_offset<4>(table, head, p, d / 64)),
+        codes_to_half(codes, scale_at(planes.k_scale, plane_offset<4, Shift>(table, head, p, d / 64)),
                       out);
     } else if constexpr (Storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
         const auto* bytes =
-            static_cast<const std::uint8_t*>(planes.k) + plane_offset<64>(table, head, p, d / 4);
+            static_cast<const std::uint8_t*>(planes.k) + plane_offset<64, Shift>(table, head, p, d / 4);
         codes_to_half(kv_cache_e8_root_unpack_i8x16(load_vec<std::uint32_t>(bytes)),
-                      scale_at(planes.k_scale, plane_offset<4>(table, head, p, d / 64)), out);
+                      scale_at(planes.k_scale, plane_offset<4, Shift>(table, head, p, d / 64)), out);
     } else if constexpr (Storage == KvCacheStorage::Fp8E4M3Row256 ||
                          Storage == KvCacheStorage::Fp8KeyNvfp4Value) {
         const auto* codes =
-            static_cast<const std::uint8_t*>(planes.k) + plane_offset<256>(table, head, p, d);
+            static_cast<const std::uint8_t*>(planes.k) + plane_offset<256, Shift>(table, head, p, d);
         const __half s =
-            static_cast<const __half*>(planes.k_scale)[plane_offset<1>(table, head, p, 0)];
+            static_cast<const __half*>(planes.k_scale)[plane_offset<1, Shift>(table, head, p, 0)];
         halves_to_words(kv_cache_fp8_dequant_f16x8(codes, s),
                         kv_cache_fp8_dequant_f16x8(codes + 8, s), out);
     } else {
         static_assert(Storage == KvCacheStorage::Nvfp4Group16);
         const auto* codes =
-            static_cast<const std::uint8_t*>(planes.k) + plane_offset<128>(table, head, p, d / 2);
+            static_cast<const std::uint8_t*>(planes.k) + plane_offset<128, Shift>(table, head, p, d / 2);
         const std::uint8_t s =
-            static_cast<const std::uint8_t*>(planes.k_scale)[plane_offset<16>(table, head, p, c)];
+            static_cast<const std::uint8_t*>(planes.k_scale)[plane_offset<16, Shift>(table, head, p, c)];
         halves_to_words(kv_cache_nvfp4_dequant_f16x8(codes, s),
                         kv_cache_nvfp4_dequant_f16x8(codes + 4, s), out);
     }
 }
 
 // Value dimensions [16 c, 16 c + 16) of one row as FP16 pairs.
-template <KvCacheStorage Storage>
+template <KvCacheStorage Storage, int Shift>
 __device__ __forceinline__ void decode_value(const KvPlanes& planes, const std::int32_t* table,
                                              int head, int p, int c,
                                              unsigned (&out)[kWordsPerChunk]) {
     const int d = c * kChunk;
     if constexpr (Storage == KvCacheStorage::Int8Group64) {
         const auto* codes =
-            static_cast<const std::int8_t*>(planes.v) + plane_offset<256>(table, head, p, d);
+            static_cast<const std::int8_t*>(planes.v) + plane_offset<256, Shift>(table, head, p, d);
         codes_to_half(load_vec<int4>(codes),
-                      scale_at(planes.v_scale, plane_offset<4>(table, head, p, d / 64)), out);
+                      scale_at(planes.v_scale, plane_offset<4, Shift>(table, head, p, d / 64)), out);
     } else if constexpr (Storage == KvCacheStorage::RotatedInt8KeyInt4ValueGroup64 ||
                          Storage == KvCacheStorage::RotatedLloyd4KeyInt4Value ||
                          Storage == KvCacheStorage::RotatedInt4KeyInt4ValueE8 ||
                          Storage == KvCacheStorage::RotatedE8RootKeyInt4Value) {
         const auto* bytes =
-            static_cast<const std::uint8_t*>(planes.v) + plane_offset<128>(table, head, p, d / 2);
+            static_cast<const std::uint8_t*>(planes.v) + plane_offset<128, Shift>(table, head, p, d / 2);
         codes_to_half(kv_cache_int4_unpack_i8x16(load_vec<uint2>(bytes)),
-                      scale_at(planes.v_scale, plane_offset<8>(table, head, p, d / 32)), out);
+                      scale_at(planes.v_scale, plane_offset<8, Shift>(table, head, p, d / 32)), out);
     } else if constexpr (Storage == KvCacheStorage::Fp8E4M3Row256) {
         const auto* codes =
-            static_cast<const std::uint8_t*>(planes.v) + plane_offset<256>(table, head, p, d);
+            static_cast<const std::uint8_t*>(planes.v) + plane_offset<256, Shift>(table, head, p, d);
         const __half s =
-            static_cast<const __half*>(planes.v_scale)[plane_offset<1>(table, head, p, 0)];
+            static_cast<const __half*>(planes.v_scale)[plane_offset<1, Shift>(table, head, p, 0)];
         halves_to_words(kv_cache_fp8_dequant_f16x8(codes, s),
                         kv_cache_fp8_dequant_f16x8(codes + 8, s), out);
     } else {
         static_assert(Storage == KvCacheStorage::Nvfp4Group16 ||
                       Storage == KvCacheStorage::Fp8KeyNvfp4Value);
         const auto* codes =
-            static_cast<const std::uint8_t*>(planes.v) + plane_offset<128>(table, head, p, d / 2);
+            static_cast<const std::uint8_t*>(planes.v) + plane_offset<128, Shift>(table, head, p, d / 2);
         const std::uint8_t s =
-            static_cast<const std::uint8_t*>(planes.v_scale)[plane_offset<16>(table, head, p, c)];
+            static_cast<const std::uint8_t*>(planes.v_scale)[plane_offset<16, Shift>(table, head, p, c)];
         halves_to_words(kv_cache_nvfp4_dequant_f16x8(codes, s),
                         kv_cache_nvfp4_dequant_f16x8(codes + 4, s), out);
     }
@@ -203,7 +209,7 @@ __device__ __forceinline__ float2 to_float2(const __half2& pair) { return __half
 
 // Split: this CTA takes positions [64 z, 64 z + 64) of the list and leaves its partial softmax in
 // `partial`; otherwise the whole list, normalised into `out`.
-template <bool Split, KvCacheStorage Storage>
+template <bool Split, KvCacheStorage Storage, int Shift>
 __global__ void __launch_bounds__(kThreads)
     sparse_attention_kernel(const __nv_bfloat16* __restrict__ q, const int* __restrict__ first,
                             const int* __restrict__ selected, const int* __restrict__ counts,
@@ -259,8 +265,8 @@ __global__ void __launch_bounds__(kThreads)
                 unsigned kw[kWordsPerChunk] = {}, vw[kWordsPerChunk] = {};
                 if (index < end) {
                     const int p = position_at(blocks, count, tail_begin, index);
-                    decode_key<Storage>(planes, block_table, kv_head, p, c, kw);
-                    decode_value<Storage>(planes, block_table, kv_head, p, c, vw);
+                    decode_key<Storage, Shift>(planes, block_table, kv_head, p, c, kw);
+                    decode_value<Storage, Shift>(planes, block_table, kv_head, p, c, vw);
                 }
                 auto* key_words = reinterpret_cast<unsigned*>(&keys[row * kRowStride + c * kChunk]);
                 auto* value_words =
@@ -280,8 +286,8 @@ __global__ void __launch_bounds__(kThreads)
                 unsigned kw = 0, vw = 0;
                 if (index < end) {
                     const int p               = position_at(blocks, count, tail_begin, index);
-                    const std::int64_t offset = paged_kv_element_offset<kHeadDim, kKvHeads>(
-                        block_table, kv_head, p, 2 * pair);
+                    const std::int64_t offset =
+                        plane_offset<kHeadDim, Shift>(block_table, kv_head, p, 2 * pair);
                     kw = *reinterpret_cast<const unsigned*>(k_pages + offset);
                     vw = *reinterpret_cast<const unsigned*>(v_pages + offset);
                 }
@@ -402,25 +408,26 @@ void require(bool condition, const char* message) {
     }
 }
 
-// One plane of the cache against the storage's layout: its dtype and row width.
-void require_plane(const Tensor& plane, DType dtype, std::int32_t leading, const char* message) {
+// One plane of the cache against the storage's layout: its dtype, row width and page size.
+void require_plane(const Tensor& plane, DType dtype, std::int32_t leading,
+                   std::int32_t page_tokens, const char* message) {
     require(plane.data != nullptr && plane.dtype == dtype && plane.is_contiguous() &&
-                plane.ne[0] == leading && plane.ne[1] == kPagedKVPageSize &&
-                plane.ne[2] == kKvHeads,
+                plane.ne[0] == leading && plane.ne[1] == page_tokens && plane.ne[2] == kKvHeads,
             message);
 }
 
-template <KvCacheStorage Storage>
+template <KvCacheStorage Storage, int Shift>
 void launch(const __nv_bfloat16* q, const int* first, const int* selected, const int* counts,
             const KvPlanes& planes, const std::int32_t* table, float scale, std::int32_t tokens,
             float* partial, __nv_bfloat16* out, cudaStream_t stream) {
     if (partial == nullptr) {
-        sparse_attention_kernel<false, Storage><<<dim3(tokens, kKvHeads), kThreads, 0, stream>>>(
-            q, first, selected, counts, planes, table, scale, out, nullptr);
+        sparse_attention_kernel<false, Storage, Shift>
+            <<<dim3(tokens, kKvHeads), kThreads, 0, stream>>>(q, first, selected, counts, planes,
+                                                              table, scale, out, nullptr);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
-    sparse_attention_kernel<true, Storage>
+    sparse_attention_kernel<true, Storage, Shift>
         <<<dim3(tokens, kKvHeads, kSplits), kThreads, 0, stream>>>(
             q, first, selected, counts, planes, table, scale, out, partial);
     CUDA_CHECK(cudaGetLastError());
@@ -461,19 +468,23 @@ void sparse_softmax_attention(const Tensor& q, const Tensor& first_position, con
                 cache.block_table.dtype == DType::I32 && cache.block_table.data != nullptr,
             "cache must be a paged layer of 2 heads of 256");
     const PagedKVStorageLayout layout = paged_kv_storage_layout(cache.storage, kHeadDim);
+    const std::int32_t page_tokens   = cache.k_pages.ne[1];
+    require(page_tokens == kPagedKVPageSize || page_tokens == kKvStreamPageTokens,
+            "pages must hold 64 positions, or 4 in a streamed layer's pool");
     require_plane(cache.k_pages, layout.key.data_dtype, layout.key.data_leading_extent,
-                  "the key plane does not match the cache storage");
+                  page_tokens, "the key plane does not match the cache storage");
     require_plane(cache.v_pages, layout.value.data_dtype, layout.value.data_leading_extent,
-                  "the value plane does not match the cache storage");
+                  page_tokens, "the value plane does not match the cache storage");
     if (layout.key.has_scale()) {
         require_plane(cache.k_scale_pages, layout.key.scale_dtype, layout.key.scale_leading_extent,
-                      "the key scale plane does not match the cache storage");
+                      page_tokens, "the key scale plane does not match the cache storage");
     }
     if (layout.value.has_scale()) {
         require_plane(cache.v_scale_pages, layout.value.scale_dtype,
-                      layout.value.scale_leading_extent,
+                      layout.value.scale_leading_extent, page_tokens,
                       "the value scale plane does not match the cache storage");
     }
+    const bool streamed = page_tokens == kKvStreamPageTokens;
     require(std::isfinite(scale) && scale > 0.0f, "scale must be positive and finite");
     const auto* q_p      = static_cast<const __nv_bfloat16*>(q.data);
     const auto* first_p  = static_cast<const int*>(first_position.data);
@@ -495,8 +506,9 @@ void sparse_softmax_attention(const Tensor& q, const Tensor& first_position, con
     switch (cache.storage) {
 #define NINFER_SPARSE_ATTENTION_CASE(STORAGE)                                                      \
     case KvCacheStorage::STORAGE:                                                                  \
-        launch<KvCacheStorage::STORAGE>(q_p, first_p, select_p, counts_p, planes, table_p, scale,  \
-                                        tokens, partial_p, out_p, stream);                         \
+        (streamed ? launch<KvCacheStorage::STORAGE, 2> : launch<KvCacheStorage::STORAGE, 6>)(      \
+            q_p, first_p, select_p, counts_p, planes, table_p, scale, tokens, partial_p, out_p,    \
+            stream);                                                                               \
         return;
         NINFER_SPARSE_ATTENTION_CASE(BFloat16)
         NINFER_SPARSE_ATTENTION_CASE(Int8Group64)

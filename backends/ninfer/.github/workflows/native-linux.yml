@@ -1,0 +1,130 @@
+name: Native Linux build
+
+on:
+  workflow_call:
+    inputs:
+      cuda:
+        type: string
+        required: true
+      archs:
+        type: string
+        required: true
+      runner:
+        type: string
+        default: ubuntu-24.04
+      jobs:
+        type: number
+        default: 4
+    secrets:
+      HF_BUILD_CACHE_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux Debian 13 CUDA ${{ inputs.cuda }} (${{ inputs.archs }})
+    runs-on: ${{ inputs.runner }}
+    container: ${{ inputs.runner == 'ubuntu-24.04' && 'debian:13-slim' || '' }}
+    timeout-minutes: 350
+    # Each CUDA family has one writer, including temporary bootstrap runs.
+    concurrency:
+      group: native-linux-shared-${{ github.ref }}-${{ inputs.cuda }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        shell: bash
+    env:
+      HF_BUILD_CACHE_SEED_REF: ${{ vars.HF_BUILD_CACHE_SEED_REF }}
+      HF_TOKEN: ${{ secrets.HF_BUILD_CACHE_TOKEN }}
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      HF_CACHE_FAMILY: native-linux-cuda-${{ inputs.cuda }}-shared-v1
+      CCACHE_DIR: ${{ github.workspace }}/.cache/objects
+      CCACHE_MAXSIZE: 8Gi
+      CCACHE_COMPILERCHECK: content
+      CCACHE_DEPEND: "true"
+      CCACHE_COMPRESSLEVEL: "5"
+      DEBIAN_FRONTEND: noninteractive
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+      LC_CTYPE: C.UTF-8
+      ARCHS: ${{ inputs.archs }}
+      CUDA_VERSION: ${{ inputs.cuda }}
+    steps:
+      - name: Reserve time for cache upload
+        run: echo "BUILD_DEADLINE=$(( $(date +%s) + 19800 ))" >> "$GITHUB_ENV"
+      - name: Install checkout tools
+        run: apt-get update && apt-get install -y --no-install-recommends ca-certificates curl git
+      - name: Check the compiler-cache environment
+        run: |
+          . /etc/os-release
+          test "$ID:$VERSION_ID" = debian:13
+          test "$GITHUB_WORKSPACE" = /__w/ninfer-all/ninfer-all
+      - uses: actions/checkout@v7
+      - name: Trust the mounted checkout for subsequent Git commands
+        run: |
+          # Checkout uses a temporary HOME; packaging uses the container user's HOME.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git -C "$GITHUB_WORKSPACE" rev-parse --verify HEAD
+      - name: Install Debian build dependencies and official CUDA Toolkit
+        run: .github/scripts/install-linux-release-tools.sh
+      - id: compiler-cache
+        name: Install pinned object cache
+        run: python3.11 .github/scripts/install-compiler-cache.py
+      - name: Install HF bucket client
+        run: python3.11 -m pip install --disable-pip-version-check huggingface_hub==1.17.0
+      - name: Restore completed objects from HF
+        id: object-cache
+        run: python3.11 .github/scripts/hf-build-cache.py restore --directory .cache/objects --family native-linux-cuda-${{ inputs.cuda }}-shared-v1 --fallback-family native-linux-cuda-${{ inputs.cuda }}-host-v2 --fallback-family native-linux-cuda-${{ inputs.cuda }}
+      - name: Verify object-cache reuse and CUDA invalidation
+        timeout-minutes: 10
+        run: python3.11 .github/scripts/check-compiler-cache.py
+      - name: Configure release products
+        run: .github/scripts/configure-linux-build.sh OFF
+      - name: Check compiler resource budget
+        id: capacity
+        run: python3.11 .github/scripts/check-build-capacity.py --jobs ${{ inputs.jobs }}
+      - name: Build release products
+        id: build
+        timeout-minutes: 305
+        # The rental exposes all host CPUs, beyond its container CPU and RAM quota.
+        run: python3.11 .github/scripts/run-cached-build.py --timeout-seconds 18000 --deadline-env BUILD_DEADLINE --log build-release/build.log --cache-stats build-release/cache-progress.jsonl -- cmake --build build-release -j ${{ steps.capacity.outputs.jobs }} --target ninfer ninfer-serve ninfer_bench ninfer-calibrate ninfer-perplexity ninfer-ngram-profile
+      - name: Prepare completed object cache for upload
+        timeout-minutes: 2
+        if: always() && steps.compiler-cache.outcome == 'success'
+        run: python3.11 .github/scripts/finish-compiler-cache.py --stats build-release/cache-stats.json
+      - name: Save completed objects even after cancellation
+        if: always() && steps.build.outcome != 'skipped' && steps.object-cache.outcome == 'success'
+        timeout-minutes: ${{ job.status == 'cancelled' && 3 || 20 }}
+        run: python3.11 .github/scripts/hf-build-cache.py save --directory .cache/objects --family native-linux-cuda-${{ inputs.cuda }}-shared-v1
+      - name: Package and verify Linux binaries
+        run: NINFER_BUILD_ROOT="$PWD/build-release" scripts/package-release.sh
+      - name: Preserve Linux archive in HF and verify its checksum
+        timeout-minutes: 60
+        run: python3.11 .github/scripts/archive-linux-artifact.py
+      - uses: actions/upload-artifact@v7
+        with:
+          name: native-linux-cuda-${{ inputs.cuda }}
+          path: |
+            dist/*.tar.gz.*
+            dist/SHA256SUMS-*.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+      - name: Preserve build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-logs-${{ inputs.cuda }}
+          path: |
+            dist/HF-*.json
+            build-cache-check/cache-stats.json
+            build-release/*.log
+            build-release/cache-stats.json
+            build-release/cache-progress.jsonl
+            build-release/CMakeFiles/CMakeConfigureLog.yaml
+            dist/*/BUILD-INFO.json
+          if-no-files-found: ignore
+          retention-days: 7
+

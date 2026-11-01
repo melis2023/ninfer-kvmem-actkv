@@ -3,7 +3,7 @@
 #include "context_cost_measure.h"
 
 #include "core/transfer_work.h"
-#include "ninfer/types.h"
+#include "ninfer/observability/snapshot.h"
 
 #include <cstdint>
 #include <filesystem>

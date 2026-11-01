@@ -416,6 +416,72 @@ __device__ __forceinline__ void kv_cache_append_prefix_copy_paged_unit(
 }
 
 template <int Capacity, int Threads>
+__global__ void kv_cache_append_prefix_cyclic_i8_kernel(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ counts,
+    const std::int32_t* __restrict__ lanes, std::int8_t* __restrict__ cache_k,
+    std::int8_t* __restrict__ cache_v, __half* __restrict__ scale_k, __half* __restrict__ scale_v,
+    __nv_bfloat16* __restrict__ shadow_k, __nv_bfloat16* __restrict__ shadow_v, int min_count,
+    int max_count, int width, int padded_capacity) {
+    static_assert(Capacity == 2048 || Capacity == 4096);
+    constexpr int HeadDim       = kKVCacheAppendPrefixHeadDim;
+    constexpr int Heads         = kKVCacheAppendPrefixHeads;
+    constexpr int Group         = kKVCacheInt8Group;
+    constexpr int Groups        = HeadDim / Group;
+    constexpr int WarpsPerBlock = Threads / 32;
+    const int warp              = static_cast<int>(threadIdx.x) >> 5;
+    const int lane              = static_cast<int>(threadIdx.x) & 31;
+    const int unit              = static_cast<int>(blockIdx.x) * WarpsPerBlock + warp;
+    const int token             = unit / (Heads * Groups);
+    const int rem               = unit % (Heads * Groups);
+    const int head              = rem / Groups;
+    const int group             = rem % Groups;
+    const int batch             = static_cast<int>(blockIdx.y);
+    const int count             = counts[batch];
+    if (count < min_count || count > max_count || token >= count) { return; }
+
+    const int position = positions[static_cast<std::int64_t>(width) * batch + token];
+    const int slot     = position & (Capacity - 1);
+    const std::int64_t row =
+        static_cast<std::int64_t>(slot) + static_cast<std::int64_t>(padded_capacity) * head;
+    const int d0 = group * Group + lane;
+    const int d1 = d0 + 32;
+    const std::int64_t element =
+        static_cast<std::int64_t>(HeadDim) * (head + static_cast<std::int64_t>(Heads) * token);
+    const std::int64_t input =
+        static_cast<std::int64_t>(HeadDim) * Heads * width * batch;
+    const float k0 = __bfloat162float(k[input + element + d0]);
+    const float k1 = __bfloat162float(k[input + element + d1]);
+    const float v0 = __bfloat162float(v[input + element + d0]);
+    const float v1 = __bfloat162float(v[input + element + d1]);
+    constexpr unsigned FullMask = 0xffffffffu;
+    const float k_abs           = warp_max(fmaxf(fabsf(k0), fabsf(k1)), FullMask);
+    const float v_abs           = warp_max(fmaxf(fabsf(v0), fabsf(v1)), FullMask);
+    const auto k_quant          = kv_cache_int8_quant_params(k_abs);
+    const auto v_quant          = kv_cache_int8_quant_params(v_abs);
+    const std::int64_t code     = row * HeadDim;
+    const std::int8_t ck0 = kv_cache_int8_quant_code(k0, k_quant.inverse_scale);
+    const std::int8_t ck1 = kv_cache_int8_quant_code(k1, k_quant.inverse_scale);
+    const std::int8_t cv0 = kv_cache_int8_quant_code(v0, v_quant.inverse_scale);
+    const std::int8_t cv1 = kv_cache_int8_quant_code(v1, v_quant.inverse_scale);
+    cache_k[code + d0]    = ck0;
+    cache_k[code + d1]    = ck1;
+    cache_v[code + d0]    = cv0;
+    cache_v[code + d1]    = cv1;
+    const std::int64_t shadow = row * HeadDim;
+    const float k_scale       = __half2float(k_quant.scale);
+    const float v_scale       = __half2float(v_quant.scale);
+    shadow_k[shadow + d0]     = __float2bfloat16(static_cast<float>(ck0) * k_scale);
+    shadow_k[shadow + d1]     = __float2bfloat16(static_cast<float>(ck1) * k_scale);
+    shadow_v[shadow + d0]     = __float2bfloat16(static_cast<float>(cv0) * v_scale);
+    shadow_v[shadow + d1]     = __float2bfloat16(static_cast<float>(cv1) * v_scale);
+    if (lane == 0) {
+        scale_k[group + static_cast<std::int64_t>(Groups) * row] = k_quant.scale;
+        scale_v[group + static_cast<std::int64_t>(Groups) * row] = v_quant.scale;
+    }
+}
+
+template <int Capacity, int Threads>
 __global__ void kv_cache_append_prefix_cyclic_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ counts,

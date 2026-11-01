@@ -165,6 +165,31 @@ class SpeedOfLightTests(unittest.TestCase):
         assert selected_bytes == 304
         assert selected_bytes == _model_work(fake_artifact(config))[2]
 
+    def test_report_schemas_with_expert_counters(self):
+        config = {
+            "architectures": ["Qwen3_5ForCausalLM"],
+            "hidden_size": 4,
+            "vocab_size": 8,
+            "layer_types": [],
+        }
+        artifact = fake_artifact(config)
+        report = {
+            "artifact_type": "ninfer_bench_report",
+            "load": {"architecture": "Qwen3_5ForCausalLM", "name": "test"},
+            "config": {"speculative_backend": "none", "expert_residency": "host",
+                       "expert_cache_bytes": 1024, "expert_routes": 8, "expert_hits": 4,
+                       "expert_admissions": 2, "expert_transferred_bytes": 4096},
+            "environment": {"gpu_name": "test gpu"},
+            "memory": {"kv_capacity": 8, "kv_payload_bytes": 64},
+            "tests": [],
+        }
+        # v18 adds the expert residency and delivery counters, which leave the counted work alone.
+        report["schema_version"] = 18
+        assert estimate(report, artifact, 1, 1)["tests"] == []
+        report["schema_version"] = 19
+        with self.assertRaisesRegex(ValueError, "v16, v17 or v18"):  # noqa: PT027
+            estimate(report, artifact, 1, 1)
+
     def test_speculative_report_is_rejected(self):
         config = {
             "architectures": ["Qwen3_5ForCausalLM"],

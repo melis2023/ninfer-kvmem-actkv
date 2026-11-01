@@ -74,7 +74,9 @@ void apply_vision_overlay_placement(Bindings& bindings, const ModelWeights& weig
         bindings.evict(WeightId{index}, kEvictRankDraft);
     }
     for (std::size_t index = mtp_parameters.first; index < mtp_parameters.second; ++index) {
-        bindings.evict(WeightId{index}, kEvictRankMtp);
+        if (bindings.at(WeightId{index}).reference.residency == artifact::Residency::Device) {
+            bindings.evict(WeightId{index}, kEvictRankMtp);
+        }
     }
     if (weights.proposal) { bindings.evict(weights.proposal->head, kEvictRankProposalHead); }
     bindings.evict(weights.text.token_embedding, kEvictRankEmbedding);

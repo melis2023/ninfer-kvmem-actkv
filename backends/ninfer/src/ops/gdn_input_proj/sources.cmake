@@ -17,6 +17,7 @@ target_sources(ninfer_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_small_t_unified.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_w4a4.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_a16.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_int8.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_a4.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_plan_unified.cpp"

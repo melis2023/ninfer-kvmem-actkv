@@ -32,11 +32,27 @@ ninfer::PromptInput history(const std::string& key) {
 }
 struct Sink final : ninfer::OutputSink {
     bool cancel_enabled = false;
+    ninfer::Engine* memory_probe = nullptr;
+    bool observed_active_memory = false;
+    void observe_memory() {
+        if (!memory_probe) return;
+        // Read the gauges from the same published execution boundary. The full
+        // memory_summary() takes the execution lock and can wait for completion.
+        const auto snapshot = memory_probe->runtime_stats();
+        if (snapshot.running_requests != 1) return;
+        const auto& memory = snapshot.kvmem;
+        require(memory.active_payload_reservation_bytes == 0,
+                "short request unexpectedly obtained a Host reservation");
+        require(memory.host_payload_bytes == 0,
+                "active short unretained request allocated Host archive pages");
+        observed_active_memory = true;
+    }
     std::atomic<bool> cancelled{false};
     void start(ninfer::GenerationStart) override {}
     void progress(ninfer::PromptProgress) override {}
-    void publish(ninfer::OutputDelta) override {}
+    void publish(ninfer::OutputDelta) override { observe_memory(); }
     void timing(ninfer::GenerationTimingObservation value) override {
+        if (value.generated_tokens) observe_memory();
         if (cancel_enabled && value.generated_tokens >= 8) cancelled.store(true);
     }
 };
@@ -90,6 +106,41 @@ int main(int argc, char** argv) {
                       << " evictions=" << memory.history_evictions << std::endl;
             return result;
         };
+        // Cross a Prefill chunk without crossing the physical window. With reuse
+        // disabled this request needs no Host reservation, even though RAM lookahead
+        // is enabled globally. Observe before terminal cleanup can hide an allocation.
+        ninfer::PromptInput short_unretained;
+        short_unretained.options.enable_thinking = false;
+        ninfer::ChatMessage short_message;
+        short_message.role = ninfer::ChatRole::User;
+        std::string short_text;
+        for (int repeat = 0; repeat < 24; ++repeat)
+            short_text += "The notebook contains ordinary observation notes. ";
+        short_text += "Continue with a detailed explanation.";
+        short_message.parts.push_back({.kind = ninfer::MessagePartKind::Text, .text = std::move(short_text)});
+        short_unretained.messages.push_back(std::move(short_message));
+        auto short_prepared = engine.prepare(std::move(short_unretained));
+        constexpr std::uint32_t short_output = 128;
+        require(short_prepared.summary().prompt_tokens > options.prefill_chunk,
+                "short-request fixture did not exercise next-chunk preparation");
+        require(short_prepared.summary().prompt_tokens + short_output <= options.kvmem.device_tokens(),
+                "short-request fixture unexpectedly requires Host archive capacity");
+        std::cout << "MEMORY_SHORT_UNRETAINED tokens=" << short_prepared.summary().prompt_tokens << std::endl;
+        ninfer::RequestOptions short_options;
+        short_options.execution.allow_prefix_reuse = false;
+        short_options.execution.requested_output_tokens = short_output;
+        short_options.execution.sampling.temperature = 0;
+        short_options.stop.include_model_defaults = false;
+        Sink short_sink;
+        short_sink.memory_probe = &engine;
+        const auto short_result = engine.submit(std::move(short_prepared), short_options,
+            ninfer::OutputConsumerMode::Streaming, {.live_timings = true})
+            .wait(&short_sink, ninfer::CancellationView([] { return false; }));
+        require(short_result.generated_token_ids.size() == short_output, "short request did not complete");
+        require(short_sink.observed_active_memory, "short request had no active memory observation");
+        require(engine.memory_summary().kvmem.host_payload_bytes == 0,
+                "short unretained request leaked Host archive pages");
+        std::cout << "MEMORY_SHORT_UNRETAINED PASS active_reservation=0 active_payload=0" << std::endl;
         auto a = history("A"), b = history("B"), c = history("C"), d = history("D");
         const auto first = run("A-cold", a, false);
         run("B-cold", b, false);

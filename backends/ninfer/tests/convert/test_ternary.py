@@ -64,6 +64,21 @@ def test_selected_rows_follow_the_row_map(tmp_path):
         )
 
 
+def test_native_ptq1_import_preserves_packed_bytes_and_selected_rows(tmp_path):
+    path, values, scales = _pq2_0_file(tmp_path, 12, 256, 41, TYPE_PTQ1_0)
+    order = np.array([11, 3, 8, 3], dtype=np.int64)
+    blocks = encode_ptq1_0(values, scales)[order]
+    with GGUFFile(path) as gguf:
+        source = ternary.ternary_source(gguf, "w", (4, 256), lambda b, e: order[b:e],
+                                        format=ternary.PTQ1)
+        words = source.read_encoded(0, 4)
+        assert words.packed and words.format == "ptq1_g128_fp16"
+        assert words.codes.numpy().tobytes() == blocks[:, :, :26].tobytes()
+        assert words.scales.numpy().tobytes() == blocks[:, :, 26:].tobytes()
+        expected = values[order].astype(np.float32) * scales[order, :, None].astype(np.float32)
+        assert torch.equal(source.rows(0, 4), torch.from_numpy(expected.reshape(4, 256)))
+
+
 def test_grouped_value_heads_pair_with_their_key_head():
     permutation = ternary.tiled_to_grouped_permutation()
     assert sorted(permutation.tolist()) == list(range(48))

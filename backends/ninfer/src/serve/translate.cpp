@@ -11,7 +11,6 @@
 #include <random>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -125,18 +124,15 @@ std::vector<const ToolDefinition*> effective_tools(const GenerationRequest& requ
     for (const ToolDefinition& tool : request.tools) { tools.push_back(&tool); }
     return tools;
 }
+
 // The members follow the order the Qwen templates were trained on, name, description and
 // parameters; `strict` is the server's enforcement flag for the output contract, and the frontend
 // leaves it out of the rendered prompt.
 std::string render_tool_definition(const ToolDefinition& tool) {
     using Json  = RequestJson;
-    // Preserve the frontend's schema order. Reordering short arguments ahead of
-    // long payloads made the model stop after the short argument (file_path /
-    // description), dropping content / command from the call.
     Json schema = Json::parse(tool.input_schema_json);
     Json function{{"name", tool.name}};
-    std::string description = tool.description;
-    if (!description.empty()) { function["description"] = std::move(description); }
+    if (!tool.description.empty()) { function["description"] = tool.description; }
     function["parameters"] = std::move(schema);
     if (tool.input_examples_json) {
         function["input_examples"] = Json::parse(*tool.input_examples_json);
@@ -199,17 +195,6 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
     auto thinking = merge_boolean("enable_thinking", request.enable_thinking);
     auto preserve = merge_boolean("preserve_thinking", request.preserve_thinking);
     auto effort   = request.reasoning_effort;
-    if (!effort) {
-        // A tool result may carry the thinking level for the turn it feeds. The last one wins:
-        // it is the result that immediately precedes this generation. The request-level field
-        // still takes precedence over every tool suggestion.
-        for (auto turn = request.messages.rbegin(); turn != request.messages.rend(); ++turn) {
-            if (turn->role == ChatRole::Tool && turn->reasoning_effort) {
-                effort = turn->reasoning_effort;
-                break;
-            }
-        }
-    }
     if (kwargs.contains("reasoning_effort") && !kwargs["reasoning_effort"].is_null()) {
         if (!kwargs["reasoning_effort"].is_string())
             invalid_prompt_option("reasoning_effort must be a string", "reasoning_effort",
@@ -225,17 +210,12 @@ ResolvedPromptSemantics resolve_prompt_semantics(const GenerationRequest& reques
         effort = nested;
     }
     kwargs.erase("reasoning_effort");
-    // pi-ai clients express "off" by omitting the field. Resolve that omission to off unless the
-    // request already decided thinking explicitly (enable_thinking or a template kwarg).
-    if (!effort && !request.enable_thinking && request.omitted_effort_means_off) {
-        effort = RequestedReasoningEffort::None;
-    }
     if (request.structured_output.kind != StructuredOutputKind::None) {
         if (!request.stop_strings.empty() ||
             request.continuation != PromptContinuationMode::NewAssistantTurn) {
             invalid_prompt_option(
                 "structured output requires default stops and a new assistant turn",
-                "response_format", "incompatible_structured_output");
+                request.structured_output_param, "incompatible_structured_output");
         }
         // Preserve explicit reasoning requests; retain the economical final-only default when
         // the caller has not selected a reasoning mode or budget.
@@ -386,6 +366,7 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.chat_template_kwargs_json        = semantics.chat_template_kwargs_json;
     input.options.graft                            = semantics.graft;
     input.options.add_vision_id                    = false;
+    input.options.speculative_drafting             = request.speculative_drafting;
     const std::vector<const ToolDefinition*> tools = effective_tools(request);
     input.options.tool_jsons.reserve(tools.size());
     for (std::size_t index = 0; index < tools.size(); ++index) {
@@ -462,6 +443,9 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
     if (semantics.enable_thinking != false) {
         options.execution.thinking.budget =
             request.thinking_budget ? request.thinking_budget : server.default_thinking_budget;
+        // Constrained requests too: the guard's control span goes through the same grammar-checked
+        // path a reached thinking budget uses.
+        options.execution.thinking.loop = server.reasoning_loop;
     }
     options.execution.sampling             = resolve_sampling_overrides(request.sampling, server);
     options.execution.post_thinking_sampling =
@@ -478,7 +462,9 @@ ninfer::RequestOptions to_request_options(const GenerationRequest& request,
             options.execution.post_thinking_sampling->presence_penalty = 0.0F;
         }
     }
-    options.execution.logprobs = request.logprobs;
+    options.execution.logprobs       = request.logprobs;
+    options.execution.readout_tokens = request.readout_tokens;
+    options.execution.speculative_drafting = request.speculative_drafting;
     options.output.raw                     = false;
     options.output.preserve_special_tokens =
         (request.tools.empty() || (request.tool_choice.constraints == ToolConstraintMode::Automatic &&

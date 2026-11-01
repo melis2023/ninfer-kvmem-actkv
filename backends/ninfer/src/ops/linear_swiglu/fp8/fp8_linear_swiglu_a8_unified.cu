@@ -1,4 +1,5 @@
 #include "ops/linear_swiglu/fp8/fp8_linear_swiglu_plan_unified.h"
+#include "ops/common/blackwell_routes.h"
 #include "ops/linear/fp8/fp8_template_launch.cuh"
 #include "ops/linear/fp8/fp8_instances.cuh"
 #include "ops/linear_swiglu/token_major_mma_epilogue.cuh"
@@ -16,6 +17,7 @@ std::size_t fp8_linear_swiglu_partial_capacity_bytes(std::int32_t max_tokens) {
 
 void fp8_linear_swiglu_a8_launch(const Tensor& x, const Weight& weight, Tensor& out,
                                  WorkspaceArena& workspace, cudaStream_t stream) {
+    require_fp8_a8_card();
     auto scope         = workspace.scope();
     const auto scratch = allocate_fp8_a8_workspace(
         workspace, x.ne[1], weight.k, fp8_linear_swiglu_partial_capacity_bytes(x.ne[1]));

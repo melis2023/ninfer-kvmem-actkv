@@ -43,11 +43,12 @@ std::uint64_t align_up(std::uint64_t value, std::uint64_t alignment) {
 }
 
 std::int32_t rowsplit_group(QType qtype) {
-    return qtype == QType::Q8_G32_FP16 ? 32 : qtype == QType::T2_G128_FP16 ? 128 : 64;
+    return qtype == QType::Q8_G32_FP16 ? 32 : is_ternary(qtype) ? 128 : 64;
 }
 
 std::size_t rowsplit_code_row_bytes(QType qtype) {
     return qtype == QType::Q8_G32_FP16    ? static_cast<std::size_t>(kHidden)
+           : qtype == QType::PTQ1_G128_FP16 ? static_cast<std::size_t>(kHidden / 128) * 24
            : qtype == QType::T2_G128_FP16 ? static_cast<std::size_t>(kHidden) / 4
                                           : static_cast<std::size_t>(kHidden) / 2;
 }
@@ -57,14 +58,16 @@ FixtureWeight make_rowsplit(QType qtype, std::int32_t rows) {
     const std::uint64_t groups       = static_cast<std::uint64_t>(rows) * (kHidden / group);
     const std::uint64_t code_bytes =
         static_cast<std::uint64_t>(rows) * rowsplit_code_row_bytes(qtype);
-    const std::uint64_t scale_offset = align_up(code_bytes, 256);
+    const std::uint64_t high_offset = align_up(code_bytes, 256);
+    const std::uint64_t high_bytes = qtype == QType::PTQ1_G128_FP16 ? groups * 2 : 0;
+    const std::uint64_t scale_offset = high_offset + align_up(high_bytes, 256);
     const std::uint64_t scale_bytes  = groups * sizeof(std::uint16_t);
     FixtureWeight result{
         DeviceBuffer(static_cast<std::size_t>(scale_offset + scale_bytes)), {}, scale_offset};
     result.payload.fill(0);
     result.weight.payload          = result.payload.p;
     result.weight.payload_bytes    = result.payload.bytes;
-    result.weight.high_plane_bytes = 0;
+    result.weight.high_plane_bytes = high_bytes;
     result.weight.qtype            = qtype;
     result.weight.group_size       = group;
     result.weight.shape[0]         = rows;
@@ -73,7 +76,7 @@ FixtureWeight make_rowsplit(QType qtype, std::int32_t rows) {
     result.weight.padded_shape[1]  = kHidden;
     result.weight.ndim             = 2;
     result.weight.qdata            = result.payload.p;
-    result.weight.qhigh            = nullptr;
+    result.weight.qhigh            = high_bytes ? static_cast<std::uint8_t*>(result.payload.p) + high_offset : nullptr;
     result.weight.scales           = static_cast<std::uint8_t*>(result.payload.p) + scale_offset;
     result.weight.n                = rows;
     result.weight.k                = kHidden;
@@ -133,7 +136,7 @@ float group_base_scale(std::int32_t group) {
 }
 
 std::int32_t rowsplit_code(QType qtype, std::int32_t k) {
-    if (qtype == QType::T2_G128_FP16) {
+    if (is_ternary(qtype)) {
         const int value = k % 3 == 0 ? 0 : 1;
         return k % 5 == 0 ? -value : value;
     }
@@ -153,6 +156,25 @@ void patch_rowsplit_row(FixtureWeight& fixture, QType qtype, std::int32_t row, f
         for (std::int32_t k = 0; k < kHidden; ++k) {
             codes[static_cast<std::size_t>(k)] = static_cast<std::uint8_t>(rowsplit_code(qtype, k));
         }
+    } else if (qtype == QType::PTQ1_G128_FP16) {
+        std::vector<std::uint8_t> high((kHidden / 128) * 2);
+        for (int group = 0; group < kHidden / 128; ++group) {
+            for (int byte = 0; byte < 26; ++byte) {
+                const int width = byte < 16 ? 16 : byte < 24 ? 8 : 2;
+                const int origin = byte < 16 ? 0 : byte < 24 ? 80 : 120;
+                const int within = byte < 16 ? byte : byte < 24 ? byte - 16 : byte - 24;
+                unsigned integer = 0;
+                for (int stage = 0; stage < (byte < 24 ? 5 : 4); ++stage)
+                    integer = integer * 3 + rowsplit_code(qtype, group * 128 + origin + stage * width + within) + 1;
+                const unsigned divisor = byte < 24 ? 243 : 81;
+                const auto raw = static_cast<std::uint8_t>((integer * 256 + divisor - 1) / divisor);
+                if (byte < 24) codes[group * 24 + byte] = raw;
+                else high[group * 2 + byte - 24] = raw;
+            }
+        }
+        const auto offset = static_cast<const std::uint8_t*>(fixture.weight.qhigh) -
+                            static_cast<const std::uint8_t*>(fixture.payload.p);
+        fixture.payload.copy_from_host(high.data(), high.size(), offset + std::size_t(row) * high.size());
     } else if (qtype == QType::T2_G128_FP16) {
         // Two's-complement fields: 0 -> 00, +1 -> 01, -1 -> 11.
         for (std::int32_t k = 0; k < kHidden; ++k) {
@@ -520,6 +542,10 @@ int main() {
                                 base_scores(QType::Q4_G64_FP16, host_hidden));
         failures += run_indexed(QType::T2_G128_FP16, "t2-indexed", hidden,
                                 base_scores(QType::T2_G128_FP16, host_hidden));
+        failures += run_full(QType::PTQ1_G128_FP16, "ptq1-full", hidden,
+                             base_scores(QType::PTQ1_G128_FP16, host_hidden));
+        failures += run_indexed(QType::PTQ1_G128_FP16, "ptq1-indexed", hidden,
+                                base_scores(QType::PTQ1_G128_FP16, host_hidden));
         std::cout << (failures == 0 ? "OK" : "FAIL") << " linear_topk\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

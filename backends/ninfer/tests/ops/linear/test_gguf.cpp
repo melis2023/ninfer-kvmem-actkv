@@ -174,7 +174,9 @@ Error compare(const std::vector<float>& got, const std::vector<double>& want) {
 }
 
 // K = 1536 and K = 2560, Qwen3.8-Flash-Next's hidden width, whose 80 slices leave the vector
-// products' last pass over a row with half of a warp's lanes idle.
+// products' last pass over a row with half of a warp's lanes idle; and Gemma 4's widths 2816, 2112
+// and 704, which are no whole number of the matrix kernel's 512-value activation steps (2112 and
+// 704 not even of its 256-value weight steps).
 int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k,
              const std::vector<std::int32_t>& widths) {
     constexpr std::int32_t kRows = 256;
@@ -184,7 +186,10 @@ int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k,
     int failures = 0;
 
     const auto host_blocks = random_blocks(c, 2 * kRows, kK, rng);
-    DeviceBuffer blocks(host_blocks.size());
+    // Zero bytes after the last row, as a bound device tail keeps them: a row whose K is no whole
+    // number of the matrix kernel's 256-value steps reads its last step into the next row.
+    DeviceBuffer blocks(host_blocks.size() + 4096);
+    blocks.fill(0);
     blocks.copy_from_host(host_blocks.data(), host_blocks.size());
     const auto block        = gguf_block_shape(c.qtype);
     const std::int64_t row_bytes = std::int64_t(kK / block.elements) * block.bytes;
@@ -278,6 +283,24 @@ int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k,
         const auto plain = product(0, t, false);
         failures += run_check("linear T=" + std::to_string(t), to_float(host), plain);
 
+        // An FP32 out is the same accumulation unrounded: rounding it gives the BF16 out exactly.
+        DeviceBuffer wide_device(std::size_t(kRows) * t * sizeof(float));
+        Tensor wide(wide_device.p, DType::FP32, {kRows, t});
+        ops::linear(x, gate, wide, ops::LinearPolicy::A16Only, workspace, nullptr);
+        check(cudaDeviceSynchronize(), "fp32 linear");
+        std::vector<float> wide_host(std::size_t(kRows) * t);
+        wide_device.copy_to_host(wide_host.data(), wide_host.size() * sizeof(float));
+        failures += run_check("fp32 linear T=" + std::to_string(t), wide_host, plain);
+        for (std::size_t i = 0; i < wide_host.size(); ++i) {
+            if (__bfloat162float(__float2bfloat16(wide_host[i])) != __bfloat162float(host[i])) {
+                std::cerr << "FAIL " << c.name << " fp32 linear T=" << t << " element " << i
+                          << " rounds to " << __bfloat162float(__float2bfloat16(wide_host[i]))
+                          << ", the BF16 out holds " << __bfloat162float(host[i]) << '\n';
+                ++failures;
+                break;
+            }
+        }
+
         ops::linear(x, gathered, out, ops::LinearPolicy::A16Only, workspace, nullptr);
         check(cudaDeviceSynchronize(), "gathered linear");
         out_device.copy_to_host(host.data(), host.size() * sizeof(__nv_bfloat16));
@@ -308,6 +331,13 @@ int run_type(const TypeCase& c, std::uint32_t seed, std::int32_t k,
         check(cudaDeviceSynchronize(), "linear_swiglu pair");
         out_device.copy_to_host(host.data(), host.size() * sizeof(__nv_bfloat16));
         failures += run_check("swiglu pair T=" + std::to_string(t), to_float(host), swiglu);
+    }
+    // The planned capacity covers every call; the slack above it only keeps a shortfall from
+    // aborting the numerical checks before this one reports it.
+    if (workspace.peak_used() > capacity) {
+        std::cerr << "FAIL " << c.name << " workspace peak " << workspace.peak_used()
+                  << " bytes over the planned " << capacity << '\n';
+        ++failures;
     }
 
     // The token-table gather is the exact weights rounded to BF16.
@@ -406,7 +436,7 @@ int main(int argc, char** argv) {
         int failures      = 0;
         std::uint32_t seed = 9001;
         std::vector<std::string> formats;
-        std::vector<std::int32_t> dimensions{1536, 2560};
+        std::vector<std::int32_t> dimensions{1536, 2560, 2816, 2112, 704};
         std::vector<std::int32_t> widths{1, 2, 3, 4, 5, 8, 9, 17, 40, 70, 130};
         const auto split = [](std::string_view value) {
             std::vector<std::string> out;
@@ -448,7 +478,7 @@ int main(int argc, char** argv) {
             if (!formats.empty() && std::find(formats.begin(), formats.end(), c.name) == formats.end()) continue;
             for (const std::int32_t k : dimensions) {
                 if (k % gguf_block_shape(c.qtype).elements != 0)
-                    throw std::invalid_argument("K must contain whole GGUF blocks");
+                    continue;
                 const int f = run_type(c, seed++, k, widths);
                 std::cout << (f == 0 ? "OK   " : "FAIL ") << "gguf " << c.name << " K=" << k
                           << '\n';

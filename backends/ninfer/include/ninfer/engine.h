@@ -3,6 +3,7 @@
 #include "ninfer/types.h"
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -63,6 +64,25 @@ private:
     friend class Engine;
 };
 
+// One request of Engine::submit_group: the arguments of Engine::submit.
+struct GenerationSubmission {
+    PreparedPrompt prompt;
+    RequestOptions options;
+    OutputConsumerMode consumer_mode = OutputConsumerMode::Aggregate;
+    GenerationObservationOptions observation;
+    std::chrono::steady_clock::time_point pending_deadline;
+};
+
+// One prompt of Engine::submit_branches and the token ids its readout names (at most
+// kMaximumReadoutTokens, each within the model's public token domain).
+struct GenerationBranch {
+    PreparedPrompt prompt;
+    std::vector<TokenId> readout_tokens;
+};
+
+// The most prompts one Engine::submit_branches request reads.
+inline constexpr std::size_t kMaximumGenerationBranches = 1024;
+
 class Engine {
 public:
     explicit Engine(EngineOptions options);
@@ -81,9 +101,11 @@ public:
     // `anchor_prompt_end` also retains a private checkpoint one token short of the prompt's end, so
     // the same prompt sent again (a regenerated raw completion) resumes from it; a raw prompt has
     // no message structure to anchor otherwise. It costs a prefill split and a StateImage.
+    // `speculative_drafting` as PromptOptions::speculative_drafting.
     [[nodiscard]] PreparedPrompt prepare_tokens(std::vector<TokenId> token_ids,
                                                 bool allow_prefix_identity = true,
-                                                bool anchor_prompt_end     = false) const;
+                                                bool anchor_prompt_end     = false,
+                                                bool speculative_drafting  = true) const;
 
     // Artifact-tokenizer raw-text encoding. No chat template or implicit special token is added;
     // special-token text in `text` encodes as that token unless `parse_special` is false.
@@ -112,6 +134,44 @@ public:
            OutputConsumerMode consumer_mode                       = OutputConsumerMode::Aggregate,
            GenerationObservationOptions observation               = {},
            std::chrono::steady_clock::time_point pending_deadline = {});
+
+    // submit() for several requests that enter the queue together, in order. The executor sees
+    // them at one boundary, so a Qwen3.5-core Engine admits them at once and runs their last prompt
+    // chunks in one shared pass instead of starting the first before the rest arrive; Gemma 4,
+    // Flint and Qwen3.8-Flash-Next admit them at once, and the first to reach a declared cache
+    // boundary they share keeps its state there for the others. Every request is checked before any
+    // is queued; an error for one request cancels the group.
+    [[nodiscard]] std::vector<GenerationHandle>
+    submit_group(std::vector<GenerationSubmission> submissions);
+
+    // Reads the first generated token of several text prompts that share a prefix, as one request
+    // on one lane: the prefix runs once, and each prompt's own tokens see only the prefix and
+    // themselves, at the positions they have in their own prompt, so each branch reads what a
+    // request for its prompt alone would, up to the rounding of a shared pass. A Qwen3.5-core
+    // Engine without pipeline stages runs the branches as blocks of shared prefill passes; Gemma 4,
+    // Flint and Qwen3.8-Flash-Next run the branches that fit a prompt chunk together in shared
+    // passes over the state at the prefix's end, and a longer branch alone from a device snapshot
+    // of it (Flash-Next with streamed KV layers runs each alone). The prefix ends at
+    // the deepest explicit cache boundary of the first prompt inside the tokens all prompts share,
+    // or where they stop agreeing when there is none, and leaves every prompt at least one token
+    // of its own; the cache serves and keeps it as it would that prompt's. `options` asks for one
+    // greedy output token with logprobs, no penalties, no structured output and no readout of its
+    // own (each branch names its readout tokens); its speculative drafting is off. The result's
+    // `branches` holds one record per branch, in order, and its content is the first branch's.
+    // runs_branches() tells whether this Engine runs them; submit_branches throws
+    // std::invalid_argument when it does not, and std::length_error, before queueing anything,
+    // when a branch is longer than branch_token_limit(): the caller can submit those prompts
+    // one by one instead.
+    [[nodiscard]] GenerationHandle
+    submit_branches(std::vector<GenerationBranch> branches, RequestOptions options,
+                    OutputConsumerMode consumer_mode         = OutputConsumerMode::Aggregate,
+                    GenerationObservationOptions observation = {},
+                    std::chrono::steady_clock::time_point pending_deadline = {});
+    [[nodiscard]] bool runs_branches() const;
+    // The most tokens one branch of submit_branches may hold past the shared prefix: one shared
+    // pass's columns on a Qwen3.5-core model, unbounded on Gemma 4, Flint and Flash-Next, which
+    // run a branch in prompt chunks; 0 when runs_branches() is false.
+    [[nodiscard]] std::uint32_t branch_token_limit() const;
 
     // The largest requested_output_tokens for this prompt whose admission entitlement -- Main KV
     // plus any MTP/DFlash backend KV, draft window included -- fits one lane's share of each pool,

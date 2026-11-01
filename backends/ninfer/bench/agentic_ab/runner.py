@@ -10,8 +10,8 @@ every arm, which is how client requests and log records are joined.
 Sequence:
   1. calibrate: the largest --max-context (starting at the launch script's own value) at which
      the control serve starts; every arm runs at it;
-  2. treatment arm: the launch script's flags plus AB_TREATMENT_EXTRA_FLAGS, with this line's
-     default checkpoint-catalog prefix cache;
+  2. treatment arm: the launch script's flags plus AB_TREATMENT_EXTRA_FLAGS, on the
+     checkpoint-catalog prefix cache (--use-original-prefix-caching);
   3. optional alt arm: the treatment build on the hybrid prefix cache (AB_ALT_EXTRA_FLAGS,
      default --use-alt-prefix-caching, without the catalog-only flags that mode rejects), so
      one run compares both prefix caches to the control;
@@ -70,7 +70,8 @@ TREATMENT_EXE = os.environ.get("AB_TREATMENT_EXE", default_serve(os.path.join(RE
 CONTROL_EXE = os.environ.get("AB_CONTROL_EXE", default_serve(os.path.join(HERE, "control", "build")))
 # Treatment flags the launch script does not already carry.
 TREATMENT_EXTRA_FLAGS = os.environ.get("AB_TREATMENT_EXTRA_FLAGS", "").split()
-# Selects the checkpoint-catalog prefix cache explicitly; it is this line's default.
+# Selects the checkpoint-catalog prefix cache in place of the hybrid prefix cache, this line's
+# default; the treatment and control arms run the catalog.
 ORIGINAL_CACHE_FLAG = "--use-original-prefix-caching"
 # The alt arm runs the treatment build on the hybrid prefix cache.
 ALT_CACHE_FLAG = "--use-alt-prefix-caching"
@@ -793,6 +794,8 @@ def main():
     base = without(bat_flags, {"--request-log-jsonl"})
     base = set_flag(set_flag(base, "--host", HOST), "--port", str(PORT))
     treat_flags = list(base)
+    if ORIGINAL_CACHE_FLAG not in dict(treat_flags):
+        treat_flags.append((ORIGINAL_CACHE_FLAG, None))
     for extra in TREATMENT_EXTRA_FLAGS:
         if extra not in dict(treat_flags):
             treat_flags.append((extra, None))
@@ -803,6 +806,10 @@ def main():
             alt_flags.append((extra, None))
     ctrl_supported = help_flags(CONTROL_EXE)
     ctrl_flags = [f for f in base if f[0] in ctrl_supported]
+    # A control build that knows the flag may default to the hybrid cache; an older one runs the
+    # catalog without it.
+    if ORIGINAL_CACHE_FLAG in ctrl_supported and ORIGINAL_CACHE_FLAG not in dict(ctrl_flags):
+        ctrl_flags.append((ORIGINAL_CACHE_FLAG, None))
     dropped = [f[0] for f in treat_flags if f[0] not in ctrl_supported]
 
     plans = {seed: workload.build_plan(seed=seed, scale=args.scale) for seed in seeds}

@@ -10,13 +10,16 @@ target_link_libraries(ninfer_ops PRIVATE CUDA::cublas)
 # Warp-specialized SM120 NVFP4 kernels use setmaxnreg to transfer registers from
 # producer to consumer warpgroups. RDC makes ptxas discard that contract. These
 # self-contained kernels therefore use a non-RDC archive and host launchers.
-# The SM120 tensor-core qualifiers do not exist on sm_86/sm_89, so this fork does not create
-# the archive there; family manifests add to it only when the target exists.
-if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+# The SM120 tensor-core qualifiers do not exist on sm_86/sm_89, so this fork creates the archive
+# only in a build with 120a, and compiles it for 120a alone; only a card that runs the 120a code
+# launches its kernels. Family manifests add to it only when the target exists.
+if(NINFER_ARCH_BLACKWELL)
   add_library(ninfer_nvfp4_non_rdc STATIC)
+  set_target_properties(ninfer_nvfp4_non_rdc PROPERTIES CUDA_ARCHITECTURES 120a)
   ninfer_internal_includes(ninfer_nvfp4_non_rdc)
   ninfer_cuda_non_rdc_archive(ninfer_nvfp4_non_rdc)
-  target_link_libraries(ninfer_nvfp4_non_rdc PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
+  target_link_libraries(ninfer_nvfp4_non_rdc PRIVATE
+    ninfer_core ${NINFER_CUDART_TARGET} CUDA::cuda_driver)
   target_link_libraries(ninfer_ops PRIVATE ninfer_nvfp4_non_rdc)
 endif()
 
@@ -29,7 +32,6 @@ include("${CMAKE_CURRENT_LIST_DIR}/dynamic_grouped_conv/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/gdn_gating_proj/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/gdn_input_proj/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/kv_cache/sources.cmake")
-include("${CMAKE_CURRENT_LIST_DIR}/kvmem/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_add/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/linear_attention/sources.cmake")
@@ -43,10 +45,10 @@ include("${CMAKE_CURRENT_LIST_DIR}/sparse_moe/sources.cmake")
 if(NINFER_COMPAT_PATH)
   # NVFP4 W4A4 uses mma.sync...kind::mxf4nvf4.block_scale; FP8 A8 uses
   # mma.sync...kind::f8f6f4. Both qualifiers are Blackwell-only, and sm_80/86/89 have no FP8 or FP4
-  # tensor-core path to fall back to, so the owning translation units cannot be compiled there.
-  # The A16 dequantizing routes for both formats are kept and remain fully functional. A 120a build
-  # on this path keeps both (NINFER_SM120_FP8, NINFER_SM120_NVFP4).
-  if(NOT CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+  # tensor-core path to fall back to, so a build without 120a leaves the owning translation units
+  # out. The A16 dequantizing routes for both formats are kept and remain fully functional. A build
+  # with 120a on this path keeps both (NINFER_SM120_FP8, NINFER_SM120_NVFP4).
+  if(NOT NINFER_ARCH_BLACKWELL)
     get_target_property(ninfer_ops_sources ninfer_ops SOURCES)
     list(FILTER ninfer_ops_sources EXCLUDE REGEX "nvfp4/.+_(w4a4|a4)\\.cu$")
     list(FILTER ninfer_ops_sources EXCLUDE REGEX "fp8/.+_a8(_unified)?\\.cu$")
@@ -57,6 +59,6 @@ if(NINFER_COMPAT_PATH)
   endif()
   target_compile_definitions(ninfer_ops PUBLIC NINFER_SM8X_COMPAT=1)
 endif()
-if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
+if(NINFER_ARCH_BLACKWELL)
   target_compile_definitions(ninfer_ops PUBLIC NINFER_SM120_NVFP4=1 NINFER_SM120_FP8=1)
 endif()

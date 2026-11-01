@@ -1,4 +1,5 @@
 #include "core/weight.h"
+#include "ops/common/blackwell_routes.h"
 #include "ops/linear_add/fp8/fp8_linear_add_plan.h"
 
 #include "core/device.h"
@@ -29,12 +30,9 @@ void launch_mma(const Weight& weight, Tensor& residual, Fp8A8Workspace workspace
     const Fp8ContiguousOutput destination{output, Geometry::kOutputRows};
 
     if constexpr (Schedule::kSharedBytes > 48 * 1024) {
-        configure_cuda_device_once([&] {
-            return cudaFuncSetAttribute(
-                fp8_mma_kernel<Geometry, Schedule, FullTokens, Fp8AddResidualEpilogue,
-                               Fp8ContiguousOutput>,
-                cudaFuncAttributeMaxDynamicSharedMemorySize, Schedule::kSharedBytes);
-        });
+        raise_dynamic_shared_memory(fp8_mma_kernel<Geometry, Schedule, FullTokens,
+                                                   Fp8AddResidualEpilogue, Fp8ContiguousOutput>,
+                                    Schedule::kSharedBytes);
     }
     fp8_mma_kernel<Geometry, Schedule, FullTokens>
         <<<blocks, Schedule::kThreads, Schedule::kSharedBytes, stream>>>(
@@ -58,6 +56,7 @@ void launch_problem(const Weight& weight, Tensor& residual, Fp8A8Workspace works
 
 void fp8_linear_add_a8_launch(const Tensor& x, const Weight& weight, Tensor& residual,
                               WorkspaceArena& workspace, cudaStream_t stream) {
+    require_fp8_a8_card();
     auto scope                   = workspace.scope();
     const Fp8A8Workspace scratch = allocate_fp8_a8_workspace(workspace, x.ne[1], weight.k);
     launch_fp8_a8_quantize(x, weight, scratch, stream);

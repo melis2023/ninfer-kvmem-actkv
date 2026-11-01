@@ -16,6 +16,7 @@ ninfer_add_test(ninfer_multi_gpu_test
           "${CMAKE_CURRENT_LIST_DIR}/../test_stage_plan.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/../test_kv_cache_ranks.cpp"
           "${CMAKE_CURRENT_LIST_DIR}/../test_stage_link.cu"
+          "${CMAKE_CURRENT_LIST_DIR}/../test_tensor_parallel.cu"
   LIBRARIES ninfer_core)
 
 ninfer_add_test(ninfer_arena_ranks_test
@@ -28,6 +29,14 @@ ninfer_add_test(ninfer_host_kv_clamp_test
 
 ninfer_add_test(ninfer_device_buffer_visibility_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device_buffer_visibility.cu"
+  LIBRARIES ninfer_core)
+
+ninfer_add_test(ninfer_expert_tier_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_tier.cpp"
+  LIBRARIES ninfer_core)
+
+ninfer_add_test(ninfer_expert_delivery_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_expert_delivery.cu"
   LIBRARIES ninfer_core)
 
 ninfer_add_test(ninfer_vmm_graph_remap_test
@@ -56,12 +65,16 @@ ninfer_add_test(ninfer_disk_kv_store_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_disk_kv_store.cpp"
   LIBRARIES ninfer_core)
 
+ninfer_add_test(ninfer_file_read_queue_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_file_read_queue.cpp"
+  LIBRARIES ninfer_core)
+
 ninfer_add_test(ninfer_disk_kv_bridge_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_disk_kv_bridge.cpp"
   LIBRARIES ninfer_core)
 
-ninfer_add_test(ninfer_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device.cpp"
-  LIBRARIES ninfer_core)
+ninfer_add_test(ninfer_device_test       SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_device.cu"
+  LIBRARIES ninfer_ops)
 
 set_tests_properties(ninfer_device_test PROPERTIES
   ENVIRONMENT_MODIFICATION "NINFER_CUDA_SYNC=unset:")

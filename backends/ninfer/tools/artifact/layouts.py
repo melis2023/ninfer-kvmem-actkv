@@ -89,11 +89,19 @@ class RowScaleGeometry:
     payload_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class RowInterleavedGeometry:
+    n: int
+    k: int
+    row_bytes: int
+    payload_bytes: int
+
+
 CONTIGUOUS_LE_V1 = Layout("contiguous_le_v1", 256, frozenset(("bf16", "fp32", "int32")))
 ROW_SPLIT_K128_V1 = Layout(
     "row_split_k128_v1",
     256,
-    frozenset(("q4_g64_fp16", "q5_g64_fp16", "q6_g64_fp16", "q8_g32_fp16", "t2_g128_fp16")),
+    frozenset(("q2_g64_fp16", "q4_g64_fp16", "q5_g64_fp16", "q6_g64_fp16", "q8_g32_fp16", "t2_g128_fp16", "ptq1_g128_fp16", "t5_g128_fp16")),
 )
 BLOCK_SCALE_K16_M128X4_V1 = Layout(
     "block_scale_k16_m128x4_v1",
@@ -105,6 +113,9 @@ ROW_SCALE_V1 = Layout(
     256,
     frozenset(("fp8_e4m3fn_row_bf16",)),
 )
+ROW_INTERLEAVED_V1 = Layout(
+    "row_interleaved_v1", 256, frozenset(("fp8_e4m3fn_row_fp16",))
+)
 GGUF_BLOCKS_V1 = Layout("gguf_blocks_v1", 256, frozenset(GGUF_FORMATS))
 
 LAYOUTS = MappingProxyType(
@@ -115,6 +126,7 @@ LAYOUTS = MappingProxyType(
             ROW_SPLIT_K128_V1,
             BLOCK_SCALE_K16_M128X4_V1,
             ROW_SCALE_V1,
+            ROW_INTERLEAVED_V1,
             GGUF_BLOCKS_V1,
         )
     }
@@ -179,13 +191,18 @@ def row_split_geometry(
     n, k = _shape(shape, rank=2)
     k_pad = align_up(k, K_ALIGNMENT)
     groups_per_row = k_pad // spec.group_size
-    # 2- and 8-bit codes pack whole; 4/5/6-bit codes keep a 4-bit base plane plus a high plane.
-    base_bytes_per_group = (
-        spec.group_size * spec.bits // 8 if spec.bits in (2, 8) else spec.group_size // 2
-    )
-    high_bytes_per_group = (
-        0 if spec.bits in (2, 4, 8) else spec.group_size * (spec.bits - 4) // 8
-    )
+    if spec.name in ("ptq1_g128_fp16", "t5_g128_fp16"):
+        if k % 128:
+            raise ValueError("PTQ1 requires whole 128-column groups")
+        base_bytes_per_group, high_bytes_per_group = (24, 2) if spec.name == "ptq1_g128_fp16" else (26, 0)
+    else:
+        # 2- and 8-bit codes pack whole; 4/5/6-bit codes keep a 4-bit base plane plus a high plane.
+        base_bytes_per_group = (
+            spec.group_size * spec.bits // 8 if spec.bits in (2, 8) else spec.group_size // 2
+        )
+        high_bytes_per_group = (
+            0 if spec.bits in (2, 4, 8) else spec.group_size * (spec.bits - 4) // 8
+        )
     base_row_bytes = groups_per_row * base_bytes_per_group
     high_row_bytes = groups_per_row * high_bytes_per_group
     scale_row_bytes = groups_per_row * 2
@@ -257,8 +274,8 @@ def row_scale_geometry(
     format: str | Fp8RowFormat, shape: Sequence[int]
 ) -> RowScaleGeometry:
     spec = _format(format)
-    if not isinstance(spec, Fp8RowFormat):
-        raise ValueError("row_scale_v1 requires a row-scaled FP8 format")
+    if not isinstance(spec, Fp8RowFormat) or spec.scale_dtype != "bf16":
+        raise ValueError("row_scale_v1 requires FP8 with BF16 row scales")
     n, k = _shape(shape, rank=2)
     code_plane_bytes = n * k
     scale_plane_offset = align_up(code_plane_bytes, PLANE_ALIGNMENT)
@@ -271,6 +288,16 @@ def row_scale_geometry(
         scale_plane_bytes=scale_plane_bytes,
         payload_bytes=scale_plane_offset + scale_plane_bytes,
     )
+
+
+def row_interleaved_geometry(
+    format: str | Fp8RowFormat, shape: Sequence[int]
+) -> RowInterleavedGeometry:
+    spec = _format(format)
+    if not isinstance(spec, Fp8RowFormat) or spec.scale_dtype != "fp16":
+        raise ValueError("row_interleaved_v1 requires FP8 with FP16 row scales")
+    n, k = _shape(shape, rank=2)
+    return RowInterleavedGeometry(n, k, k + 2, n * (k + 2))
 
 
 def gguf_blocks_geometry(
@@ -330,6 +357,8 @@ def encoded_size(
         if not isinstance(numeric_spec, Fp8RowFormat):
             raise ValueError("row_scale_v1 requires a row-scaled FP8 format")
         return row_scale_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is ROW_INTERLEAVED_V1:
+        return row_interleaved_geometry(numeric_spec, shape).payload_bytes
     if layout_spec is GGUF_BLOCKS_V1:
         if not isinstance(numeric_spec, GgufFormat):
             raise ValueError("gguf_blocks_v1 requires a ggml block format")

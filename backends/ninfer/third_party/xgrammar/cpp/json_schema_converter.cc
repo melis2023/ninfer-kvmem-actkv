@@ -2552,10 +2552,28 @@ int32_t JSONSchemaConverter::GenerateString(const StringSpec& spec, const std::s
   }
   // Check for length constraints
   if (spec.min_length != 0 || spec.max_length != -1) {
-    // One repeated FSM atom represents one decoded Unicode scalar, irrespective of JSON spelling.
-    int32_t character = RegexExpression(R"([\u0000-\u{10ffff}])", true);
-    int32_t body = Repeat(rule_name + "_characters", character, spec.min_length, spec.max_length);
-    return Sequence({ByteString("\""), body, ByteString("\"")});
+    if (spec.max_length == 0) {
+      return ByteString("\"\"");
+    }
+    // NInfer: one rule holds both quotes around a counted repetition of one decoded Unicode scalar
+    // in any JSON spelling, a unit every length-bounded string of the grammar shares. The unit is a
+    // deterministic, prefix-free byte language and the quote after it cannot start one, so the
+    // matcher decides most tokens inside the string from the repetitions left
+    // (PopulateRepeatMasks) instead of replaying each against the parse.
+    if (!json_string_scalar_rule_id_.has_value()) {
+      const int32_t scalar = RegexExpression(R"([\u0000-\u{10ffff}])", true);
+      json_string_scalar_rule_id_ = builder_.AddRuleWithHint(
+          "json_string_scalar", builder_.AddChoices({builder_.AddSequence({scalar})})
+      );
+    }
+    const int32_t upper = spec.max_length == -1 ? INT32_MAX : spec.max_length;
+    const int32_t repeat = builder_.AddRepeat(*json_string_scalar_rule_id_, spec.min_length, upper);
+    return RuleRef(builder_.AddRuleWithHint(
+        rule_name + "_bounded",
+        builder_.AddChoices(
+            {builder_.AddSequence({ByteString("\""), repeat, ByteString("\"")})}
+        )
+    ));
   }
   // Default string
   return Sequence({ByteString("\""), RegexExpression(R"([\u0000-\u{10ffff}]*)", true), ByteString("\"")});

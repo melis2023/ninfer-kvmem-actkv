@@ -7,7 +7,7 @@
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/round_buffers.h"
 #include "ninfer/ops/softmax_attention.h"
-#include "ninfer/types.h"
+#include "ninfer/kv_cache_storage.h"
 #include "ops/softmax_attention/dense/causal_cache/launch.h"
 
 #include <algorithm>
