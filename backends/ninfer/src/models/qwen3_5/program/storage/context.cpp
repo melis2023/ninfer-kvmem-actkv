@@ -1163,6 +1163,12 @@ bool ProgramImpl::clear_lane_strict(SequenceState& sequence, RequestControl& req
     return true;
 }
 
+std::uint32_t ProgramImpl::masked_draft_ring_capacity() const noexcept {
+    if (!is_masked_draft_backend(speculative_backend)) { return 0U; }
+    const auto& config = parameters.model.config();
+    return config.draft ? config.draft->sliding_window.value_or(0U) : 0U;
+}
+
 void ProgramImpl::clear_execution_failure_lanes(std::span<const std::uint32_t> lanes) noexcept {
     // A concurrent resource transaction may pin or inspect these active owners. Engine-wide
     // cleanup aborts that transaction before releasing lanes, preserving the only safe order.

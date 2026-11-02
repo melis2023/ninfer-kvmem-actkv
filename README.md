@@ -98,6 +98,25 @@ copy 条件     = expected_copy > neural_expected × 1.3
 
 128K 下 ngram 没有收益时不触发 copy，decode 与 ngram 0 基本一致；之前 20 token “OK” 测试的 20% 差异来自小样本轮数噪声，不是 ngram 兼容问题。
 
+### 4. DFlash2 草稿环 floor 修复
+
+0.19 rebase 时丢失了 floor 公式里的 `masked_draft_ring_capacity()`。KVMem 重选后只保留一个 recent page（64 token），而 DFlash2 草稿环的 conditioning 容量是 2048 token，接受率被压到 30% 左右。
+
+修复：
+
+```cpp
+floor = max(recent_blocks * 64, draft ring capacity)
+```
+
+覆盖三处：KVMem 重选、query restore、checkpoint restore。
+
+64K（prompt 80,566，输出 2000 token，greedy，ngram 0）：
+
+| | 接受率 | decode |
+|---|---:|---:|
+| 修复前 | 32.7% | 47.9 tok/s |
+| 修复后 | 39.2% | 56.6 tok/s |
+
 ## 更新日志（2026-10-31）
 
 ### 1. DFlash2 同步

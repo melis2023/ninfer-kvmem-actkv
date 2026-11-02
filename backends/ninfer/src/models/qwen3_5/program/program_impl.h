@@ -2112,6 +2112,10 @@ private:
                   std::span<const runtime::RoundBudget> budgets);
     // Moves the prepared prompt's ngram index and archive snapshot into an admitted request.
     static void take_ngram_index(RequestControl& request, PreparedPromptData& prompt);
+    // The DFlash2 draft ring's conditioning capacity. A KVMem reselection must retain at least
+    // this many trailing tokens, otherwise the ring is masked down to one recent page and its
+    // acceptance collapses after the first eviction.
+    [[nodiscard]] std::uint32_t masked_draft_ring_capacity() const noexcept;
     [[nodiscard]] NgramProposer::Match propose_ngram_one(std::uint32_t lane,
                                                          const runtime::RoundBudget& budget);
     static void record_ngram_round(RequestControl& request, const NgramProposer::Match& match,

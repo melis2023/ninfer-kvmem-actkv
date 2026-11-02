@@ -765,7 +765,9 @@ void ProgramImpl::publish_checkpoint_drop(SequenceState& sequence,
         sequence.mtp_drafts_pending = false;
     } else if (is_masked_draft_backend(speculative_backend)) {
         sequence.dflash_context_frontier = retained->main_frontier;
-        const auto recent = static_cast<std::uint64_t>(kvmem_options.recent_blocks()) * 64ULL;
+        const auto recent = std::max<std::uint64_t>(
+            static_cast<std::uint64_t>(kvmem_options.recent_blocks()) * 64ULL,
+            masked_draft_ring_capacity());
         sequence.dflash_context_floor = kvmem_window_tokens && retained->main_frontier > recent
             ? static_cast<std::uint32_t>(retained->main_frontier - recent) : 0U;
     }

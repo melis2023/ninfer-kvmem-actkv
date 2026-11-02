@@ -767,8 +767,9 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
         // A reselection replaces the selected blocks; only the trailing recent pages are
         // guaranteed to stay. Raise the masked-draft floor to that trailing continuous segment
         // so the DFlash2 ring stops reading features of blocks that were swapped out.
-        const std::uint64_t recent_tokens =
-            static_cast<std::uint64_t>(kvmem_options.recent_blocks()) * page_tokens;
+        const std::uint64_t recent_tokens = std::max<std::uint64_t>(
+            static_cast<std::uint64_t>(kvmem_options.recent_blocks()) * page_tokens,
+            masked_draft_ring_capacity());
         sequence.dflash_context_floor =
             end > recent_tokens ? static_cast<std::uint32_t>(end - recent_tokens) : 0U;
         auto backend = std::make_shared<WindowMemoryBackend>(*this, sequence, end);
@@ -1541,7 +1542,9 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
     sequence.text_kv_valid = frontier;
     if (speculative_backend == SpeculativeBackend::DFlash2) {
         sequence.dflash_context_frontier = frontier;
-        const auto recent = static_cast<std::uint64_t>(kvmem_options.recent_blocks()) * page_tokens;
+        const auto recent = std::max<std::uint64_t>(
+            static_cast<std::uint64_t>(kvmem_options.recent_blocks()) * page_tokens,
+            masked_draft_ring_capacity());
         sequence.dflash_context_floor = frontier > recent
             ? static_cast<std::uint32_t>(frontier - recent) : 0U;
     }
