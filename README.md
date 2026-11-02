@@ -138,6 +138,19 @@ ngram 开启时，CUDA Graph 捕获会写入 DFlash2 draft ring 的 int8 shadow�
 - ngram copy cursor：`NgramCopySignal` 拒绝 match 后清 `ngram_copy_source`，下一轮不再续旧 source。
 - StateImage 恢复：`copy_from_host` / `copy_from_host_segments` 后从 int8 code/scales 重建 BF16 shadow，覆盖 full / Rest-only / contiguous 三条路径。
 
+### 7. 最近工具调用锚点
+
+`--kvmem-keep` 现在会把最近 4 条 tool call / tool result 消息与工具定义一起固定保留：
+
+- assistant tool-call 消息（工具名 + 参数）
+- 对应的 tool result 消息
+- 默认 `tool_recent_messages = 4`，工具示例页 cap 为 `keep * 8%`
+- `KVMEM_PROMPT_PIN` 增加 `tool_msgs` 字段
+
+budget 满时，模型仍能看到上一次成功调用 `write` / `read` 的工具名和格式，降低 `bash` / `read_file` 等错误工具名和 `<tool_call>` 文本格式的概率。
+
+注意：这只保留工具调用示例，不解析 `<tool_call>` XML，也不做工具名别名；这些仍需 parser 容错/别名补丁。
+
 ## 更新日志（2026-10-31）
 
 ### 1. DFlash2 同步
