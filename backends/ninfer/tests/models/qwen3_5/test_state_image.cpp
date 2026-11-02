@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <exception>
 #include <iostream>
 #include <span>
@@ -33,7 +34,8 @@ struct PlannedPool {
     std::size_t bytes = 0;
 };
 
-PlannedPool plan_pool(bool dflash, std::int32_t slots = 4, bool dflash2 = false) {
+PlannedPool plan_pool(bool dflash, std::int32_t slots = 4, bool dflash2 = false,
+                      ninfer::KvCacheStorage storage = ninfer::KvCacheStorage::BFloat16) {
     q36::StateImageSpec spec{
         .linear =
             {
@@ -53,7 +55,8 @@ PlannedPool plan_pool(bool dflash, std::int32_t slots = 4, bool dflash2 = false)
                                 ? q36::DFlashLocalStateSpec{.layers   = 5,
                                                             .capacity = 2048,
                                                             .kv_heads = 8,
-                                                            .head_dim = 128}
+                                                            .head_dim = 128,
+                                                            .storage  = storage}
                                 : q36::DFlashLocalStateSpec{
                                       .layers = 2, .capacity = 17, .kv_heads = 2, .head_dim = 4};
     }
@@ -76,6 +79,30 @@ void expect_bytes(const ninfer::Tensor& tensor, unsigned char expected, std::str
             return;
         }
     }
+}
+
+void set_u16(const ninfer::Tensor& tensor, std::uint16_t value) {
+    std::vector<std::uint16_t> host(static_cast<std::size_t>(tensor.numel()), value);
+    CUDA_CHECK(cudaMemcpy(tensor.data, host.data(), tensor.bytes(), cudaMemcpyHostToDevice));
+}
+
+void expect_u16(const ninfer::Tensor& tensor, std::uint16_t expected, std::string_view label) {
+    std::vector<std::uint16_t> host(static_cast<std::size_t>(tensor.numel()));
+    CUDA_CHECK(cudaMemcpy(host.data(), tensor.data, tensor.bytes(), cudaMemcpyDeviceToHost));
+    for (const std::uint16_t value : host) {
+        if (value != expected) {
+            ++failures;
+            std::cerr << "FAIL: " << label << " differs\n";
+            return;
+        }
+    }
+}
+
+std::uint16_t bf16_bits(float value) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    bits += 0x7FFFU + ((bits >> 16U) & 1U);
+    return static_cast<std::uint16_t>(bits >> 16U);
 }
 
 void fill_slot(q36::StateImageDevicePool& pool, std::int32_t slot, unsigned char base) {
@@ -242,6 +269,64 @@ void test_segmented_roundtrip(bool dflash, ninfer::DeviceContext& device, bool d
     (void)contiguous.release(*handle);
 }
 
+// Quantized draft rings derive their BF16 attention input from codes and scales. Restoring the host
+// payload must rebuild that shadow on every path; otherwise the restored slot keeps attending to
+// whatever the previous owner left there.
+void test_int8_restore_refreshes_shadow(ninfer::DeviceContext& device) {
+    PlannedPool planned = plan_pool(true, 2, true, ninfer::KvCacheStorage::Int8Group64);
+    ninfer::DeviceArena arena(planned.bytes);
+    q36::StateImageDevicePool pool({arena.base(), arena.capacity()}, planned.layout);
+    const auto prepare = [&](std::int32_t slot, unsigned char code_base, std::uint16_t shadow_bits) {
+        for (std::uint32_t layer = 0; layer < pool.dflash_local()->layer_count(); ++layer) {
+            const auto view = pool.dflash_local()->layer_view(layer);
+            set_bytes(view.k.slice(3, slot, 1), static_cast<unsigned char>(code_base + layer));
+            set_bytes(view.v.slice(3, slot, 1),
+                      static_cast<unsigned char>(code_base + 0x10 + layer));
+            set_u16(view.k_scales.slice(3, slot, 1), 0x3C00); // FP16 1.0
+            set_u16(view.v_scales.slice(3, slot, 1), 0x3C00);
+            set_u16(view.k_bf16.slice(3, slot, 1), shadow_bits);
+            set_u16(view.v_bf16.slice(3, slot, 1), shadow_bits);
+        }
+    };
+    const auto expect_shadow = [&](std::string_view label) {
+        for (std::uint32_t layer = 0; layer < pool.dflash_local()->layer_count(); ++layer) {
+            const auto view = pool.dflash_local()->layer_view(layer);
+            const float key_code   = static_cast<float>(1 + layer);
+            const float value_code = static_cast<float>(0x11 + layer);
+            expect_u16(view.k_bf16.slice(3, 1, 1), bf16_bits(key_code), label);
+            expect_u16(view.v_bf16.slice(3, 1, 1), bf16_bits(value_code), label);
+        }
+    };
+
+    prepare(0, 1, 0x1111);
+    prepare(1, 0x21, 0x2222);
+    q36::HostStatePool host(planned.layout.host, 1);
+    const auto handle = host.allocate();
+    pool.copy_to_host(0, host.writable_view(*handle), device.stream);
+    device.synchronize();
+
+    const std::byte* source[]     = {host.view(*handle).data};
+    const std::size_t image_bytes = planned.layout.host.image_bytes;
+
+    prepare(1, 0x31, 0x3333);
+    pool.copy_from_host_segments(source, image_bytes, 1, device.stream);
+    device.synchronize();
+    expect_shadow("segmented INT8 restore leaves a stale DFlash shadow");
+
+    prepare(1, 0x41, 0x4444);
+    pool.copy_from_host_segments(
+        source, image_bytes, 1,
+        q36::StateImagePart{.kind = q36::StateImagePart::Kind::Rest}, device.stream);
+    device.synchronize();
+    expect_shadow("Rest-only INT8 restore leaves a stale DFlash shadow");
+
+    prepare(1, 0x51, 0x5555);
+    pool.copy_from_host(host.view(*handle), 1, device.stream);
+    device.synchronize();
+    expect_shadow("contiguous INT8 restore leaves a stale DFlash shadow");
+    (void)host.release(*handle);
+}
+
 // Tensor parallelism: two shards hold one half of every layer's channels and heads each. A host
 // image keeps each layer's halves side by side in part order and restores each half to its shard.
 void test_parted_roundtrip() {
@@ -378,6 +463,7 @@ int main() {
     test_segmented_roundtrip(true, device);
     test_parted_roundtrip();
     test_segmented_roundtrip(true, device, true);
+    test_int8_restore_refreshes_shadow(device);
 
     return failures == 0 ? 0 : 1;
 }

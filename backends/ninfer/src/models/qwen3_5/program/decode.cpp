@@ -812,6 +812,9 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         if (!request.ngram_signal.should_copy(
                 length, request.mtp_signal.expected_tokens(draft_window, available[row]))) {
             matches[row].tokens.clear();
+            // A rejected match must not keep the previous copy cursor: the next round would
+            // continue a source the yield estimate just rejected.
+            request.ngram_copy_source = 0;
         }
     }
     const bool copy_round =
@@ -1053,6 +1056,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         const float neural = request.mtp_signal.expected_tokens(draft_window, draft_window);
         if (!request.ngram_signal.should_copy(length, neural)) {
             matches[row].tokens.clear();
+            request.ngram_copy_source = 0;
         }
     }
     const bool copy_round =
@@ -1091,6 +1095,7 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
         }
         SequenceState& sequence = active_sequence(lane);
         const RequestControl& request = requests[lane];
+        clamp_masked_draft_floor(sequence);
         if (request.lifecycle != Lifecycle::Active ||
             budgets[row].generated_tokens_remaining == 0 || !sequence.kv ||
             text_kv_addresses->bound_row(sequence.kv->text) < 0 ||

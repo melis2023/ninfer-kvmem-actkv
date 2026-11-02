@@ -772,6 +772,7 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
             masked_draft_ring_capacity());
         sequence.dflash_context_floor =
             end > recent_tokens ? static_cast<std::uint32_t>(end - recent_tokens) : 0U;
+        clamp_masked_draft_floor(sequence);
         auto backend = std::make_shared<WindowMemoryBackend>(*this, sequence, end);
         const auto count = kv_pages_for_tokens(begin);
         const auto keep = std::min(count, kvmem_options.selected_tokens / page_tokens);
@@ -789,7 +790,15 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
                 for (std::uint32_t id = 0; id < sink_keep; ++id) core.push_back(id);
             }
             for (const auto id : state.media_pages) if (id < count) core.push_back(id);
-            const auto recent_keep = std::min(kvmem_options.recent_blocks(), count);
+            // The DFlash2 floor retains a full draft ring of conditioning tokens, so the pages
+            // that back it must stay resident too. Keeping only one recent page (the default)
+            // makes the draft read evicted features once the budget fills and collapses
+            // acceptance.
+            const auto ring_pages = static_cast<std::uint32_t>(
+                (static_cast<std::uint64_t>(masked_draft_ring_capacity()) + page_tokens - 1U) /
+                page_tokens);
+            const auto recent_keep =
+                std::min(std::max(kvmem_options.recent_blocks(), ring_pages), keep);
             for (std::uint32_t i = 0; i < recent_keep; ++i) core.push_back(count - 1 - i);
         }
         std::sort(core.begin(), core.end());
@@ -1547,6 +1556,7 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
             masked_draft_ring_capacity());
         sequence.dflash_context_floor = frontier > recent
             ? static_cast<std::uint32_t>(frontier - recent) : 0U;
+        clamp_masked_draft_floor(sequence);
     }
     if (backend_kv_pages) { sequence.mtp_kv_valid = frontier; sequence.mtp_draft_count = 0; }
     ++window.stamp.execution_history;

@@ -24,8 +24,8 @@ struct DFlashLocalStateSpec {
     std::uint32_t capacity = 0;
     std::int32_t kv_heads  = 0;
     std::int32_t head_dim  = 0;
-    // Draft ring storage follows the target's --kv-dtype so draft q and target p are built
-    // from the same KV precision.
+    // The draft ring is its own cache and does not need to match the target KV precision. BF16
+    // keeps proposal quality; INT8 is an explicit memory trade selected by --draft-kv-dtype.
     KvCacheStorage storage = KvCacheStorage::BFloat16;
 };
 

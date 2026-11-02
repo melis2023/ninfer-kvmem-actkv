@@ -2116,6 +2116,9 @@ private:
     // this many trailing tokens, otherwise the ring is masked down to one recent page and its
     // acceptance collapses after the first eviction.
     [[nodiscard]] std::uint32_t masked_draft_ring_capacity() const noexcept;
+    // A truncating reuse/restore can leave the floor above the committed conditioning frontier,
+    // which masks the whole ring. Self-heal instead of failing the row or collapsing acceptance.
+    void clamp_masked_draft_floor(SequenceState& sequence) noexcept;
     [[nodiscard]] NgramProposer::Match propose_ngram_one(std::uint32_t lane,
                                                          const runtime::RoundBudget& budget);
     static void record_ngram_round(RequestControl& request, const NgramProposer::Match& match,

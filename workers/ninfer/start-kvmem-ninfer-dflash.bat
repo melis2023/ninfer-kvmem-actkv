@@ -32,7 +32,7 @@ cd /d "%BIN%"
     --kvmem-budget 36834 --kvmem-gen-reserve 4096 --kvmem-host-mib 12288 ^
    --kvmem-keep ^
   --kv-dtype int8 --draft-kv-dtype int8  --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
-  --spec dflash2 --draft-tokens 4 --ngram-draft-tokens 0 ^
+  --spec dflash2 --draft-tokens 4 --ngram-draft-tokens 15 ^
   --vision --vision-residency cpu --vision-max-merged 256 ^
   --default-reasoning-effort xhigh  
 

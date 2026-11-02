@@ -1169,6 +1169,12 @@ std::uint32_t ProgramImpl::masked_draft_ring_capacity() const noexcept {
     return config.draft ? config.draft->sliding_window.value_or(0U) : 0U;
 }
 
+void ProgramImpl::clamp_masked_draft_floor(SequenceState& sequence) noexcept {
+    if (sequence.dflash_context_floor > sequence.dflash_context_frontier) {
+        sequence.dflash_context_floor = sequence.dflash_context_frontier;
+    }
+}
+
 void ProgramImpl::clear_execution_failure_lanes(std::span<const std::uint32_t> lanes) noexcept {
     // A concurrent resource transaction may pin or inspect these active owners. Engine-wide
     // cleanup aborts that transaction before releasing lanes, preserving the only safe order.

@@ -770,6 +770,7 @@ void ProgramImpl::publish_checkpoint_drop(SequenceState& sequence,
             masked_draft_ring_capacity());
         sequence.dflash_context_floor = kvmem_window_tokens && retained->main_frontier > recent
             ? static_cast<std::uint32_t>(retained->main_frontier - recent) : 0U;
+        clamp_masked_draft_floor(sequence);
     }
     if (host_kv_extents) { (void)host_kv_extents->release_unreferenced(); }
     refresh_state_views(sequence);

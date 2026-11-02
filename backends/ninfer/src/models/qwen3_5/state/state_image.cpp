@@ -181,6 +181,24 @@ void validate_slot(std::int32_t slot, std::int32_t slot_count, const char* label
     if (slot < 0 || slot >= slot_count) { throw std::out_of_range(label); }
 }
 
+// Quantized draft rings keep a BF16 shadow because the sliding-window attention kernel reads it
+// directly. The shadow is derived state: any path that replaces the codes/scales must rebuild it,
+// otherwise the drafter attends to stale values restored from a previous owner of the slot.
+void refresh_dflash_shadow(CyclicKVCache& local, std::int32_t slot, cudaStream_t stream) {
+    for (std::uint32_t layer = 0; layer < local.layer_count(); ++layer) {
+        CyclicKVCacheLayerView view = local.layer_view(layer);
+        if (view.storage == KvCacheStorage::BFloat16) { continue; }
+        view.k             = view.k.slice(3, slot, 1);
+        view.v             = view.v.slice(3, slot, 1);
+        view.k_scales      = view.k_scales.slice(3, slot, 1);
+        view.v_scales      = view.v_scales.slice(3, slot, 1);
+        view.k_bf16        = view.k_bf16.slice(3, slot, 1);
+        view.v_bf16        = view.v_bf16.slice(3, slot, 1);
+        view.lane_capacity = 1;
+        ops::detail::dequant_cyclic_i8_launch(view, view.k_bf16, view.v_bf16, stream);
+    }
+}
+
 } // namespace
 
 StateImageDeviceLayout plan_state_image_device_pool(LayoutBuilder& builder,
@@ -733,10 +751,8 @@ void StateImageDevicePool::copy_from_host(HostStateImageConstView source, std::i
                                     layer * host_layout_.dflash_local_scale_layer_bytes),
                     scales.bytes(), cudaMemcpyHostToDevice, stream));
             }
-            if (view.storage != KvCacheStorage::BFloat16) {
-                ops::detail::dequant_cyclic_i8_launch(view, view.k_bf16, view.v_bf16, stream);
-            }
         }
+        refresh_dflash_shadow(*dflash_local_, destination, stream);
     }
 }
 
@@ -818,6 +834,9 @@ void StateImageDevicePool::copy_from_host_segments(std::span<const std::byte* co
                                                cudaMemcpyHostToDevice, streams[rank]));
                 });
         });
+    if (part.kind == StateImagePart::Kind::Rest && dflash_local_) {
+        refresh_dflash_shadow(*dflash_local_, destination, streams[0]);
+    }
 }
 
 } // namespace ninfer::models::qwen3_5

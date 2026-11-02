@@ -434,8 +434,8 @@ struct KvmemOptions {
     // selects Action only when such a span exists (tool result as final message).
     // Default Auto: ordinary prompts have no action span and fall back to User.
     KvmemQuerySource query_source = KvmemQuerySource::Auto;
-    // Draft ring KV storage. BF16 keeps the historical precision; int8 matches the
-    // target's int8 KV so draft q and target p share a precision.
+    // Draft ring KV storage, independent of the target's kv_cache. BF16 keeps proposal quality;
+    // int8 trades some draft accuracy for capacity. There is no requirement to match the target.
     KvCacheStorage draft_kv_storage = KvCacheStorage::BFloat16;
     bool query_meanq_cosine = false;
     double graph_alpha = 0.2;
