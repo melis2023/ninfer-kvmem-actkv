@@ -131,6 +131,13 @@ ngram 开启时，CUDA Graph 捕获会写入 DFlash2 draft ring 的 int8 shadow�
 | 修复后 | 93.9 tok/s | 66.7% | 101 轮 |
 | no-graph 对照 | 84.9 tok/s | 64.2% | 90 轮 |
 
+### 6. DFlash2 恢复路径与 ngram 竞争修复
+
+- `clamp_masked_draft_floor`：重选/恢复后 floor 高于 conditioning frontier 时自愈，避免整环被 mask。
+- recent 保留页：budget 满时至少保留 draft ring 容量（2048 token / 32 页），避免 draft conditioning 页被换出。64K 复测仍是 39.2%，说明当前瓶颈是 target 远程检索页与 draft 只看最近 2048 token 的不一致，不是 recent 页不足。
+- ngram copy cursor：`NgramCopySignal` 拒绝 match 后清 `ngram_copy_source`，下一轮不再续旧 source。
+- StateImage 恢复：`copy_from_host` / `copy_from_host_segments` 后从 int8 code/scales 重建 BF16 shadow，覆盖 full / Rest-only / contiguous 三条路径。
+
 ## 更新日志（2026-10-31）
 
 ### 1. DFlash2 同步
