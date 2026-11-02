@@ -194,6 +194,9 @@ struct PreparedPromptData {
     bool starts_in_reasoning = false;
     std::int32_t memory_think_open = -1, memory_think_close = -1;
     std::vector<TokenSpan> memory_messages;
+    // Recent tool-call/result message spans. KVMem pins the tail of this list so the model keeps
+    // seeing the last working tool name and call shape even when the budget evicts history.
+    std::vector<TokenSpan> memory_tool_messages;
     PrepareStats prepare;
     std::string graft_name;
     std::uint32_t graft_frontier = 0;

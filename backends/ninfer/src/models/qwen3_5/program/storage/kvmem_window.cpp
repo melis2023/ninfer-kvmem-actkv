@@ -678,6 +678,19 @@ void ProgramImpl::retain_prompt_spans(SequenceState& sequence,
         std::vector<std::uint32_t> brief;
         span_pages(system_span, system_cap, false, system);
         if (prompt.tools_region) span_pages(*prompt.tools_region, tool_cap, true, tools);
+        // Pin the trailing tool-call/result messages with the tool definitions. The schema names
+        // the tools; the recent pair shows the model the call shape it just used successfully.
+        const std::uint32_t tool_example_cap = std::max(1U, keep * 8U / 100U);
+        const std::size_t tool_message_count = std::min<std::size_t>(
+            prompt.memory_tool_messages.size(), kvmem_options.tool_recent_messages);
+        if (tool_message_count != 0) {
+            const std::uint32_t per_message_cap = std::max(
+                1U, tool_example_cap / static_cast<std::uint32_t>(tool_message_count));
+            const std::size_t first = prompt.memory_tool_messages.size() - tool_message_count;
+            for (std::size_t i = first; i < prompt.memory_tool_messages.size(); ++i) {
+                span_pages(prompt.memory_tool_messages[i], per_message_cap, true, tools);
+            }
+        }
         if (prompt.memory_query) span_pages(*prompt.memory_query, task_cap, true, task);
         if (prompt.first_user_region) span_pages(*prompt.first_user_region, brief_cap, true, brief);
 
@@ -721,9 +734,9 @@ void ProgramImpl::retain_prompt_spans(SequenceState& sequence,
         window.demoted_pages.swap(demoted_only);
         if (kvmem_options.verify_transfers) {
             std::fprintf(stderr,
-                         "KVMEM_PROMPT_PIN system=%zu tools=%zu task=%zu brief=%zu "
+                         "KVMEM_PROMPT_PIN system=%zu tools=%zu tool_msgs=%zu task=%zu brief=%zu "
                          "sink=%zu pages=%u\n",
-                         window.system_pages.size(), window.tool_pages.size(),
+                         window.system_pages.size(), window.tool_pages.size(), tool_message_count,
                          window.pinned_pages.size(), window.brief_pages.size(),
                          window.dynamic_sink_pages.size(), total_pages);
         }

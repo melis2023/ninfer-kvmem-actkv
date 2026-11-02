@@ -447,6 +447,9 @@ struct KvmemOptions {
     // Values below 64 are rejected when KVMem is enabled; the default keeps one page.
     std::uint32_t sink_tokens = 0;
     std::uint32_t recent_tokens = 64;
+    // Trailing tool call/result messages pinned with the tool definitions. They keep the last
+    // working tool name and call shape in context when the budget evicts older history.
+    std::uint32_t tool_recent_messages = 4;
     std::uint64_t host_bytes = 0;      // H; hard bound on archived native payload
     [[nodiscard]] std::uint32_t sink_blocks() const noexcept {
         return sink_tokens < 64 ? 1U : sink_tokens / 64U;

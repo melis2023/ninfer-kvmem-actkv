@@ -1481,7 +1481,22 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     for(std::size_t i=0;i+1<message_boundaries.size();++i) {
         if((message_boundaries[i] || i==0) && message_boundaries[i+1]) {
             const auto begin=message_boundaries[i].value_or(0),end=*message_boundaries[i+1];
-            if(begin<end && end<=result.token_ids.size()) result.memory_messages.push_back({begin,end-begin});
+            if(begin<end && end<=result.token_ids.size()) {
+                const TokenSpan span{begin,end-begin};
+                result.memory_messages.push_back(span);
+                if (i < message_roles.size()) {
+                    const ChatRole role = message_roles[i];
+                    // Keep the assistant tool-call message paired with its tool result. A result
+                    // alone shows the output but not the tool name/arguments the model should
+                    // imitate.
+                    const bool tool_result = role == ChatRole::Tool;
+                    const bool tool_call = role == ChatRole::Assistant &&
+                        i + 1 < message_roles.size() && message_roles[i + 1] == ChatRole::Tool;
+                    if (tool_result || tool_call) {
+                        result.memory_tool_messages.push_back(span);
+                    }
+                }
+            }
         }
     }
     if (impl_->ngram_archive_enabled && options.speculative_drafting) {
