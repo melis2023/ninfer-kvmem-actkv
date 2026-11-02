@@ -491,6 +491,16 @@ void StateImageDevicePool::zero_slot(std::int32_t slot, RankStreams streams) {
             const Tensor v                    = view.v.slice(3, slot, 1);
             CUDA_CHECK(cudaMemsetAsync(k.data, 0, k.bytes(), stream));
             CUDA_CHECK(cudaMemsetAsync(v.data, 0, v.bytes(), stream));
+            // The shadow is derived from the codes. Clearing the codes without the shadow lets a
+            // slot reused after CUDA Graph capture attend to the capture's proposal tokens.
+            if (view.k_bf16.data != nullptr) {
+                const Tensor shadow = view.k_bf16.slice(3, slot, 1);
+                CUDA_CHECK(cudaMemsetAsync(shadow.data, 0, shadow.bytes(), stream));
+            }
+            if (view.v_bf16.data != nullptr) {
+                const Tensor shadow = view.v_bf16.slice(3, slot, 1);
+                CUDA_CHECK(cudaMemsetAsync(shadow.data, 0, shadow.bytes(), stream));
+            }
         }
     }
 }
@@ -508,6 +518,12 @@ void StateImageDevicePool::zero_all(RankStreams streams) {
             const CyclicKVCacheLayerView view = dflash_local_->layer_view(layer);
             CUDA_CHECK(cudaMemsetAsync(view.k.data, 0, view.k.bytes(), stream));
             CUDA_CHECK(cudaMemsetAsync(view.v.data, 0, view.v.bytes(), stream));
+            if (view.k_bf16.data != nullptr) {
+                CUDA_CHECK(cudaMemsetAsync(view.k_bf16.data, 0, view.k_bf16.bytes(), stream));
+            }
+            if (view.v_bf16.data != nullptr) {
+                CUDA_CHECK(cudaMemsetAsync(view.v_bf16.data, 0, view.v_bf16.bytes(), stream));
+            }
         }
     }
 }

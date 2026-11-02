@@ -117,6 +117,20 @@ floor = max(recent_blocks * 64, draft ring capacity)
 | 修复前 | 32.7% | 47.9 tok/s |
 | 修复后 | 39.2% | 56.6 tok/s |
 
+### 5. ngram graph 捕获 shadow 污染修复
+
+ngram 开启时，CUDA Graph 捕获会写入 DFlash2 draft ring 的 int8 shadow；捕获后的 `zero_all` 只清零 code，没有清 shadow。slot 被复用时，DFlash2 读到捕获时的 proposal token shadow，接受率从约 65% 掉到 23%。
+
+修复：`zero_slot` / `zero_all` 同步清零 `k_bf16` / `v_bf16` shadow，scales 保留。
+
+8K 鹈鹕骑车，int8 draft，draft 4，ngram 15，8000 token：
+
+| | decode | 接受率 | ngram |
+|---|---:|---:|---:|
+| 修复前 | 45.9 tok/s | 23.3% | 8 轮 |
+| 修复后 | 93.9 tok/s | 66.7% | 101 轮 |
+| no-graph 对照 | 84.9 tok/s | 64.2% | 90 轮 |
+
 ## 更新日志（2026-10-31）
 
 ### 1. DFlash2 同步
