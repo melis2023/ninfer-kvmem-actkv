@@ -11,6 +11,32 @@ QQ 交流群：**1040777853**。本项目仅供研究学习，稳定使用请前
 
 **所有修补、测速与召回数据汇总在 [docs/CHANGELOG.md](docs/CHANGELOG.md)。**
 
+## 更新日志（2026-11-04）
+
+### 1. 工具调用错误/修改锚点
+
+问题：dsh 在大文件 edit 失败后会反复读取同一文件，`old_string not found` / `file changed since it was read` 被上下文压缩掉，模型丢失失败原因，形成 read -> edit 失败 -> read 的循环。
+
+修复：
+
+- 工具消息分类：Call / Result / Error / Mutation / Read
+- Error 最近 2 条固定保留，cap 3% B
+- write/edit 成功结果最近 2 条固定保留，cap 3% B
+- 普通工具消息最近 4 条，cap 8% B
+- 同一文件 read 只保留最近一次，重复读取不再挤占上下文
+- `KVMEM_PROMPT_PIN` 增加 `tool_msgs`
+
+测试（dsh headless，飞机大战.html）：
+
+| 场景 | 工具序列 | 结果 |
+|---|---|---|
+| `lives: 3` -> `lives: 5` | read -> edit -> grep | 一次成功 |
+| `lives: 99` -> `lives: 5` | read -> grep -> edit 失败 -> edit 真实值成功 -> grep | 6 步完成，无重复 read |
+
+之前一次 30 分钟卡住是 dsh 沙箱权限（工作目录 `C:\WINDOWS\system32`，写 `I:\dsh` 被拒绝），不是 KVMem 问题。
+
+提交：`c693456`。
+
 ## 更新日志（2026-11-02）
 
 ### 1. DFlash2 草稿 KV 精度同步
