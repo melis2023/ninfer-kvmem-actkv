@@ -196,7 +196,21 @@ struct PreparedPromptData {
     std::vector<TokenSpan> memory_messages;
     // Recent tool-call/result message spans. KVMem pins the tail of this list so the model keeps
     // seeing the last working tool name and call shape even when the budget evicts history.
-    std::vector<TokenSpan> memory_tool_messages;
+    // Errors and successful write/edit results are pinned separately: an edit failure must stay
+    // visible, or the model re-reads the same large file and repeats the same edit.
+    enum class ToolMessageKind : std::uint8_t {
+        Call,
+        Result,
+        Error,
+        Mutation,
+        Read,
+    };
+    struct ToolMessageSpan {
+        TokenSpan span;
+        ToolMessageKind kind = ToolMessageKind::Result;
+        std::string file_key;
+    };
+    std::vector<ToolMessageSpan> memory_tool_messages;
     PrepareStats prepare;
     std::string graft_name;
     std::uint32_t graft_frontier = 0;

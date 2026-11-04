@@ -450,6 +450,10 @@ struct KvmemOptions {
     // Trailing tool call/result messages pinned with the tool definitions. They keep the last
     // working tool name and call shape in context when the budget evicts older history.
     std::uint32_t tool_recent_messages = 4;
+    // Edit/write panics must survive compaction so the model stops re-reading the same file and
+    // repeating a failed edit; successful mutations show which file was already changed.
+    std::uint32_t tool_recent_errors = 2;
+    std::uint32_t tool_recent_mutations = 2;
     std::uint64_t host_bytes = 0;      // H; hard bound on archived native payload
     [[nodiscard]] std::uint32_t sink_blocks() const noexcept {
         return sink_tokens < 64 ? 1U : sink_tokens / 64U;

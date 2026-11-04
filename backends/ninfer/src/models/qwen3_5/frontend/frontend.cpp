@@ -32,6 +32,7 @@
 #include <fstream>
 #include <memory>
 #include <optional>
+#include <unordered_map>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -1305,7 +1306,59 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         impl_->max_context - (graft ? graft_context_slots(*graft) : 0U);
     std::vector<ChatRole> message_roles;
     message_roles.reserve(input.messages.size());
-    for (const ChatMessage& message : input.messages) { message_roles.push_back(message.role); }
+    struct ToolMessageMeta {
+        PreparedPromptData::ToolMessageKind kind = PreparedPromptData::ToolMessageKind::Result;
+        std::string file_key;
+    };
+    const auto tool_file_key = [](const std::string& arguments) -> std::string {
+        try {
+            const Json value = Json::parse(arguments);
+            if (value.contains("file_path") && value["file_path"].is_string()) {
+                return value["file_path"].get<std::string>();
+            }
+            if (value.contains("path") && value["path"].is_string()) {
+                return value["path"].get<std::string>();
+            }
+        } catch (...) {
+        }
+        return {};
+    };
+    std::vector<ToolMessageMeta> tool_meta;
+    tool_meta.reserve(input.messages.size());
+    std::unordered_map<std::string, std::pair<std::string, std::string>> tool_calls;
+    for (const ChatMessage& message : input.messages) {
+        message_roles.push_back(message.role);
+        ToolMessageMeta meta;
+        if (message.role == ChatRole::Assistant && !message.tool_calls.empty()) {
+            meta.kind     = PreparedPromptData::ToolMessageKind::Call;
+            meta.file_key = tool_file_key(message.tool_calls.front().arguments_json);
+            for (const ToolCall& call : message.tool_calls) {
+                tool_calls[call.id] = {call.name, tool_file_key(call.arguments_json)};
+            }
+        } else if (message.role == ChatRole::Tool) {
+            std::string text;
+            for (const MessagePart& part : message.parts) {
+                if (part.kind == MessagePartKind::Text) { text += part.text; }
+            }
+            const bool is_error =
+                text.rfind("Error:", 0) == 0 ||
+                text.find("unknown tool") != std::string::npos ||
+                text.find("not found") != std::string::npos ||
+                text.find("file changed since it was read") != std::string::npos;
+            const auto call = tool_calls.find(message.tool_call_id);
+            const std::string name =
+                call == tool_calls.end() ? std::string{} : call->second.first;
+            if (call != tool_calls.end()) { meta.file_key = call->second.second; }
+            if (is_error) {
+                meta.kind = PreparedPromptData::ToolMessageKind::Error;
+            } else if (name == "write" || name == "edit") {
+                meta.kind = PreparedPromptData::ToolMessageKind::Mutation;
+            } else if (name == "read") {
+                meta.kind = PreparedPromptData::ToolMessageKind::Read;
+            }
+        }
+        tool_meta.push_back(std::move(meta));
+    }
     const auto tool_call_output = fi::build_tool_call_output_contract(
         options.tool_jsons, !options.tool_jsons.empty(), options.forced_tool_name);
     const std::optional<std::uint32_t> leading_boundary =
@@ -1493,7 +1546,13 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
                     const bool tool_call = role == ChatRole::Assistant &&
                         i + 1 < message_roles.size() && message_roles[i + 1] == ChatRole::Tool;
                     if (tool_result || tool_call) {
-                        result.memory_tool_messages.push_back(span);
+                        PreparedPromptData::ToolMessageSpan entry;
+                        entry.span = span;
+                        if (i < tool_meta.size()) {
+                            entry.kind     = tool_meta[i].kind;
+                            entry.file_key = tool_meta[i].file_key;
+                        }
+                        result.memory_tool_messages.push_back(std::move(entry));
                     }
                 }
             }

@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <unordered_set>
 
 namespace ninfer::models::qwen3_5::detail {
 namespace {
@@ -678,17 +679,60 @@ void ProgramImpl::retain_prompt_spans(SequenceState& sequence,
         std::vector<std::uint32_t> brief;
         span_pages(system_span, system_cap, false, system);
         if (prompt.tools_region) span_pages(*prompt.tools_region, tool_cap, true, tools);
-        // Pin the trailing tool-call/result messages with the tool definitions. The schema names
-        // the tools; the recent pair shows the model the call shape it just used successfully.
-        const std::uint32_t tool_example_cap = std::max(1U, keep * 8U / 100U);
-        const std::size_t tool_message_count = std::min<std::size_t>(
-            prompt.memory_tool_messages.size(), kvmem_options.tool_recent_messages);
-        if (tool_message_count != 0) {
+        // Pin the trailing tool-call/result messages with the tool definitions. Errors and
+        // successful mutations are pinned separately: an edit failure must stay visible, or the
+        // model re-reads the same large file and repeats the same edit after compaction.
+        const std::uint32_t tool_error_cap    = std::max(1U, keep * 3U / 100U);
+        const std::uint32_t tool_mutation_cap = std::max(1U, keep * 3U / 100U);
+        const std::uint32_t tool_example_cap  = std::max(1U, keep * 8U / 100U);
+        std::size_t tool_message_count        = 0;
+        const auto add_tool_kind = [&](PreparedPromptData::ToolMessageKind kind,
+                                       std::uint32_t cap, std::size_t limit,
+                                       std::vector<std::uint32_t>& out) {
+            if (limit == 0 || cap == 0) { return; }
+            std::vector<const PreparedPromptData::ToolMessageSpan*> selected;
+            for (auto it = prompt.memory_tool_messages.rbegin();
+                 it != prompt.memory_tool_messages.rend() && selected.size() < limit; ++it) {
+                if (it->kind == kind) { selected.push_back(&*it); }
+            }
+            if (selected.empty()) { return; }
             const std::uint32_t per_message_cap = std::max(
-                1U, tool_example_cap / static_cast<std::uint32_t>(tool_message_count));
-            const std::size_t first = prompt.memory_tool_messages.size() - tool_message_count;
-            for (std::size_t i = first; i < prompt.memory_tool_messages.size(); ++i) {
-                span_pages(prompt.memory_tool_messages[i], per_message_cap, true, tools);
+                1U, cap / static_cast<std::uint32_t>(selected.size()));
+            for (const auto* entry : selected) {
+                span_pages(entry->span, per_message_cap, true, out);
+            }
+        };
+        add_tool_kind(PreparedPromptData::ToolMessageKind::Error, tool_error_cap,
+                      kvmem_options.tool_recent_errors, tools);
+        add_tool_kind(PreparedPromptData::ToolMessageKind::Mutation, tool_mutation_cap,
+                      kvmem_options.tool_recent_mutations, tools);
+        {
+            std::vector<const PreparedPromptData::ToolMessageSpan*> selected;
+            std::unordered_set<std::string> seen_read_files;
+            for (auto it = prompt.memory_tool_messages.rbegin();
+                 it != prompt.memory_tool_messages.rend() &&
+                 selected.size() < kvmem_options.tool_recent_messages; ++it) {
+                if (it->kind != PreparedPromptData::ToolMessageKind::Call &&
+                    it->kind != PreparedPromptData::ToolMessageKind::Result &&
+                    it->kind != PreparedPromptData::ToolMessageKind::Read) {
+                    continue;
+                }
+                // One read of a large file is enough. Repeated reads of the same file crowd out
+                // the mutation and error messages that would actually break the loop.
+                if (it->kind == PreparedPromptData::ToolMessageKind::Read &&
+                    !it->file_key.empty() &&
+                    !seen_read_files.insert(it->file_key).second) {
+                    continue;
+                }
+                selected.push_back(&*it);
+            }
+            tool_message_count = selected.size();
+            if (!selected.empty()) {
+                const std::uint32_t per_message_cap = std::max(
+                    1U, tool_example_cap / static_cast<std::uint32_t>(selected.size()));
+                for (const auto* entry : selected) {
+                    span_pages(entry->span, per_message_cap, true, tools);
+                }
             }
         }
         if (prompt.memory_query) span_pages(*prompt.memory_query, task_cap, true, task);
