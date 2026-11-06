@@ -90,6 +90,28 @@ decode 慢 3.3%–3.7%
 - `tools/convert/sources/compressed_tensors.py`：weight-only NVFP4 缺 `input_global_scale` 时返回 `None`
 - `tools/convert/methods.py`：`import_encoded` 跳过缺失的 input divisor
 
+### 4. WorkBuddy 工具成功锚点
+
+WorkBuddy 使用大写 `Read`/`Edit`/`Write`，并且同一文件会混用 `C:/...` 与 `C:\...`。旧分类只匹配小写，导致成功读取/修改没有进入 keep 锚点，长会话里模型会反复 Read 同一文件。
+
+修复：
+
+- 工具名统一转小写后再分类
+- 路径分隔符统一为 `/`
+- 新增 `memory_tool_successes`，按 `(tool, file)` 去重，只保留最新成功记录
+- keep 新增 4% B 的成功工具锚点，默认保留最近 2 条
+- `KVMEM_PROMPT_PIN` 增加 `tool_success=N`
+
+测试（WorkBuddy 风格 Read/Edit 历史）：
+
+```text
+tool_msgs=4
+tool_success=2
+HTTP 200
+```
+
+服务端只保证成功记录不被压缩，不能阻止客户端重复发起 Read；彻底去重仍需 WorkBuddy/agent 层缓存。
+
 ## 更新日志（2026-11-04）
 
 ### 1. 工具调用错误/修改锚点

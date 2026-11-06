@@ -454,6 +454,10 @@ struct KvmemOptions {
     // repeating a failed edit; successful mutations show which file was already changed.
     std::uint32_t tool_recent_errors = 2;
     std::uint32_t tool_recent_mutations = 2;
+    // Successful Read/Grep/Edit records kept as first-class anchors. WorkBuddy
+    // re-reads the same file even after a successful load; keeping the latest
+    // success per (tool, file) lets the model see it has already been loaded.
+    std::uint32_t tool_recent_successes = 2;
     std::uint64_t host_bytes = 0;      // H; hard bound on archived native payload
     [[nodiscard]] std::uint32_t sink_blocks() const noexcept {
         return sink_tokens < 64 ? 1U : sink_tokens / 64U;

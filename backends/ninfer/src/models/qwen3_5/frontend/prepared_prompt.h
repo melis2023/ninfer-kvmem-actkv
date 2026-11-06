@@ -209,8 +209,15 @@ struct PreparedPromptData {
         TokenSpan span;
         ToolMessageKind kind = ToolMessageKind::Result;
         std::string file_key;
+        // Lower-case tool name. WorkBuddy sends Read/Edit/Write while dsh sends
+        // read/edit/write, so classification and de-duplication normalize it.
+        std::string tool_name;
     };
     std::vector<ToolMessageSpan> memory_tool_messages;
+    // Recent successful tool results, one per (tool, file). Kept separately from
+    // the ordinary recent-message list so a WorkBuddy-style Read storm cannot
+    // evict the record of what has already been loaded successfully.
+    std::vector<ToolMessageSpan> memory_tool_successes;
     PrepareStats prepare;
     std::string graft_name;
     std::uint32_t graft_frontier = 0;

@@ -706,6 +706,31 @@ void ProgramImpl::retain_prompt_spans(SequenceState& sequence,
                       kvmem_options.tool_recent_errors, tools);
         add_tool_kind(PreparedPromptData::ToolMessageKind::Mutation, tool_mutation_cap,
                       kvmem_options.tool_recent_mutations, tools);
+        // Successful loads are their own anchor: WorkBuddy re-issues the same Read
+        // even after it succeeded, and the ordinary recent window can evict it.
+        std::size_t tool_success_count = 0;
+        {
+            std::vector<const PreparedPromptData::ToolMessageSpan*> selected;
+            std::unordered_set<std::string> seen_success;
+            for (auto it = prompt.memory_tool_successes.rbegin();
+                 it != prompt.memory_tool_successes.rend() &&
+                 selected.size() < kvmem_options.tool_recent_successes; ++it) {
+                const std::string key = it->tool_name + "\n" + it->file_key;
+                if (!it->file_key.empty() && !seen_success.insert(key).second) {
+                    continue;
+                }
+                selected.push_back(&*it);
+            }
+            tool_success_count = selected.size();
+            if (!selected.empty()) {
+                const std::uint32_t tool_success_cap = std::max(1U, keep * 4U / 100U);
+                const std::uint32_t per_success_cap = std::max(
+                    1U, tool_success_cap / static_cast<std::uint32_t>(selected.size()));
+                for (const auto* entry : selected) {
+                    span_pages(entry->span, per_success_cap, true, tools);
+                }
+            }
+        }
         {
             std::vector<const PreparedPromptData::ToolMessageSpan*> selected;
             std::unordered_set<std::string> seen_read_files;
@@ -778,10 +803,10 @@ void ProgramImpl::retain_prompt_spans(SequenceState& sequence,
         window.demoted_pages.swap(demoted_only);
         if (kvmem_options.verify_transfers) {
             std::fprintf(stderr,
-                         "KVMEM_PROMPT_PIN system=%zu tools=%zu tool_msgs=%zu task=%zu brief=%zu "
-                         "sink=%zu pages=%u\n",
+                         "KVMEM_PROMPT_PIN system=%zu tools=%zu tool_msgs=%zu tool_success=%zu "
+                         "task=%zu brief=%zu sink=%zu pages=%u\n",
                          window.system_pages.size(), window.tool_pages.size(), tool_message_count,
-                         window.pinned_pages.size(), window.brief_pages.size(),
+                         tool_success_count, window.pinned_pages.size(), window.brief_pages.size(),
                          window.dynamic_sink_pages.size(), total_pages);
         }
     } catch (const std::exception& error) {

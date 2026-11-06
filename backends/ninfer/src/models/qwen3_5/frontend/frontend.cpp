@@ -1309,16 +1309,26 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     struct ToolMessageMeta {
         PreparedPromptData::ToolMessageKind kind = PreparedPromptData::ToolMessageKind::Result;
         std::string file_key;
+        std::string tool_name;
+    };
+    const auto normalize_tool_name = [](std::string name) {
+        std::transform(name.begin(), name.end(), name.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return name;
     };
     const auto tool_file_key = [](const std::string& arguments) -> std::string {
         try {
             const Json value = Json::parse(arguments);
+            std::string path;
             if (value.contains("file_path") && value["file_path"].is_string()) {
-                return value["file_path"].get<std::string>();
+                path = value["file_path"].get<std::string>();
+            } else if (value.contains("path") && value["path"].is_string()) {
+                path = value["path"].get<std::string>();
             }
-            if (value.contains("path") && value["path"].is_string()) {
-                return value["path"].get<std::string>();
-            }
+            // WorkBuddy mixes C:/... and C:\... for the same file. Normalize the
+            // separator so both spellings share one keep anchor.
+            std::replace(path.begin(), path.end(), '\\', '/');
+            return path;
         } catch (...) {
         }
         return {};
@@ -1330,10 +1340,12 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         message_roles.push_back(message.role);
         ToolMessageMeta meta;
         if (message.role == ChatRole::Assistant && !message.tool_calls.empty()) {
-            meta.kind     = PreparedPromptData::ToolMessageKind::Call;
-            meta.file_key = tool_file_key(message.tool_calls.front().arguments_json);
+            meta.kind      = PreparedPromptData::ToolMessageKind::Call;
+            meta.tool_name = normalize_tool_name(message.tool_calls.front().name);
+            meta.file_key  = tool_file_key(message.tool_calls.front().arguments_json);
             for (const ToolCall& call : message.tool_calls) {
-                tool_calls[call.id] = {call.name, tool_file_key(call.arguments_json)};
+                tool_calls[call.id] = {normalize_tool_name(call.name),
+                                       tool_file_key(call.arguments_json)};
             }
         } else if (message.role == ChatRole::Tool) {
             std::string text;
@@ -1348,6 +1360,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
             const auto call = tool_calls.find(message.tool_call_id);
             const std::string name =
                 call == tool_calls.end() ? std::string{} : call->second.first;
+            meta.tool_name = name;
             if (call != tool_calls.end()) { meta.file_key = call->second.second; }
             if (is_error) {
                 meta.kind = PreparedPromptData::ToolMessageKind::Error;
@@ -1551,6 +1564,28 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
                         if (i < tool_meta.size()) {
                             entry.kind     = tool_meta[i].kind;
                             entry.file_key = tool_meta[i].file_key;
+                            entry.tool_name = tool_meta[i].tool_name;
+                        }
+                        if (tool_result &&
+                            entry.kind != PreparedPromptData::ToolMessageKind::Error) {
+                            // One success per (tool, file), newest wins. A successful
+                            // Edit replaces the older Read anchor for the same file.
+                            const auto same = std::find_if(
+                                result.memory_tool_successes.begin(),
+                                result.memory_tool_successes.end(),
+                                [&](const PreparedPromptData::ToolMessageSpan& existing) {
+                                    return existing.tool_name == entry.tool_name &&
+                                        existing.file_key == entry.file_key;
+                                });
+                            if (same != result.memory_tool_successes.end()) {
+                                result.memory_tool_successes.erase(same);
+                            }
+                            result.memory_tool_successes.push_back(entry);
+                            constexpr std::size_t kMaximumToolSuccesses = 8;
+                            if (result.memory_tool_successes.size() > kMaximumToolSuccesses) {
+                                result.memory_tool_successes.erase(
+                                    result.memory_tool_successes.begin());
+                            }
                         }
                         result.memory_tool_messages.push_back(std::move(entry));
                     }
