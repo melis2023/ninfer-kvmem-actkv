@@ -11,6 +11,85 @@ QQ 交流群：**1040777853**。本项目仅供研究学习，稳定使用请前
 
 **所有修补、测速与召回数据汇总在 [docs/CHANGELOG.md](docs/CHANGELOG.md)。**
 
+## 更新日志（2026-11-06）
+
+### 1. KVMem pressure 不再因 cold mandatory 页崩溃
+
+问题：长会话 + 历史 restore + 工具锚点时，pressure 重选会检查 mandatory 页（sink / system / tool schema / brief / DFlash2 recent ring）是否仍驻留。某个页被 swap 或 restore 后不在 `state.pages`，旧代码直接抛：
+
+```text
+KVMem pressure cannot recall a cold mandatory page
+```
+
+worker 退出，请求返回 HTTP 500。
+
+修复（`kvmem_window.cpp`）：
+
+- cold mandatory 页有完整 host archive 时，保留在 working set，让 `WindowMemoryBackend` restore
+- 没有持久副本时，从 mandatory 中降级丢弃并打日志，不再打崩 worker
+- 新增日志：`KVMEM_PRESSURE cold_mandatory=N recovered=N dropped=N`
+
+测试（200K 多轮工具调用，dsh OpenAI 协议）：
+
+| 请求 | prompt | prefill | decode | 结果 |
+|---|---:|---:|---:|---|
+| 第一轮 | 201,203 | 804.5 | 35.8 | HTTP 200 |
+| 第二轮 | 251,409 | 751.6 | 74.8 | HTTP 200，restore frontier 201,196 |
+
+```text
+cold_mandatory: none
+ERROR / FATAL / HTTP 500: none
+```
+
+测试脚本：`longctx_pressure.py`（dsh test 目录），按 dsh 的 assistant tool_calls + tool results 历史构造 200K+ prompt。
+
+### 2. NVFP4 草稿头实测
+
+本地找到三份 27B DFlash2 NVFP4 草稿：
+
+| 工件 | 格式 | 能否转换 |
+|---|---|---|
+| `dflash2-nvfp4-modelopt` | ModelOpt NVFP4 | 可以，原样导入 |
+| `yuanlin...NVFP4-drafter` | compressed-tensors NVFP4 | 可以，补 input divisor 兼容 |
+| `Qwen3.8-27B-DFlash2-NVFP4.gguf` | GGML type 40 | 不可以，布局与 ninfer 的 `block_scale_k16_m128x4_v1` 不同 |
+
+转换后草稿格式：
+
+```text
+QKV                    q8_g32_fp16
+gate/up                nvfp4
+attention/output       nvfp4
+mlp/down               nvfp4
+feature_projection     nvfp4
+selector hidden        nvfp4
+conv / norm / codebook bf16
+```
+
+64K 同条件对比（int8 KV，draft 4）：
+
+| 草稿 | prefill | decode | 接受率 | free |
+|---|---:|---:|---:|---:|
+| q3km | 319.0 | 51.0 | 32.3% | 421 MiB |
+| NVFP4 ModelOpt | 325.9 | 49.1 | 32.8% | 464 MiB |
+| NVFP4 yuanlin | 325.3 | 49.3 | 33.0% | 449 MiB |
+
+结论：
+
+```text
+NVFP4 草稿可用，但没有加速
+decode 慢 3.3%–3.7%
+接受率 +0.5–0.7pp，统计上不显著
+模型大 130 MiB，显存基本不变
+```
+
+原因与代码一致：draft 4 走 `tokens <= 4 -> C4 SIMT`，weight-only A16，权重 4.5 bpw，不走 NVGEMM。
+
+### 3. NVFP4 转换器兼容修复
+
+- `tools/convert/nvfp4.py`：`nvfp4_maxabs` 只检查当前矩阵的 activation policy，不再被其他组件的 A8/A4 误拒
+- `tools/convert/sources/compressed_tensors.py`：weight-only NVFP4 缺 `input_global_scale` 时返回 `None`
+- `tools/convert/methods.py`：`import_encoded` 跳过缺失的 input divisor
+
 ## 更新日志（2026-11-04）
 
 ### 1. 工具调用错误/修改锚点
