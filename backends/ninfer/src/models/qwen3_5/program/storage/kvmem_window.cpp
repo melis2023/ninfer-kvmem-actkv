@@ -917,12 +917,42 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
             std::vector<std::uint32_t> candidates;
             std::vector<std::uint64_t> starts;
             for(auto id:state.pages) if(id<count) { candidates.push_back(id); starts.push_back(std::uint64_t(id)*64); }
-            const std::vector<std::uint32_t> required(mandatory.begin(),mandatory.end());
-            for(auto id:required) if(std::find(candidates.begin(),candidates.end(),id)==candidates.end() && count)
-                throw std::logic_error("KVMem pressure cannot recall a cold mandatory page");
+            // A mandatory page that was swapped out is still recoverable while its
+            // host record is complete: keep it in the working set and let the
+            // backend restore it. Only a page with no durable copy is dropped.
+            // Crashing the worker here turned a recoverable pressure event into an
+            // HTTP 500, and a stale keep span could make that happen after a
+            // prefix restore.
+            std::vector<std::uint64_t> effective_mandatory;
+            effective_mandatory.reserve(mandatory.size());
+            std::size_t cold_recovered = 0, cold_dropped = 0;
+            for (const auto id64 : mandatory) {
+                const auto id = static_cast<std::uint32_t>(id64);
+                const bool cold = count && id < count &&
+                    std::find(candidates.begin(), candidates.end(), id) == candidates.end();
+                if (cold) {
+                    const bool recoverable = id < state.archive.size() && state.archive[id] &&
+                        id < state.host_versions.size() &&
+                        state.host_versions[id] >= valid_columns(id, sequence.text_kv_valid);
+                    if (!recoverable) {
+                        ++cold_dropped;
+                        continue;
+                    }
+                    ++cold_recovered;
+                }
+                effective_mandatory.push_back(id64);
+            }
+            if ((cold_recovered || cold_dropped) && kvmem_options.verify_transfers) {
+                std::fprintf(stderr,
+                    "KVMEM_PRESSURE cold_mandatory=%zu recovered=%zu dropped=%zu\n",
+                    cold_recovered + cold_dropped, cold_recovered, cold_dropped);
+            }
+            const std::vector<std::uint32_t> required(
+                effective_mandatory.begin(), effective_mandatory.end());
             const auto scores=state.feedback.pressure_scores(starts);
             const auto ids=kvmem::pressure_selection(candidates,scores,required,std::max(1u,keep));
             selected.assign(ids.begin(),ids.end());
+            mandatory = std::move(effective_mandatory);
             if(kvmem_options.verify_transfers) std::fprintf(stderr,
                 "KVMEM_PRESSURE phase=%s logical=%u candidates=%zu selected=%zu graph=0\n",
                 reason==kvmem::SelectionReason::DecodePressure?"decode":"prefill",begin,candidates.size(),ids.size());

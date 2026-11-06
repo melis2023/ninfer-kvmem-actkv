@@ -326,10 +326,14 @@ def import_encoded(request: PrepareRequest) -> PreparedMethod:
     # disagree here, and keeping both words has the bank refused at bind.
     activation_divisor = None
     if request.target.format == "nvfp4" and len(request.inputs) > 1:
+        # Weight-only exports may expose the callable but omit the tensor. Skip the
+        # absent divisor instead of treating None as an FP32 word.
         words = [
-            item.source.input_divisor()
+            word
             for item in request.inputs
             if item.source.input_divisor is not None
+            for word in (item.source.input_divisor(),)
+            if word is not None
         ]
         if words:
             activation_divisor = min(

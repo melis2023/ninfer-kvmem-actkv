@@ -171,6 +171,17 @@ def compressed_matrix_source(
             values = values * scales / struct.unpack("<f", words.weight_divisor)[0]
         return values.reshape(-1)[begin - first * k : end - first * k]
 
+    def input_divisor() -> bytes | None:
+        # Weight-only NVFP4 (A16) checkpoints need no activation divisor, and some
+        # compressed-tensors exports omit input_global_scale entirely. Only an
+        # A4/A8 route, which import_encoded checks separately, requires one.
+        if format != "nvfp4":
+            return None
+        _, _, input_name, reciprocal = nvfp4_names()
+        if not store.has(f"{prefix}.{input_name}"):
+            return None
+        return divisor(input_name, reciprocal)
+
     return LogicalSource(
         shape,
         f"{store.path}:{prefix} ({format})",
@@ -179,9 +190,7 @@ def compressed_matrix_source(
         (lambda: divisor(nvfp4_names()[1], nvfp4_names()[3]))
         if format == "nvfp4"
         else None,
-        (lambda: divisor(nvfp4_names()[2], nvfp4_names()[3]))
-        if format == "nvfp4"
-        else None,
+        input_divisor,
     )
 
 

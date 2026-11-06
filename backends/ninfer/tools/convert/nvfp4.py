@@ -29,7 +29,14 @@ def nvfp4_maxabs(request):
     n, k = request.target.shape
     if n % 128 or k % 64:
         raise ValueError('NVFP4 matrix requires N % 128 == 0 and K % 64 == 0')
-    if any(policy != 'A16Only' for policy in request.policies.values()):
+    # ``policies`` carries the whole recipe's use table. Only this matrix's inputs
+    # decide whether the weight-only route applies; other components may legitimately
+    # keep A8/A4 policies.
+    if any(
+        request.policies[key] != 'A16Only'
+        for item in request.inputs
+        for key in item.uses
+    ):
         raise ValueError('nvfp4_maxabs is weight-only; use A16Only')
     chunk = max(128, request.rows_per_chunk // 128 * 128)
     maximum = 0.
