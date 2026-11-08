@@ -37,6 +37,25 @@ void dspine_bridge_finish(const Tensor& raw, const Tensor& delta, const Tensor& 
                           const Tensor& next_norm, std::int32_t block_size, std::int32_t batch,
                           float eps, Tensor& out, Tensor& normed, cudaStream_t stream);
 
+// `out [R,H] = norm[h] * write[last_layer][h,r]`, ready as a [H,R] linear weight.
+void dspine_write_scaled(const Tensor& write, const Tensor& norm, std::int32_t layer,
+                         Tensor& out, cudaStream_t stream);
+
+// Stable top-16 over each column of a BF16 logits matrix. `logits` is consumed in place.
+void dspine_top16(Tensor& logits, Tensor& ids, std::int32_t valid_rows, cudaStream_t stream);
+
+// Serial last-write refinement over the proposal rows.
+// cand_ids [16,rows,batch] rank-fastest, rms [width,batch], raw [H,width,batch],
+// q [rank,width,batch], anchors [batch], write_scaled [R,H], head_rows [H,columns],
+// norm [H]. message [rank,columns] and delta [H,columns] are transient.
+// scratch is FP32 [2*rank,columns]. drafts is I32 [rows,batch].
+void dspine_refine(const Tensor& cand_ids, const Tensor& rms, const Tensor& raw, const Tensor& q,
+                   const Tensor& anchors, const Tensor& codebook, const Tensor& predecessor_gate,
+                   const Tensor& prev, const Tensor& gate_bias, const Tensor& write_scaled,
+                   const Tensor& head_rows, const Tensor& norm, std::int32_t width,
+                   std::int32_t batch, Tensor& message, Tensor& delta, Tensor& scratch,
+                   Tensor& drafts, cudaStream_t stream);
+
 // Causal block attention over the sliding context plus the current proposal block.
 // q [D,Hq,width,batch], k/v [D,Hkv,width,batch], context K/V
 // [D,padded,Hkv,lanes], positions [width,batch], valid_columns/lanes [batch].

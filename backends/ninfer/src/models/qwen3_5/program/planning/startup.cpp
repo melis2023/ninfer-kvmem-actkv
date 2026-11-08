@@ -1004,6 +1004,16 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
                                        ? parameters.proposal->head
                                        : parameters.draft->output_head;
                 linear_scratch(layout, head, proposal_drafts * batch, proposal_drafts * batch);
+                if (draft->dspine && parameters.draft->dspine_bridge) {
+                    const auto hidden = dimension(config.hidden_size);
+                    const auto rank   = static_cast<std::int32_t>(draft->dspine->rank);
+                    const auto refinement_columns = 16 * proposal_drafts * batch;
+                    matrix(layout, DType::I32, 16, proposal_drafts * batch);
+                    matrix(layout, DType::BF16, hidden, refinement_columns);
+                    matrix(layout, DType::BF16, rank, refinement_columns);
+                    matrix(layout, DType::FP32, hidden, refinement_columns);
+                    matrix(layout, DType::FP32, 2 * rank, refinement_columns);
+                }
                 return finish(layout);
             };
 
