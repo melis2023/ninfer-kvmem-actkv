@@ -1,4 +1,4 @@
-#include "ops/linear/bf16/bf16_general.cuh"
+﻿#include "ops/linear/bf16/bf16_general.cuh"
 #include "core/device.h"
 #include "ops/linear/bf16/bf16_dispatch.h"
 
@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <mutex>
 #include <stdexcept>
@@ -115,3 +116,5 @@ void bf16_general_gemm(const Tensor& x, const Weight& weight, Tensor& out, cudaS
 }
 
 } // namespace ninfer::ops::detail
+
+

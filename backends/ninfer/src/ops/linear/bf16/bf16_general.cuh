@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 // General-purpose BF16 x BF16 GEMM fallback for shapes the specialised bf16 linear path does not
 // tile (for example a full-precision vocab projection kept as BF16 by a QAT checkpoint), and for
@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdio>
 
 namespace ninfer::ops::detail {
 
@@ -151,3 +152,4 @@ __global__ void __launch_bounds__(kGemvWarps * 32)
 }
 
 } // namespace ninfer::ops::detail
+

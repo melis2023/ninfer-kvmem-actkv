@@ -637,6 +637,17 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                                 {dimension(config.attention.query_width()), columns}),
                             weight.output, projected, state.execution.work,
                             state.execution.device.stream);
+                    if (const char* dump = std::getenv("NINFER_DSPINE_DUMP");
+                        dump != nullptr && layer == 0) {
+                        const auto& w = weight.output.weight;
+                        std::fprintf(stderr, "[dspine-q] payload=%p qdata=%p\n", w.payload,
+                                     w.qdata);
+                        Tensor qdata(const_cast<void*>(w.qdata), DType::BF16, {w.k, w.n});
+                        dump_tensor(qdata, dump, "o_proj_qdata",
+                                    state.execution.device.stream);
+                        dump_tensor(projected, dump, "attention_projected",
+                                    state.execution.device.stream);
+                    }
                     ops::residual_add(projected, residual, state.execution.device.stream);
                 } else {
                     project_add(
