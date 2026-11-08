@@ -456,6 +456,13 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                                          static_cast<std::uint64_t>(k + 1U) * batch_size);
         propose_dflash2_batch(state, frame, batch_size, k, envelopes);
     } else {
+        // The verify kernel only admits the proposals its extent publishes; leaving this at
+        // zero verifies the anchor alone and never accepts a draft token.
+        std::array<std::int32_t, kMaximumConcurrency> extents{};
+        extents.fill(static_cast<std::int32_t>(k));
+        CUDA_CHECK(cudaMemcpyAsync(frame.proposal_extents.data, extents.data(),
+                                   static_cast<std::size_t>(batch_size) * sizeof(std::int32_t),
+                                   cudaMemcpyHostToDevice, state.execution.device.stream));
         const auto& target         = state.execution.parameters.model.config().text;
         const auto& config         = *state.execution.parameters.model.config().draft;
         const std::int32_t width   = static_cast<std::int32_t>(k) + 1;
@@ -976,6 +983,13 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                     .feature_sink    = &sink,
                 },
                 target_envelope);
+        }
+        if (const char* dump = std::getenv("NINFER_DSPINE_DUMP"); dump != nullptr) {
+            const auto stream = state.execution.device.stream;
+            dump_tensor(verify_ids, dump, "verify_ids", stream);
+            dump_tensor(target_tokens, dump, "target_argmax", stream);
+            dump_tensor(drafts, dump, "drafts", stream);
+            dump_tensor(accepted, dump, "accepted", stream);
         }
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    sizeof(qwen3_5::DFlashDecodeEgress), cudaMemcpyDeviceToHost,
