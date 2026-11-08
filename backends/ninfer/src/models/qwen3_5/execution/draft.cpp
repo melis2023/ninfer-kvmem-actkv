@@ -599,14 +599,21 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                                 1.0 / std::sqrt(double(config.attention.head_dim))),
                             attention_batch, state.execution.device.stream);
                         if (const char* dump = std::getenv("NINFER_DSPINE_DUMP");
-                            dump != nullptr && layer == 0) {
+                            dump != nullptr) {
                             const auto stream = state.execution.device.stream;
-                            dump_tensor(query_batch, dump, "attention_query", stream);
-                            dump_tensor(key_batch, dump, "attention_key", stream);
-                            dump_tensor(value_batch, dump, "attention_value", stream);
-                            dump_tensor(attention_batch, dump, "attention_out", stream);
-                            dump_tensor(local.k, dump, "attention_context_k", stream);
-                            dump_tensor(local.v, dump, "attention_context_v", stream);
+                            const auto prefix = "layer" + std::to_string(layer) + "_";
+                            dump_tensor(query_batch, dump, (prefix + "attention_query").c_str(),
+                                        stream);
+                            dump_tensor(key_batch, dump, (prefix + "attention_key").c_str(),
+                                        stream);
+                            dump_tensor(value_batch, dump, (prefix + "attention_value").c_str(),
+                                        stream);
+                            dump_tensor(attention_batch, dump, (prefix + "attention_out").c_str(),
+                                        stream);
+                            dump_tensor(local.k, dump, (prefix + "attention_context_k").c_str(),
+                                        stream);
+                            dump_tensor(local.v, dump, (prefix + "attention_context_v").c_str(),
+                                        stream);
                         }
                     } else {
                         ops::sliding_window_attention(
