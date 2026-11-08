@@ -496,17 +496,30 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                     {dimension(config.attention.head_dim),
                      dimension(config.attention.num_attention_heads), width, batch_size});
                 if (config.layer_types[layer] == DraftAttentionKind::SlidingAttention) {
-                    ops::sliding_window_attention(
-                        query_batch, key_batch, value_batch, positions, valid_columns,
-                        state_destinations, Tensor{},
-                        {dimension(config.attention.head_dim),
-                         dimension(config.attention.num_attention_heads),
-                         dimension(config.attention.num_key_value_heads)},
-                        dimension(config.sliding_window.value_or(0)),
-                        static_cast<float>(1.0 / std::sqrt(double(config.attention.head_dim))),
-                        dflash_state(state).local_layer(config.compact_layer_index(layer)),
-                        envelopes.local, state.execution.work, attention_batch,
-                        state.execution.device.stream);
+                    const auto local =
+                        dflash_state(state).local_layer(config.compact_layer_index(layer));
+                    if (config.dspine) {
+                        ops::dspine_causal_attention(
+                            query_batch, key_batch, value_batch, positions, valid_columns,
+                            state_destinations, local.k, local.v,
+                            static_cast<std::int32_t>(local.capacity),
+                            static_cast<std::int32_t>(local.padded_capacity),
+                            static_cast<float>(
+                                1.0 / std::sqrt(double(config.attention.head_dim))),
+                            attention_batch, state.execution.device.stream);
+                    } else {
+                        ops::sliding_window_attention(
+                            query_batch, key_batch, value_batch, positions, valid_columns,
+                            state_destinations, Tensor{},
+                            {dimension(config.attention.head_dim),
+                             dimension(config.attention.num_attention_heads),
+                             dimension(config.attention.num_key_value_heads)},
+                            dimension(config.sliding_window.value_or(0)),
+                            static_cast<float>(
+                                1.0 / std::sqrt(double(config.attention.head_dim))),
+                            local, envelopes.local, state.execution.work, attention_batch,
+                            state.execution.device.stream);
+                    }
                 } else {
                     ops::context_softmax_attention(
                         query_batch, key_batch, value_batch, frontiers, valid_columns, full_rows,

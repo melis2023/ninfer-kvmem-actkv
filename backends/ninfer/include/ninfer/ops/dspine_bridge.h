@@ -37,4 +37,14 @@ void dspine_bridge_finish(const Tensor& raw, const Tensor& delta, const Tensor& 
                           const Tensor& next_norm, std::int32_t block_size, std::int32_t batch,
                           float eps, Tensor& out, Tensor& normed, cudaStream_t stream);
 
+// Causal block attention over the sliding context plus the current proposal block.
+// q [D,Hq,width,batch], k/v [D,Hkv,width,batch], context K/V
+// [D,padded,Hkv,lanes], positions [width,batch], valid_columns/lanes [batch].
+void dspine_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                             const Tensor& positions, const Tensor& valid_columns,
+                             const Tensor& lanes, const Tensor& context_k,
+                             const Tensor& context_v, std::int32_t capacity,
+                             std::int32_t padded_capacity, float scale, Tensor& out,
+                             cudaStream_t stream);
+
 } // namespace ninfer::ops

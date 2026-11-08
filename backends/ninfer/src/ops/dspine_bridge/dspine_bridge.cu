@@ -190,6 +190,72 @@ __global__ void dspine_bridge_finish_kernel(const __nv_bfloat16* raw,
     }
 }
 
+constexpr int kDSpineHeadDim = 128;
+constexpr int kDSpineQueryHeads = 32;
+constexpr int kDSpineKvHeads = 8;
+
+__device__ __forceinline__ float block_sum_broadcast(float value) {
+    __shared__ float total;
+    const float sum = block_sum(value);
+    if (threadIdx.x == 0) { total = sum; }
+    __syncthreads();
+    return total;
+}
+
+__global__ void dspine_causal_attention_kernel(
+    const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
+    const std::int32_t* positions, const std::int32_t* valid_columns,
+    const std::int32_t* lanes, const __nv_bfloat16* context_k,
+    const __nv_bfloat16* context_v, int capacity, int padded, int width, int batch,
+    float scale, __nv_bfloat16* out) {
+    const int block = static_cast<int>(blockIdx.x);
+    const int w     = block % width;
+    const int rest  = block / width;
+    const int b     = rest % batch;
+    const int head  = rest / batch;
+    const int dim   = static_cast<int>(threadIdx.x);
+    const int kv_head = head / (kDSpineQueryHeads / kDSpineKvHeads);
+    // All proposal rows share the same context frontier: positions[0, b]. The
+    // ring holds context only; proposal K/V is the block below.
+    const int frontier = positions[b];
+    const int end      = min(frontier, capacity);
+    const int begin    = max(0, frontier - capacity);
+    const std::int64_t q_index =
+        dim + static_cast<std::int64_t>(kDSpineHeadDim) *
+                  (head + kDSpineQueryHeads * (w + width * b));
+    const float qv = __bfloat162float(q[q_index]);
+    float m = -INFINITY;
+    float l = 0.0f;
+    float acc = 0.0f;
+    const auto add_key = [&](const __nv_bfloat16* key, const __nv_bfloat16* value,
+                             std::int64_t key_index, std::int64_t value_index) {
+        const float score = block_sum_broadcast(
+            qv * __bfloat162float(key[key_index])) * scale;
+        const float m_new = fmaxf(m, score);
+        const float e     = expf(score - m_new);
+        const float scale_old = expf(m - m_new);
+        l   = l * scale_old + e;
+        acc = acc * scale_old + e * __bfloat162float(value[value_index]);
+        m   = m_new;
+    };
+    const std::int64_t lane_base =
+        static_cast<std::int64_t>(lanes[b]) * kDSpineHeadDim * padded * kDSpineKvHeads;
+    for (int p = begin; p < end; ++p) {
+        const int slot = p & (capacity - 1);
+        const std::int64_t base = lane_base +
+            static_cast<std::int64_t>(kDSpineHeadDim) * slot +
+            static_cast<std::int64_t>(kDSpineHeadDim) * padded * kv_head;
+        add_key(context_k, context_v, base + dim, base + dim);
+    }
+    for (int j = 0; j <= w; ++j) {
+        const std::int64_t base =
+            static_cast<std::int64_t>(kDSpineHeadDim) *
+            (kv_head + kDSpineKvHeads * (j + width * b));
+        add_key(k, v, base + dim, base + dim);
+    }
+    out[q_index] = __float2bfloat16(acc / l);
+}
+
 void require_bf16(const Tensor& tensor, const char* name) {
     if (tensor.dtype != DType::BF16 || tensor.data == nullptr || !tensor.is_contiguous()) {
         throw std::invalid_argument(std::string("dspine_bridge: invalid ") + name);
@@ -330,6 +396,47 @@ void dspine_bridge_finish(const Tensor& raw, const Tensor& delta, const Tensor& 
         static_cast<const __nv_bfloat16*>(next_norm.data), h, t, block_size, batch, eps,
         static_cast<__nv_bfloat16*>(out.data),
         static_cast<__nv_bfloat16*>(normed.data));
+}
+
+void dspine_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
+                             const Tensor& positions, const Tensor& valid_columns,
+                             const Tensor& lanes, const Tensor& context_k,
+                             const Tensor& context_v, std::int32_t capacity,
+                             std::int32_t padded_capacity, float scale, Tensor& out,
+                             cudaStream_t stream) {
+    require_bf16(q, "q");
+    require_bf16(k, "k");
+    require_bf16(v, "v");
+    require_bf16(context_k, "context_k");
+    require_bf16(context_v, "context_v");
+    require_bf16(out, "out");
+    const int width = q.ne[2];
+    const int batch = q.ne[3];
+    if (q.ne[0] != kDSpineHeadDim || q.ne[1] != kDSpineQueryHeads || k.ne[0] != kDSpineHeadDim ||
+        k.ne[1] != kDSpineKvHeads || k.ne[2] != width || k.ne[3] != batch ||
+        v.ne[0] != kDSpineHeadDim || v.ne[1] != kDSpineKvHeads || v.ne[2] != width ||
+        v.ne[3] != batch || context_k.ne[0] != kDSpineHeadDim ||
+        context_k.ne[1] != padded_capacity || context_k.ne[2] != kDSpineKvHeads ||
+        context_v.ne[0] != kDSpineHeadDim || context_v.ne[1] != padded_capacity ||
+        context_v.ne[2] != kDSpineKvHeads || out.ne[0] != kDSpineHeadDim ||
+        out.ne[1] != kDSpineQueryHeads || out.ne[2] != width || out.ne[3] != batch ||
+        positions.dtype != DType::I32 || valid_columns.dtype != DType::I32 ||
+        lanes.dtype != DType::I32 || positions.ne[0] != width || positions.ne[1] != batch ||
+        valid_columns.ne[0] != batch || lanes.ne[0] != batch || capacity <= 0 ||
+        (capacity & (capacity - 1)) != 0) {
+        throw std::invalid_argument("dspine_causal_attention: invalid geometry");
+    }
+    const int grid = width * batch * kDSpineQueryHeads;
+    dspine_causal_attention_kernel<<<grid, kDSpineHeadDim, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(q.data),
+        static_cast<const __nv_bfloat16*>(k.data),
+        static_cast<const __nv_bfloat16*>(v.data),
+        static_cast<const std::int32_t*>(positions.data),
+        static_cast<const std::int32_t*>(valid_columns.data),
+        static_cast<const std::int32_t*>(lanes.data),
+        static_cast<const __nv_bfloat16*>(context_k.data),
+        static_cast<const __nv_bfloat16*>(context_v.data), capacity, padded_capacity, width,
+        batch, scale, static_cast<__nv_bfloat16*>(out.data));
 }
 
 } // namespace ninfer::ops
