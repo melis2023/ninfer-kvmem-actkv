@@ -37,6 +37,11 @@ def configure(model, recipe, sources):
         if name.endswith("/attention/output"):
             recipe.assign(name, format="bf16", method=cast_direct)
             continue
+        # The target-feature projection feeds every draft layer's context K/V.
+        # Q4 there rotates the context by ~34 degrees; keep it wide.
+        if name.endswith("/feature_projection"):
+            recipe.assign(name, format=Q8, method=grouped_search)
+            continue
         if parameter.projection:
             recipe.assign(name, format=Q4, method=grouped_search)
         else:
