@@ -45,8 +45,7 @@ DraftWeights bind_draft(Bindings& b, const DraftConfig& config, const TextConfig
         const auto p      = component + "/selected_prefix_bridge/";
         DSpineBridgeWeights bridge;
         bridge.codebook = b.direct(p + "codebook",
-                                   {target.vocab_size, extra.code_size},
-                                   QType::Q8_G32_FP16);
+                                   {target.vocab_size, extra.code_size}, QType::BF16);
         bridge.early_read_weights = b.direct(
             p + "early_read_weights", {extra.first_exact, extra.code_size, h});
         bridge.feature_write_weights = b.direct(

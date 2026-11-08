@@ -168,11 +168,18 @@ struct SelectorParameters {
     Tensor predecessor_codebook, successor_codebook;
 };
 
+struct DSpineBridgeParameters {
+    Tensor gate_weight, predecessor_gate_weight, prev_weight;
+    Tensor early_read_weights, read_weight;
+    Tensor feature_write_weights, codebook, gate_bias;
+};
+
 struct DraftParameters {
     LinearParameters feature_projection;
     Tensor context_norm, final_norm;
     std::vector<DraftBlockParameters> layers;
     std::optional<SelectorParameters> selector;
+    std::optional<DSpineBridgeParameters> dspine_bridge;
     LinearParameters output_head;
 };
 

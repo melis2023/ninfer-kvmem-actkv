@@ -16,10 +16,9 @@ def configure(model, recipe, sources):
         if not name.startswith("dflash/"):
             continue
         if "/selected_prefix_bridge/" in name:
-            if name.endswith("/codebook"):
-                recipe.assign(name, format=Q8, method=grouped_search)
-            else:
-                recipe.assign(name, format="bf16", method=cast_direct)
+            # The bridge codebook is a row lookup, not a GEMM weight; keep it BF16 so
+            # the execution path can read it as a contiguous tensor.
+            recipe.assign(name, format="bf16", method=cast_direct)
             continue
         # The fused attention input projection admits Q8, not Q4. DFlash2 keeps
         # QKV at Q8 for the same reason; DSpine reuses that route.

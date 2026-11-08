@@ -11,6 +11,7 @@
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "ninfer/ops/context_kv_materialize.h"
+#include "ninfer/ops/dspine_bridge.h"
 #include "ninfer/ops/rmsnorm_rope.h"
 #include "ninfer/ops/rmsnorm_pack_tail.h"
 #include "ninfer/ops/linear_topk.h"
@@ -430,6 +431,13 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
         embed_tokens(ids.view({columns}), state.execution.parameters.text.token_embedding,
                      state.execution.parameters.text.token_embedding_signs, residual,
                      state.execution.device.stream);
+        Tensor layer_input =
+            state.execution.work.alloc(DType::BF16, {dimension(target.hidden_size), columns});
+        if (config.dspine) {
+            ops::rmsnorm(
+                residual, state.execution.parameters.draft->layers.front().input_norm,
+                config.rms_norm_eps, false, layer_input, state.execution.device.stream);
+        }
 
         for (int layer = 0; layer < dimension(config.num_hidden_layers); ++layer) {
             nvtx::ScopedRange layer_range(nvtx::Name::DFlashLayer, nvtx::Category::DFlash,
@@ -443,8 +451,11 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                 auto attention_scope = state.execution.work.scope();
                 auto roots =
                     workspace::dflash_attention(state.execution.work, target, config, columns);
-                ops::rmsnorm(residual, weight.input_norm, config.rms_norm_eps, false, roots.hidden,
-                             state.execution.device.stream);
+                if (!config.dspine) {
+                    ops::rmsnorm(residual, weight.input_norm, config.rms_norm_eps, false,
+                                 roots.hidden, state.execution.device.stream);
+                }
+                const Tensor& attention_input = config.dspine ? layer_input : roots.hidden;
                 Tensor query_raw = roots.query_raw.view(
                     {dimension(config.attention.head_dim),
                      dimension(config.attention.num_attention_heads), columns});
@@ -458,7 +469,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                     query_raw.view({dimension(config.attention.query_width()), columns});
                 Tensor key_flat = key_raw.view({dimension(config.attention.key_width()), columns});
                 Tensor value_flat = value.view({dimension(config.attention.key_width()), columns});
-                ops::attn_input_proj(roots.hidden, weight.query_key_value.weight, query_flat,
+                ops::attn_input_proj(attention_input, weight.query_key_value.weight, query_flat,
                                      key_flat, value_flat, state.execution.device.stream);
                 Tensor query =
                     roots.query.view({dimension(config.attention.head_dim),
@@ -539,6 +550,56 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                 project_add(roots.intermediate, weight.mlp.down, residual, state.execution.work,
                             state.execution.device.stream);
             }
+            if (config.dspine) {
+                const auto& bridge = *state.execution.parameters.draft->dspine_bridge;
+                const auto& extra  = *config.dspine;
+                const std::int32_t hidden = dimension(target.hidden_size);
+                const std::int32_t code_size = static_cast<std::int32_t>(extra.code_size);
+                const std::int32_t rank      = static_cast<std::int32_t>(extra.rank);
+                Tensor raw = state.execution.work.alloc(DType::BF16, {hidden, columns});
+                Tensor normalized = state.execution.work.alloc(DType::BF16, {hidden, columns});
+                Tensor rms        = state.execution.work.alloc(DType::FP32, {columns});
+                Tensor projected =
+                    state.execution.work.alloc(DType::BF16, {code_size, columns});
+                Tensor codes = state.execution.work.alloc(DType::BF16, {code_size, columns});
+                Tensor q       = state.execution.work.alloc(DType::BF16, {rank, columns});
+                Tensor s       = state.execution.work.alloc(DType::BF16, {rank, columns});
+                Tensor v       = state.execution.work.alloc(DType::BF16, {rank, columns});
+                Tensor message = state.execution.work.alloc(DType::BF16, {rank, columns});
+                Tensor delta   = state.execution.work.alloc(DType::BF16, {hidden, columns});
+                Tensor out     = state.execution.work.alloc(DType::BF16, {hidden, columns});
+                Tensor normed  = state.execution.work.alloc(DType::BF16, {hidden, columns});
+                ops::dspine_bridge_read(residual, nullptr, config.rms_norm_eps, raw, normalized,
+                                        rms, state.execution.device.stream);
+                ops::dspine_bridge_read_proj(
+                    normalized, bridge.early_read_weights, bridge.read_weight, layer, projected,
+                    state.execution.device.stream);
+                ops::dspine_bridge_codes(
+                    projected, bridge.codebook, anchors, width, batch_size,
+                    static_cast<float>(std::sqrt(double(code_size))), config.rms_norm_eps, codes,
+                    state.execution.device.stream);
+                ops::dspine_bridge_linear(codes, bridge.gate_weight, q,
+                                          state.execution.device.stream);
+                ops::dspine_bridge_linear(codes, bridge.predecessor_gate_weight, s,
+                                          state.execution.device.stream);
+                ops::dspine_bridge_linear(codes, bridge.prev_weight, v,
+                                          state.execution.device.stream);
+                ops::dspine_bridge_message(q, s, v, bridge.gate_bias, width, batch_size, message,
+                                           state.execution.device.stream);
+                ops::dspine_bridge_write(message, bridge.feature_write_weights, layer, delta,
+                                         state.execution.device.stream);
+                const Tensor& next_norm =
+                    layer + 1 < dimension(config.num_hidden_layers)
+                        ? state.execution.parameters.draft
+                              ->layers[static_cast<std::size_t>(layer + 1)]
+                              .input_norm
+                        : state.execution.parameters.draft->final_norm;
+                ops::dspine_bridge_finish(raw, delta, rms, next_norm, width, batch_size,
+                                          config.rms_norm_eps, out, normed,
+                                          state.execution.device.stream);
+                residual = out;
+                layer_input = normed;
+            }
         }
 
         Tensor packed =
@@ -549,17 +610,24 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                                       static_cast<std::size_t>(k) * element_bytes;
         const std::size_t source_pitch =
             static_cast<std::size_t>(dimension(target.hidden_size)) * width * element_bytes;
+        const Tensor& final_hidden = config.dspine ? layer_input : residual;
         const auto* source =
-            static_cast<const std::byte*>(residual.data) +
+            static_cast<const std::byte*>(final_hidden.data) +
             static_cast<std::size_t>(dimension(target.hidden_size)) * element_bytes;
         CUDA_CHECK(cudaMemcpy2DAsync(packed.data, row_bytes, source, source_pitch, row_bytes,
                                      static_cast<std::size_t>(batch_size), cudaMemcpyDeviceToDevice,
                                      state.execution.device.stream));
         Tensor proposal_hidden =
-            state.execution.work.alloc(DType::BF16, {dimension(target.hidden_size),
-                                                     static_cast<std::int32_t>(k) * batch_size});
-        ops::rmsnorm(packed, state.execution.parameters.draft->final_norm, config.rms_norm_eps,
-                     false, proposal_hidden, state.execution.device.stream);
+            config.dspine
+                ? packed
+                : state.execution.work.alloc(DType::BF16,
+                                             {dimension(target.hidden_size),
+                                              static_cast<std::int32_t>(k) * batch_size});
+        if (!config.dspine) {
+            ops::rmsnorm(packed, state.execution.parameters.draft->final_norm,
+                         config.rms_norm_eps, false, proposal_hidden,
+                         state.execution.device.stream);
+        }
         Tensor flat_drafts = drafts.view({static_cast<std::int32_t>(k) * batch_size});
         if (state.execution.proposal_head == ProposalHead::Full) {
             Tensor logits = state.execution.work.alloc(

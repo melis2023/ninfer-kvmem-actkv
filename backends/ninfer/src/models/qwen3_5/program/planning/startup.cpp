@@ -972,6 +972,24 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
                     for (const auto& block : parameters.draft->layers) {
                         add_scratch(layout, block.mlp.down, tokens, tokens);
                     }
+                    if (draft->dspine && parameters.draft->dspine_bridge) {
+                        const auto& bridge = *parameters.draft->dspine_bridge;
+                        const auto hidden = dimension(config.hidden_size);
+                        const auto code   = static_cast<std::int32_t>(draft->dspine->code_size);
+                        const auto rank   = static_cast<std::int32_t>(draft->dspine->rank);
+                        matrix(layout, DType::BF16, hidden, tokens);
+                        matrix(layout, DType::BF16, hidden, tokens);
+                        matrix(layout, DType::FP32, 1, tokens);
+                        matrix(layout, DType::BF16, code, tokens);
+                        matrix(layout, DType::BF16, code, tokens);
+                        matrix(layout, DType::BF16, rank, tokens);
+                        matrix(layout, DType::BF16, rank, tokens);
+                        matrix(layout, DType::BF16, rank, tokens);
+                        matrix(layout, DType::BF16, rank, tokens);
+                        matrix(layout, DType::BF16, hidden, tokens);
+                        matrix(layout, DType::BF16, hidden, tokens);
+                        matrix(layout, DType::BF16, hidden, tokens);
+                    }
                 }
                 matrix(layout, DType::BF16, dimension(config.hidden_size), proposal_drafts * batch);
                 matrix(layout, DType::BF16, dimension(config.hidden_size), proposal_drafts * batch);
