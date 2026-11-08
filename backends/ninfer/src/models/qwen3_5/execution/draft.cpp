@@ -500,6 +500,9 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
         embed_tokens(ids.view({columns}), state.execution.parameters.text.token_embedding,
                      state.execution.parameters.text.token_embedding_signs, residual,
                      state.execution.device.stream);
+        if (const char* dump = std::getenv("NINFER_DSPINE_DUMP"); dump != nullptr) {
+            dump_tensor(residual, dump, "embed_residual", state.execution.device.stream);
+        }
         Tensor layer_input =
             state.execution.work.alloc(DType::BF16, {dimension(target.hidden_size), columns});
         if (config.dspine) {
@@ -626,11 +629,14 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                     // update the residual explicitly until a 4096 fused route exists.
                     Tensor projected = state.execution.work.alloc(
                         DType::BF16, {dimension(target.hidden_size), columns});
-                    ops::linear(
-                        roots.attention.view(
-                            {dimension(config.attention.query_width()), columns}),
-                        weight.output.weight, projected, ops::LinearPolicy::A16Only,
-                        state.execution.work, state.execution.device.stream);
+                    // Use project(), not raw ops::linear: the bound output projection may
+                    // carry Hadamard signs, and only project() rotates the activation.
+                    // Use project(), not raw ops::linear: the bound output projection
+                    // owns the route policy for this exact shape.
+                    project(roots.attention.view(
+                                {dimension(config.attention.query_width()), columns}),
+                            weight.output, projected, state.execution.work,
+                            state.execution.device.stream);
                     ops::residual_add(projected, residual, state.execution.device.stream);
                 } else {
                     project_add(
@@ -645,6 +651,10 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                                             static_cast<std::uint64_t>(layer));
                 auto mlp_scope = state.execution.work.scope();
                 auto roots = workspace::dflash_mlp(state.execution.work, target, config, columns);
+                if (const char* dump = std::getenv("NINFER_DSPINE_DUMP"); dump != nullptr) {
+                    const auto prefix = "layer" + std::to_string(layer) + "_h";
+                    dump_tensor(residual, dump, prefix.c_str(), state.execution.device.stream);
+                }
                 ops::rmsnorm(residual, weight.post_attention_norm, config.rms_norm_eps, false,
                              roots.hidden, state.execution.device.stream);
                 project_swiglu(roots.hidden, weight.mlp.gate_up, roots.intermediate,
