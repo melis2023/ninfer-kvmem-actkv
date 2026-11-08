@@ -879,7 +879,9 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         Tensor context_starts     = frame.context_frontiers.slice(0, 0, batch_size);
         Tensor draft_frontiers    = frame.draft_frontiers.slice(0, 0, batch_size);
         Tensor extents            = frame.proposal_extents.slice(0, 0, batch_size);
-        Tensor valid_columns      = frame.target_valid_columns.slice(0, 0, batch_size);
+        // The verify round consumes width tokens; target_valid_columns is the round's newly
+        // committed count and would mask every draft row after the anchor.
+        Tensor valid_columns      = frame.proposal_valid_columns.slice(0, 0, batch_size);
         Tensor target_rope        = frame.target_rope_positions.slice(1, 0, batch_size);
         Tensor text_rows          = frame.text_kv_table_rows.slice(0, 0, batch_size);
         Tensor dflash_rows        = frame.dflash_kv_table_rows.slice(0, 0, batch_size);
@@ -906,6 +908,10 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         ops::prepare_ragged_prefix(dflash_state(state).pending_features, active_lanes,
                                    context_starts, draft_frontiers, compact_features, append_positions,
                                    append_counts, state.execution.device.stream);
+        if (const char* dump = std::getenv("NINFER_DSPINE_DUMP"); dump != nullptr) {
+            dump_tensor(compact_features, dump, "compact_features",
+                        state.execution.device.stream);
+        }
         append_context_impl(state, compact_features, append_positions, append_counts,
                             state_destinations, dflash_rows,
                             {0, static_cast<std::uint32_t>(frame.append_positions.ne[0])});

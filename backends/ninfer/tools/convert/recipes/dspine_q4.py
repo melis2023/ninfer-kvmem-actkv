@@ -1,4 +1,4 @@
-"""Quantize the DSpine draft body to Q4 and keep its bridge in high precision.
+﻿"""Quantize the DSpine draft body to Q4 and keep its bridge in high precision.
 
 DSpine is a DFlashDraftModel with a block-16 causal proposal and a
 selected-prefix code bridge. The body (fc, QKV, MLP) uses the native
@@ -31,7 +31,7 @@ def configure(model, recipe, sources):
                 "/attention/context_value",
             )
         ):
-            recipe.assign(name, format=Q8, method=grouped_search)
+            recipe.assign(name, format=Q4, method=grouped_search)
             continue
         # q4/q8 linear_add does not admit the 4096-column attention output.
         if name.endswith("/attention/output"):
@@ -41,3 +41,5 @@ def configure(model, recipe, sources):
             recipe.assign(name, format=Q4, method=grouped_search)
         else:
             recipe.assign(name, format="bf16", method=cast_direct)
+
+
