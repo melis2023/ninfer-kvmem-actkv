@@ -349,9 +349,9 @@ __global__ void dspine_refine_kernel(
 #pragma unroll
         for (int jp = 0; jp < kDSpineCandidates; ++jp) { score[jp] = 0.0f; }
         for (int h = 0; h < H; ++h) {
+            // delta already carries norm_w (write_scaled), so only the raw term is scaled.
             const float combined =
-                __bfloat162float(norm[h]) *
-                (__bfloat162float(base[h]) + rm * delta_column[h]);
+                __bfloat162float(norm[h]) * __bfloat162float(base[h]) + rm * delta_column[h];
 #pragma unroll
             for (int jp = 0; jp < kDSpineCandidates; ++jp) {
                 score[jp] += combined * __bfloat162float(

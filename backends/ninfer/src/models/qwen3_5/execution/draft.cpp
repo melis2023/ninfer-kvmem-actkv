@@ -97,6 +97,9 @@ DFlashFeatureSink batch_feature_sink_impl(DFlashBatchContext& state, const Tenso
     }
 }
 
+void dump_tensor(const Tensor& tensor, const char* directory, const char* name,
+                 cudaStream_t stream);
+
 template <class Context>
 void append_context_impl(Context& state, const Tensor& features, const Tensor& positions,
                          const Tensor& commit_counts, const Tensor& lanes, const Tensor& table_rows,
@@ -162,6 +165,12 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 state.execution.work, state.execution.device.stream);
         ops::rmsnorm(projected, state.execution.parameters.draft->context_norm, config.rms_norm_eps,
                      false, context, state.execution.device.stream);
+        if (const char* dump = std::getenv("NINFER_DSPINE_DUMP"); dump != nullptr) {
+            dump_tensor(projected, dump, "context_projected",
+                        state.execution.device.stream);
+            dump_tensor(context, dump, "context_normalized",
+                        state.execution.device.stream);
+        }
 
         if (config.dflash2 &&
             dflash_state(state).local_layer(0).storage == KvCacheStorage::BFloat16) {
@@ -815,6 +824,14 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                     state.execution.work.alloc(DType::FP32, {hidden, candidate_columns});
                 Tensor scratch =
                     state.execution.work.alloc(DType::FP32, {2 * rank, candidate_columns});
+                if (const char* dump = std::getenv("NINFER_DSPINE_DUMP"); dump != nullptr) {
+                    const auto stream = state.execution.device.stream;
+                    dump_tensor(candidate_ids, dump, "refine_cand_ids", stream);
+                    dump_tensor(head_rows, dump, "refine_head_rows", stream);
+                    dump_tensor(dspine_raw, dump, "refine_raw", stream);
+                    dump_tensor(dspine_rms, dump, "refine_rms", stream);
+                    dump_tensor(dspine_q, dump, "refine_q", stream);
+                }
                 ops::dspine_refine(
                     candidate_ids.view({16, static_cast<std::int32_t>(k), batch_size}),
                     dspine_rms.view({width, batch_size}),
