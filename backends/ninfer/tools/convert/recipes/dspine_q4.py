@@ -31,7 +31,7 @@ def configure(model, recipe, sources):
                 "/attention/context_value",
             )
         ):
-            recipe.assign(name, format=Q4, method=grouped_search)
+            recipe.assign(name, format=Q8, method=grouped_search)
             continue
         # q4/q8 linear_add does not admit the 4096-column attention output.
         if name.endswith("/attention/output"):
@@ -41,5 +41,4 @@ def configure(model, recipe, sources):
             recipe.assign(name, format=Q4, method=grouped_search)
         else:
             recipe.assign(name, format="bf16", method=cast_direct)
-
 
