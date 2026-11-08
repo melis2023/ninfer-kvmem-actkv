@@ -155,7 +155,13 @@ void validate_cyclic_cache(const CyclicKVCacheLayerView& cache,
         cache.padded_capacity >
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         envelope.max_count > cache.capacity) {
-        throw std::invalid_argument("kv_cache_append_prefix: invalid cyclic cache");
+        throw std::invalid_argument(
+            "kv_cache_append_prefix: invalid cyclic cache cap=" +
+            std::to_string(cache.capacity) + " padded=" +
+            std::to_string(cache.padded_capacity) + " kv=" +
+            std::to_string(cache.num_kv_heads) + " head=" +
+            std::to_string(cache.head_dim) + " max=" +
+            std::to_string(envelope.max_count));
     }
     const auto padded = static_cast<std::int32_t>(cache.padded_capacity);
     const DType expected =

@@ -21,6 +21,9 @@ struct KVEntitlementShape {
     std::uint32_t capacity           = 0; // --max-context, each sequence's ceiling
     std::uint32_t draft_window       = 0;
     SpeculativeBackend backend       = SpeculativeBackend::None;
+    // DFlash only allocates a Backend KV pool when the drafter has full-attention
+    // layers. DSpine is all-sliding, so its Backend entitlement must stay zero.
+    bool backend_kv                  = false;
 };
 
 [[nodiscard]] constexpr std::uint32_t kv_pages_for_tokens(std::uint32_t tokens) noexcept {
@@ -38,7 +41,7 @@ kv_page_entitlement(const KVEntitlementShape& shape, std::uint32_t prompt_tokens
     if (shape.backend == SpeculativeBackend::Mtp) {
         out.backend_pages = kv_pages_for_tokens(static_cast<std::uint32_t>(std::min<std::uint64_t>(
             shape.capacity, static_cast<std::uint64_t>(reserved) + shape.draft_window - 1ULL)));
-    } else if (shape.backend == SpeculativeBackend::DFlash) {
+    } else if (shape.backend == SpeculativeBackend::DFlash && shape.backend_kv) {
         out.backend_pages = kv_pages_for_tokens(reserved);
     }
     return out;

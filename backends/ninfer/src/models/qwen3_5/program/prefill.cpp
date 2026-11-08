@@ -736,8 +736,9 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
             speculative_backend == SpeculativeBackend::Mtp
                 ? std::min(capacity,
                            prompt_tokens + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
-            : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
-                                                                : 0U;
+            : speculative_backend == SpeculativeBackend::DFlash && backend_kv_cache()
+                  ? prompt_tokens
+                  : 0U;
         if (!kvmem_window_tokens) {
             ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized);
         }

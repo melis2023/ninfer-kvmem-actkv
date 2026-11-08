@@ -266,7 +266,10 @@ detail::PhysicalResources positive_difference(detail::PhysicalResources value,
 
 KVEntitlementShape ProgramImpl::kv_entitlement_shape() const noexcept {
     return KVEntitlementShape{
-        .capacity = capacity, .draft_window = draft_window, .backend = speculative_backend};
+        .capacity = capacity,
+        .draft_window = draft_window,
+        .backend = speculative_backend,
+        .backend_kv = backend_kv_cache() != nullptr};
 }
 
 std::uint32_t ProgramImpl::concurrent_output_budget(std::uint32_t prompt_tokens) const noexcept {
@@ -471,7 +474,8 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                          widest + std::min(draft_window, qwen3_5::kMtpDecodeMaximumDrafts));
             base->backend_kv_page_entitlement = kv_pages_for_tokens(
                 std::min(capacity, base->summary.prompt_tokens + backend_window_tokens - 1U));
-        } else if (speculative_backend == SpeculativeBackend::DFlash) {
+        } else if (speculative_backend == SpeculativeBackend::DFlash &&
+                   backend_kv_cache() != nullptr) {
             const std::uint32_t backend_window_tokens = std::max(leased_output_tokens, widest + 1U);
             base->backend_kv_page_entitlement         = kv_pages_for_tokens(
                 std::min(capacity, base->summary.prompt_tokens + backend_window_tokens - 1U));

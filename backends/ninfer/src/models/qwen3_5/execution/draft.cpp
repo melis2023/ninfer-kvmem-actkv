@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/graph_execution.h"
 #include "models/qwen3_5/execution/linear.h"
 #include <cmath>
+#include <cstdlib>
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/execution/workspace.h"
@@ -395,7 +396,8 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
 
 void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame,
                         std::int32_t batch_size, std::uint32_t k, DFlashEnvelopes envelopes) {
-    if (state.execution.parameters.model.config().draft->dspine) {
+    if (state.execution.parameters.model.config().draft->dspine &&
+        std::getenv("NINFER_DSPINE_BASELINE") == nullptr) {
         throw std::logic_error(
             "DSpine draft execution is not implemented yet; the weights and config load");
     }

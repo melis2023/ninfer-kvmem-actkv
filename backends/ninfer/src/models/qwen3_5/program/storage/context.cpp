@@ -1513,7 +1513,7 @@ const qwen3_5::PagedKVCache* ProgramImpl::backend_kv_cache() const noexcept {
 
 std::uint32_t ProgramImpl::backend_kv_valid(const SequenceState& sequence) const noexcept {
     if (speculative_backend == SpeculativeBackend::Mtp) { return sequence.mtp_kv_valid; }
-    if (speculative_backend == SpeculativeBackend::DFlash) {
+    if (speculative_backend == SpeculativeBackend::DFlash && backend_kv_cache()) {
         return sequence.dflash_context_frontier;
     }
     return 0;

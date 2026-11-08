@@ -921,8 +921,9 @@ ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction
                            prefill.prompt_tokens + (prefill.initial_mtp_extent == 0
                                                         ? 0U
                                                         : prefill.initial_mtp_extent - 1U))
-            : speculative_backend == SpeculativeBackend::DFlash ? prefill.prompt_tokens
-                                                                : 0U;
+            : speculative_backend == SpeculativeBackend::DFlash && backend_kv_cache()
+                  ? prefill.prompt_tokens
+                  : 0U;
         ensure_sequence_kv_mapped(sequence, prefill.prompt_tokens, backend_materialized);
     }
 
