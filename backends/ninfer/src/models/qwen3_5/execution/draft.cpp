@@ -18,7 +18,9 @@
 #include "ninfer/ops/embedding.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
+#include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/prepare_masked_block.h"
@@ -393,6 +395,10 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
 
 void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame,
                         std::int32_t batch_size, std::uint32_t k, DFlashEnvelopes envelopes) {
+    if (state.execution.parameters.model.config().draft->dspine) {
+        throw std::logic_error(
+            "DSpine draft execution is not implemented yet; the weights and config load");
+    }
     if (state.execution.parameters.model.config().draft->dflash2) {
         nvtx::ScopedRange proposal_range(nvtx::Name::DFlashProposal, nvtx::Category::DFlash,
                                          static_cast<std::uint64_t>(k + 1U) * batch_size);
@@ -499,9 +505,25 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                         envelopes.full, state.execution.work, attention_batch,
                         state.execution.device.stream);
                 }
-                project_add(
-                    roots.attention.view({dimension(config.attention.query_width()), columns}),
-                    weight.output, residual, state.execution.work, state.execution.device.stream);
+                if (config.dspine) {
+                    // DSpine's attention output is 4096 columns; the fused linear_add
+                    // plans only admit 6144/17408. Keep this projection BF16 and
+                    // update the residual explicitly until a 4096 fused route exists.
+                    Tensor projected = state.execution.work.alloc(
+                        DType::BF16, {dimension(target.hidden_size), columns});
+                    ops::linear(
+                        roots.attention.view(
+                            {dimension(config.attention.query_width()), columns}),
+                        weight.output.weight, projected, ops::LinearPolicy::A16Only,
+                        state.execution.work, state.execution.device.stream);
+                    ops::residual_add(projected, residual, state.execution.device.stream);
+                } else {
+                    project_add(
+                        roots.attention.view(
+                            {dimension(config.attention.query_width()), columns}),
+                        weight.output, residual, state.execution.work,
+                        state.execution.device.stream);
+                }
             }
             {
                 nvtx::ScopedRange mlp_range(nvtx::Name::DFlashMlp, nvtx::Category::PostMixer,

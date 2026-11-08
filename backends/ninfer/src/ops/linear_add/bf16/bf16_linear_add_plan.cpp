@@ -4,6 +4,7 @@
 #include "ops/linear_add/bf16/bf16_linear_add_plan.h"
 
 #include <stdexcept>
+#include <string>
 
 namespace ninfer::ops::detail {
 
@@ -15,7 +16,10 @@ bool bf16_linear_add_admits(std::int32_t output_rows, std::int32_t input_rows,
 Bf16LinearAddScheduleId bf16_linear_add_select(std::int32_t output_rows, std::int32_t input_rows,
                                                std::int32_t tokens) {
     if (!bf16_linear_add_admits(output_rows, input_rows, tokens)) {
-        throw std::invalid_argument("bf16 linear_add: unsupported exact problem");
+        throw std::invalid_argument("bf16 linear_add: unsupported exact problem rows=" +
+                                    std::to_string(output_rows) + " k=" +
+                                    std::to_string(input_rows) + " tokens=" +
+                                    std::to_string(tokens));
     }
     if (tokens == 1) { return Bf16LinearAddScheduleId::Decode; }
     if (tokens <= kBf16LinearAddSmallTDispatchEnd) { return Bf16LinearAddScheduleId::SmallT; }

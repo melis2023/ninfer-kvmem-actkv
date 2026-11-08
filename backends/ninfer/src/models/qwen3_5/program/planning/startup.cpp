@@ -948,7 +948,14 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
                                           dimension(draft->attention.num_key_value_heads)},
                                          {0, plan.capacity}, width, width, batch)));
                     for (const auto& block : parameters.draft->layers) {
-                        add_scratch(layout, block.output, tokens, tokens);
+                        if (draft->dspine) {
+                            // DSpine's 4096-column attention output runs as a plain
+                            // linear plus residual add, not the fused linear_add.
+                            matrix(layout, DType::BF16, dimension(config.hidden_size), tokens);
+                            linear_scratch(layout, block.output, tokens, tokens);
+                        } else {
+                            add_scratch(layout, block.output, tokens, tokens);
+                        }
                     }
                 }
                 {

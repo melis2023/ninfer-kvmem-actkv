@@ -178,14 +178,21 @@ def draft_config(raw: dict, target: dict, backend: str) -> dict:
     _fixed(raw, "model_type", "qwen3", backend)
     _fixed(raw, "hidden_act", "silu", backend)
     _fixed(raw, "attention_bias", False, backend)
-    _fixed(raw, "is_causal", False, backend)
+    if backend == "dflash2":
+        _fixed(raw, "is_causal", False, backend)
+    elif type(raw.get("is_causal", False)) is not bool:
+        raise ValueError(f"{backend}.is_causal must be boolean")
     for key, value in (
         ("hidden_size", target["hidden_size"]),
         ("vocab_size", target["vocab_size"]),
         ("num_target_layers", target["num_hidden_layers"]),
     ):
         _fixed(raw, key, value, backend)
-    result = {"architectures": [architecture], "model_type": "qwen3"}
+    result = {
+        "architectures": [architecture],
+        "model_type": "qwen3",
+        "is_causal": raw.get("is_causal", False),
+    }
     for key in (
         "intermediate_size",
         "num_attention_heads",
@@ -249,6 +256,19 @@ def draft_config(raw: dict, target: dict, backend: str) -> dict:
     if type(mask) is not int or not 0 <= mask < target["vocab_size"]:
         raise ValueError(f"{backend}: mask token outside target embedding")
     output = {"target_layer_ids": list(taps), "mask_token_id": mask}
+    # DSpine keeps the DFlash draft body but adds a block-16 causal proposal and
+    # a selected-prefix code bridge. Preserve those sections so the engine can
+    # consume them once the DSpine execution path exists.
+    for key in ("block_size", "draft_block_causal"):
+        if key in raw:
+            output[key] = raw[key]
+        if key in draft:
+            output[key] = draft[key]
+    for key in ("selected_prefix_code_bridge", "selected_prefix_last_write_refine"):
+        if key in draft:
+            output[key] = draft[key]
+    if "code_bridge_second_pass" in raw:
+        output["code_bridge_second_pass"] = raw["code_bridge_second_pass"]
     if backend == "dflash2":
         for key in (
             "conv_kernel_size",
@@ -855,6 +875,44 @@ class _Builder:
                         (2 * taps * groups, h),
                         inputs=(p + branch + "_input",),
                     )
+        bridge = draft.get("selected_prefix_code_bridge")
+        if backend == "dflash" and bridge:
+            code_size = _positive(bridge.get("code_size"), backend + ".code_size")
+            rank = _positive(bridge.get("rank"), backend + ".rank")
+            self.add(
+                backend + "/selected_prefix_bridge/codebook",
+                store,
+                "selected_prefix_bridge.codebook",
+                (target["vocab_size"], code_size),
+            )
+            for role, source in (
+                ("early_read_weights", "selected_prefix_bridge.early_read_weights"),
+                ("feature_write_weights", "selected_prefix_bridge.feature_write_weights"),
+            ):
+                self.add(
+                    backend + "/selected_prefix_bridge/" + role,
+                    store,
+                    source,
+                    tuple(store.describe(source).shape),
+                )
+            for role, source, shape in (
+                ("gate_weight", "selected_prefix_bridge.gate.weight", (rank, code_size)),
+                ("gate_bias", "selected_prefix_bridge.gate.bias", (rank,)),
+                ("out_weight", "selected_prefix_bridge.out.weight", (code_size, rank)),
+                ("prev_weight", "selected_prefix_bridge.prev.weight", (rank, code_size)),
+                (
+                    "predecessor_gate_weight",
+                    "selected_prefix_bridge.predecessor_gate.weight",
+                    (rank, code_size),
+                ),
+                ("read_weight", "selected_prefix_bridge.read_weight", (code_size, h)),
+            ):
+                self.add(
+                    backend + "/selected_prefix_bridge/" + role,
+                    store,
+                    source,
+                    shape,
+                )
         if backend == "dflash2":
             rank = draft["selector_rank"]
             self.add(

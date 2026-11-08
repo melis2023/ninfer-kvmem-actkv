@@ -40,6 +40,26 @@ DraftWeights bind_draft(Bindings& b, const DraftConfig& config, const TextConfig
         layer.mlp = bind_dense(b, h, config.intermediate_size, p, true);
         out.layers.push_back(std::move(layer));
     }
+    if (config.dspine) {
+        const auto& extra = *config.dspine;
+        const auto p      = component + "/selected_prefix_bridge/";
+        DSpineBridgeWeights bridge;
+        bridge.codebook = b.direct(p + "codebook",
+                                   {target.vocab_size, extra.code_size},
+                                   QType::Q8_G32_FP16);
+        bridge.early_read_weights = b.direct(
+            p + "early_read_weights", {extra.first_exact, extra.code_size, h});
+        bridge.feature_write_weights = b.direct(
+            p + "feature_write_weights", {config.num_hidden_layers, h, extra.rank});
+        bridge.gate_weight = b.direct(p + "gate_weight", {extra.rank, extra.code_size});
+        bridge.gate_bias   = b.direct(p + "gate_bias", {extra.rank});
+        bridge.out_weight  = b.direct(p + "out_weight", {extra.code_size, extra.rank});
+        bridge.prev_weight = b.direct(p + "prev_weight", {extra.rank, extra.code_size});
+        bridge.predecessor_gate_weight = b.direct(
+            p + "predecessor_gate_weight", {extra.rank, extra.code_size});
+        bridge.read_weight = b.direct(p + "read_weight", {extra.code_size, h});
+        out.dspine_bridge  = std::move(bridge);
+    }
     if (config.dflash2) { bind_dflash2(b, out, config, target); }
     return out;
 }

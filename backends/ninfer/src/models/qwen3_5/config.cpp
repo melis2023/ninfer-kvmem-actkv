@@ -214,13 +214,14 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
                      "num_key_value_heads", "head_dim", "num_hidden_layers",
                      "max_position_embeddings", "rms_norm_eps", "rope_parameters", "layer_types",
                      "dflash_config"},
-                    {"sliding_window"}, "draft config");
+                    {"sliding_window", "is_causal"}, "draft config");
     if (architecture(value) != (dflash2 ? "DFlash2DraftModel" : "DFlashDraftModel") ||
         value.at("model_type") != "qwen3") {
         throw ArtifactError("draft architecture/model_type mismatch");
     }
     DraftConfig out;
     out.attention = attention(value);
+    out.causal    = value.value("is_causal", false);
     if (out.attention.head_dim % 2) { throw ArtifactError("draft head dimension must be even"); }
     out.intermediate_size       = dimension(value, "intermediate_size");
     out.num_hidden_layers       = dimension(value, "num_hidden_layers");
@@ -247,13 +248,32 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
         out.sliding_window = dimension(value, "sliding_window");
     }
     const auto& config = value.at("dflash_config");
+    if (config.contains("selected_prefix_code_bridge")) {
+        const auto& bridge = config.at("selected_prefix_code_bridge");
+        DSpineConfig extra;
+        extra.block_size = config.value("block_size", 0U);
+        extra.code_size  = dimension(bridge, "code_size");
+        extra.rank       = dimension(bridge, "rank");
+        extra.eps        = positive_float(bridge, "eps");
+        extra.kappa      = positive_float(bridge, "kappa");
+        if (config.contains("code_bridge_second_pass")) {
+            extra.first_exact =
+                dimension(config.at("code_bridge_second_pass"), "first_exact");
+        }
+        out.dspine = extra;
+    }
     if (dflash2) {
         require_members(config,
                         {"target_layer_ids", "mask_token_id", "conv_kernel_size", "conv_group_size",
                          "selector_rank", "selector_top_k"},
-                        {}, "DFlash2 config");
+                        {"block_size", "draft_block_causal", "selected_prefix_code_bridge",
+                         "selected_prefix_last_write_refine", "code_bridge_second_pass"},
+                        "DFlash2 config");
     } else {
-        require_members(config, {"target_layer_ids", "mask_token_id"}, {}, "DFlash config");
+        require_members(config, {"target_layer_ids", "mask_token_id"},
+                        {"block_size", "draft_block_causal", "selected_prefix_code_bridge",
+                         "selected_prefix_last_write_refine", "code_bridge_second_pass"},
+                        "DFlash config");
     }
     const auto& taps = config.at("target_layer_ids");
     if (!taps.is_array() || taps.empty()) {
