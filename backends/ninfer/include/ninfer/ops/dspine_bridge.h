@@ -53,7 +53,7 @@ void dspine_refine(const Tensor& cand_ids, const Tensor& rms, const Tensor& raw,
                    const Tensor& anchors, const Tensor& codebook, const Tensor& predecessor_gate,
                    const Tensor& prev, const Tensor& gate_bias, const Tensor& write_scaled,
                    const Tensor& head_rows, const Tensor& norm, std::int32_t width,
-                   std::int32_t batch, Tensor& message, Tensor& delta, Tensor& scratch,
+                   std::int32_t batch, float eps, Tensor& message, Tensor& delta, Tensor& scratch,
                    Tensor& drafts, cudaStream_t stream);
 
 // Causal block attention over the sliding context plus the current proposal block.

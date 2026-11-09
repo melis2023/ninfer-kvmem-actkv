@@ -846,8 +846,9 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                     dspine_q.view({rank, width, batch_size}), anchors, bridge.codebook,
                     bridge.predecessor_gate_weight, bridge.prev_weight, bridge.gate_bias,
                     refinement->write_scaled, head_rows,
-                    state.execution.parameters.draft->final_norm, width, batch_size, message,
-                    delta, scratch, drafts, state.execution.device.stream);
+                    state.execution.parameters.draft->final_norm, width, batch_size,
+                    config.rms_norm_eps, message, delta, scratch, drafts,
+                    state.execution.device.stream);
             } else {
                 ops::argmax(
                     logits, flat_drafts,
@@ -935,6 +936,13 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         if (const char* dump = std::getenv("NINFER_DSPINE_DUMP"); dump != nullptr) {
             dump_tensor(compact_features, dump, "compact_features",
                         state.execution.device.stream);
+            dump_tensor(append_counts, dump, "append_counts", state.execution.device.stream);
+            dump_tensor(append_positions, dump, "append_positions", state.execution.device.stream);
+            dump_tensor(accepted, dump, "accepted_live", state.execution.device.stream);
+            dump_tensor(context_starts, dump, "context_frontiers", state.execution.device.stream);
+            dump_tensor(draft_frontiers, dump, "draft_frontiers", state.execution.device.stream);
+            dump_tensor(target_positions, dump, "verify_positions", state.execution.device.stream);
+            dump_tensor(frontiers, dump, "execution_frontiers", state.execution.device.stream);
         }
         append_context_impl(state, compact_features, append_positions, append_counts,
                             state_destinations, dflash_rows,

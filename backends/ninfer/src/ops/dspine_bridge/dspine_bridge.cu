@@ -278,8 +278,8 @@ __global__ void dspine_refine_kernel(
     const __nv_bfloat16* predecessor_gate, const __nv_bfloat16* prev,
     const __nv_bfloat16* gate_bias, const __nv_bfloat16* write_scaled,
     const __nv_bfloat16* head_rows, const __nv_bfloat16* norm, int width, int batch,
-    int code_size, int rank, int hidden, float sqrt_c, __nv_bfloat16* message, float* delta,
-    float* scratch, std::int32_t* drafts) {
+    int code_size, int rank, int hidden, float sqrt_c, float eps, __nv_bfloat16* message,
+    float* delta, float* scratch, std::int32_t* drafts) {
     __shared__ std::int32_t choice[kDSpineMaximumRows * kDSpineCandidates];
     const int b       = static_cast<int>(blockIdx.x);
     const int rows    = width - 1;
@@ -348,10 +348,17 @@ __global__ void dspine_refine_kernel(
         float score[kDSpineCandidates];
 #pragma unroll
         for (int jp = 0; jp < kDSpineCandidates; ++jp) { score[jp] = 0.0f; }
+        // The reference normalises the refined residual before the head read:
+        //   normalized = state / sqrt(mean(state^2)+eps) * norm_w
+        // combined already carries norm_w, so the head dot is  norm_w * state,
+        // and only the per-sender scale below is missing.
+        float square_sum = 0.0f;
         for (int h = 0; h < H; ++h) {
+            const float norm_h = __bfloat162float(norm[h]);
             // delta already carries norm_w (write_scaled), so only the raw term is scaled.
-            const float combined =
-                __bfloat162float(norm[h]) * __bfloat162float(base[h]) + rm * delta_column[h];
+            const float combined = norm_h * __bfloat162float(base[h]) + rm * delta_column[h];
+            const float state    = norm_h != 0.0f ? combined / norm_h : 0.0f;
+            square_sum += state * state;
 #pragma unroll
             for (int jp = 0; jp < kDSpineCandidates; ++jp) {
                 score[jp] += combined * __bfloat162float(
@@ -359,6 +366,9 @@ __global__ void dspine_refine_kernel(
                                   (b * columns + i * kDSpineCandidates + jp) + h]);
             }
         }
+        const float inverse_rms = rsqrtf(square_sum / static_cast<float>(H) + eps);
+#pragma unroll
+        for (int jp = 0; jp < kDSpineCandidates; ++jp) { score[jp] *= inverse_rms; }
         int best         = 0;
         float best_score = -INFINITY;
 #pragma unroll
@@ -642,7 +652,7 @@ void dspine_refine(const Tensor& cand_ids, const Tensor& rms, const Tensor& raw,
                    const Tensor& anchors, const Tensor& codebook, const Tensor& predecessor_gate,
                    const Tensor& prev, const Tensor& gate_bias, const Tensor& write_scaled,
                    const Tensor& head_rows, const Tensor& norm, std::int32_t width,
-                   std::int32_t batch, Tensor& message, Tensor& delta, Tensor& scratch,
+                   std::int32_t batch, float eps, Tensor& message, Tensor& delta, Tensor& scratch,
                    Tensor& drafts, cudaStream_t stream) {
     require_bf16(raw, "raw");
     require_bf16(q, "q");
@@ -690,7 +700,7 @@ void dspine_refine(const Tensor& cand_ids, const Tensor& rms, const Tensor& raw,
         static_cast<const __nv_bfloat16*>(write_scaled.data),
         static_cast<const __nv_bfloat16*>(head_rows.data),
         static_cast<const __nv_bfloat16*>(norm.data), width, batch, code, rank, hidden,
-        std::sqrt(static_cast<float>(code)), static_cast<__nv_bfloat16*>(message.data),
+        std::sqrt(static_cast<float>(code)), eps, static_cast<__nv_bfloat16*>(message.data),
         static_cast<float*>(delta.data), static_cast<float*>(scratch.data),
         static_cast<std::int32_t*>(drafts.data));
 }
