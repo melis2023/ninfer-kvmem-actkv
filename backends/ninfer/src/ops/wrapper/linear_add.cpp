@@ -186,6 +186,15 @@ std::size_t linear_add_route_workspace_bytes(QType qtype, std::int32_t output_ro
                                                            min_tokens, max_tokens),
             output_rows, input_rows, policy, min_tokens, max_tokens);
     }
+    if (qtype == QType::Q6_G64_FP16) {
+        // No fused Q6 residual epilogue: the projection lands in an arena tile and
+        // residual_add folds it back, so the tile is the whole workspace.
+        (void)linear_workspace_capacity_bytes(qtype, output_rows, input_rows,
+                                              LinearPolicy::A16Only, min_tokens, max_tokens);
+        WorkspaceLayoutBuilder layout;
+        (void)layout.alloc(DType::BF16, {output_rows, max_tokens});
+        return layout.peak_bytes(1);
+    }
     if (qtype == QType::NVFP4) {
         const bool supported = (output_rows == detail::Nvfp4N5120K6144::kOutputRows &&
                                 input_rows == detail::Nvfp4N5120K6144::kInputRows) ||
@@ -287,6 +296,15 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         }
         (void)ws;
         detail::bf16_linear_add_dispatch(x, w, residual_out, stream);
+        return;
+    }
+
+    if (w.qtype == QType::Q6_G64_FP16) {
+        // No fused Q6 residual epilogue: project into the arena, then add.
+        auto scope       = ws.scope();
+        Tensor projected = ws.alloc(DType::BF16, {w.n, t});
+        linear(x, w, projected, stream);
+        residual_add(projected, residual_out, stream);
         return;
     }
 
