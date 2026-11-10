@@ -1373,6 +1373,11 @@ void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& 
             if (layer < layer_ready_.size()) {
                 CUDA_CHECK(cudaStreamWaitEvent(ctx_.stream, layer_ready_[layer], 0));
             }
+            // The DSpine adapter reads `layer_inp[lid]`: layer `lid`'s input, i.e. the
+            // output of layer `lid - 1`. Capture before the mixer runs.
+            if constexpr (Tap::enabled) {
+                tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
+            }
             {
                 nvtx::ScopedRange mixer_range(
                     full ? (prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention)
@@ -1396,9 +1401,6 @@ void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& 
                 mlp_tail(block, x, ph,
                          layer + 1 < end ? next_projection_hints(static_cast<int>(layer))
                                          : ops::SparseMoeHints{});
-            }
-            if constexpr (Tap::enabled) {
-                tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
             }
         } catch (const std::exception& error) {
             throw std::runtime_error("text/layers/" + std::to_string(layer) +
