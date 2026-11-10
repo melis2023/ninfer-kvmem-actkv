@@ -97,6 +97,14 @@ std::size_t linear_swiglu_route_workspace_bytes(QType qtype, std::int32_t gate_u
         (void)layout.alloc(DType::BF16, {gate_up_rows, max_tokens});
         return layout.peak_bytes(1);
     }
+    if (qtype == QType::BF16) {
+        // The reference draft body is BF16; it has no fused SwiGLU either.
+        (void)linear_workspace_capacity_bytes(qtype, gate_up_rows, input_rows, policy, min_tokens,
+                                              max_tokens);
+        WorkspaceLayoutBuilder layout;
+        (void)layout.alloc(DType::BF16, {gate_up_rows, max_tokens});
+        return layout.peak_bytes(1);
+    }
     if (qtype == QType::Q4_G64_FP16) {
         // Every valid policy admits the A16 route (upstream relaxed the A16-only check); the
         // integer-A8 policies additionally admit the q4a8 prefill and small-T decode routes.
@@ -225,6 +233,8 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     const bool q6_weight = large_shape && gate_up_weight.qtype == QType::Q6_G64_FP16 &&
                            gate_up_weight.group_size == 64 && gate_up_weight.group == 64 &&
                            common_row_split;
+    // A BF16 gate/up pair (the reference draft body) has no fused route either.
+    const bool bf16_weight = large_shape && gate_up_weight.qtype == QType::BF16;
     const bool nvfp4_weight = large_shape && gate_up_weight.qtype == QType::NVFP4;
     const bool fp8_weight   = large_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16;
     const bool t2_weight    = large_shape && is_ternary(gate_up_weight.qtype) &&
@@ -232,7 +242,8 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
                                    ? gate_up_weight.qhigh == nullptr && gate_up_weight.high_plane_bytes == 0
                                    : gate_up_weight.qhigh != nullptr && gate_up_weight.high_plane_bytes != 0) &&
                               common_row_split;
-    if (!q4_weight && !q6_weight && !q8_weight && !nvfp4_weight && !fp8_weight && !t2_weight) {
+    if (!q4_weight && !q6_weight && !bf16_weight && !q8_weight && !nvfp4_weight && !fp8_weight &&
+        !t2_weight) {
         throw std::invalid_argument("linear_swiglu: unsupported weight");
     }
 
@@ -264,6 +275,16 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
     if (q6_weight) {
         // Q6 has no fused SwiGLU kernel, so project both halves into one arena tile
         // and run the elementwise activation over them.
+        auto scope     = ws.scope();
+        Tensor gate_up = ws.alloc(DType::BF16, {gate_up_weight.n, t});
+        linear(x, gate_up_weight, gate_up, policy, ws, stream);
+        const Tensor gate = gate_up.slice(0, 0, out.ne[0]);
+        const Tensor up   = gate_up.slice(0, out.ne[0], out.ne[0]);
+        silu_mul(gate, up, out, stream);
+        return;
+    }
+
+    if (bf16_weight) {
         auto scope     = ws.scope();
         Tensor gate_up = ws.alloc(DType::BF16, {gate_up_weight.n, t});
         linear(x, gate_up_weight, gate_up, policy, ws, stream);

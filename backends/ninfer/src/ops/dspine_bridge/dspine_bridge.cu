@@ -348,17 +348,13 @@ __global__ void dspine_refine_kernel(
         float score[kDSpineCandidates];
 #pragma unroll
         for (int jp = 0; jp < kDSpineCandidates; ++jp) { score[jp] = 0.0f; }
-        // The reference normalises the refined residual before the head read:
-        //   normalized = state / sqrt(mean(state^2)+eps) * norm_w
-        // combined already carries norm_w, so the head dot is  norm_w * state,
-        // and only the per-sender scale below is missing.
-        float square_sum = 0.0f;
+        // Greedy refinement follows the reference's `RefinementTail.greedy`:
+        // score = head · (norm_w·raw + rms·write@msg), with no state RMSNorm.
+        // Only the sampled table normalises the refined state.
         for (int h = 0; h < H; ++h) {
             const float norm_h = __bfloat162float(norm[h]);
             // delta already carries norm_w (write_scaled), so only the raw term is scaled.
             const float combined = norm_h * __bfloat162float(base[h]) + rm * delta_column[h];
-            const float state    = norm_h != 0.0f ? combined / norm_h : 0.0f;
-            square_sum += state * state;
 #pragma unroll
             for (int jp = 0; jp < kDSpineCandidates; ++jp) {
                 score[jp] += combined * __bfloat162float(
@@ -366,9 +362,6 @@ __global__ void dspine_refine_kernel(
                                   (b * columns + i * kDSpineCandidates + jp) + h]);
             }
         }
-        const float inverse_rms = rsqrtf(square_sum / static_cast<float>(H) + eps);
-#pragma unroll
-        for (int jp = 0; jp < kDSpineCandidates; ++jp) { score[jp] *= inverse_rms; }
         int best         = 0;
         float best_score = -INFINITY;
 #pragma unroll

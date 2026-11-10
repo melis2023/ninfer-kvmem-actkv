@@ -1,4 +1,4 @@
-#include "models/qwen3_5/program/structured_round.h"
+﻿#include "models/qwen3_5/program/structured_round.h"
 #include "models/qwen3_5/program/graph_execution.h"
 #include "models/qwen3_5/execution/linear.h"
 #include <cmath>
@@ -99,6 +99,11 @@ DFlashFeatureSink batch_feature_sink_impl(DFlashBatchContext& state, const Tenso
 
 void dump_tensor(const Tensor& tensor, const char* directory, const char* name,
                  cudaStream_t stream);
+
+// Appends one round's small diagnostic tensors to a single file so a whole run
+// can be replayed offline (the per-round dump above overwrites each round).
+void trace_append(const Tensor& tensor, const char* path, std::uint32_t tag,
+                  cudaStream_t stream);
 
 template <class Context>
 void append_context_impl(Context& state, const Tensor& features, const Tensor& positions,
@@ -430,6 +435,20 @@ void dump_tensor(const Tensor& tensor, const char* directory, const char* name,
     }
 }
 
+void trace_append(const Tensor& tensor, const char* path, std::uint32_t tag,
+                  cudaStream_t stream) {
+    std::vector<std::byte> host(static_cast<std::size_t>(tensor.bytes()));
+    if (host.empty()) { return; }
+    CUDA_CHECK(cudaMemcpyAsync(host.data(), tensor.data, host.size(), cudaMemcpyDeviceToHost,
+                               stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    std::ofstream file(path, std::ios::binary | std::ios::app);
+    const std::uint32_t header[2] = {tag, static_cast<std::uint32_t>(host.size())};
+    file.write(reinterpret_cast<const char*>(header), sizeof(header));
+    file.write(reinterpret_cast<const char*>(host.data()),
+               static_cast<std::streamsize>(host.size()));
+}
+
 DSpineRefinementTable& dspine_refinement_table(const execution::Parameters& parameters,
                                                cudaStream_t stream) {
     static std::mutex mutex;
@@ -708,34 +727,42 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                 Tensor delta   = state.execution.work.alloc(DType::BF16, {hidden, columns});
                 Tensor out     = state.execution.work.alloc(DType::BF16, {hidden, columns});
                 Tensor normed  = state.execution.work.alloc(DType::BF16, {hidden, columns});
-                ops::dspine_bridge_read(residual, nullptr, config.rms_norm_eps, raw, normalized,
-                                        rms, state.execution.device.stream);
-                ops::dspine_bridge_read_proj(
-                    normalized, bridge.early_read_weights, bridge.read_weight, layer, projected,
-                    state.execution.device.stream);
-                ops::dspine_bridge_codes(
-                    projected, bridge.codebook, anchors, width, batch_size,
-                    static_cast<float>(std::sqrt(double(code_size))), config.rms_norm_eps, codes,
-                    state.execution.device.stream);
-                ops::dspine_bridge_linear(codes, bridge.gate_weight, q,
-                                          state.execution.device.stream);
-                ops::dspine_bridge_linear(codes, bridge.predecessor_gate_weight, s,
-                                          state.execution.device.stream);
-                ops::dspine_bridge_linear(codes, bridge.prev_weight, v,
-                                          state.execution.device.stream);
-                ops::dspine_bridge_message(q, s, v, bridge.gate_bias, width, batch_size, message,
-                                           state.execution.device.stream);
-                ops::dspine_bridge_write(message, bridge.feature_write_weights, layer, delta,
-                                         state.execution.device.stream);
                 const Tensor& next_norm =
                     layer + 1 < dimension(config.num_hidden_layers)
                         ? state.execution.parameters.draft
                               ->layers[static_cast<std::size_t>(layer + 1)]
                               .input_norm
                         : state.execution.parameters.draft->final_norm;
-                ops::dspine_bridge_finish(raw, delta, rms, next_norm, width, batch_size,
-                                          config.rms_norm_eps, out, normed,
-                                          state.execution.device.stream);
+                if (std::getenv("NINFER_DSPINE_NO_BRIDGE") == nullptr) {
+                    ops::dspine_bridge_read(residual, nullptr, config.rms_norm_eps, raw, normalized,
+                                            rms, state.execution.device.stream);
+                    ops::dspine_bridge_read_proj(
+                        normalized, bridge.early_read_weights, bridge.read_weight, layer, projected,
+                        state.execution.device.stream);
+                    ops::dspine_bridge_codes(
+                        projected, bridge.codebook, anchors, width, batch_size,
+                        static_cast<float>(std::sqrt(double(code_size))), config.rms_norm_eps, codes,
+                        state.execution.device.stream);
+                    ops::dspine_bridge_linear(codes, bridge.gate_weight, q,
+                                              state.execution.device.stream);
+                    ops::dspine_bridge_linear(codes, bridge.predecessor_gate_weight, s,
+                                              state.execution.device.stream);
+                    ops::dspine_bridge_linear(codes, bridge.prev_weight, v,
+                                              state.execution.device.stream);
+                    ops::dspine_bridge_message(q, s, v, bridge.gate_bias, width, batch_size, message,
+                                               state.execution.device.stream);
+                    ops::dspine_bridge_write(message, bridge.feature_write_weights, layer, delta,
+                                             state.execution.device.stream);
+                    ops::dspine_bridge_finish(raw, delta, rms, next_norm, width, batch_size,
+                                              config.rms_norm_eps, out, normed,
+                                              state.execution.device.stream);
+                } else {
+                    // Diagnostic: drop the code bridge and keep only the target-context
+                    // attention, i.e. a plain pre-norm draft layer.
+                    ops::rmsnorm(residual, next_norm, config.rms_norm_eps, false, normed,
+                                 state.execution.device.stream);
+                    out = residual;
+                }
                 if (const char* dump = std::getenv("NINFER_DSPINE_DUMP"); dump != nullptr) {
                     const auto prefix = [&](const char* name) {
                         return "layer" + std::to_string(layer) + "_" + name;
@@ -758,6 +785,14 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                     dump_tensor(out, dump, prefix("out").c_str(), state.execution.device.stream);
                     dump_tensor(normed, dump, prefix("normed").c_str(),
                                 state.execution.device.stream);
+                }
+                if (const char* trace = std::getenv("NINFER_DSPINE_TRACE");
+                    trace != nullptr && layer + 1 == dimension(config.num_hidden_layers)) {
+                    const auto stream = state.execution.device.stream;
+                    trace_append(raw, trace, 5, stream);
+                    trace_append(rms, trace, 6, stream);
+                    trace_append(q, trace, 7, stream);
+                    trace_append(anchors, trace, 8, stream);
                 }
                 residual = out;
                 layer_input = normed;
@@ -838,6 +873,10 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                     dump_tensor(dspine_raw, dump, "refine_raw", stream);
                     dump_tensor(dspine_rms, dump, "refine_rms", stream);
                     dump_tensor(dspine_q, dump, "refine_q", stream);
+                }
+                if (const char* trace = std::getenv("NINFER_DSPINE_TRACE"); trace != nullptr) {
+                    trace_append(candidate_ids, trace, 1, state.execution.device.stream);
+                    trace_append(head_rows, trace, 10, state.execution.device.stream);
                 }
                 ops::dspine_refine(
                     candidate_ids.view({16, static_cast<std::int32_t>(k), batch_size}),
@@ -1050,6 +1089,24 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             dump_tensor(drafts, dump, "drafts", stream);
             dump_tensor(accepted, dump, "accepted", stream);
         }
+        if (const char* trace = std::getenv("NINFER_DSPINE_TRACE"); trace != nullptr) {
+            const auto stream = state.execution.device.stream;
+            trace_append(target_tokens, trace, 2, stream);
+            trace_append(drafts, trace, 3, stream);
+            trace_append(accepted, trace, 4, stream);
+            if (state.execution.parameters.draft->dspine_bridge) {
+                const auto hidden =
+                    dimension(state.execution.parameters.model.config().text.hidden_size);
+                const auto columns = static_cast<std::int32_t>(k) * batch_size;
+                Tensor target_rows =
+                    state.execution.work.alloc(DType::BF16, {hidden, columns});
+                ops::embedding(target_tokens.slice(0, 0, static_cast<std::int32_t>(k)).view(
+                                   {columns}),
+                               state.execution.parameters.draft->output_head.weight, target_rows,
+                               stream);
+                trace_append(target_rows, trace, 9, stream);
+            }
+        }
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    sizeof(qwen3_5::DFlashDecodeEgress), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));
@@ -1094,3 +1151,4 @@ void dflash_decode_batch(DFlashBatchContext& state, std::int32_t batch_size, std
 }
 
 } // namespace ninfer::models::qwen3_5::execution
+

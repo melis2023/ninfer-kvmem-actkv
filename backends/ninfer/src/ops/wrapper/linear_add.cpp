@@ -165,9 +165,18 @@ std::size_t linear_add_route_workspace_bytes(QType qtype, std::int32_t output_ro
                                                        qtype == QType::PTQ1_G128_FP16));
     }
     if (qtype == QType::BF16) {
-        (void)detail::bf16_linear_add_select(output_rows, input_rows, min_tokens);
-        (void)detail::bf16_linear_add_select(output_rows, input_rows, max_tokens);
-        return 0;
+        if (detail::bf16_linear_add_admits(output_rows, input_rows, min_tokens) &&
+            detail::bf16_linear_add_admits(output_rows, input_rows, max_tokens)) {
+            (void)detail::bf16_linear_add_select(output_rows, input_rows, min_tokens);
+            (void)detail::bf16_linear_add_select(output_rows, input_rows, max_tokens);
+            return 0;
+        }
+        // Shapes the exact BF16 plan does not admit take Linear plus an arena tile.
+        (void)linear_workspace_capacity_bytes(qtype, output_rows, input_rows, policy, min_tokens,
+                                              max_tokens);
+        WorkspaceLayoutBuilder layout;
+        (void)layout.alloc(DType::BF16, {output_rows, max_tokens});
+        return layout.peak_bytes(1);
     }
     if (qtype == QType::Q4_G64_FP16) {
         (void)detail::select_q4_linear_add(output_rows, input_rows, min_tokens);
@@ -287,7 +296,13 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
     if (w.qtype == QType::BF16) {
         require_bf16(w);
         if (!detail::bf16_linear_add_admits(w.n, w.k, t)) {
-            throw std::invalid_argument("linear_add: unsupported BF16 shape");
+            // The exact BF16 plan only covers its one calibrated shape; everything
+            // else projects into the arena and adds explicitly.
+            auto scope       = ws.scope();
+            Tensor projected = ws.alloc(DType::BF16, {w.n, t});
+            linear(x, w, projected, stream);
+            residual_add(projected, residual_out, stream);
+            return;
         }
         if (!aligned_to(x.data, 16) || !aligned_to(residual_out.data, 16) ||
             !aligned_to(w.qdata, 16)) {
