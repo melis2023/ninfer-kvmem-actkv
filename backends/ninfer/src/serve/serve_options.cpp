@@ -1979,7 +1979,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         const bool adaptive_mtp = memory_mtp &&
             options.speculative.mtp_policy == MtpDraftPolicy::Adaptive;
         // DFlash2 uses the native lane capacity; target/draft execution stays on one GPU.
-        const bool memory_dflash2 = options.speculative.backend == SpeculativeBackend::DFlash2 &&
+        const bool memory_dflash2 =
+            (options.speculative.backend == SpeculativeBackend::DFlash2 ||
+             options.speculative.backend == SpeculativeBackend::DFlash) &&
             options.max_concurrency <= kMaximumConcurrency && options.devices.size() <= 1 &&
             options.speculative.draft_tokens >= 1 && options.speculative.draft_tokens <= 15;
         const bool memory_ngram_supported = options.speculative.ngram_draft_tokens == 0 ||
