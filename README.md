@@ -11,6 +11,39 @@ QQ 交流群：**1040777853**。本项目仅供研究学习，稳定使用请前
 
 **所有修补、测速与召回数据汇总在 [docs/CHANGELOG.md](docs/CHANGELOG.md)。**
 
+## 更新日志（2026-11-13）
+
+### 1. DSpine 草案接入 KVMem
+
+DSpine 的草案环按**绝对位置**写入，读侧却用 KVMem 的 compact 地址；重选之后读到的是
+旋转过的窗口，这正是它只敢扫 `capacity/8 = 1024` 行、而训练窗口是 8192 的原因。现在
+环的写入、RoPE、floor、gather 区间与草案块 frontier 全部走逻辑位置，扫描恢复训练窗口：
+
+- 8,642 token（removed=1,984）：接受率 **50.0% → 58.3%**；
+- 108,664 token、k=4：55.3% / 62.0 tok/s（旧的 compact 读法 56.9% / 63.8——扫满窗口每轮
+  多读 8 倍上下文，长上下文下不划算，因此保留 switchable）；
+- 117K–203K：decode 51–70 tok/s、接受率 46–62%。
+
+### 2. 草案链采样与参考实现对齐
+
+链行现在按参考实现的 `filter_probs` 做 top-k/top-p/min-p 联合截断再归一化，q 携带截断后的
+分布。默认参数（16 候选、top_p 0.95）下不改变接受率，属接口对齐。
+
+### 3. 与 llama.cpp `dspine` 分支的实测对照
+
+同 prompt（15,325 token）、同草稿、同 `n-max 4`、贪婪：两边**接受数与平均链长完全一致**
+（91/142、3.53），ninfer decode **70.8 vs 44.6 tok/s（+59%）**、prefill **1.00k vs 763
+tok/s（+31%）**。llama.cpp 用卡片推荐的 `n-max 15` 在 16 GB 卡上因显存不足崩到 1.86 tok/s，
+说明官方那套数字依赖 3090 级别的校验预算。
+
+### 4. 转换器、GUI 与文档
+
+- `tools/convert/dspine_gguf.py` + `recipes/dspine_gguf_q4.py`：草稿 Q4_K 块按原字节直通；
+- `gguf转ninfer工具` 新增「DSpine 草稿」勾选项（内置转换器 `ninfer-convert/dspine/`）；
+- 新增 [docs/dspine-convert-guide.md](docs/dspine-convert-guide.md)（转换全流程）与
+  [docs/dspine-port-20261111.md](docs/dspine-port-20261111.md)（移植与测量全记录）；
+- 服务端在 WDDM 可见空闲显存 < 640 MiB 时打印 WARN（草稿常驻约 1.2 GiB，启动器需留余量）。
+
 ## 更新日志（2026-11-06）
 
 ### 1. KVMem pressure 不再因 cold mandatory 页崩溃
@@ -465,11 +498,33 @@ python3 -m tools.convert \
   详见 [docs/dflash2-nvfp4-20261023.md](docs/dflash2-nvfp4-20261023.md)；
 - `kernel_projection` 与 conv 必须保持 BF16（prepare 路径没有量化内核）。
 
+### DSpine 草稿
+
+```bash
+python3 -m tools.convert \
+  --model /path/to/conversion-input/metadata \
+  --recipe qwen3_5_dense_gguf \
+  --source gguf=Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf \
+  --source dflash=Qwen3.8-27B-DSpine-b16-Q4_K_M.gguf \
+  --components text,mtp,dflash \
+  --override tools/convert/recipes/dspine_gguf_q4.py \
+  --name qwen3.8-27b-iq3s-mtp-dspine-q4k \
+  --out model.ninfer
+```
+
+- `dflash` 源（注意不是 `dflash2`）指向
+  [aj9o9/Qwen3.8-27B-DSpine-b16-GGUF](https://hf-mirror.com/aj9o9/Qwen3.8-27B-DSpine-b16-GGUF/tree/main)
+  的草稿；该仓库只提供草稿，目标 GGUF 另取（要 MTP 就选 `-mtp` 版）；
+- 草稿的 Q4_K 块按原字节直通，只有视觉塔压 Q4、selected-prefix bridge 保持 BF16；
+- 产物约 12.9 GiB，CPU 转换约 60 秒；运行用 `--spec dflash --draft-tokens 4 --full-draft-head`；
+- 全流程（GUI、校验、常见报错）：[docs/dspine-convert-guide.md](docs/dspine-convert-guide.md)。
+
 ## 快速开始
 
 1. 下载 `.ninfer` 工件，或按上文自行转换。
-2. 双击 `workers/ninfer/start-kvmem-ninfer-dflash.bat`（DFlash2）或
-   `start-kvmem-ninfer.bat`（MTP）。模型路径和参数都在 bat 里。
+2. 双击 `workers/ninfer/start-kvmem-ninfer-dspine.bat`（DSpine）、
+   `start-kvmem-ninfer-dflash.bat`（DFlash2）或 `start-kvmem-ninfer.bat`（MTP）。
+   模型路径和参数都在 bat 里。
 3. 服务地址 `http://127.0.0.1:18200`，OpenAI 兼容 API。
 
 ## 文档
@@ -484,3 +539,5 @@ python3 -m tools.convert \
 | [docs/cuda-graph-calibration.md](docs/cuda-graph-calibration.md) | Graph 探针与启动数据 |
 | [docs/multi-backend.md](docs/multi-backend.md) | 后端能力与启动说明 |
 | [docs/multi-backend-repository.md](docs/multi-backend-repository.md) | 仓库结构与构建 |
+| [docs/dspine-convert-guide.md](docs/dspine-convert-guide.md) | **DSpine 草稿转 ninfer（GUI + CLI）** |
+| [docs/dspine-port-20261111.md](docs/dspine-port-20261111.md) | DSpine 移植与测量全记录 |
