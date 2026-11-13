@@ -1,6 +1,7 @@
 #include "models/qwen3_5/config.h"
 
 #include "artifact/schema.h"
+#include "ninfer/ops/speculative_round.h"
 
 #include <algorithm>
 #include <cmath>
@@ -257,8 +258,32 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
         extra.eps        = positive_float(bridge, "eps");
         extra.kappa      = positive_float(bridge, "kappa");
         if (config.contains("code_bridge_second_pass")) {
-            extra.first_exact =
-                dimension(config.at("code_bridge_second_pass"), "first_exact");
+            const auto& second = config.at("code_bridge_second_pass");
+            extra.first_exact = dimension(second, "first_exact");
+            if (second.contains("head_topk")) {
+                extra.head_topk = dimension(second, "head_topk");
+            }
+        }
+        if (config.contains("selected_prefix_last_write_refine") &&
+            config.at("selected_prefix_last_write_refine").contains("head_topk")) {
+            const auto refine_k =
+                dimension(config.at("selected_prefix_last_write_refine"), "head_topk");
+            if (refine_k != extra.head_topk) {
+                throw ArtifactError("DSpine refinement head_topk mismatch");
+            }
+        }
+        // The serial refinement kernel is compiled for the sparse verifier's
+        // 16-candidate, 15-row lattice; refuse a checkpoint that would be truncated.
+        if (!out.causal) {
+            throw ArtifactError("DSpine requires causal block attention");
+        }
+        if (extra.head_topk !=
+                static_cast<std::uint32_t>(ops::kSparseSpeculativeCandidates) ||
+            (extra.block_size != 0 &&
+             (extra.block_size < 2 ||
+              extra.block_size > static_cast<std::uint32_t>(ops::kSparseSpeculativeCandidates))) ||
+            (extra.first_exact != 0 && extra.first_exact + 1 != out.num_hidden_layers)) {
+            throw ArtifactError("unsupported DSpine refinement geometry");
         }
         out.dspine = extra;
     }
@@ -377,6 +402,14 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
             options.speculative == SpeculativeBackend::DFlash2) {
             out.draft = draft(companion(directory, options.speculative_component()).config,
                               out.text, options.speculative == SpeculativeBackend::DFlash2);
+        }
+        // DSpine's 16x16 transition lattice is built from top-16 rows of the full
+        // vocabulary head. An optimised shortlist head cannot produce the candidate
+        // frame the sparse verifier requires, so reject it at load time instead of
+        // letting a round consume uninitialised ids/q.
+        if (out.draft && out.draft->dspine && options.proposal_head != ProposalHead::Full) {
+            throw ArtifactError(
+                "DSpine requires the full draft proposal head (--full-draft-head)");
         }
         return out;
     } catch (const std::exception& error) {

@@ -115,6 +115,12 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
                                                    : -1);
     if (state.take_layer_ready) { card.set_layer_ready(state.take_layer_ready()); }
     if (state.first_token) { card.set_first_token_hook(state.first_token); }
+    if (std::getenv("NINFER_DSPINE_POSDUMP") != nullptr) {
+        static int calls = 0;
+        std::fprintf(stderr, "[posdump] prefill_chunk call=%d len=%u dflash=%d drafter=%d\n",
+                     ++calls, nominal_length, state.dflash != nullptr ? 1 : 0,
+                     state.drafter ? 1 : 0);
+    }
     const std::span<const int> prompt(ids.data(), ids.size());
     if (state.dflash != nullptr && state.drafter) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);

@@ -229,11 +229,18 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
             add_tensor(builder, DType::I32, {verify_columns, batch}, "DFlash proposal positions");
         decode.verify_positions = add_tensor(builder, DType::I32, {verify_columns, batch},
                                              "target verify cache positions");
-        if (layout.spec.backend == SpeculativeBackend::DFlash2) {
-            decode.candidate_ids = add_tensor(builder, DType::I32, {16, verify_columns - 1, batch},
-                                              "DFlash2 candidate ids");
-            decode.proposal_q    = add_tensor(builder, DType::FP32, {16, verify_columns - 1, batch},
-                                              "DFlash2 sampled proposal q");
+        // DFlash2 and DSpine (--spec dflash with a code bridge) both publish a
+        // candidate lattice and its sampled proposal distribution to the verifier.
+        if (layout.spec.backend == SpeculativeBackend::DFlash2 ||
+            layout.spec.backend == SpeculativeBackend::DFlash) {
+            decode.candidate_ids =
+                add_tensor(builder, DType::I32,
+                           {ops::kSparseSpeculativeCandidates, verify_columns - 1, batch},
+                           "DFlash candidate ids");
+            decode.proposal_q =
+                add_tensor(builder, DType::FP32,
+                           {ops::kSparseSpeculativeCandidates, verify_columns - 1, batch},
+                           "DFlash sampled proposal q");
         }
         decode.append_positions =
             add_tensor(builder, DType::I32, {verify_columns, batch}, "DFlash append positions");
@@ -433,6 +440,8 @@ DFlashDecodeState::DFlashDecodeState(DeviceSpan backing, const DFlashDecodeState
         ingress_tensor(offsetof(DFlashDecodeIngress, context_frontiers), DType::I32, {batch});
     draft_frontiers =
         ingress_tensor(offsetof(DFlashDecodeIngress, draft_frontiers), DType::I32, {batch});
+    draft_contexts =
+        ingress_tensor(offsetof(DFlashDecodeIngress, draft_contexts), DType::I32, {batch});
     draft_floors = ingress_tensor(offsetof(DFlashDecodeIngress, draft_floors), DType::I32, {batch});
     proposal_extents =
         ingress_tensor(offsetof(DFlashDecodeIngress, proposal_extents), DType::I32, {batch});

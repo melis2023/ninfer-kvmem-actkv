@@ -40,6 +40,10 @@ def _open_named_source(name: str, path: Path, block_sources: frozenset[str]):
             from .dflash2_gguf import DraftSource
 
             return DraftSource(path)
+        if name == "dflash":
+            from .dspine_gguf import DraftSource
+
+            return DraftSource(path)
         from .sources.gguf_source import GGUFSource
 
         return GGUFSource(path)

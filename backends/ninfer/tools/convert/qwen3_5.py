@@ -255,6 +255,20 @@ def draft_config(raw: dict, target: dict, backend: str) -> dict:
     mask = draft.get("mask_token_id")
     if type(mask) is not int or not 0 <= mask < target["vocab_size"]:
         raise ValueError(f"{backend}: mask token outside target embedding")
+    # The DSpine feature sink captures the *input* of a target layer (the residual
+    # stream at the top of that layer's block), exactly like llama.cpp's
+    # layer_inp[lid]. HF checkpoints number layer *outputs*, so their ids need +1
+    # to address the same hidden state here. The GGUF adapter already emits
+    # layer-input ids and marks them, so its numbering is left untouched.
+    marker = raw.get("target_layer_ids_are_inputs", False)
+    if type(marker) is not bool:
+        raise ValueError(f"{backend}.target_layer_ids_are_inputs must be boolean")
+    if "selected_prefix_code_bridge" in draft and not marker:
+        taps = [index + 1 for index in taps]
+        if any(not 0 <= index < target["num_hidden_layers"] for index in taps):
+            raise ValueError(
+                f"{backend}: DSpine layer-input ids exceed the target layer count"
+            )
     output = {"target_layer_ids": list(taps), "mask_token_id": mask}
     # DSpine keeps the DFlash draft body but adds a block-16 causal proposal and
     # a selected-prefix code bridge. Preserve those sections so the engine can

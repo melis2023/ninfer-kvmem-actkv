@@ -1,4 +1,4 @@
-#include "models/qwen3_5/program/internal.h"
+﻿#include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/gdn.h"
@@ -231,6 +231,18 @@ void DFlashFeatureSink::consume_prefill_chunk(std::int32_t tokens, bool rewrite_
     }
     Tensor feature_window  = features->slice(1, 0, tokens);
     Tensor position_window = positions->slice(0, 0, tokens);
+    if (std::getenv("NINFER_DSPINE_POSDUMP") != nullptr) {
+        std::int32_t dump[4] = {};
+        const auto count = std::min<std::int64_t>(4, position_window.ne[0]);
+        if (count > 0) {
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMemcpy(dump, position_window.data,
+                                  sizeof(std::int32_t) * static_cast<std::size_t>(count),
+                                  cudaMemcpyDeviceToHost));
+        }
+        std::fprintf(stderr, "[posdump] prefill tokens=%d pos=%d %d %d %d\n", tokens,
+                     dump[0], dump[1], dump[2], dump[3]);
+    }
     consume_prefill(feature_window, position_window, rewrite_checkpoint);
 }
 
@@ -1375,8 +1387,19 @@ void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& 
             }
             // The DSpine adapter reads `layer_inp[lid]`: layer `lid`'s input, i.e. the
             // output of layer `lid - 1`. Capture before the mixer runs.
+            //
+            // NINFER_DSPINE_TAP_OUTPUT=1 switches the tap to the layer's OUTPUT (the
+            // convention the authors' MLX port uses: its layer hook stores the block's
+            // return value). A/B both against the same acceptance bench; keep whichever
+            // scores higher.
+            static const bool tap_output = [] {
+                const char* v = std::getenv("NINFER_DSPINE_TAP_OUTPUT");
+                return v != nullptr && v[0] != '\0' && v[0] != '0';
+            }();
             if constexpr (Tap::enabled) {
-                tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
+                if (!tap_output) {
+                    tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
+                }
             }
             {
                 nvtx::ScopedRange mixer_range(
@@ -1401,6 +1424,13 @@ void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& 
                 mlp_tail(block, x, ph,
                          layer + 1 < end ? next_projection_hints(static_cast<int>(layer))
                                          : ops::SparseMoeHints{});
+            }
+            // Layer-OUTPUT tap (NINFER_DSPINE_TAP_OUTPUT=1): `x` is now the residual
+            // after this block, which is what the authors' MLX layer hook stores.
+            if constexpr (Tap::enabled) {
+                if (tap_output) {
+                    tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
+                }
             }
         } catch (const std::exception& error) {
             throw std::runtime_error("text/layers/" + std::to_string(layer) +

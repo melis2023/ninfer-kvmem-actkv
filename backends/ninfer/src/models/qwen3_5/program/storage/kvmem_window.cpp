@@ -846,18 +846,25 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
         compact_position(sequence,end)>kvmem_window_tokens)
         throw std::logic_error("bounded Query replay cannot execute Pressure");
     if (force_selection || compact_position(sequence, end) > kvmem_window_tokens) {
+        const auto count = kv_pages_for_tokens(begin);
+        const auto keep = std::min(count, kvmem_options.selected_tokens / page_tokens);
         // A reselection replaces the selected blocks; only the trailing recent pages are
         // guaranteed to stay. Raise the masked-draft floor to that trailing continuous segment
-        // so the DFlash2 ring stops reading features of blocks that were swapped out.
-        const std::uint64_t recent_tokens = std::max<std::uint64_t>(
-            static_cast<std::uint64_t>(kvmem_options.recent_blocks()) * page_tokens,
-            masked_draft_ring_capacity());
+        // so the ring stops reading features of blocks that were swapped out. The retained
+        // segment can never exceed the selected-history budget: a DSpine 8192-token sliding
+        // window is a capability, not a promise that KVMem keeps 8192 tokens when
+        // --kvmem-budget is smaller. Without this clamp the floor stays at 0 and draft
+        // attention reads cyclic slots whose pages were evicted.
+        const std::uint64_t retention_tokens = static_cast<std::uint64_t>(keep) * page_tokens;
+        const std::uint64_t recent_tokens = std::min<std::uint64_t>(
+            std::max<std::uint64_t>(
+                static_cast<std::uint64_t>(kvmem_options.recent_blocks()) * page_tokens,
+                masked_draft_ring_capacity()),
+            std::max<std::uint64_t>(retention_tokens, page_tokens));
         sequence.dflash_context_floor =
             end > recent_tokens ? static_cast<std::uint32_t>(end - recent_tokens) : 0U;
         clamp_masked_draft_floor(sequence);
         auto backend = std::make_shared<WindowMemoryBackend>(*this, sequence, end);
-        const auto count = kv_pages_for_tokens(begin);
-        const auto keep = std::min(count, kvmem_options.selected_tokens / page_tokens);
         auto& state = sequence.window;
         std::vector<std::uint64_t> core;
         if (count == 0) {
@@ -865,22 +872,30 @@ bool ProgramImpl::prepare_window(SequenceState& sequence, std::uint32_t begin, s
         } else {
             if (kvmem_options.keep && !state.dynamic_sink_pages.empty()) {
                 for (const auto id : state.dynamic_sink_pages) {
-                    if (id < count) core.push_back(id);
+                    if (id < count && core.size() < keep) core.push_back(id);
                 }
             } else {
-                const auto sink_keep = std::min(kvmem_options.sink_blocks(), count);
+                const auto sink_keep =
+                    std::min({kvmem_options.sink_blocks(), count, keep});
                 for (std::uint32_t id = 0; id < sink_keep; ++id) core.push_back(id);
             }
-            for (const auto id : state.media_pages) if (id < count) core.push_back(id);
-            // The DFlash2 floor retains a full draft ring of conditioning tokens, so the pages
-            // that back it must stay resident too. Keeping only one recent page (the default)
-            // makes the draft read evicted features once the budget fills and collapses
-            // acceptance.
+            for (const auto id : state.media_pages)
+                if (id < count && core.size() < keep) core.push_back(id);
+            std::sort(core.begin(), core.end());
+            core.erase(std::unique(core.begin(), core.end()), core.end());
+            // The masked-draft floor retains a full draft ring of conditioning tokens, so the
+            // pages that back it must stay resident too. Keeping only one recent page (the
+            // default) makes the draft read evicted features once the budget fills and collapses
+            // acceptance. Sink/media pages are mandatory as well, so leave them room inside
+            // `keep`: pressure_selection() rejects any mandatory set larger than its budget,
+            // and a DSpine 128-page ring against an 8-page budget used to crash the worker.
             const auto ring_pages = static_cast<std::uint32_t>(
                 (static_cast<std::uint64_t>(masked_draft_ring_capacity()) + page_tokens - 1U) /
                 page_tokens);
-            const auto recent_keep =
-                std::min(std::max(kvmem_options.recent_blocks(), ring_pages), keep);
+            const auto room = static_cast<std::uint32_t>(
+                keep > core.size() ? keep - core.size() : 0U);
+            const auto recent_keep = std::min(
+                std::min(std::max(kvmem_options.recent_blocks(), ring_pages), keep), room);
             for (std::uint32_t i = 0; i < recent_keep; ++i) core.push_back(count - 1 - i);
         }
         std::sort(core.begin(), core.end());
@@ -1661,7 +1676,10 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
         if (slot && slot->prefix.size() > frontier) slot.reset();
     }
     sequence.text_kv_valid = frontier;
-    if (speculative_backend == SpeculativeBackend::DFlash2) {
+    if (speculative_backend == SpeculativeBackend::DFlash2 ||
+        speculative_backend == SpeculativeBackend::DFlash) {
+        // DSpine shares DFlash2's all-sliding cyclic ring, so its frontier and floor
+        // must be re-anchored after a query restore as well.
         sequence.dflash_context_frontier = frontier;
         const auto recent = std::max<std::uint64_t>(
             static_cast<std::uint64_t>(kvmem_options.recent_blocks()) * page_tokens,

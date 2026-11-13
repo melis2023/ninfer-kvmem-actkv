@@ -235,9 +235,23 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
         const auto* draft =
             parameters.model.config().draft ? &*parameters.model.config().draft : nullptr;
         if (plan.features.masked_draft()) {
+            const std::uint32_t trained_window = draft->sliding_window.value_or(0U);
+            // The drafter can never see more history than KVMem's device window,
+            // but a full trained-window KV ring was allocated for every lane. At
+            // 8 lanes that is ~1 GiB of BF16 K/V no request can reach. The DSpine
+            // attention kernel bounds its scan by min(window, ring capacity)
+            // (dspine_bridge.cu), so a smaller physical ring is exact, not an
+            // approximation. Round UP to one of the capacities the cyclic-cache
+            // append kernel registers (kv_cache_append.cpp: 2048/4096/8192).
+            // With a normal window (>= trained_window) this is a no-op.
+            std::uint32_t ring_capacity = trained_window;
+            if (plan.kvmem_window_tokens && plan.kvmem_window_tokens < ring_capacity) {
+                const std::uint32_t window = plan.kvmem_window_tokens;
+                ring_capacity = window <= 2048U ? 2048U : (window <= 4096U ? 4096U : 8192U);
+            }
             state_image_spec.dflash_local = qwen3_5::DFlashLocalStateSpec{
                 .layers   = draft->local_layer_count(),
-                .capacity = draft->sliding_window.value_or(0),
+                .capacity = ring_capacity,
                 .kv_heads = dimension(draft->attention.num_key_value_heads),
                 .head_dim = dimension(draft->attention.head_dim),
                 // Quantized draft rings need the matching per-head layout; the default stays

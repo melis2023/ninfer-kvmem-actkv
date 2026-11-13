@@ -1,4 +1,4 @@
-#include "models/qwen3_5/program/structured_round.h"
+﻿#include "models/qwen3_5/program/structured_round.h"
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/context.h"
@@ -494,8 +494,8 @@ void ProgramImpl::enqueue_dflash_context_append(std::span<const std::uint32_t> l
     const auto batch                = static_cast<std::int32_t>(lanes.size());
     Tensor active_lane_tensor       = frame.active_lanes.slice(0, 0, batch);
     Tensor state_destination_tensor = frame.state_destination_slots.slice(0, 0, batch);
-    Tensor device_starts            = frame.context_frontiers.slice(0, 0, batch);
-    Tensor device_ends              = frame.execution_frontiers.slice(0, 0, batch);
+    Tensor device_starts            = frame.draft_contexts.slice(0, 0, batch);
+    Tensor device_ends              = frame.draft_frontiers.slice(0, 0, batch);
     Tensor table_rows               = frame.dflash_kv_table_rows.slice(0, 0, batch);
     Tensor positions                = frame.append_positions.slice(1, 0, batch);
     Tensor device_counts            = frame.append_counts.slice(0, 0, batch);
@@ -1163,7 +1163,12 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             const std::uint32_t extent =
                 std::min({proposed, max_by_budget, capacity - frontier - 1U});
             dflash_host_ingress->anchors[row] = sequence.ledger.back();
-            // Compact coordinates: target_rope_positions below stays logical for RoPE.
+            // Target KV is rewritten into compact coordinates after a KVMem reselection,
+            // and the prefill feature sink appends the draft ring at those same compact
+            // positions. DFlash2 owns a logical ring; DFlash/DSpine must stay compact or
+            // decode would append newly committed features at logical slots the attention
+            // kernel never reads (under a swapped view, logical 1408 vs compact 640).
+            // target_rope_positions below stays logical for RoPE.
             const bool logical_draft = speculative_backend == SpeculativeBackend::DFlash2;
             dflash_host_ingress->execution_frontiers[row] =
                 checked_i32(compact_position(sequence, frontier), "DFlash batch frontier");
@@ -1171,11 +1176,27 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                 logical_draft ? sequence.dflash_context_frontier
                               : compact_position(sequence, sequence.dflash_context_frontier),
                 "DFlash context frontier");
-            dflash_host_ingress->draft_frontiers[row] = checked_i32(
-                logical_draft ? frontier : compact_position(sequence, frontier),
-                "DFlash draft frontier");
-            dflash_host_ingress->draft_floors[row] = checked_i32(
-                logical_draft ? sequence.dflash_context_floor : 0, "DFlash draft floor");
+            // The ring is a dense cyclic buffer addressed by absolute positions: KVMem
+            // rebases the compact KV address on every reselection and the ring cannot follow.
+            dflash_host_ingress->draft_frontiers[row] =
+                checked_i32(frontier, "draft ring frontier");
+            dflash_host_ingress->draft_contexts[row] =
+                checked_i32(sequence.dflash_context_frontier, "draft ring context");
+            dflash_host_ingress->draft_floors[row] =
+                checked_i32(sequence.dflash_context_floor, "draft ring floor");
+            if (std::getenv("NINFER_DSPINE_POSDUMP") != nullptr && row == 0) {
+                std::fprintf(stderr,
+                             "[posdump] decode frontier=%u compact_frontier=%u removed=%u "
+                             "ctx_frontier=%u floor=%u width=%u extent=%u append=%u %u %u %u "
+                             "anchor=%d ledger=%zu\n",
+                             frontier, compact_position(sequence, frontier),
+                             sequence.window.removed_tokens, sequence.dflash_context_frontier,
+                             sequence.dflash_context_floor, width, extent,
+                             frontier + std::min(0U, extent), frontier + std::min(1U, extent),
+                             frontier + std::min(2U, extent), frontier + std::min(3U, extent),
+                             static_cast<int>(dflash_host_ingress->anchors[row]),
+                             sequence.ledger.size());
+            }
             dflash_host_ingress->proposal_valid_columns[row] =
                 static_cast<std::int32_t>(draft_window + 1U);
             dflash_host_ingress->proposal_extents[row]       = static_cast<std::int32_t>(extent);

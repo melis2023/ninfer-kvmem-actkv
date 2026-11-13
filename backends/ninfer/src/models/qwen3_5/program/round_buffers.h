@@ -89,12 +89,16 @@ struct DFlashDecodeIngress {
     std::array<TokenId, kMaximumConcurrency> anchors{};
     std::array<std::int32_t, kMaximumConcurrency> execution_frontiers{};
     std::array<std::int32_t, kMaximumConcurrency> context_frontiers{};
-    // Draft-side local-ring coordinates. DFlash (Full paged pool in the target's compact space)
-    // keeps the compact coordinate, but DFlash2 is cyclic-only: its rings are addressed by
-    // `position mod S` and are not moved by a KVMem window compaction, so it keeps logical
-    // positions. Using compact coordinates here makes `removed_tokens` shift every ring slot and
-    // collapses acceptance once the context crosses the B/R window.
+    // Draft-side local-ring coordinates. Every masked draft backend is cyclic-only:
+    // its rings are addressed by `position mod S` and are not moved by a KVMem window
+    // compaction, so it keeps logical positions. Using compact coordinates here makes
+    // `removed_tokens` shift every ring slot and collapses acceptance once the context
+    // crosses the B/R window. DSpine is all-sliding and needs the same treatment.
     std::array<std::int32_t, kMaximumConcurrency> draft_frontiers{};
+    // Absolute start of the ring's appendable span (the context frontier before the
+    // round). The ring is addressed in absolute positions, so this must not be the
+    // compact KV address.
+    std::array<std::int32_t, kMaximumConcurrency> draft_contexts{};
     std::array<std::int32_t, kMaximumConcurrency> proposal_extents{};
     std::array<std::int32_t, kMaximumConcurrency> target_valid_columns{};
     std::array<std::int32_t, kMaximumConcurrency> proposal_valid_columns{};
@@ -111,8 +115,9 @@ struct DFlashDecodeIngress {
     // Rows whose proposal is the ngram copy payload below; other rows keep the neural drafter's
     // proposal. Read on the device, so one captured ngram-family graph serves every mixture.
     std::array<std::int32_t, kMaximumConcurrency> copy_rows{};
-    // DFlash2: the lowest logical ring position still guaranteed live after a KVMem reselection;
-    // older slots are masked in the draft attention. DFlash keeps 0 (its Full pool reads by row).
+    // Lowest logical ring position still guaranteed live after a KVMem reselection;
+    // older slots are masked in the draft attention. DFlash2 and DSpine (all-sliding
+    // cyclic rings) both consume it; a drafter with a Full pool reads by row and keeps 0.
     std::array<std::int32_t, kMaximumConcurrency> draft_floors{};
     // Neural rounds copy only the prefix before ngram_tokens. Keep all controls above it;
     // proposal-only payloads below it preserve the existing vector-aligned offsets. The arrays
@@ -315,6 +320,7 @@ struct DFlashDecodeState {
     Tensor execution_frontiers;
     Tensor context_frontiers;
     Tensor draft_frontiers;
+    Tensor draft_contexts;
     Tensor draft_floors;
     Tensor proposal_extents;
     Tensor target_valid_columns;

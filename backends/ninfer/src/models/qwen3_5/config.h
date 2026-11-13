@@ -114,6 +114,7 @@ struct DSpineConfig {
     std::uint32_t code_size   = 0;
     std::uint32_t rank        = 0;
     std::uint32_t first_exact = 0;
+    std::uint32_t head_topk   = 16;
     float eps                 = 0;
     float kappa               = 0;
 };

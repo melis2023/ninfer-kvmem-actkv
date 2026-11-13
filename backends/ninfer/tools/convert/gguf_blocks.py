@@ -501,6 +501,10 @@ def _companions(model, recipe, sources) -> None:
 
     vision = _vision_source(model, sources) if "vision" in model.components else None
     blocks = draft_blocks(model, sources["dflash2"]) if "dflash2" in model.components else {}
+    if "dflash" in model.components:
+        from .dspine_gguf import dspine_blocks
+
+        blocks |= dspine_blocks(model, sources["dflash"])
     for name, parameter in model.parameters.items():
         if name.startswith("vision/"):
             source = model.source(name, vision)

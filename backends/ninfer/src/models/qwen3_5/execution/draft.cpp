@@ -1,7 +1,10 @@
-﻿#include "models/qwen3_5/program/structured_round.h"
+#include "models/qwen3_5/program/structured_round.h"
 #include "models/qwen3_5/program/graph_execution.h"
 #include "models/qwen3_5/execution/linear.h"
+#include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include "models/qwen3_5/program/internal.h"
@@ -27,6 +30,7 @@
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/prepare_masked_block.h"
+#include "ninfer/ops/position.h"
 #include "ninfer/ops/prepare_ragged_prefix.h"
 #include "ninfer/ops/rmsnorm.h"
 #include "ninfer/ops/rope.h"
@@ -154,7 +158,6 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
             ops::set_i32_scalar(local_counts, dimension(config.sliding_window.value_or(0)),
                                 state.execution.device.stream);
         }
-
         const int projected_width = config.dflash2.has_value() ? local_width : width;
         const Tensor input        = config.dflash2.has_value() && replace_local_window
                                         ? features.slice(1, local_offset, local_width)
@@ -424,7 +427,7 @@ void dump_tensor(const Tensor& tensor, const char* directory, const char* name,
     if (host.empty()) { return; }
     CUDA_CHECK(cudaMemcpyAsync(host.data(), tensor.data, host.size(), cudaMemcpyDeviceToHost,
                                stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaDeviceSynchronize());
     const std::string path = std::string(directory) + "/" + name + ".bin";
     std::ofstream file(path, std::ios::binary);
     file.write(reinterpret_cast<const char*>(host.data()),
@@ -439,9 +442,16 @@ void trace_append(const Tensor& tensor, const char* path, std::uint32_t tag,
                   cudaStream_t stream) {
     std::vector<std::byte> host(static_cast<std::size_t>(tensor.bytes()));
     if (host.empty()) { return; }
+    // The decode graph is captured once with representative ingress; tracing during that
+    // capture would both log fake values and trip cudaErrorStreamCaptureUnsupported.
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &capture) == cudaSuccess &&
+        capture != cudaStreamCaptureStatusNone) {
+        return;
+    }
     CUDA_CHECK(cudaMemcpyAsync(host.data(), tensor.data, host.size(), cudaMemcpyDeviceToHost,
                                stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaDeviceSynchronize());
     std::ofstream file(path, std::ios::binary | std::ios::app);
     const std::uint32_t header[2] = {tag, static_cast<std::uint32_t>(host.size())};
     file.write(reinterpret_cast<const char*>(header), sizeof(header));
@@ -474,21 +484,19 @@ DSpineRefinementTable& dspine_refinement_table(const execution::Parameters& para
 }
 
 void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame,
-                        std::int32_t batch_size, std::uint32_t k, DFlashEnvelopes envelopes) {    if (state.execution.parameters.model.config().draft->dspine &&
-        std::getenv("NINFER_DSPINE_BASELINE") == nullptr) {
-        throw std::logic_error(
-            "DSpine draft execution is not implemented yet; the weights and config load");
-    }
+                        std::int32_t batch_size, std::uint32_t k, DFlashEnvelopes envelopes) {
     if (state.execution.parameters.model.config().draft->dflash2) {
         nvtx::ScopedRange proposal_range(nvtx::Name::DFlashProposal, nvtx::Category::DFlash,
                                          static_cast<std::uint64_t>(k + 1U) * batch_size);
         propose_dflash2_batch(state, frame, batch_size, k, envelopes);
     } else {
-        // The verify kernel only admits the proposals its extent publishes; leaving this at
-        // zero verifies the anchor alone and never accepts a draft token.
-        std::array<std::int32_t, kMaximumConcurrency> extents{};
-        extents.fill(static_cast<std::int32_t>(k));
-        CUDA_CHECK(cudaMemcpyAsync(frame.proposal_extents.data, extents.data(),
+        // The verify kernel only admits the proposals its extent publishes. The host
+        // ingress carries each row's *budget-capped* extent; republishing it here keeps
+        // the DFlash1-style proposal path independent of the ingress copy prefix.
+        // Filling it with k instead lets a high-acceptance drafter license more tokens
+        // than the request has left, which the round's metadata check then rejects.
+        CUDA_CHECK(cudaMemcpyAsync(frame.proposal_extents.data,
+                                   state.host_ingress.proposal_extents.data(),
                                    static_cast<std::size_t>(batch_size) * sizeof(std::int32_t),
                                    cudaMemcpyHostToDevice, state.execution.device.stream));
         const auto& target         = state.execution.parameters.model.config().text;
@@ -511,8 +519,38 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
         Tensor positions          = frame.proposal_positions.slice(1, 0, batch_size);
         Tensor drafts             = frame.draft_tokens.slice(1, 0, batch_size);
 
+        // Temporary latency breakdown, enabled with NINFER_DSPINE_PROFILE=1 together
+        // with --no-cuda-graph: the synchronises below cannot run inside a capture.
+        const bool dspine_profile = std::getenv("NINFER_DSPINE_PROFILE") != nullptr;
+        const auto profile_now = [] {
+            return std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        };
+        double p_layers = 0.0, p_head = 0.0, p_refine = 0.0;
+        double p_attn = 0.0, p_mlp = 0.0, p_bridge = 0.0;
+        double p_top16 = 0.0, p_gather = 0.0;
+        double p_mark = dspine_profile ? profile_now() : 0.0;
+        const auto profile_sync = [&] {
+            if (dspine_profile) {
+                CUDA_CHECK(cudaStreamSynchronize(state.execution.device.stream));
+                p_mark = profile_now();
+            }
+        };
+        const auto profile_add = [&](double& sink) {
+            if (dspine_profile) {
+                CUDA_CHECK(cudaStreamSynchronize(state.execution.device.stream));
+                const double now = profile_now();
+                sink += now - p_mark;
+                p_mark = now;
+            }
+        };
         state.execution.work.reset();
-        ops::prepare_masked_block(anchors, frontiers, valid_columns,
+        // The block is appended after the context in the reference, so its rows are placed at
+        // the ring frontier (absolute) and the context scan stays strictly below it. The
+        // ingest frontier used for RoPE here must be the ring's, not the compact KV address.
+        Tensor block_frontiers = frame.draft_frontiers.slice(0, 0, batch_size);
+        ops::prepare_masked_block(anchors, block_frontiers, valid_columns,
                                   dimension(config.mask_token_id), ids, positions,
                                   state.execution.device.stream);
         if (const char* dump = std::getenv("NINFER_DSPINE_DUMP"); dump != nullptr) {
@@ -549,6 +587,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
             dspine_q   = state.execution.work.alloc(DType::BF16, {rank, columns});
         }
 
+        profile_sync();
         for (int layer = 0; layer < dimension(config.num_hidden_layers); ++layer) {
             nvtx::ScopedRange layer_range(nvtx::Name::DFlashLayer, nvtx::Category::DFlash,
                                           static_cast<std::uint64_t>(layer));
@@ -609,11 +648,54 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                     const auto local =
                         dflash_state(state).local_layer(config.compact_layer_index(layer));
                     if (config.dspine) {
+                        // Never scan the entire ring. Once the compact frontier has
+                        // wrapped the ring, span == capacity makes the scan cover every
+                        // slot exactly once, including slots still holding features from
+                        // an earlier KVMem generation. Measured on a 108,662-token prompt
+                        // (B/R 65536/2048, k=6, meanq-cosine, 512 out, temp 0):
+                        //   span 8192 (=capacity): 30.1% accepted, 43.3 tok/s
+                        //   span 7168: 83.5%, 96.0 | 4096: 80.1%, 94.9
+                        //   span 2048: 79.0%, 101.8 | 1024: 80.1%, 104.0 tok/s
+                        // Cap the default at capacity/8 (>=512) so the kernel never takes
+                        // the full-ring path. Short prompts are unaffected or slightly
+                        // better (1393 tokens: 60.3% -> 61.5%, 91.5 -> 93.4 tok/s).
+                        // NINFER_DSPINE_DRAFT_WINDOW overrides for experiments; setting
+                        // it to capacity (8192) restores the old behaviour.
+                        static const std::int32_t window_override = [] {
+                            const char* value = std::getenv("NINFER_DSPINE_DRAFT_WINDOW");
+                            if (value == nullptr || *value == '\0') { return 0; }
+                            const int parsed = std::atoi(value);
+                            return parsed > 0 ? parsed : 0;
+                        }();
+                        const auto trained_window =
+                            static_cast<std::int32_t>(config.sliding_window.value_or(0));
+                        const auto ring_capacity = static_cast<std::int32_t>(local.capacity);
+                        // KVMem reselections shift the compact positions while the ring keeps
+                        // its slots, so scanning the trained 8192 window reads stale rows
+                        // (31.3% at 108K against 43.9% at capacity/8). The cap stays until the
+                        // prefill sink is proven to publish absolute positions.
+                        // The ring is a dense cyclic buffer: its slots are addressed by the
+                        // position the row was written at, and the ring and reader share one
+                        // absolute coordinate system, so the trained 8192-token window is the
+                        // faithful scan (the reference iswa cache holds exactly that many cells).
+                        const auto safe_window =
+                            std::max<std::int32_t>(512, ring_capacity);
+                        // A quantized ring stores a BF16 shadow beside the int8 planes, and
+                        // the append kernel refuses to run without it: --draft-kv-dtype int8
+                        // therefore costs more ring memory (shadow + planes) and the draft
+                        // attention still reads BF16. Measured at 8.6K: 54.1% / 61.9 tok/s
+                        // against 54.1% / 61.7 for BF16, with runtime 902 vs 820 MiB.
+                        // BF16 stays the default until the attention itself consumes int8.
+                        const auto scan_window =
+                            window_override > 0 ? window_override
+                                                : std::min(trained_window, safe_window);
                         ops::dspine_causal_attention(
                             query_batch, key_batch, value_batch, positions, valid_columns,
-                            state_destinations, local.k, local.v,
-                            static_cast<std::int32_t>(local.capacity),
+                            frame.draft_floors.slice(0, 0, batch_size), state_destinations,
+                            local.k, local.v,
+                            ring_capacity,
                             static_cast<std::int32_t>(local.padded_capacity),
+                            scan_window,
                             static_cast<float>(
                                 1.0 / std::sqrt(double(config.attention.head_dim))),
                             attention_batch, state.execution.device.stream);
@@ -691,6 +773,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                         weight.output, residual, state.execution.work,
                         state.execution.device.stream);
                 }
+                profile_add(p_attn);
             }
             {
                 nvtx::ScopedRange mlp_range(nvtx::Name::DFlashMlp, nvtx::Category::PostMixer,
@@ -707,6 +790,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                                state.execution.work, state.execution.device.stream);
                 project_add(roots.intermediate, weight.mlp.down, residual, state.execution.work,
                             state.execution.device.stream);
+                profile_add(p_mlp);
             }
             if (config.dspine) {
                 const auto& bridge = *state.execution.parameters.draft->dspine_bridge;
@@ -733,36 +817,31 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                               ->layers[static_cast<std::size_t>(layer + 1)]
                               .input_norm
                         : state.execution.parameters.draft->final_norm;
-                if (std::getenv("NINFER_DSPINE_NO_BRIDGE") == nullptr) {
-                    ops::dspine_bridge_read(residual, nullptr, config.rms_norm_eps, raw, normalized,
-                                            rms, state.execution.device.stream);
-                    ops::dspine_bridge_read_proj(
-                        normalized, bridge.early_read_weights, bridge.read_weight, layer, projected,
-                        state.execution.device.stream);
-                    ops::dspine_bridge_codes(
-                        projected, bridge.codebook, anchors, width, batch_size,
-                        static_cast<float>(std::sqrt(double(code_size))), config.rms_norm_eps, codes,
-                        state.execution.device.stream);
-                    ops::dspine_bridge_linear(codes, bridge.gate_weight, q,
-                                              state.execution.device.stream);
-                    ops::dspine_bridge_linear(codes, bridge.predecessor_gate_weight, s,
-                                              state.execution.device.stream);
-                    ops::dspine_bridge_linear(codes, bridge.prev_weight, v,
-                                              state.execution.device.stream);
-                    ops::dspine_bridge_message(q, s, v, bridge.gate_bias, width, batch_size, message,
-                                               state.execution.device.stream);
-                    ops::dspine_bridge_write(message, bridge.feature_write_weights, layer, delta,
-                                             state.execution.device.stream);
-                    ops::dspine_bridge_finish(raw, delta, rms, next_norm, width, batch_size,
-                                              config.rms_norm_eps, out, normed,
-                                              state.execution.device.stream);
-                } else {
-                    // Diagnostic: drop the code bridge and keep only the target-context
-                    // attention, i.e. a plain pre-norm draft layer.
-                    ops::rmsnorm(residual, next_norm, config.rms_norm_eps, false, normed,
-                                 state.execution.device.stream);
-                    out = residual;
-                }
+                // The bridge's own eps governs the read RMS and the projected-code
+                // normalisation; the final RMSNorm uses the target norm's eps. Both
+                // are 1e-6 in the released checkpoint but are distinct config fields.
+                ops::dspine_bridge_read(residual, nullptr, extra.eps, raw, normalized, rms,
+                                        state.execution.device.stream);
+                ops::dspine_bridge_read_proj(
+                    normalized, bridge.early_read_weights, bridge.read_weight, layer, projected,
+                    state.execution.device.stream);
+                ops::dspine_bridge_codes(
+                    projected, bridge.codebook, anchors, width, batch_size,
+                    static_cast<float>(std::sqrt(double(code_size))), extra.eps, codes,
+                    state.execution.device.stream);
+                // Three GEMVs over the same codes, fused into one launch per layer.
+                // Saves two launches here (ten per round over five layers) with the
+                // same per-column accumulation order.
+                ops::dspine_bridge_qsv(codes, bridge.gate_weight,
+                                       bridge.predecessor_gate_weight, bridge.prev_weight,
+                                       q, s, v, state.execution.device.stream);
+                ops::dspine_bridge_message(q, s, v, bridge.gate_bias, width, batch_size, message,
+                                           state.execution.device.stream);
+                ops::dspine_bridge_write(message, bridge.feature_write_weights, layer, delta,
+                                         state.execution.device.stream);
+                ops::dspine_bridge_finish(raw, delta, rms, next_norm, width, batch_size,
+                                          config.rms_norm_eps, out, normed,
+                                          state.execution.device.stream);
                 if (const char* dump = std::getenv("NINFER_DSPINE_DUMP"); dump != nullptr) {
                     const auto prefix = [&](const char* name) {
                         return "layer" + std::to_string(layer) + "_" + name;
@@ -793,11 +872,16 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                     trace_append(rms, trace, 6, stream);
                     trace_append(q, trace, 7, stream);
                     trace_append(anchors, trace, 8, stream);
+                    trace_append(normed, trace, 11, stream);
                 }
                 residual = out;
                 layer_input = normed;
+                profile_add(p_bridge);
             }
         }
+        // profile_add() consumes each interval, so the layer total is their sum --
+        // adding one more here would only measure the empty tail after the last bridge.
+        p_layers = p_attn + p_mlp + p_bridge;
 
         Tensor packed =
             state.execution.work.alloc(DType::BF16, {dimension(target.hidden_size),
@@ -828,44 +912,80 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
         Tensor flat_drafts = drafts.view({static_cast<std::int32_t>(k) * batch_size});
         DSpineRefinementTable* refinement = nullptr;
         if (config.dspine) {
+            // The lattice is built from top-16 rows of the *full* vocabulary head and
+            // published to the sparse verifier. A shortlist head or a missing frame
+            // would leave candidate_ids/proposal_q uninitialised, so fail loudly.
+            if (state.execution.proposal_head != ProposalHead::Full) {
+                throw std::logic_error(
+                    "DSpine requires the full draft proposal head (no --lm-head-draft)");
+            }
+            if (!state.execution.parameters.draft->dspine_bridge || !frame.candidate_ids.data ||
+                !frame.proposal_q.data) {
+                throw std::logic_error("DSpine draft is missing bridge weights or its sparse frame");
+            }
+            if (config.dspine->head_topk != ops::kSparseSpeculativeCandidates) {
+                throw std::logic_error("DSpine head_topk disagrees with the sparse acceptance frame");
+            }
+            // The refinement lattice scores each (sender, candidate) pair against a
+            // gathered output-head row. That gather is only exact in the primal basis,
+            // so a Hadamard-rotated head would need an inverse transform first.
+            if (rotated(state.execution.parameters.draft->output_head.hadamard_signs)) {
+                throw std::logic_error(
+                    "DSpine refinement does not support a Hadamard-rotated proposal head");
+            }
             auto& table = dspine_refinement_table(state.execution.parameters,
                                                    state.execution.device.stream);
             if (table.owner != nullptr) { refinement = &table; }
         }
         if (state.execution.proposal_head == ProposalHead::Full) {
+            profile_sync();
             Tensor logits = state.execution.work.alloc(
                 DType::BF16,
                 {dimension(target.vocab_size), static_cast<std::int32_t>(k) * batch_size});
             project(proposal_hidden, state.execution.parameters.draft->output_head, logits,
                     state.execution.work, state.execution.device.stream);
+            profile_add(p_head);
             if (const char* dump = std::getenv("NINFER_DSPINE_DUMP"); dump != nullptr) {
-                dump_tensor(proposal_hidden, dump, "proposal_hidden",
-                            state.execution.device.stream);
-                dump_tensor(logits, dump, "proposal_logits", state.execution.device.stream);
+                // The per-round dump OVERWRITES, so without a gate the files hold the
+                // last round -- degenerate (one valid position, the rest padded to
+                // 15328) and uninformative. Keep the first few full rounds instead.
+                static int dspine_dump_round = 0;
+                if (++dspine_dump_round <= 2) {
+                    dump_tensor(proposal_hidden, dump, "proposal_hidden",
+                                state.execution.device.stream);
+                    dump_tensor(logits, dump, "proposal_logits",
+                                state.execution.device.stream);
+                }
             }
-            if (refinement != nullptr && std::getenv("NINFER_DSPINE_NO_REFINE") == nullptr) {
+            if (refinement != nullptr) {
+                constexpr std::int32_t candidates = ops::kSparseSpeculativeCandidates;
                 const auto& bridge = *state.execution.parameters.draft->dspine_bridge;
                 const auto rank    = static_cast<std::int32_t>(config.dspine->rank);
                 const auto hidden  = dimension(target.hidden_size);
                 const auto drafts_columns = static_cast<std::int32_t>(k) * batch_size;
-                const auto candidate_columns = 16 * drafts_columns;
-                Tensor candidate_ids =
-                    state.execution.work.alloc(DType::I32, {16, drafts_columns});
+                const auto candidate_columns = candidates * drafts_columns;
+                Tensor candidate_ids = frame.candidate_ids.slice(2, 0, batch_size)
+                                           .view({candidates, drafts_columns});
                 ops::dspine_top16(
                     logits, candidate_ids,
                     dimension(state.execution.parameters.model.resources().public_token_count),
                     state.execution.device.stream);
+                profile_add(p_top16);
                 Tensor head_rows =
                     state.execution.work.alloc(DType::BF16, {hidden, candidate_columns});
                 ops::embedding(candidate_ids.view({candidate_columns}),
                                state.execution.parameters.draft->output_head.weight, head_rows,
                                state.execution.device.stream);
+                profile_add(p_gather);
                 Tensor message =
                     state.execution.work.alloc(DType::BF16, {rank, candidate_columns});
                 Tensor delta =
                     state.execution.work.alloc(DType::FP32, {hidden, candidate_columns});
                 Tensor scratch =
                     state.execution.work.alloc(DType::FP32, {2 * rank, candidate_columns});
+                Tensor table = state.execution.work.alloc(
+                    DType::FP32,
+                    {candidates * candidates, static_cast<std::int32_t>(k), batch_size});
                 if (const char* dump = std::getenv("NINFER_DSPINE_DUMP"); dump != nullptr) {
                     const auto stream = state.execution.device.stream;
                     dump_tensor(candidate_ids, dump, "refine_cand_ids", stream);
@@ -878,16 +998,34 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                     trace_append(candidate_ids, trace, 1, state.execution.device.stream);
                     trace_append(head_rows, trace, 10, state.execution.device.stream);
                 }
+                profile_sync();
                 ops::dspine_refine(
-                    candidate_ids.view({16, static_cast<std::int32_t>(k), batch_size}),
+                    candidate_ids.view({candidates, static_cast<std::int32_t>(k), batch_size}),
                     dspine_rms.view({width, batch_size}),
                     dspine_raw.view({hidden, width, batch_size}),
                     dspine_q.view({rank, width, batch_size}), anchors, bridge.codebook,
                     bridge.predecessor_gate_weight, bridge.prev_weight, bridge.gate_bias,
                     refinement->write_scaled, head_rows,
                     state.execution.parameters.draft->final_norm, width, batch_size,
-                    config.rms_norm_eps, message, delta, scratch, drafts,
+                    config.rms_norm_eps, message, delta, scratch, table,
                     state.execution.device.stream);
+                // Publish the lattice to the verifier and walk it from the anchor,
+                // greedily by default or under the request's sampling temperature.
+                // The proposal distribution is written through a non-const Tensor&, so
+                // bind the narrowed slice to a named view instead of a temporary.
+                profile_add(p_refine);
+                Tensor proposal_q = frame.proposal_q.slice(2, 0, batch_size);
+                Tensor base_positions = frame.draft_frontiers.slice(0, 0, batch_size);
+                ops::dspine_lattice_walk(
+                    candidate_ids.view({candidates, static_cast<std::int32_t>(k), batch_size}),
+                    table, base_positions, frame.sampling, drafts, proposal_q,
+                    state.execution.device.stream);
+                if (const char* dump = std::getenv("NINFER_DSPINE_DUMP"); dump != nullptr) {
+                    const auto stream = state.execution.device.stream;
+                    dump_tensor(table, dump, "refine_table", stream);
+                    dump_tensor(proposal_q, dump, "proposal_q", stream);
+                    dump_tensor(drafts, dump, "walk_drafts", stream);
+                }
             } else {
                 ops::argmax(
                     logits, flat_drafts,
@@ -914,6 +1052,15 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                     flat_drafts, static_cast<const std::int32_t*>(proposal.token_ids->data),
                     dimension(proposal.rows), state.execution.device.stream);
         }
+        if (dspine_profile) {
+            // Every boundary here is a stream sync, so the absolute numbers carry a
+            // constant sync tax; the shares between sections are what the split is for.
+            std::fprintf(stderr,
+                         "[draft-prof] layers %.2f (attn %.2f mlp %.2f bridge %.2f) "
+                         "head %.2f refine %.2f (top16 %.2f gather %.2f) ms | k=%d cols=%d\n",
+                         p_layers, p_attn, p_mlp, p_bridge, p_head, p_refine,
+                         p_top16, p_gather, static_cast<int>(k), static_cast<int>(columns));
+        }
         if (const char* dump = std::getenv("NINFER_DSPINE_DUMP"); dump != nullptr) {
             dump_tensor(drafts, dump, "drafts", state.execution.device.stream);
         }
@@ -931,6 +1078,10 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             throw std::logic_error("DFlash decode batch state is incomplete");
         }
         auto frame               = state.frame.narrowed(k);
+        // DFlash2 and DSpine publish a candidate lattice; plain DFlash v1 does not,
+        // even though its frame reserves the buffers for a shared layout.
+        const auto& draft_cfg = *state.execution.parameters.model.config().draft;
+        const bool lattice_round = draft_cfg.dspine.has_value() || draft_cfg.dflash2.has_value();
         const std::int32_t width = static_cast<std::int32_t>(k) + 1;
         const std::size_t ingress_bytes =
             state.ngram ? sizeof(qwen3_5::DFlashDecodeIngress)
@@ -940,7 +1091,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
 
         Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers          = frame.execution_frontiers.slice(0, 0, batch_size);
-        Tensor context_starts     = frame.context_frontiers.slice(0, 0, batch_size);
+        Tensor context_starts     = frame.draft_contexts.slice(0, 0, batch_size);
         Tensor draft_frontiers    = frame.draft_frontiers.slice(0, 0, batch_size);
         Tensor extents            = frame.proposal_extents.slice(0, 0, batch_size);
         // The verify round consumes width tokens; target_valid_columns is the round's newly
@@ -982,6 +1133,8 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             dump_tensor(draft_frontiers, dump, "draft_frontiers", state.execution.device.stream);
             dump_tensor(target_positions, dump, "verify_positions", state.execution.device.stream);
             dump_tensor(frontiers, dump, "execution_frontiers", state.execution.device.stream);
+            dump_tensor(target_hidden, dump, "target_hidden", state.execution.device.stream);
+            dump_tensor(selected_hidden, dump, "selected_hidden", state.execution.device.stream);
         }
         append_context_impl(state, compact_features, append_positions, append_counts,
                             state_destinations, dflash_rows,
@@ -1063,11 +1216,12 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                     .target_tokens           = target_tokens,
                     .drafts                  = drafts,
                     .current_extents         = extents,
-                    .candidate_ids           = frame.candidate_ids.data
+                    .candidate_ids           = lattice_round && frame.candidate_ids.data
                                                    ? frame.candidate_ids.slice(2, 0, batch_size)
                                                    : Tensor{},
-                    .proposal_q =
-                        frame.proposal_q.data ? frame.proposal_q.slice(2, 0, batch_size) : Tensor{},
+                    .proposal_q = lattice_round && frame.proposal_q.data
+                                      ? frame.proposal_q.slice(2, 0, batch_size)
+                                      : Tensor{},
                     // Sampling keys remain logical when KVMem compacts target KV positions.
                     .frontiers = state.execution.parameters.model.config().draft->dflash2
                                      ? draft_frontiers : frontiers,
@@ -1083,11 +1237,15 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                 target_envelope);
         }
         if (const char* dump = std::getenv("NINFER_DSPINE_DUMP"); dump != nullptr) {
-            const auto stream = state.execution.device.stream;
-            dump_tensor(verify_ids, dump, "verify_ids", stream);
-            dump_tensor(target_tokens, dump, "target_argmax", stream);
-            dump_tensor(drafts, dump, "drafts", stream);
-            dump_tensor(accepted, dump, "accepted", stream);
+            // Same overwrite problem as the proposal dump above: keep the first rounds.
+            static int dspine_verify_dump_round = 0;
+            if (++dspine_verify_dump_round <= 2) {
+                const auto stream = state.execution.device.stream;
+                dump_tensor(verify_ids, dump, "verify_ids", stream);
+                dump_tensor(target_tokens, dump, "target_argmax", stream);
+                dump_tensor(drafts, dump, "drafts", stream);
+                dump_tensor(accepted, dump, "accepted", stream);
+            }
         }
         if (const char* trace = std::getenv("NINFER_DSPINE_TRACE"); trace != nullptr) {
             const auto stream = state.execution.device.stream;

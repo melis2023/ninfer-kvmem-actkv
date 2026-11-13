@@ -13,7 +13,7 @@ namespace {
 
 constexpr std::int32_t kSparseMaxDrafts        = 63;
 constexpr std::int32_t kSparseBatchedMaxDrafts = 31;
-constexpr std::int32_t kSparseCandidates       = 16;
+constexpr std::int32_t kSparseCandidates       = kSparseSpeculativeCandidates;
 constexpr std::int32_t kSparsePhysicalRows     = 248320;
 constexpr std::int32_t kSparseTokenDomain      = 248077;
 constexpr std::int32_t kSparseMaxBatch         = 8;
