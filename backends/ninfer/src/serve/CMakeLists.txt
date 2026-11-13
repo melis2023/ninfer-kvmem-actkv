@@ -51,10 +51,29 @@ target_link_libraries(ninfer_serve
 # such a directory.
 set(NINFER_WEBUI_DIR "" CACHE PATH
     "Directory of built WebUI files (with index.html) to serve from ninfer-serve; empty embeds none")
+
+# A build directory that inherits no cache would otherwise compile webui_none.cpp and ship a
+# ninfer-serve whose GET / is a bare 404 -- the build log never says the UI was skipped. Pick up
+# the bundle this checkout already assembled instead, and say so.
+if(NOT NINFER_WEBUI_DIR)
+  foreach(NINFER_WEBUI_CANDIDATE
+          "${CMAKE_SOURCE_DIR}/../../build-ui/full/dist"
+          "${CMAKE_SOURCE_DIR}/../../build/share/kvmem/ui")
+    if(EXISTS "${NINFER_WEBUI_CANDIDATE}/index.html" OR
+       EXISTS "${NINFER_WEBUI_CANDIDATE}/index.html.gz")
+      set(NINFER_WEBUI_DIR "${NINFER_WEBUI_CANDIDATE}" CACHE PATH
+          "Directory of built WebUI files (with index.html) to serve from ninfer-serve; empty embeds none"
+          FORCE)
+      break()
+    endif()
+  endforeach()
+endif()
+
 if(NINFER_WEBUI_DIR)
   if(NOT EXISTS "${NINFER_WEBUI_DIR}/index.html" AND NOT EXISTS "${NINFER_WEBUI_DIR}/index.html.gz")
     message(FATAL_ERROR "NINFER_WEBUI_DIR has no index.html: ${NINFER_WEBUI_DIR}")
   endif()
+  message(STATUS "WebUI: embedding ${NINFER_WEBUI_DIR}")
   add_executable(ninfer_webui_embed webui/embed.cpp)
   file(GLOB_RECURSE NINFER_WEBUI_FILES CONFIGURE_DEPENDS "${NINFER_WEBUI_DIR}/*")
   set(NINFER_WEBUI_SOURCE "${CMAKE_CURRENT_BINARY_DIR}/webui_assets.cpp")
@@ -67,4 +86,8 @@ if(NINFER_WEBUI_DIR)
   target_sources(ninfer_serve PRIVATE "${NINFER_WEBUI_SOURCE}")
 else()
   target_sources(ninfer_serve PRIVATE webui_none.cpp)
+  message(WARNING
+    "WebUI: NINFER_WEBUI_DIR is empty, so ninfer-serve is built without a WebUI and GET / "
+    "answers 404. Pass -DNINFER_WEBUI_DIR=<dir with index.html> (build-ui/full/dist in this "
+    "checkout) to embed one; --no-webui only hides an embedded UI at run time.")
 endif()
