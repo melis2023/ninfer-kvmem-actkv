@@ -50,6 +50,8 @@ y = W x + scale · B (A x)        scale = adapter.lora.alpha / rank × --lora-sc
 | 底模 | <https://huggingface.co/Qwen/Qwen3.8-27B> |
 | LoRA 实现契约参考（llama.cpp） | <https://github.com/ggml-org/llama.cpp> |
 
+国内网络把域名前缀换成 `hf-mirror.com` 即可（与本仓库 DSpine 草稿的链接方式一致）。
+
 官方关键数据（均为 pi harness、单次尝试、100 步预算的 agentic 任务，供对照）：
 
 | 基准 | 底模 | 底模 `xhigh` | 适配器（关思考） | 适配器 `xhigh` |
