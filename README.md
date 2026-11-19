@@ -11,6 +11,117 @@ QQ 交流群：**1040777853**。本项目仅供研究学习，稳定使用请前
 
 **所有修补、测速与召回数据汇总在 [docs/CHANGELOG.md](docs/CHANGELOG.md)。**
 
+## 分支 `exp/lora`：运行时外挂 LoRA 适配器
+
+> 本分支从 `exp/dspine` 拉出，只包含 LoRA 相关改动（不含 DSpine 那 39 个提交）。
+
+### 这个分支解决什么
+
+ninfer 的工作流是“先把模型转成 `.ninfer` 工件”，权重量化在转换期就固定了。因此一个 PEFT
+适配器过去必须**合并进底模重新量化**才能用，代价是重新转换、重新校准、多一份几十 GB 的工件。
+
+本分支把适配器变成**运行期参数**：
+
+- 权重仍然读 `.ninfer` 工件里的量化数据，一个字节都不重写；
+- 只把适配器的 FP16 因子（本模型 304 MiB）和一块 FP32 scratch（8 MiB）放进显存；
+- 换适配器、调强度只改启动参数，不重新转换。
+
+数学上沿用 llama.cpp `build_lora_mm` 的契约：受影响投影变成
+
+```
+y = W x + scale · B (A x)        scale = adapter.lora.alpha / rank × --lora-scale
+```
+
+### 适用范围（重要）
+
+这个适配器（pi）是**为 agent 编码循环训练的**，不是通用增强件：
+
+- 训练分布是 SWE-bench Pro / Terminal-Bench 那类“改仓库、跑测试、用终端”的任务；
+- 官方结论是它把**关思考**的表现拉到**底模开思考**的水平，同时省约 4.5× token、约一半轮次；
+- 对 HTML、单轮生成等分布外任务没有正收益，甚至可能更差；
+- 官方提示低位量化会有偏移，本项目底模是 IQ3_S（官方建议 Q8_0），属于偏低的一档。
+
+### 官方地址与模型链接
+
+| 项目 | 地址 |
+|---|---|
+| 适配器（官方模型卡） | <https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted> |
+| 适配器文件列表 | <https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted/tree/main> |
+| 底模 | <https://huggingface.co/Qwen/Qwen3.8-27B> |
+| LoRA 实现契约参考（llama.cpp） | <https://github.com/ggml-org/llama.cpp> |
+
+官方关键数据（均为 pi harness、单次尝试、100 步预算的 agentic 任务，供对照）：
+
+| 基准 | 底模 | 底模 `xhigh` | 适配器（关思考） | 适配器 `xhigh` |
+|---|---|---|---|---|
+| SWE-bench Pro (hard 51) | 39.2% | 64.7% | **64.7%** | 66.7% |
+| Terminal-Bench 2.1 | 41.0% | 54.2% | **56.6%** | 56.6% |
+
+可以看出：关思考时适配器的增益是 +25.5 / +16.3 点，开思考时只剩 +2.0 / +2.4 点——它是把
+“开思考时的行为”固化进不思考的前向过程，一旦底模本来就已经在思考，它能额外提供的东西就不
+多了。
+
+### 加载方式
+
+**1. 把 PEFT 适配器转成 GGUF**
+
+ninfer 只读 GGUF 布局的适配器（`general.type = adapter`、`adapter.type = lora`），用
+llama.cpp 的转换脚本：
+
+```bash
+python convert_lora_to_gguf.py <peft-adapter-dir> --outtype f16 --outfile adapter-f16.gguf
+```
+
+**2. 启动时挂载**
+
+```bat
+ninfer-serve.exe <model>.ninfer ^
+  --lora adapter-f16.gguf --lora-scale 1.0 ^
+  --spec mtp --draft-tokens 3 --no-thinking
+```
+
+`--lora-scale` 取值范围 `[1e-4, 16]`，最终生效倍率是 `alpha/rank × --lora-scale`。
+
+**3. 仓库自带启动器**
+
+`workers/ninfer/` 下（该目录被 `.gitignore` 忽略，属本地文件）：
+
+| 文件 | 配置 |
+|---|---|
+| `start-mtp-lora-nothink.bat` | MTP k=3 + 关思考，官方推荐组合，KV budget 36864 |
+| `start-mtp-lora-think.bat` | MTP k=3 + `--default-reasoning-effort xhigh --preserve-thinking` |
+| `start-kvmem-ninfer-dspine-lora.bat` | dflash k=4 + 关思考，KV budget 18432（dflash 权重更占显存） |
+
+**4. 开关与限制**
+
+- `--no-thinking` 与 `--default-reasoning-effort` **互斥**，同时给会直接报错；要开思考就是
+  去掉前者、加上后者。
+- 多轮对话必须加 `--preserve-thinking`，否则关闭轮的推理不会带回后续 prompt。
+- 适配器只作用于**文本主干**；vision / audio 塔与 MoE expert 会被跳过并给出原因，不会静默
+  忽略。
+- `NINFER_LORA_FUSED_SWIGLU=1` 可以启用融合的 gate/up delta + SwiGLU 单次 launch 路径。它在
+  张量级与逐因子路径一致（差 1 个 bf16 ulp），但端到端输出仍与逐因子路径不同，原因尚未查
+  明，因此**默认关闭**。
+
+### 实测代价
+
+8K 上下文、MTP k=3、交替 A/B 四组配对：**decode −3.4%**。
+
+单次对比会严重高估这个数字：同配置两次运行逐位一致，但跨进程波动可达 ±3.5%，早期用单次
+测量得出的 −19% 属于测量方法错误。
+
+### 新增代码位置
+
+| 目录 | 内容 |
+|---|---|
+| `backends/ninfer/include/ninfer/ops/` | `lora_accum.h`、`lora_swiglu.h` 公开接口 |
+| `backends/ninfer/src/ops/kernel/` | `lora_accum.cuh`、`lora_swiglu.cuh` |
+| `backends/ninfer/src/ops/launcher/` | `.cu` / `.h` 启动与分派 |
+| `backends/ninfer/src/ops/wrapper/` | 参数校验 |
+| `backends/ninfer/src/models/qwen3_5/` | `lora_adapter.{h,cpp}`、`load/lora_adapter.cpp` |
+| `backends/ninfer/src/serve/` | `--lora` / `--lora-scale` 接线 |
+| `backends/ninfer/docs/serving.md` | “Attached LoRA adapters” 一节 |
+
 ## 更新日志（2026-11-13）
 
 ### 1. DSpine 草案接入 KVMem
