@@ -8,9 +8,17 @@
 #include "ninfer/ops/linear.h"
 #include "ninfer/ops/linear_add.h"
 #include "ninfer/ops/linear_swiglu.h"
+#include "ninfer/ops/lora_accum.h"
+#include "ninfer/ops/lora_swiglu.h"
 #include "ninfer/ops/residual_add.h"
 #include "ninfer/ops/silu_mul.h"
 
+#include <cmath>
+#include <cstdio>
+#include <vector>
+#include <cstring>
+#include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::execution {
@@ -99,14 +107,30 @@ std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t fi
     if (is_gguf(gu.qtype)) {
         WorkspaceLayoutBuilder layout;
         const std::int32_t rows = p.up ? gu.n : gu.n / 2;
-        (void)layout.alloc(DType::BF16, {rows, last});
-        {
-            auto scope = layout.scope();
-            (void)layout.alloc_bytes(
-                p.up ? ops::linear_swiglu_pair_workspace_capacity_bytes(
-                           gu.qtype, p.up->weight.qtype, gu.n, gu.k, p.gate_up.policy, first, last)
-                     : ops::linear_swiglu_workspace_capacity_bytes(gu.qtype, gu.n, gu.k,
-                                                                   p.gate_up.policy, first, last));
+        const bool adapter_gate_up =
+            p.lora.has_value() && (p.lora->gate.present() || p.lora->up.present());
+        if (adapter_gate_up) {
+            // The adapter reads its projections' pre-activation rows, so both parents are staged.
+            const std::int32_t staging_rows = gu.n + (p.up ? p.up->weight.n : 0) + rows;
+            (void)layout.alloc(DType::BF16, {staging_rows, last});
+            (void)layout.alloc_bytes(ops::linear_workspace_capacity_bytes(
+                gu.qtype, gu.n, gu.k, p.gate_up.policy, first, last));
+            if (p.up) {
+                (void)layout.alloc_bytes(ops::linear_workspace_capacity_bytes(
+                    p.up->weight.qtype, p.up->weight.n, gu.k, p.up->policy, first, last));
+            }
+        } else {
+            (void)layout.alloc(DType::BF16, {rows, last});
+            {
+                auto scope = layout.scope();
+                (void)layout.alloc_bytes(
+                    p.up ? ops::linear_swiglu_pair_workspace_capacity_bytes(
+                               gu.qtype, p.up->weight.qtype, gu.n, gu.k, p.gate_up.policy, first,
+                               last)
+                         : ops::linear_swiglu_workspace_capacity_bytes(gu.qtype, gu.n, gu.k,
+                                                                       p.gate_up.policy, first,
+                                                                       last));
+            }
         }
         {
             auto scope = layout.scope();
@@ -223,24 +247,110 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
         return;
     }
     const auto& p = std::get<DenseParameters>(parameters);
+    if (p.lora && rotated_dense(p)) {
+        throw std::runtime_error("--lora: a Hadamard-rotated dense FFN is not supported");
+    }
     if (rotated_dense(p)) {
         rotated_dense_ffn(hidden, p, residual, workspace, stream, basis, wide_verification);
         return;
     }
     const auto& gu   = p.gate_up.weight;
     const auto& down = p.down.weight;
+    const DenseLora* lora = p.lora ? &*p.lora : nullptr;
+    if (lora != nullptr && basis != InputBasis::Primal) {
+        throw std::runtime_error("--lora: a rotated dense FFN input is not supported");
+    }
     if (is_gguf(gu.qtype)) {
-        Tensor activation = workspace.alloc(DType::BF16, {p.up ? gu.n : gu.n / 2, columns});
+        const std::int32_t intermediate = p.up ? gu.n : gu.n / 2;
+        bool adapter_gate_up = lora != nullptr && (lora->gate.present() || lora->up.present());
+        // Diagnostic: force the generic linear route with no adapter attached, so the cost of
+        // leaving the fused swiglu kernel is separable from the adapter's own kernels. Resolved
+        // once: this runs for every layer of every forward pass and getenv walks the environment.
+        static const bool unfuse_for_bench =
+            std::getenv("NINFER_LORA_EXPERIMENT_UNFUSE") != nullptr;
+        if (unfuse_for_bench) { adapter_gate_up = true; }
+        if (!adapter_gate_up) {
+            Tensor activation = workspace.alloc(DType::BF16, {intermediate, columns});
+            {
+                auto call = workspace.scope();
+                if (p.up) {
+                    ops::linear_swiglu(hidden, gu, p.up->weight, activation, p.gate_up.policy,
+                                       workspace, stream);
+                } else {
+                    ops::linear_swiglu(hidden, gu, activation, p.gate_up.policy, workspace, stream);
+                }
+            }
+            ops::linear_add(activation, down, residual, p.down.policy, workspace, stream);
+            if (lora != nullptr && lora->down.present()) {
+                ops::lora_accum(activation, lora->down.a, lora->down.b, residual, lora->down.scratch,
+                                lora->down.scale, stream);
+            }
+            return;
+        }
+        // Materialize the pre-activation parents so the adapter delta lands before the product.
+        Tensor plane = workspace.alloc(DType::BF16, {gu.n, columns});
         {
             auto call = workspace.scope();
-            if (p.up) {
-                ops::linear_swiglu(hidden, gu, p.up->weight, activation, p.gate_up.policy,
-                                   workspace, stream);
-            } else {
-                ops::linear_swiglu(hidden, gu, activation, p.gate_up.policy, workspace, stream);
+            ops::linear(hidden, gu, plane, p.gate_up.policy, workspace, stream);
+        }
+        // A fused gate/up parent keeps gate in its first half and up in its second, so one fused
+        // delta-and-product launch replaces two per-factor accumulations and a separate silu_mul.
+        const bool fusable_pair = !p.up && lora->gate.present() && lora->up.present() &&
+                                 lora->swiglu_scratch.data != nullptr;
+        // Diagnostic: NINFER_LORA_NO_FUSED_SWIGLU=1 keeps the per-factor route, so the fused op can
+        // be compared against the path it replaced.
+        // The fused op reproduces the per-factor route at the tensor level, but end-to-end runs
+        // still diverge from it, so it stays opt-in until that is explained. Default: the verified
+        // per-factor route below.
+        static const bool fused_swiglu =
+            std::getenv("NINFER_LORA_FUSED_SWIGLU") != nullptr;
+        if (fusable_pair && fused_swiglu) {
+            Tensor activation = workspace.alloc(DType::BF16, {intermediate, columns});
+            ops::LoraSwiGLUFactors factors;
+            factors.a_gate     = lora->gate.a;
+            factors.b_gate     = lora->gate.b;
+            factors.a_up       = lora->up.a;
+            factors.b_up       = lora->up.b;
+            factors.scale_gate = lora->gate.scale;
+            factors.scale_up   = lora->up.scale;
+            ops::lora_swiglu(hidden, plane, factors, activation, lora->swiglu_scratch, stream);
+            ops::linear_add(activation, down, residual, p.down.policy, workspace, stream);
+            if (lora->down.present()) {
+                ops::lora_accum(activation, lora->down.a, lora->down.b, residual,
+                                lora->down.scratch, lora->down.scale, stream);
             }
+            return;
+        }
+        Tensor gate_rows = p.up ? plane : plane.slice(0, 0, intermediate);
+        if (lora != nullptr && lora->gate.present()) {
+            ops::lora_accum(hidden, lora->gate.a, lora->gate.b, gate_rows, lora->gate.scratch,
+                            lora->gate.scale, stream);
+        }
+        Tensor activation = workspace.alloc(DType::BF16, {intermediate, columns});
+        if (p.up) {
+            Tensor up_plane = workspace.alloc(DType::BF16, {p.up->weight.n, columns});
+            {
+                auto call = workspace.scope();
+                ops::linear(hidden, p.up->weight, up_plane, p.up->policy, workspace, stream);
+            }
+            if (lora != nullptr && lora->up.present()) {
+                ops::lora_accum(hidden, lora->up.a, lora->up.b, up_plane, lora->up.scratch,
+                                lora->up.scale, stream);
+            }
+            ops::silu_mul(plane, up_plane, activation, stream);
+        } else {
+            Tensor up_rows = plane.slice(0, intermediate, intermediate);
+            if (lora != nullptr && lora->up.present()) {
+                ops::lora_accum(hidden, lora->up.a, lora->up.b, up_rows, lora->up.scratch,
+                                lora->up.scale, stream);
+            }
+            ops::silu_mul(gate_rows, up_rows, activation, stream);
         }
         ops::linear_add(activation, down, residual, p.down.policy, workspace, stream);
+        if (lora != nullptr && lora->down.present()) {
+            ops::lora_accum(activation, lora->down.a, lora->down.b, residual, lora->down.scratch,
+                            lora->down.scale, stream);
+        }
         return;
     }
     if (mtp || gu.qtype == QType::Q6_G64_FP16) {

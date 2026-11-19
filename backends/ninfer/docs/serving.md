@@ -152,7 +152,10 @@ retried. An on-demand read failure returns an unavailable error for that image r
 continues serving other requests. The artifact must remain available at its original entry path. This policy applies to the
 Qwen3.5-family CPU tower; Gemma 4 retains its separate CPU implementation.
 
-`/props.cpu_vision` reports residency, logical weight bytes, active encoder leases, load/unload
+`/props.cpu_vision` reads live Host-cache metadata independently of the Engine execution lock,
+so monitoring stays responsive during prefill and decode. `Engine::cpu_vision_status()` exposes
+the same observation without loading weights or querying CUDA. It reports residency, logical
+weight bytes, active encoder leases, load/unload
 counts, the last load time and the idle timeout. `CPU_VISION loaded` / `unloaded` log records
 identify actual transitions. Weight bytes exclude vector spare capacity and allocator overhead;
 OS working set and private memory can differ from this logical count.
@@ -957,11 +960,21 @@ Each capability rejection identifies the affected field and the guarantee NInfer
 Semantically neutral fields do not make an otherwise executable request fail. All-zero
 `logit_bias`, `logprobs:false`, `verbosity:"medium"`, empty legacy tool controls,
 text-only `audio` configuration, and `prediction` are accepted without changing Engine execution.
-Metadata, user/safety identifiers, service-tier and prompt-cache hints are likewise advisory.
+Metadata, user/safety identifiers and service-tier hints are likewise advisory.
 `prompt_cache_key` (at most 256 bytes, beyond the API's 64 so that a gateway can namespace keys per
-user) is not a prefix identity, but a non-empty key, on Chat Completions as on Responses, makes the
-Engine keep a private long-anchor checkpoint at the end of the prompt, so an agent loop with no new
-user turn between requests resumes from its previous request. Unknown top-level fields are ignored.
+user) is not a prefix identity. A non-empty Chat Completions key binds a live cache session,
+advances its session index and keeps a private long anchor at the prompt end, including when
+`store:false`. This matches the client-managed Responses path (`store:false`, no previous response).
+Chat also accepts `promptCacheKey`, as emitted by OpenCode's openai-compatible SDK adapter.
+If both spellings have non-empty values they must agree; a conflict is a request error.
+The optional `kvmem.conversation_id` (1–256 bytes) takes precedence over `prompt_cache_key`.
+Keep the identity stable across append, regenerate and history rollback; use separate identities
+for independent conversations. Shared keys share one cache lineage: editing an earlier prefix
+can discard its later checkpoints, so independently retained branches require distinct owners.
+Every restore still validates the token/media prefix and native KV/state; a matching key alone
+does not make incompatible inputs reusable. Missing, null or empty cache keys remain anonymous.
+Ordinary tool continuation retains its append and resident-only Pressure behavior.
+Unknown top-level fields are ignored.
 
 A string `name` on any message is accepted and ignored, as the optional OpenAI participant label
 that agent frameworks use to tag injected messages and that some clients mirror onto tool results.
@@ -1054,6 +1067,50 @@ does not match the model-held endpoint and can reuse only an earlier exact check
 
 `--chat-template FILE` selects a local Jinja template; by default, the server uses the template
 stored in the artifact. See the [CLI guide](cli.md#text-input) for an example.
+
+### Attached LoRA adapters
+
+`--lora FILE` attaches a llama.cpp-compatible GGUF adapter (the `convert_lora_to_gguf.py` layout)
+to a resident model. The adapter is a runtime overlay, not a weight of the artifact: the file is
+read once at startup, its factors are uploaded to the device, and every projection the adapter
+names adds `scale * B(A x)` to its result — llama.cpp's `build_lora_mm` contract, with
+`scale = adapter.lora.alpha / rank * --lora-scale`.
+
+```bash
+./build/apps/ninfer-serve models/qwen3_8_27b.ninfer \
+  --max-context 220000 --kvmem --kvmem-budget 18432 \
+  --lora adapters/my-adapter.gguf
+```
+
+What the engine attaches:
+
+* **Text-block projections only** — `attn_q`, `attn_k`, `attn_v`, `attn_output`, `attn_gate`,
+  `ffn_gate`, `ffn_up` and `ffn_down`. The PEFT spellings (`q_proj`, `k_proj`, ...) are accepted.
+  Token embeddings, the output head, MoE routers and expert banks, the linear-attention path and
+  the MTP/DFlash drafters are **not** adapted; their factors are ignored, not refused.
+* **Fused `q_proj` is split by head.** A GGUF `attn_q` stores each head's Q rows next to that
+  head's gate rows; the engine gathers the two logical projections out of the one factor, exactly
+  as the weight converter does.
+* **The gated FFN keeps its halves.** A fused gate/up parent is addressed per half, so the adapter's
+  `ffn_gate` and `ffn_up` factors land on the pre-activation rows they name.
+* Factors must be F32, F16 or BF16 and must match the base's shapes; a mismatched adapter is
+  refused at startup with the projection and both shapes in the message, which almost always means
+  it was trained against a different base.
+* One device only: a staged or tensor-parallel plan refuses `--lora`, because a block does not own
+  all of its weights.
+
+Cost. The factors are **device memory, not host memory** — they live where the weights they modify
+live, as in llama.cpp. An adapter covering all 64 blocks of a 27B model at rank 32 costs about
+304 MiB, so subtract that from `--kvmem-budget` (or `--kv-capacity`) to keep the same KV window;
+otherwise the start ends with too little VRAM headroom and Windows pages weights out to shared
+memory, which is far more expensive than the adapter itself.
+
+Speed. Each adapted projection adds one or two kernel launches per forward pass. On the reference
+card (RTX 5060 Ti, 27B IQ3_S, DFlash k=4) a full adapter costs about 8% of decode throughput
+(54.6 → 46.6 tok/s at 256 tokens); an adapter that only touches `ffn_down` measured at baseline
+speed, and one that only touches attention at about 4% below it. Merging the adapter into the
+weights (`merge_and_unload` in PEFT, then converting again) removes the cost entirely and needs the
+base in training precision.
 
 Clients send a wider effort vocabulary than the maintained Qwen templates accept (`low`, `medium`,
 `xhigh`). This fork collapses `minimal` onto `low` and `high`/`max` onto `xhigh` before rendering,
@@ -2138,6 +2195,9 @@ The table lists executable defaults. The startup example selects a long-context 
 
 | Option | Meaning | Default |
 |---|---|---:|
+| `--chat-template FILE` | replace the artifact's chat template at startup | artifact's template |
+| `--lora FILE` | attach a GGUF LoRA adapter beside the artifact ([attached adapters](#attached-lora-adapters)); its factors live in device memory like the weights they modify, so lower `--kvmem-budget` or `--kv-capacity` by the adapter's size | none |
+| `--lora-scale S` | multiply the adapter's own `adapter.lora.alpha / rank`, so `1` is llama.cpp's default strength; `(0,16]` | `1` |
 | `--host H` | listen address | `127.0.0.1` |
 | `--port N` | listen port | `8080` |
 | `--stats-port N` | also serve `GET /health`, `/stats`, `/v1/load` and `/metrics` on port `N` of the same address, with one worker of their own, so a dashboard or watchdog is never queued behind the connections the request pool serves; the readiness and API-key rules are the main listener's | off |

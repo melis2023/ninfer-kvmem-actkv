@@ -2,6 +2,8 @@
 #include "models/qwen3_5/execution/rotation.h"
 
 #include "core/weight_view.h"
+#include "ninfer/ops/lora_accum.h"
+#include "ninfer/ops/lora_swiglu.h"
 
 #include <array>
 #include <limits>
@@ -633,4 +635,277 @@ Parameters::Parameters(const Model& source) : model(source) {
     }
 }
 
+namespace {
+
+struct LoraCopy {
+    LoraPair* pair          = nullptr;
+    const LoraMatrixHost* a = nullptr;
+    const LoraMatrixHost* b = nullptr;
+    std::int32_t in         = 0;
+    std::int32_t out        = 0;
+    std::int32_t rank       = 0;
+    bool transpose_a        = false;
+    bool transpose_b        = false;
+    std::size_t a_offset    = 0;
+    std::size_t b_offset    = 0;
+    // Destination row i of B is source row `rows[i]`; empty keeps the file's order. A fused
+    // q_proj stores each head's Q rows next to that head's gate rows, and the engine keeps the two
+    // projections apart, so the split is a row gather rather than two contiguous slices.
+    std::vector<std::int32_t> rows;
+};
+
+constexpr std::size_t kLoraAlignment = 256;
+
+// Columns an attached adapter's scratch must hold: the widest single forward pass the engine
+// launches (a prefill chunk or a wide verification block), never the whole window.
+constexpr std::int32_t kLoraScratchTokens = 8192;
+
+std::size_t align_up(std::size_t value) noexcept {
+    return (value + kLoraAlignment - 1) / kLoraAlignment * kLoraAlignment;
+}
+
+std::vector<std::uint16_t> transposed(const LoraMatrixHost& matrix) {
+    std::vector<std::uint16_t> out(matrix.data.size());
+    for (std::int32_t inner = 0; inner < matrix.ne0; ++inner) {
+        for (std::int32_t outer = 0; outer < matrix.ne1; ++outer) {
+            out[static_cast<std::size_t>(outer) +
+                static_cast<std::size_t>(inner) * matrix.ne1] =
+                matrix.data[static_cast<std::size_t>(inner) +
+                            static_cast<std::size_t>(outer) * matrix.ne0];
+        }
+    }
+    return out;
+}
+
+// Resolves one factor against the layout the Op reads: `inner` varies fastest, `outer` second.
+void resolve(const LoraMatrixHost& matrix, std::int32_t inner, std::int32_t outer, bool& transpose,
+             std::int32_t& resolved_inner, std::int32_t& resolved_outer, const char* what,
+             const char* projection) {
+    if (matrix.ne0 == inner && matrix.ne1 == outer) {
+        transpose       = false;
+        resolved_inner  = inner;
+        resolved_outer  = outer;
+        return;
+    }
+    if (matrix.ne0 == outer && matrix.ne1 == inner) {
+        transpose       = true;
+        resolved_inner  = inner;
+        resolved_outer  = outer;
+        return;
+    }
+    throw std::invalid_argument(
+        std::string("lora adapter: ") + projection + " " + what + " is [" +
+        std::to_string(matrix.ne0) + ", " + std::to_string(matrix.ne1) + "] but the base needs [" +
+        std::to_string(inner) + ", " + std::to_string(outer) + "] (adapter built for another base?)");
+}
+
+// The rank of a factor whose inner dim is the projection's input.
+std::int32_t factor_rank(const LoraMatrixHost& a, std::int32_t in) noexcept {
+    return a.ne0 == in ? a.ne1 : a.ne0;
+}
+
+void collect(const LoraPairHost& source, LoraPair& target, std::int32_t in, std::int32_t out,
+             const char* projection, std::vector<LoraCopy>& copies,
+             std::vector<std::int32_t> rows = {}) {
+    if (!source.present()) { return; }
+    LoraCopy copy;
+    copy.a    = &source.a;
+    copy.b    = &source.b;
+    copy.pair = &target;
+    copy.in   = in;
+    copy.out  = out;
+    copy.rows = std::move(rows);
+    // A is [rank, in]: its inner dim is the projection's input and its outer dim the rank, and the
+    // file may store the two the other way round.
+    if (source.a.ne0 == in) {
+        copy.transpose_a = false;
+        copy.rank        = source.a.ne1;
+    } else if (source.a.ne1 == in) {
+        copy.transpose_a = true;
+        copy.rank        = source.a.ne0;
+    } else {
+        throw std::invalid_argument(std::string("lora adapter: ") + projection + " A is [" +
+                                    std::to_string(source.a.ne0) + ", " +
+                                    std::to_string(source.a.ne1) +
+                                    "] but the base input is " + std::to_string(in) +
+                                    " (adapter built for another base?)");
+    }
+    if (copy.rank <= 0) { throw std::invalid_argument("lora adapter: zero rank"); }
+    // A gathered copy takes the rows it names out of a wider parent, so `out` counts the
+    // destination's rows and the parent only has to hold every index.
+    const std::int32_t source_rows = source.b.ne0 == copy.rank ? source.b.ne1 : source.b.ne0;
+    std::int32_t rank_b_inner = 0;
+    std::int32_t rank_b_outer = 0;
+    resolve(source.b, copy.rank, source_rows, copy.transpose_b, rank_b_inner, rank_b_outer, "B",
+            projection);
+    if (!copy.rows.empty()) {
+        for (const std::int32_t row : copy.rows) {
+            if (row < 0 || row >= source_rows) {
+                throw std::invalid_argument(std::string("lora adapter: ") + projection +
+                                            " gather row out of range");
+            }
+        }
+        copy.out = static_cast<std::int32_t>(copy.rows.size());
+    } else if (rank_b_outer != out) {
+        throw std::invalid_argument(std::string("lora adapter: ") + projection + " B is [" +
+                                    std::to_string(source.b.ne0) + ", " +
+                                    std::to_string(source.b.ne1) + "] but the base needs " +
+                                    std::to_string(out) + " output rows");
+    }
+    copies.push_back(copy);
+}
+
+} // namespace
+
+void attach_lora(Parameters& parameters, const LoraAdapter& adapter, float user_scale) {
+    if (parameters.text.split_execution()) {
+        throw std::invalid_argument(
+            "--lora needs every block's weights on one device; this plan is staged or tensor-parallel");
+    }
+    const auto& config = parameters.model.config().text;
+    const auto hidden  = static_cast<std::int32_t>(config.hidden_size);
+    if (hidden <= 0 || !config.attention) {
+        throw std::invalid_argument("--lora needs the artifact's text attention dimensions");
+    }
+    const auto query_width = static_cast<std::int32_t>(config.attention->query_width());
+    const auto key_width   = static_cast<std::int32_t>(config.attention->key_width());
+
+    std::vector<LoraCopy> copies;
+    for (std::size_t layer = 0; layer < parameters.text.layers.size(); ++layer) {
+        if (layer >= adapter.layers.size()) { break; }
+        const LoraLayerHost& source = adapter.layers[layer];
+        BlockParameters& block      = parameters.text.layers[layer];
+        if (auto* attention = std::get_if<AttentionParameters>(&block.mixer)) {
+            attention->lora.emplace();
+            AttentionLora& lora = *attention->lora;
+            // The adapter's `attn_q` is the fused q_proj of the GGUF/llama.cpp layout: each head's
+            // Q rows sit next to that head's gate rows, so the two logical projections have to be
+            // gathered out of one factor. A file that keeps them apart is read as it is.
+            const LoraPairHost& query =
+                source.projections[static_cast<std::size_t>(LoraProjection::Query)];
+            const LoraPairHost& gate =
+                source.projections[static_cast<std::size_t>(LoraProjection::AttentionGate)];
+            const auto head_dim = static_cast<std::int32_t>(config.attention->head_dim);
+            const auto heads    = static_cast<std::int32_t>(config.attention->num_attention_heads);
+            const std::int32_t fused_rows = query.present() ? (query.b.ne0 == factor_rank(query.a, hidden)
+                                                                  ? query.b.ne1
+                                                                  : query.b.ne0)
+                                                            : 0;
+            if (!gate.present() && fused_rows == 2 * query_width) {
+                std::vector<std::int32_t> query_rows, gate_rows;
+                query_rows.reserve(static_cast<std::size_t>(query_width));
+                gate_rows.reserve(static_cast<std::size_t>(query_width));
+                for (std::int32_t head = 0; head < heads; ++head) {
+                    for (std::int32_t at = 0; at < head_dim; ++at) {
+                        query_rows.push_back(head * 2 * head_dim + at);
+                        gate_rows.push_back(head * 2 * head_dim + head_dim + at);
+                    }
+                }
+                collect(query, lora.query, hidden, query_width, "attn_q", copies, query_rows);
+                collect(query, lora.gate, hidden, query_width, "attn_gate", copies, gate_rows);
+            } else {
+                collect(query, lora.query, hidden, query_width, "attn_q", copies);
+                collect(gate, lora.gate, hidden, query_width, "attn_gate", copies);
+            }
+            collect(source.projections[static_cast<std::size_t>(LoraProjection::Key)], lora.key,
+                    hidden, key_width, "attn_k", copies);
+            collect(source.projections[static_cast<std::size_t>(LoraProjection::Value)], lora.value,
+                    hidden, key_width, "attn_v", copies);
+            collect(source.projections[static_cast<std::size_t>(LoraProjection::Output)],
+                    lora.output, query_width, hidden, "attn_output", copies);
+        }
+        if (auto* dense = std::get_if<DenseParameters>(&block.ffn)) {
+            const auto intermediate = static_cast<std::int32_t>(
+                dense->up ? dense->up->weight.n : dense->gate_up.weight.n / 2);
+            dense->lora.emplace();
+            DenseLora& lora = *dense->lora;
+            collect(source.projections[static_cast<std::size_t>(LoraProjection::FfnGate)], lora.gate,
+                    hidden, intermediate, "ffn_gate", copies);
+            collect(source.projections[static_cast<std::size_t>(LoraProjection::FfnUp)], lora.up,
+                    hidden, intermediate, "ffn_up", copies);
+            collect(source.projections[static_cast<std::size_t>(LoraProjection::FfnDown)], lora.down,
+                    intermediate, hidden, "ffn_down", copies);
+        }
+    }
+    if (copies.empty()) {
+        throw std::invalid_argument("--lora: the adapter's projections do not match any text block");
+    }
+
+    std::size_t total = 0;
+    std::int32_t widest_rank = 0;
+    for (LoraCopy& copy : copies) {
+        const std::size_t a_bytes =
+            static_cast<std::size_t>(copy.in) * static_cast<std::size_t>(copy.rank) * sizeof(std::uint16_t);
+        const std::size_t b_bytes =
+            static_cast<std::size_t>(copy.out) * static_cast<std::size_t>(copy.rank) * sizeof(std::uint16_t);
+        copy.a_offset = total;
+        total         = align_up(total + a_bytes);
+        copy.b_offset = total;
+        total         = align_up(total + b_bytes);
+        widest_rank   = std::max(widest_rank, copy.rank);
+    }
+
+    // Three buffers are pushed below (rank scratch, fused-swiglu scratch, adapter factors); reserve
+    // for them so the vector never reallocates under the references taken here.
+    parameters.lora_owner.reserve(4);
+    // One scratch buffer serves every factor: a captured decode graph keeps the address it was
+    // captured with, and the widest factor's rank covers the narrower ones.
+    parameters.lora_owner.emplace_back(ops::lora_accum_scratch_bytes(
+        ops::lora_accum_scratch_rank(widest_rank), kLoraScratchTokens));
+    // The fused gate/up delta-and-product reads both projections at once, so it needs twice the
+    // rows; it gets its own buffer rather than halving the shared one's meaning.
+    parameters.lora_owner.emplace_back(ops::lora_accum_scratch_bytes(
+        static_cast<std::int32_t>(ops::lora_swiglu_scratch_rank(widest_rank)), kLoraScratchTokens));
+    parameters.lora_owner.emplace_back(total);
+    DeviceBuffer& device         = parameters.lora_owner[2];
+    DeviceBuffer& scratch_device = parameters.lora_owner[0];
+    DeviceBuffer& swiglu_device  = parameters.lora_owner[1];
+    const Tensor scratch(scratch_device.p, DType::FP32,
+                         {ops::lora_accum_scratch_rank(widest_rank), kLoraScratchTokens});
+    const Tensor swiglu_scratch(
+        swiglu_device.p, DType::FP32,
+        {static_cast<std::int32_t>(ops::lora_swiglu_scratch_rank(widest_rank)),
+         kLoraScratchTokens});
+    for (const LoraCopy& copy : copies) {
+        const std::size_t a_bytes =
+            static_cast<std::size_t>(copy.in) * static_cast<std::size_t>(copy.rank) * sizeof(std::uint16_t);
+        const std::size_t b_bytes =
+            static_cast<std::size_t>(copy.out) * static_cast<std::size_t>(copy.rank) * sizeof(std::uint16_t);
+        if (copy.transpose_a) {
+            const auto staging = transposed(*copy.a);
+            device.copy_from_host(staging.data(), a_bytes, copy.a_offset);
+        } else {
+            device.copy_from_host(copy.a->data.data(), a_bytes, copy.a_offset);
+        }
+        if (copy.transpose_b) {
+            const auto staging = transposed(*copy.b);
+            device.copy_from_host(staging.data(), b_bytes, copy.b_offset);
+        } else if (!copy.rows.empty()) {
+            // B is [out, rank]: take the named rows of the source, in the destination's order.
+            std::vector<std::uint16_t> staging(static_cast<std::size_t>(copy.out) *
+                                               static_cast<std::size_t>(copy.rank));
+            for (std::size_t row = 0; row < copy.rows.size(); ++row) {
+                const auto source = copy.rows[row];
+                std::copy_n(copy.b->data.begin() + static_cast<std::ptrdiff_t>(source) * copy.rank,
+                            copy.rank, staging.begin() + static_cast<std::ptrdiff_t>(row) * copy.rank);
+            }
+            device.copy_from_host(staging.data(), b_bytes, copy.b_offset);
+        } else {
+            device.copy_from_host(copy.b->data.data(), b_bytes, copy.b_offset);
+        }
+        auto* base    = static_cast<char*>(device.p);
+        copy.pair->a  = Tensor(base + copy.a_offset, DType::FP16, {copy.in, copy.rank});
+        copy.pair->b  = Tensor(base + copy.b_offset, DType::FP16, {copy.rank, copy.out});
+        copy.pair->scratch = scratch;
+        copy.pair->scale =
+            (adapter.alpha > 0.0F ? adapter.alpha / static_cast<float>(copy.rank) : 1.0F) *
+            user_scale;
+    }
+    // The fused gate/up path needs its own two-projection scratch, on every block that has one.
+    for (BlockParameters& block : parameters.text.layers) {
+        if (auto* dense = std::get_if<DenseParameters>(&block.ffn)) {
+            if (dense->lora) { dense->lora->swiglu_scratch = swiglu_scratch; }
+        }
+    }
+}
 } // namespace ninfer::models::qwen3_5::execution

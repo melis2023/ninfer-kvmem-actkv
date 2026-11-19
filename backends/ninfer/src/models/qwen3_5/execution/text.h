@@ -283,7 +283,8 @@ private:
     // A mixer's output projection: added to the residual, or in a tensor-parallel pass written to
     // the rank's FP32 partial, which the exchange adds.
     void project_residual(const Tensor& input, const LinearParameters& p, Tensor& x,
-                          InputBasis basis, bool wide_verification);
+                          InputBasis basis, bool wide_verification,
+                          const LoraPair* lora = nullptr);
     // The Linear Attention state pool holding GDN layer `layer`, and its index within that pool.
     struct GdnStateRef {
         LinearAttentionStatePool* pool;

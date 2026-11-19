@@ -299,6 +299,8 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     ninfer::EngineOptions engine_options;
     engine_options.artifact_path            = options.artifact_path;
     engine_options.chat_template_path       = options.chat_template_path;
+    engine_options.lora_path                = options.lora_path;
+    engine_options.lora_scale               = options.lora_scale;
     engine_options.device                   = options.device;
     engine_options.max_context              = options.max_context;
     engine_options.kv_capacity              = options.kv_capacity;
@@ -714,6 +716,11 @@ StagedRequest GenerationService::stage_impl(const GenerationRequest& incoming,
             prepared.effective_thinking_budget.reset();
         }
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
+        if (request.return_token_ids) {
+            const auto ids = prompt.token_ids();
+            prepared.prompt_token_ids.assign(ids.begin(), ids.end());
+            prepared.return_token_ids = true;
+        }
         if (request.derive_output_budget) {
             request_options.execution.requested_output_tokens =
                 engine_->concurrent_output_budget(prompt);
@@ -858,6 +865,8 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     }
     GenerationOutcome outcome;
     outcome.tokens              = result.generated_token_ids;
+    outcome.prompt_token_ids    = std::move(prepared.prompt_token_ids);
+    outcome.return_token_ids    = prepared.return_token_ids;
     outcome.text                = std::move(result.content);
     outcome.reasoning           = std::move(result.reasoning);
     outcome.content_logprobs    = std::move(result.content_logprobs);

@@ -1,7 +1,10 @@
 #pragma once
 
+#include "models/qwen3_5/lora_adapter.h"
 #include "models/qwen3_5/model.h"
 #include "ninfer/ops/weight_input.h"
+
+#include "core/arena.h"
 
 #include <array>
 #include <memory>
@@ -31,6 +34,32 @@ using LinearParameters = ops::SingleProjectionWeight;
     return static_cast<std::int32_t>(value);
 }
 
+// One attached adapter projection: A [rank, in] and B [out, rank], both FP16, both views on the
+// adapter's single device allocation. `scale` already folds alpha/rank and --lora-scale.
+struct LoraPair {
+    Tensor a;
+    Tensor b;
+    // FP32 [rank_capacity, max_tokens] shared by every factor of the adapter; a captured decode
+    // graph keeps its address, so it cannot come from a per-call workspace arena.
+    Tensor scratch;
+    float scale = 0.0F;
+
+    [[nodiscard]] bool present() const noexcept {
+        return a.data != nullptr && b.data != nullptr && scratch.data != nullptr;
+    }
+};
+
+struct AttentionLora {
+    LoraPair query, key, value, output, gate;
+};
+
+struct DenseLora {
+    LoraPair gate, up, down;
+    // FP32 [2 * rank_capacity, tokens_capacity]: the fused gate/up delta and product needs both
+    // projections' rank reductions at once, so it cannot share `LoraPair::scratch`.
+    Tensor swiglu_scratch;
+};
+
 struct DenseParameters {
     LinearParameters gate_up;
     LinearParameters down;
@@ -40,6 +69,8 @@ struct DenseParameters {
     ops::LinearPolicy verify_gate_up_policy = ops::LinearPolicy::A16Only;
     // The up matrix when gate and up are separate GGUF parents; gate_up then holds the gate alone.
     std::optional<LinearParameters> up;
+    // Attached adapter for this block's dense FFN, absent for an artifact without one.
+    std::optional<DenseLora> lora;
 };
 
 struct StreamedMoeParameters {
@@ -55,6 +86,8 @@ struct AttentionParameters {
     ops::ProjectionWeights projection;
     Tensor query_norm, key_norm;
     LinearParameters output;
+    // Attached adapter for this block's attention, absent for an artifact without one.
+    std::optional<AttentionLora> lora;
 };
 
 struct GdnParameters {
@@ -206,6 +239,13 @@ public:
     std::optional<VisionParameters> vision;
     std::optional<DraftParameters> draft;
     std::optional<ProposalParameters> proposal;
-};
+    // The one device allocation every attached adapter factor is a view on. Empty without --lora.
+    std::vector<DeviceBuffer> lora_owner;};
+
+// Uploads `adapter` and points each text block's projection at its factors. `user_scale` multiplies
+// the file's own alpha/rank so `--lora-scale 1` is llama.cpp's default. Throws when a factor's
+// shape does not match the projection it names (an adapter built for another base) or when the
+// process runs a staged/tensor-parallel plan, where one block does not own all of its weights.
+void attach_lora(Parameters& parameters, const LoraAdapter& adapter, float user_scale);
 
 } // namespace ninfer::models::qwen3_5::execution

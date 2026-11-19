@@ -17,6 +17,8 @@
 #include "core/startup.h"
 #include "models/qwen3_5/frontend/graft.h"
 #include "models/qwen3_5/load.h"
+#include "models/qwen3_5/lora_adapter.h"
+#include "models/qwen3_5/execution/parameters.h"
 #include "models/qwen3_5/execution/expert_runtime.h"
 #include "models/qwen3_5/expert_admission.h"
 #include "models/qwen3_5/measurement.h"
@@ -304,7 +306,6 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         options.kvmem.host_bytes > UINT64_MAX - options.kvmem.disk_bytes) {
         throw std::invalid_argument("KVMem SSD requires a directory and a valid nonzero disk quota");
     }
-    if(!options.kvmem.query_max_tokens) throw std::invalid_argument("KVMem Query cap must be positive");
     kvmem::validate_query_scoring(options.kvmem.query_meanq_cosine ? kvmem::QueryScorer::MeanQCosine : kvmem::QueryScorer::PageSoftmax,
         options.kvmem.score_agg_max ? 1 : 0,options.kvmem.graph_alpha);
     if (options.kvmem.selected_tokens)
@@ -376,7 +377,6 @@ EngineOptions normalize_engine_options(EngineOptions options) {
             options.kv_capacity.mode != KvCapacityMode::Explicit ||
             options.kv_capacity.explicit_tokens != window * options.max_concurrency || window % 64 != 0 || window < 256 ||
             window > options.max_context || options.kvmem.selected_tokens < 128 ||
-            !options.kvmem.query_max_tokens || !options.kvmem.query_replay_max_tokens ||
             options.kvmem.selected_tokens % 64 != 0 || options.kvmem.reserve_tokens < 64 ||
             options.kvmem.reserve_tokens % 64 != 0 || !options.kvmem.host_bytes ||
             options.kvmem.retained_sessions == 0 || options.kvmem.retained_sessions > 16 ||
@@ -633,7 +633,18 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
            .long_anchor_min_spacing_tokens = options.context_cache.long_anchor_min_spacing_tokens,
            .progress_anchor_tokens         = options.context_cache.progress_anchor_tokens,
            .grafts = models::qwen3_5::load_prompt_grafts(options.grafts, model->config().text)})),
-      capacity(options.max_context) {}
+      capacity(options.max_context) {
+    if (!options.lora_path.empty()) {
+        const auto adapter = models::qwen3_5::read_lora_adapter(options.lora_path,
+                                                               parameters.text.layers.size());
+        models::qwen3_5::execution::attach_lora(parameters, adapter, options.lora_scale);
+        runtime::publish_diagnostic(
+            options.diagnostic_observer, DiagnosticLevel::Info,
+            "lora: %s attached over %zu blocks (%zu projections, %.1f MiB of device memory)",
+            options.lora_path.string().c_str(), adapter.layers.size(), adapter.projection_count(),
+            static_cast<double>(adapter.bytes()) / (1024.0 * 1024.0));
+    }
+}
 
 ModelInstance::~ModelInstance() = default;
 

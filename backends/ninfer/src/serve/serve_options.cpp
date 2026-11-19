@@ -125,6 +125,9 @@ std::string serve_usage_text(const char* argv0) {
            "                                SSD: process-local active/idle tiering; fast prefill supports\n"
            "                                INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 text/images\n"
            "  --kvmem-verify-transfers      check restored KV/GDN bytes (diagnostic)\n"
+           "  --rollout-score               enable POST /generate teacher-forced scoring\n"
+           "  --rollout-score-context N     scoring window in tokens (default 8192)\n"
+           "  --rollout-score-tile N        scoring staging tile (default 1024; use 256 on 16 GB)\n"
            "  --max-context N               logical context ceiling of each request (default\n"
            "                                8192)\n"
            "  --max-concurrency N           requests decoded together, 1..8 (default 1)\n"
@@ -140,6 +143,9 @@ std::string serve_usage_text(const char* argv0) {
            "  --model-id ID                 public model name instead of the artifact's\n"
            "                                metadata.name\n"
            "  --chat-template FILE          replace the artifact's chat template at startup\n"
+           "  --lora FILE                   attach a GGUF LoRA adapter (llama.cpp layout);\n"
+           "                                its factors live in device memory like weights\n"
+           "  --lora-scale S                multiply the adapter's alpha/rank (default 1)\n"
            "  --device N                    CUDA device index (default 0)\n"
            "  --devices A,B,...             one pipeline stage per listed device, 2..8\n"
            "                                (Linux/Windows); excludes --device\n"
@@ -700,6 +706,30 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.model_id_override->empty()) {
                 throw std::invalid_argument("--model-id must not be empty");
             }
+            continue;
+        }
+        if (arg == "--rollout-score") {
+            _putenv_s("NINFER_ROLLOUT_SCORE", "1");
+            continue;
+        }
+        if (arg == "--rollout-score-context") {
+            const char* text = require_value("--rollout-score-context");
+            char* end        = nullptr;
+            const unsigned long value = std::strtoul(text, &end, 10);
+            if (end == text || *end != '\0' || value < 2 || value > 262144UL) {
+                throw std::invalid_argument("--rollout-score-context must be in [2,262144]");
+            }
+            _putenv_s("NINFER_ROLLOUT_SCORE_CONTEXT", text);
+            continue;
+        }
+        if (arg == "--rollout-score-tile") {
+            const char* text = require_value("--rollout-score-tile");
+            char* end        = nullptr;
+            const unsigned long value = std::strtoul(text, &end, 10);
+            if (end == text || *end != '\0' || value < 32UL || value > 4096UL) {
+                throw std::invalid_argument("--rollout-score-tile must be in [32,4096]");
+            }
+            _putenv_s("NINFER_ROLLOUT_SCORE_TILE", text);
             continue;
         }
         if (arg == "--max-context") {
@@ -1565,6 +1595,18 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
             continue;
         }
+        if (arg == "--lora") {
+            options.lora_path = require_value("--lora");
+            if (options.lora_path.empty()) {
+                throw std::invalid_argument("--lora must not be empty");
+            }
+            continue;
+        }
+        if (arg == "--lora-scale") {
+            options.lora_scale =
+                parse_float_in(require_value("--lora-scale"), "--lora-scale", 1.0e-4F, 16.0F);
+            continue;
+        }
         if (arg == "--no-thinking") {
             options.enable_thinking = false;
             continue;
@@ -2062,3 +2104,4 @@ std::string resolve_public_model_id(const ServeOptions& options,
 }
 
 } // namespace ninfer::serve
+

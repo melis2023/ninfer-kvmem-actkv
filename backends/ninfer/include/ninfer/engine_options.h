@@ -419,8 +419,11 @@ enum class CudaMemoryPolicy : std::uint8_t {
 enum class KvmemQuerySource { User, Action, Auto };
 
 struct KvmemOptions {
+    // Zero keeps the historical bounded defaults: a full-Query capture at a 256K context
+    // needs per-token Q rows for every scored token and ran the host allocator dry, so
+    // unbounded has to be opt-in rather than implied by the option being omitted.
     std::uint32_t query_replay_max_tokens = 2048;
-    std::uint32_t query_max_tokens = 512; // tail of the actual last-user span, matching llama.cpp
+    std::uint32_t query_max_tokens = 512;
     bool lrfu = false;
     double lrfu_lambda = 0.5;
     double lrfu_top_fraction = 0.9;
@@ -477,6 +480,12 @@ struct KvmemOptions {
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
+    // An attached LoRA adapter: a llama.cpp-compatible GGUF adapter file read beside the artifact.
+    // Its factors stay in device memory (VRAM, like the layer's weights) and every forward pass
+    // adds `scale * B(A x)` to the projection it names. Empty attaches nothing.
+    std::filesystem::path lora_path;
+    // Multiplies the adapter's own alpha/rank, so 1 is llama.cpp's default application strength.
+    float lora_scale = 1.0F;
     // Message the model receives when it hits its thinking budget, before the canonical
     // </think> close the frontend appends when the message lacks it. Empty preserves the
     // model's built-in end-of-thinking control suffix.

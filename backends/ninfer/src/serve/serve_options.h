@@ -32,6 +32,9 @@ struct ServeOptions {
     std::string build_version;
     std::string artifact_path;
     std::filesystem::path chat_template_path;
+    // --lora: an attached GGUF LoRA adapter beside the artifact; empty attaches nothing.
+    std::filesystem::path lora_path;
+    float lora_scale = 1.0F;
     std::string host = "127.0.0.1";
     int port         = 8080;
     // --stats-port: also serve /health, /stats, /v1/load and /metrics on this port with one

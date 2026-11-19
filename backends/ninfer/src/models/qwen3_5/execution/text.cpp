@@ -1,4 +1,4 @@
-﻿#include "models/qwen3_5/program/internal.h"
+#include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/gdn.h"
@@ -27,6 +27,7 @@
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/speculative_round.h"
 #include "ninfer/ops/linear_add.h"
+#include "ninfer/ops/lora_accum.h"
 #include "ninfer/ops/linear_pair.h"
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/mtp_pack.h"
@@ -912,6 +913,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     // The NVFP4 W4A4 route can normalize while it quantizes, which skips the BF16 round trip of
     // the normalized hidden state, so only the other routes stage it.
     const auto* single     = std::get_if<LinearParameters>(&p.projection);
+    const auto* lora       = p.lora ? &*p.lora : nullptr;
     const bool fused_nvfp4 = input_basis == InputBasis::Primal && single != nullptr &&
                              ops::attn_input_proj_fused_rmsnorm_nvfp4_eligible(single->weight,
                                                                                single->policy, T);
@@ -924,10 +926,17 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     Tensor h;
     if (!fused_nvfp4 && !fused_int8) {
         h = workspace::matrix(work_, DType::BF16, dimension(config_.hidden_size), T);
+    } else if (lora != nullptr) {
+        // A fused route normalizes and quantizes in one pass and never materializes the normalized
+        // row, so the adapter gets its own copy. The projection keeps the fused mainloop, which is
+        // worth more than the copy costs.
+        h = workspace::matrix(work_, DType::BF16, dimension(config_.hidden_size), T);
     }
     if (input_basis == InputBasis::Rotated) {
         ops::rmsnorm_hadamard(x, w.input_norm, config_.rms_norm_eps, true, input_signs, h, s);
     } else if (!fused_nvfp4 && !fused_int8) {
+        ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
+    } else if (lora != nullptr) {
         ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
     }
 
@@ -953,6 +962,22 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
                                                 single->policy, work_, s);
     } else {
         attention_projection(h, p, q_flat, gate_flat, k_flat, v_flat, work_, s, input_basis);
+    }
+    if (lora != nullptr) {
+        // Every adapter factor reads the normalized hidden state of its block, which is `h` only in
+        // the primal basis: a rotated input would need the inverse rotation first.
+        if (input_basis != InputBasis::Primal) {
+            throw std::runtime_error("--lora: a rotated attention projection input is not supported");
+        }
+        const auto update = [&](const LoraPair& pair, Tensor& destination) {
+            if (pair.present()) {
+                ops::lora_accum(h, pair.a, pair.b, destination, pair.scratch, pair.scale, s);
+            }
+        };
+        update(lora->query, q_flat);
+        update(lora->gate, gate_flat);
+        update(lora->key, k_flat);
+        update(lora->value, v_flat);
     }
 
     const auto results = workspace::text_attention_results(work_, config_, T);
@@ -1064,18 +1089,29 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     }
     const bool wide = wide_residual_verification(ph, row_width(T), row_width(T));
     Tensor gated    = a.view({dimension(config_.attention->query_width()), T});
+    const LoraPair* output_lora =
+        lora != nullptr && lora->output.present() ? &lora->output : nullptr;
     if (rotated_output) {
         ops::sigmoid_mul_hadamard(gate, a, p.output.hadamard_signs, gated, s);
-        project_residual(gated, p.output, x, InputBasis::Rotated, wide);
+        project_residual(gated, p.output, x, InputBasis::Rotated, wide, output_lora);
         return;
     }
-    project_residual(gated, p.output, x, InputBasis::Primal, wide);
+    project_residual(gated, p.output, x, InputBasis::Primal, wide, output_lora);
 }
 
 void TextContext::project_residual(const Tensor& input, const LinearParameters& p, Tensor& x,
-                                   InputBasis basis, bool wide_verification) {
+                                   InputBasis basis, bool wide_verification, const LoraPair* lora) {
+    if (lora != nullptr && basis != InputBasis::Primal) {
+        throw std::runtime_error("--lora: a rotated output projection basis is not supported");
+    }
+    if (residual_partial_ != nullptr && lora != nullptr) {
+        throw std::runtime_error("--lora: a tensor-parallel residual share cannot carry an adapter");
+    }
     if (residual_partial_ == nullptr) {
         project_add(input, p, x, work_, ctx_.stream, basis, wide_verification);
+        if (lora != nullptr) {
+            ops::lora_accum(input, lora->a, lora->b, x, lora->scratch, lora->scale, ctx_.stream);
+        }
         return;
     }
     auto scope     = work_.scope();
