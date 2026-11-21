@@ -12,6 +12,8 @@ struct SlidingWindowAttentionPolicy {
     int padded_context;
     int window_mask;
     int min_position = 0;
+    // Causal: a query row sees the query rows at or before it; otherwise every live query row.
+    bool causal = false;
 
     __device__ __forceinline__ int context_count(int value) const {
         return min(max(value - min_position, 0), window_mask);
@@ -21,6 +23,10 @@ struct SlidingWindowAttentionPolicy {
 
     __device__ __forceinline__ bool allow_context(int query, int key) const {
         return key >= query - (window_mask);
+    }
+
+    __device__ __forceinline__ bool allow_query(int query_token, int key_token) const {
+        return !causal || key_token <= query_token;
     }
 
     __device__ __forceinline__ std::int64_t context_tile(int kv_head, int, int) const {
@@ -45,7 +51,8 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
         const std::int32_t* __restrict__ valid_columns, const std::int32_t* __restrict__ lanes,
         const std::int32_t* __restrict__ min_positions,
         const __nv_bfloat16* __restrict__ context_k, const __nv_bfloat16* __restrict__ context_v,
-        int padded_context, int window_mask, int max_context, int split_capacity, float scale,
+        int padded_context, int window_mask, bool causal, int max_context, int split_capacity,
+        float scale,
         float* __restrict__ partial_acc, float* __restrict__ partial_m,
         float* __restrict__ partial_l, __nv_bfloat16* __restrict__ out) {
     pdl::enter_streaming();
@@ -60,6 +67,7 @@ __launch_bounds__(WarpsPerCta * 32, 2) __global__
         .padded_context = padded_context,
         .window_mask = window_mask,
         .min_position = min_positions != nullptr ? min_positions[batch] : 0,
+        .causal      = causal,
     };
     context_query_split_partial_body<SlidingWindowAttentionPolicy, Tokens, WarpsPerCta,
                                      KeyBlock, DirectOutput>(

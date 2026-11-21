@@ -104,7 +104,8 @@ std::size_t sliding_window_attention_workspace_capacity_bytes(
     std::size_t capacity = 0;
     for (int tokens = min_tokens; tokens <= max_tokens; ++tokens) {
         const auto plan =
-            detail::sliding_window_attention_resolve_plan(window, tokens, batch_size, envelope);
+            detail::sliding_window_attention_resolve_plan(window, SlidingWindowMask::Symmetric, tokens,
+                                                              batch_size, envelope);
         if (plan.route == detail::SlidingWindowAttentionRoute::Direct) continue;
         WorkspaceLayoutBuilder layout;
         (void)allocate_workspace(layout, tokens, plan.split_capacity, batch_size);
@@ -120,7 +121,8 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
                               std::uint32_t window, float scale,
                               const CyclicKVCacheLayerView& context,
                               SlidingWindowAttentionExecutionEnvelope envelope,
-                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream) {
+                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
+                              SlidingWindowMask mask) {
     constexpr const char* op = "sliding_window_attention";
     require_profile(geometry, window, op);
     if (q.dtype != DType::BF16 || query_k.dtype != DType::BF16 || query_v.dtype != DType::BF16 ||
@@ -192,7 +194,7 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
 
     auto scope = workspace.scope();
     const auto plan =
-        detail::sliding_window_attention_resolve_plan(window, tokens, batch, envelope);
+        detail::sliding_window_attention_resolve_plan(window, mask, tokens, batch, envelope);
     PartialWorkspace partial{};
     if (plan.route == detail::SlidingWindowAttentionRoute::SplitKv) {
         partial = allocate_workspace(workspace, tokens, plan.split_capacity, batch);

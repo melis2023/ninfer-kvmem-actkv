@@ -52,6 +52,21 @@ void require_weight(const Weight& weight, std::int32_t k, const char* label) {
     }
 }
 
+// The admitted pair contract of require_weight, asked as a question instead of asserted. A caller
+// that gets false projects with two linear() calls.
+bool admitted(const Weight& weight, std::int32_t k) {
+    if (weight.qtype != QType::Q8_G32_FP16 || weight.layout != QuantLayout::RowSplit ||
+        weight.scale_dtype != DType::FP16 || weight.group != 32 || weight.group_size != 32 ||
+        weight.ndim != 2 || weight.n != 1024 || weight.k != k || weight.shape[0] != 1024 ||
+        weight.shape[1] != k || weight.padded_shape[0] != 1024 || weight.padded_shape[1] != k ||
+        weight.qhigh != nullptr || weight.high_plane_bytes != 0 ||
+        weight.payload_bytes < required_payload_bytes(1024, k) ||
+        !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 4)) {
+        return false;
+    }
+    return true;
+}
+
 void require_nonoverlap(const Tensor& x, const Weight& first_weight, const Weight& second_weight,
                         const Tensor& first_out, const Tensor& second_out) {
     struct Range {
@@ -88,6 +103,11 @@ void require_nonoverlap(const Tensor& x, const Weight& first_weight, const Weigh
 }
 
 } // namespace
+
+bool linear_pair_admits(const Weight& first_weight, const Weight& second_weight) {
+    const std::int32_t k = first_weight.k;
+    return (k == 5120 || k == 2048) && admitted(first_weight, k) && admitted(second_weight, k);
+}
 
 std::size_t linear_pair_workspace_capacity_bytes(const Weight& first_weight,
                                                  const Weight& second_weight,

@@ -7,6 +7,10 @@
 
 namespace ninfer::ops {
 
+// True when linear_pair accepts the weight pair: the formats and shapes it documents.
+// A caller projects any other pair with two linear() calls.
+[[nodiscard]] bool linear_pair_admits(const Weight& first_weight, const Weight& second_weight);
+
 // Validates the native weight pair and inclusive T interval. Existing routes use no scratch.
 [[nodiscard]] std::size_t linear_pair_workspace_capacity_bytes(const Weight& first_weight,
                                                                const Weight& second_weight,

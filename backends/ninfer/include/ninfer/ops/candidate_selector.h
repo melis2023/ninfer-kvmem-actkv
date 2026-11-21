@@ -50,4 +50,20 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
                              Tensor& drafts, Tensor& proposal_q, WorkspaceArena& workspace,
                              cudaStream_t stream);
 
+// Transient bytes candidate_topk() needs for U columns.
+[[nodiscard]] std::size_t candidate_topk_workspace_capacity_bytes(std::int32_t columns);
+
+/**
+ * Op: candidate_topk
+ *
+ * The selector's candidates from dense logits (a head that the fused linear_topk does not take):
+ * for each column u of logits, contiguous BF16 or FP32 [rows,U], the 16 rows v < valid_rows with
+ * the largest logits[v,u], in descending order with the lower id first on a tie, as candidate_ids
+ * I32 and their logits as candidate_scores FP32, each any contiguous tensor of 16 x U elements
+ * with 16 fastest ([16,K,B] for U = K B). A NaN logit takes no part; a slot that no logit fills
+ * holds id 0 and score -inf. valid_rows is in [16,rows].
+ */
+void candidate_topk(const Tensor& logits, std::int32_t valid_rows, Tensor& candidate_ids,
+                    Tensor& candidate_scores, WorkspaceArena& workspace, cudaStream_t stream);
+
 } // namespace ninfer::ops

@@ -20,10 +20,13 @@ struct SlidingWindowAttentionPlan {
     std::int32_t split_capacity;
     std::int32_t max_context;
     std::int32_t window;
+    // Causal inside a DSpine block: a query row sees the temporary query rows at or before it.
+    bool causal;
 };
 
 [[nodiscard]] SlidingWindowAttentionPlan
-sliding_window_attention_resolve_plan(std::uint32_t window, std::int32_t tokens, std::int32_t batch,
+sliding_window_attention_resolve_plan(std::uint32_t window, SlidingWindowMask mask,
+                                      std::int32_t tokens, std::int32_t batch,
                                       SlidingWindowAttentionExecutionEnvelope envelope);
 [[nodiscard]] const char* sliding_window_attention_route_name(SlidingWindowAttentionRoute route);
 

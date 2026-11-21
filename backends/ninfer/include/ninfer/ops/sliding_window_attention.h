@@ -18,6 +18,13 @@ struct SlidingWindowAttentionExecutionEnvelope {
     std::uint32_t max_context = 0;
 };
 
+// Which temporary query rows a live query row sees: every live one of its batch row (a DFlash
+// block), or those at or before it (a DSpine block, causal inside the block).
+enum class SlidingWindowMask : std::uint8_t {
+    Symmetric,
+    Causal,
+};
+
 /**
  * Symmetric non-causal sliding-window grouped-query attention.
  *
@@ -60,7 +67,8 @@ void sliding_window_attention(const Tensor& q, const Tensor& query_k, const Tens
                               std::uint32_t window, float scale,
                               const CyclicKVCacheLayerView& context,
                               SlidingWindowAttentionExecutionEnvelope envelope,
-                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream);
+                              WorkspaceArena& workspace, Tensor& out, cudaStream_t stream,
+                              SlidingWindowMask mask = SlidingWindowMask::Symmetric);
 
 /**
  * Return transient capacity for every T in the inclusive optimized interval at the exact batch
