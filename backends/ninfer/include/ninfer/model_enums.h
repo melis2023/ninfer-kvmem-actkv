@@ -30,6 +30,9 @@ enum class SpeculativeBackend : std::uint8_t {
     Mtp,
     DFlash,
     DFlash2,
+    // A standalone DSpine drafter artifact (SpeculativeOptions::draft_model), loaded beside the
+    // target rather than stored inside its artifact.
+    DSpine,
 };
 
 // How many of its drafts an MTP round verifies: always all of them, or a width the Engine adapts

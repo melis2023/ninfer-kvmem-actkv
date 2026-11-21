@@ -214,15 +214,33 @@ def build_model(source: DraftSource, num_target_layers: int) -> Model:
 
 
 def recipe_bf16(model, recipe, sources) -> None:
-    """Every drafter weight in BF16: the artifact is 1.2 GiB and the bridge is rounding-sensitive."""
-    for name in model.parameters:
-        if name.endswith("/context_key") or name.endswith("/context_value"):
-            continue
+    """Every drafter weight in BF16: the bridge's roundings are what the refinement depends on."""
+    _share_context(model, recipe)
+
+
+def recipe_q8(model, recipe, sources) -> None:
+    """The layer and feature projections in Q8, the bridge and its tables in BF16.
+
+    The bridge writes into the residual and its tables are what the serial refinement chains, so
+    they keep BF16; everything the drafter multiplies by an activation goes to Q8.
+    """
+    from tools.convert.methods import grouped_absmax
+
+    for name, parameter in model.parameters.items():
+        if parameter.projection and not name.startswith(COMPONENT + "/bridge/"):
+            recipe.assign(name, format="q8_g32_fp16", method=grouped_absmax)
+    _share_context(model, recipe)
+
+
+def _share_context(model, recipe) -> None:
     # The context projections are the key/value matrices; share them rather than store twice.
     for layer in range(model.components[COMPONENT]["config"]["num_hidden_layers"]):
         prefix = f"{COMPONENT}/layers/{layer}/attention/"
         for role in ("key", "value"):
             recipe.share(prefix + "context_" + role, prefix + role)
+
+
+RECIPES = {"bf16": recipe_bf16, "q8": recipe_q8}
 
 
 def main() -> int:
@@ -232,6 +250,8 @@ def main() -> int:
                         help="the target model's layer count (the drafter is trained per target)")
     parser.add_argument("--out", required=True, help="the artifact to write")
     parser.add_argument("--device", default="cpu", help="cpu (default) or cuda")
+    parser.add_argument("--recipe", default="q8", choices=sorted(RECIPES),
+                        help="q8 (default; projections quantized, bridge BF16) or bf16")
     args = parser.parse_args()
 
     from tools.convert.pipeline import convert
@@ -243,7 +263,7 @@ def main() -> int:
           f"{len(model.components[COMPONENT]['config'])} config fields", flush=True)
 
     recipe = Recipe(model)
-    recipe_bf16(model, recipe, {"dspine": source})
+    RECIPES[args.recipe](model, recipe, {"dspine": source})
     report = convert(model, recipe, args.out, name="dspine-drafter",
                      provenance={"source": str(args.source)}, device=args.device)
     print(f"wrote {args.out}: {report['payload_bytes'] / 1024 ** 2:.1f} MiB, "

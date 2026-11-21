@@ -15,6 +15,7 @@ namespace ninfer::product {
     if (value == "mtp") { return SpeculativeBackend::Mtp; }
     if (value == "dflash") { return SpeculativeBackend::DFlash; }
     if (value == "dflash2") { return SpeculativeBackend::DFlash2; }
+    if (value == "dspine") { return SpeculativeBackend::DSpine; }
     throw std::invalid_argument("invalid speculative backend: " + std::string(value));
 }
 
@@ -28,6 +29,8 @@ namespace ninfer::product {
         return "dflash";
     case SpeculativeBackend::DFlash2:
         return "dflash2";
+    case SpeculativeBackend::DSpine:
+        return "dspine";
     }
     return "unknown";
 }
@@ -65,11 +68,12 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
     if (options.ngram_draft_tokens != 0 &&
         ((options.backend != SpeculativeBackend::DFlash2 &&
           options.backend != SpeculativeBackend::DFlash &&
+          options.backend != SpeculativeBackend::DSpine &&
           options.backend != SpeculativeBackend::Mtp) ||
          options.ngram_draft_tokens > 63 || options.ngram_min_match < 4 ||
          options.ngram_min_match > 64)) {
         throw std::invalid_argument(
-            "ngram requires --spec mtp|dflash|dflash2, drafts 1..63 and match 4..64");
+            "ngram requires --spec mtp|dflash|dflash2|dspine, drafts 1..63 and match 4..64");
     }
     if (options.mtp_attention_window != 0 &&
         (options.backend != SpeculativeBackend::Mtp ||
@@ -103,6 +107,17 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
     case SpeculativeBackend::DFlash2:
         if (options.draft_tokens == 0 || options.draft_tokens > 15) {
             throw std::invalid_argument("--spec dflash2 requires --draft-tokens in [1,15]");
+        }
+        if (options.mtp_policy != MtpDraftPolicy::Fixed) {
+            throw std::invalid_argument("--adaptive-mtp requires --spec mtp");
+        }
+        return;
+    case SpeculativeBackend::DSpine:
+        if (options.draft_tokens == 0 || options.draft_tokens > 15) {
+            throw std::invalid_argument("--spec dspine requires --draft-tokens in [1,15]");
+        }
+        if (options.draft_model.empty()) {
+            throw std::invalid_argument("--spec dspine requires --draft-model <drafter.ninfer>");
         }
         if (options.mtp_policy != MtpDraftPolicy::Fixed) {
             throw std::invalid_argument("--adaptive-mtp requires --spec mtp");

@@ -20,6 +20,7 @@
 #include "models/qwen3_5/execution/expert_runtime.h"
 #include "models/qwen3_5/expert_admission.h"
 #include "models/qwen3_5/measurement.h"
+#include "models/dspine/config.h"
 #include "runtime/engine/host_memory.h"
 #include "runtime/engine/graph_probe.h"
 #include "runtime/contract/rope_scaling.h"
@@ -633,7 +634,24 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
            .long_anchor_min_spacing_tokens = options.context_cache.long_anchor_min_spacing_tokens,
            .progress_anchor_tokens         = options.context_cache.progress_anchor_tokens,
            .grafts = models::qwen3_5::load_prompt_grafts(options.grafts, model->config().text)})),
-      capacity(options.max_context) {}
+      capacity(options.max_context) {
+    if (options.speculative.backend == SpeculativeBackend::DSpine) {
+        // The drafter is its own artifact beside the target. Read its config now so a malformed or
+        // mismatched drafter fails at startup with a message naming the file, not at the first
+        // draft.
+        const auto config = models::dspine::read_config(options.speculative.draft_model);
+        models::dspine::check_target(
+            config, static_cast<std::uint64_t>(model->config().text.hidden_size),
+            static_cast<std::uint64_t>(model->config().text.vocab_size),
+            static_cast<std::uint64_t>(model->config().text.num_hidden_layers), "Qwen3.5");
+        runtime::publish_diagnostic(
+            options.diagnostic_observer, DiagnosticLevel::Info,
+            "dspine: %s loaded (%u layers, window %u, block %u, %zu taps, rank %u, code %u)",
+            options.speculative.draft_model.string().c_str(), config.num_hidden_layers,
+            config.sliding_window, config.block_size, config.target_layer_ids.size(),
+            config.rank, config.code_size);
+    }
+}
 
 ModelInstance::~ModelInstance() = default;
 

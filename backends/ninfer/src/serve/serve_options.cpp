@@ -400,11 +400,13 @@ std::string serve_usage_text(const char* argv0) {
            "                                the server stops (Ctrl+C twice) (default off)\n"
            "\n"
            "SPECULATIVE DECODING\n"
-           "  --spec none|mtp|dflash|dflash2\n"
+           "  --spec none|mtp|dflash|dflash2|dspine\n"
            "                                speculative decoding backend (default: mtp with 3\n"
            "                                drafts for Flash-Next and Gemma 4 host or disk\n"
            "                                experts whose artifact has the drafter, else none)\n"
            "  --draft-tokens N              drafts per round, 1..15\n"
+           "  --draft-model FILE            the standalone DSpine drafter artifact --spec\n"
+           "                                dspine drafts with (a single dspine component)\n"
            "  --draft-min-p P              Flash-Next MTP confidence floor, 0..1 (default 0;\n"
            "                                0.5 when the engine chooses MTP)\n"
            "  --lm-head-draft               draft with the optimized proposal head, which\n"
@@ -1216,6 +1218,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
+            continue;
+        }
+        if (arg == "--draft-model") {
+            options.speculative.draft_model = require_value("--draft-model");
+            if (options.speculative.draft_model.empty()) {
+                throw std::invalid_argument("--draft-model must not be empty");
+            }
             continue;
         }
         if (arg == "--draft-min-p") {

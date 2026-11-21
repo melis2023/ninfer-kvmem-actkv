@@ -40,6 +40,10 @@ struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
     // Startup-fixed K: MTP, DFlash and DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
+    // --spec dspine: the drafter's own artifact (a single `dspine` component). It loads beside the
+    // target, which keeps its embedding, head and KV; the engine derives the head-dependent tables
+    // once both are loaded.
+    std::filesystem::path draft_model;
     // Flash-Next MTP: end drafting and verification at the first draft whose absolute probability
     // is at or below this floor. Zero keeps the full window.
     float draft_min_p = 0;
