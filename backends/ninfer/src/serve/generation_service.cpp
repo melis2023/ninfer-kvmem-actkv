@@ -716,11 +716,6 @@ StagedRequest GenerationService::stage_impl(const GenerationRequest& incoming,
             prepared.effective_thinking_budget.reset();
         }
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
-        if (request.return_token_ids) {
-            const auto ids = prompt.token_ids();
-            prepared.prompt_token_ids.assign(ids.begin(), ids.end());
-            prepared.return_token_ids = true;
-        }
         if (request.derive_output_budget) {
             request_options.execution.requested_output_tokens =
                 engine_->concurrent_output_budget(prompt);
@@ -865,8 +860,6 @@ GenerationOutcome GenerationService::run(PreparedRequest& prepared, const Stream
     }
     GenerationOutcome outcome;
     outcome.tokens              = result.generated_token_ids;
-    outcome.prompt_token_ids    = std::move(prepared.prompt_token_ids);
-    outcome.return_token_ids    = prepared.return_token_ids;
     outcome.text                = std::move(result.content);
     outcome.reasoning           = std::move(result.reasoning);
     outcome.content_logprobs    = std::move(result.content_logprobs);

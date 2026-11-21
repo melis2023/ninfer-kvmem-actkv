@@ -24,7 +24,9 @@ struct ModelInstance {
     // Keep the fixed Host pool and device accounting alive through Program and weight destruction.
     std::shared_ptr<core::ResidentMemorySession> residency;
     std::unique_ptr<models::qwen3_5::Model> model;
-    const models::qwen3_5::execution::Parameters parameters;
+    // Not const: an attached LoRA adapter adds its factors and scratch to the parameters after the
+    // constructor body has built them (execution::attach_lora).
+    models::qwen3_5::execution::Parameters parameters;
     models::qwen3_5::Frontend frontend;
     KvCapacityResolution kv_capacity_resolution;
     const std::uint32_t capacity;
