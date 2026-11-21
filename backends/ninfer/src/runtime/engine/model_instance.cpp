@@ -650,6 +650,13 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
             options.speculative.draft_model.string().c_str(), config.num_hidden_layers,
             config.sliding_window, config.block_size, config.target_layer_ids.size(),
             config.rank, config.code_size);
+        // The artifact loads and checks out, but nothing drives dspine::Runtime yet: the decode
+        // path has no DSpine batch execution, so a round would have no drafts to verify. Refuse
+        // here rather than fail inside graph capture.
+        throw std::runtime_error(
+            "--spec dspine: the drafter loaded and matches this target, but this build has no "
+            "DSpine decode path (dspine::Runtime is not driven yet), so it would draft nothing. "
+            "Use --spec dflash2 or --spec mtp for now.");
     }
 }
 

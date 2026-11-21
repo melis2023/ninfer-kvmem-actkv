@@ -90,6 +90,15 @@ struct LoadOptions {
         return speculative == SpeculativeBackend::DFlash2;
     }
 
+    // A standalone DSpine drafter artifact (--draft-model): its own ring, its own weights, the
+    // target's embedding and head.
+    [[nodiscard]] bool dspine() const noexcept {
+        return speculative == SpeculativeBackend::DSpine;
+    }
+
+    // DFlash / DFlash2 share the target artifact's drafter component and its batched decode
+    // machinery. A DSpine drafter is its own artifact with its own ring, so it does not: see
+    // dspine() below.
     [[nodiscard]] bool masked_draft() const noexcept { return dflash() || dflash2(); }
 
     [[nodiscard]] bool proposal_enabled() const noexcept {
@@ -107,13 +116,18 @@ struct LoadOptions {
             return "dflash";
         case SpeculativeBackend::DFlash2:
             return "dflash2";
+        case SpeculativeBackend::DSpine:
+            // The drafter's own artifact and weight prefix. The target carries no such component;
+            // the drafter is loaded from SpeculativeOptions::draft_model.
+            return "dspine";
         }
         return {};
     }
 };
 
 [[nodiscard]] constexpr bool is_masked_draft_backend(SpeculativeBackend backend) noexcept {
-    return backend == SpeculativeBackend::DFlash || backend == SpeculativeBackend::DFlash2;
+    return backend == SpeculativeBackend::DFlash || backend == SpeculativeBackend::DFlash2 ||
+           backend == SpeculativeBackend::DSpine;
 }
 
 // The draft head a plan uses: an automatic head not yet resolved against an artifact

@@ -377,10 +377,7 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
             (options.vision || options.speculative != SpeculativeBackend::None)) {
             throw ArtifactError("CausalScoring loads the Text backbone only");
         }
-        // DSpine is exempt: its drafter is its own artifact (--draft-model), so the target needs no
-        // component for it.
         if (options.speculative != SpeculativeBackend::None &&
-            options.speculative != SpeculativeBackend::DSpine &&
             options.speculative_component().empty()) {
             throw ArtifactError("unknown speculative backend");
         }
