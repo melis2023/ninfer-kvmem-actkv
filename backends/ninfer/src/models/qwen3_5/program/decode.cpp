@@ -1206,8 +1206,12 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
                              static_cast<int>(dflash_host_ingress->anchors[row]),
                              sequence.ledger.size());
             }
-            dflash_host_ingress->proposal_valid_columns[row] =
-                static_cast<std::int32_t>(draft_window + 1U);
+            // A copy round verifies at the ngram window, not the neural draft window.
+            // The target still has to compute valid attention/logits for every column the
+            // acceptance kernel may inspect. Keeping this at draft_window + 1 leaves the
+            // wider ngram columns invalid, so sparse acceptance can license tokens that
+            // were never actually verified.
+            dflash_host_ingress->proposal_valid_columns[row] = static_cast<std::int32_t>(width);
             dflash_host_ingress->proposal_extents[row]       = static_cast<std::int32_t>(extent);
             dflash_host_ingress->target_valid_columns[row] = static_cast<std::int32_t>(extent + 1U);
             for (std::uint32_t column = 0; column < width; ++column) {

@@ -10,6 +10,9 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <chrono>
+#include <filesystem>
+#include <limits>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -359,6 +362,9 @@ struct Manifest {
     std::vector<std::byte> derived;
     std::uint64_t file_payload_bytes = 0;
     std::uint64_t next_derived       = 0;
+    // A cache hit already holds the derived bytes at the offsets `derive` recomputes; only the
+    // directory entries still have to be built.
+    bool from_cache = false;
 
     [[nodiscard]] const Tensor& stored(std::string_view name) const {
         const auto found = tensors.find(name);
@@ -388,10 +394,16 @@ struct Manifest {
         const auto absolute =
             artifact::align_up(file_payload_bytes + next_derived, 256, "derived object offset");
         next_derived = absolute - file_payload_bytes;
-        if (derived.size() < next_derived + bytes) {
-            derived.resize(static_cast<std::size_t>(next_derived + bytes));
+        if (from_cache) {
+            if (derived.size() < next_derived + bytes) {
+                throw ArtifactError("GGUF derived cache is shorter than this drafter needs");
+            }
+        } else {
+            if (derived.size() < next_derived + bytes) {
+                derived.resize(static_cast<std::size_t>(next_derived + bytes));
+            }
+            fill(std::span<std::byte>(derived.data() + next_derived, static_cast<std::size_t>(bytes)));
         }
-        fill(std::span<std::byte>(derived.data() + next_derived, static_cast<std::size_t>(bytes)));
         directory.objects.emplace_back(artifact::TensorObject{
             id, std::move(shape), std::string(artifact::format_name(format)),
             std::string(artifact::layout_name(layout)), absolute, bytes, 1});
@@ -1273,6 +1285,79 @@ bool is_gguf(const std::filesystem::path& path) {
                       [](char a, std::byte b) { return a == static_cast<char>(b); });
 }
 
+// The derived half of a GGUF drafter is deterministic for a given file: DSpine's sender table is
+// a [vocab, 2*rank] BF16 product that costs tens of seconds on the CPU. Cache it beside the GGUF so
+// a later process pays only one read. The cache is keyed by the same fingerprint as the reader's
+// artifact id plus the file's mtime, and a bad or stale cache is simply recomputed.
+namespace {
+
+constexpr std::string_view kDerivedMagic = "NINFER-DERIVED-v1";
+
+std::filesystem::path derived_cache_path(const std::filesystem::path& gguf) {
+    std::string name = gguf.string();
+    name += ".derived";
+    return std::filesystem::path(name);
+}
+
+std::int64_t derived_mtime(const std::filesystem::path& path) noexcept {
+    try {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::filesystem::last_write_time(path).time_since_epoch())
+            .count();
+    } catch (...) { return 0; }
+}
+
+bool read_derived_cache(const std::filesystem::path& gguf, const artifact::ArtifactId& id,
+                        std::int64_t mtime, std::vector<std::byte>& derived) {
+    try {
+        std::ifstream in(derived_cache_path(gguf), std::ios::binary);
+        if (!in) { return false; }
+        std::array<char, kDerivedMagic.size()> magic{};
+        artifact::ArtifactId stored{};
+        std::int64_t stored_mtime = 0;
+        std::uint64_t bytes = 0;
+        in.read(magic.data(), magic.size());
+        in.read(reinterpret_cast<char*>(stored.data()), stored.size());
+        in.read(reinterpret_cast<char*>(&stored_mtime), sizeof(stored_mtime));
+        in.read(reinterpret_cast<char*>(&bytes), sizeof(bytes));
+        if (!in || std::memcmp(magic.data(), kDerivedMagic.data(), magic.size()) != 0 ||
+            stored != id || stored_mtime != mtime ||
+            bytes == 0 || bytes > std::numeric_limits<std::size_t>::max()) {
+            return false;
+        }
+        derived.resize(static_cast<std::size_t>(bytes));
+        in.read(reinterpret_cast<char*>(derived.data()), static_cast<std::streamsize>(bytes));
+        return static_cast<bool>(in);
+    } catch (...) { return false; }
+}
+
+void write_derived_cache(const std::filesystem::path& gguf, const artifact::ArtifactId& id,
+                         std::int64_t mtime, const std::vector<std::byte>& derived) {
+    try {
+        const auto cache = derived_cache_path(gguf);
+        const auto temp  = std::filesystem::path(cache.string() + ".tmp");
+        {
+            std::ofstream out(temp, std::ios::binary | std::ios::trunc);
+            if (!out) { return; }
+            out.write(kDerivedMagic.data(), static_cast<std::streamsize>(kDerivedMagic.size()));
+            out.write(reinterpret_cast<const char*>(id.data()), static_cast<std::streamsize>(id.size()));
+            out.write(reinterpret_cast<const char*>(&mtime), sizeof(mtime));
+            const auto bytes = static_cast<std::uint64_t>(derived.size());
+            out.write(reinterpret_cast<const char*>(&bytes), sizeof(bytes));
+            out.write(reinterpret_cast<const char*>(derived.data()),
+                      static_cast<std::streamsize>(derived.size()));
+            out.flush();
+            if (!out) { return; }
+        }
+        std::filesystem::remove(cache);
+        std::filesystem::rename(temp, cache);
+    } catch (...) {
+        // A cache is an optimisation: a read-only model directory must still load the GGUF.
+    }
+}
+
+} // namespace
+
 artifact::PreparedPayload prepare_draft_gguf(const std::filesystem::path& path) {
     const artifact::InputFile file(path);
     Prefix prefix(file);
@@ -1351,11 +1436,34 @@ artifact::PreparedPayload prepare_draft_gguf(const std::filesystem::path& path) 
         manifest.directory.object_index.emplace(tensor->name,
                                                ObjectHandle{manifest.directory.objects.size() - 1});
     }
+    // The fingerprint only needs the container's layout, so compute it before deriving anything
+    // and use it to look up a previous process's derived objects.
+    std::uint64_t fingerprint = file.bytes();
+    for (const auto& [tensor_name, tensor] : tensors) {
+        for (const char c : tensor_name) {
+            fingerprint = (fingerprint ^ static_cast<unsigned char>(c)) * 1099511628211ULL;
+        }
+        fingerprint = (fingerprint ^ tensor.offset) * 1099511628211ULL;
+    }
+    artifact::ArtifactId id{};
+    std::memcpy(id.data(), &fingerprint, sizeof(fingerprint));
+    std::memcpy(id.data() + sizeof(fingerprint), &data_offset, sizeof(data_offset));
+    const auto mtime    = derived_mtime(path);
+    const bool from_disk = read_derived_cache(path, id, mtime, manifest.derived);
+    manifest.from_cache  = from_disk;
+
     if (kind == DraftArtifactKind::DSpine) {
         add_dspine(manifest, Source(file, data_offset), geometry);
     } else {
         add_dflash(manifest, Source(file, data_offset), geometry, kind);
     }
+    if (from_disk && manifest.next_derived != manifest.derived.size()) {
+        // A layout change that kept the same fingerprint cannot be trusted; drop the cache so
+        // this and later loads recompute it.
+        std::filesystem::remove(derived_cache_path(path));
+        throw ArtifactError(path.string() + ": stale GGUF derived cache, recompute required");
+    }
+    if (!from_disk) { write_derived_cache(path, id, mtime, manifest.derived); }
 
     artifact::Directory built = std::move(manifest.directory);
     built.payload_bytes = artifact::checked_add(file_payload_bytes, manifest.derived.size(),
@@ -1376,16 +1484,8 @@ artifact::PreparedPayload prepare_draft_gguf(const std::filesystem::path& path) 
     out.source_alignment = std::min<std::uint64_t>(alignment, 256);
     // A prepared payload has no container id; the file's shape stands in, so a diagnostic can tell
     // two artifacts apart and a reload can compare them.
-    std::uint64_t fingerprint = file.bytes();
-    for (const auto& [tensor_name, tensor] : tensors) {
-        for (const char c : tensor_name) {
-            fingerprint = (fingerprint ^ static_cast<unsigned char>(c)) * 1099511628211ULL;
-        }
-        fingerprint = (fingerprint ^ tensor.offset) * 1099511628211ULL;
-    }
-    std::memcpy(out.artifact_id.data(), &fingerprint, sizeof(fingerprint));
-    std::memcpy(out.artifact_id.data() + sizeof(fingerprint), &data_offset, sizeof(data_offset));
-    out.derived = std::move(manifest.derived);
+    out.artifact_id = id;
+    out.derived     = std::move(manifest.derived);
     return out;
 }
 

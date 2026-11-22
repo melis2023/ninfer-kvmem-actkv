@@ -249,8 +249,10 @@ void ProgramImpl::prepare_graphs() {
                     checked_i32(frontier, "graph representative DFlash context frontier");
                 dflash_host_ingress->draft_frontiers[row] =
                     checked_i32(frontier, "graph representative DFlash draft frontier");
-                dflash_host_ingress->proposal_valid_columns[row] =
-                    static_cast<std::int32_t>(draft_window + 1U);
+                // Copy families are captured at the wider ngram verify width. The
+                // representative ingress must mark that whole window valid so the
+                // captured target verification matches a live copy round.
+                dflash_host_ingress->proposal_valid_columns[row] = static_cast<std::int32_t>(width);
                 dflash_host_ingress->proposal_extents[row] = static_cast<std::int32_t>(extent);
                 dflash_host_ingress->target_valid_columns[row] =
                     static_cast<std::int32_t>(extent + 1U);
