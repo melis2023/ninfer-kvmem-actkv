@@ -2,7 +2,7 @@
 
 本文对应多后端分支及 2026-10-10 的活跃 KV 分层候选源码。已发布 ZIP 早于这些能力。两后端参数差异见 [实现差异](multi-backend-differences.md)，本次验收进度见 [分层实现计划](active-kv-tiering-plan.md)。
 
-迁移候选改用 `iamwavecut/ninfer-all` 的固定提交 `8319e8f51247`，llama.cpp 基线保持原值。当前迁移验收进度见 [迁移记录](ninfer-all-migration-validation.md)；下文各有日期的实验是旧基线证据，不能视为新基线已经完成同等覆盖。KVMem 暂不支持新增的 `qwen4_exp`、模型 suspend、prompt graft 和 router，开启这些组合时明确报错。
+迁移候选改用 `iamwavecut/ninfer-all` 的固定提交 `8319e8f51247`，llama.cpp 基线保持原值。当前迁移验收进度见 [迁移记录](validation/multi-backend/ninfer-all-migration-validation.md)；下文各有日期的实验是旧基线证据，不能视为新基线已经完成同等覆盖。KVMem 暂不支持新增的 `qwen4_exp`、模型 suspend、prompt graft 和 router，开启这些组合时明确报错。
 
 Windows 入口 `scripts/windows/start-backend.ps1` 在启动时选择 `llamacpp` 或 `ninfer`。两个 worker 分进程运行，各自拥有推理引擎和 GPU 内存；公共 KVMem 策略库直接链接在 worker 内。
 
@@ -16,7 +16,7 @@ ninfer 预编译包可直接运行默认脚本。将包含文本、视觉和 MTP
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows\start-ninfer.ps1
 ```
 
-默认端口18200，context200k、budget36k、gen reserve及输出上限16k、思考预算8192、双INT8、自适应MTP上限4、ngram31、CPU视觉（图片上限1024 tokens），Host预算12GiB。脚本调用统一启动器，可编辑模型路径与预算，通过 `-Gpu` 选择设备。小预算CPU/resident视觉的实际1024-token图片及八路图文功能已通过，范围见 [视觉并发验收](vision-concurrency-validation-20261006.md)；完整36k/16k/200k配置尚未验收。需要包含本次放行代码的服务端，旧ZIP尚未更新。
+默认端口18200，context200k、budget36k、gen reserve及输出上限16k、思考预算8192、双INT8、自适应MTP上限4、ngram31、CPU视觉（图片上限1024 tokens），Host预算12GiB。脚本调用统一启动器，可编辑模型路径与预算，通过 `-Gpu` 选择设备。小预算CPU/resident视觉的实际1024-token图片及八路图文功能已通过，范围见 [视觉并发验收](validation/vision/vision-concurrency-validation-20261006.md)；完整36k/16k/200k配置尚未验收。需要包含本次放行代码的服务端，旧ZIP尚未更新。
 
 解压包后，在 PowerShell 中运行：
 
@@ -39,7 +39,7 @@ ninfer 源码的多卡采用上游 layer pipeline。`-Gpu 'GPU-a,GPU-b'` 保留 
   -MtpDrafts 3 -Budget 2048 -Reserve 512 -Prefill 512 -SinkTokens 64 -RecentTokens 64
 ```
 
-多卡范围与证据见 [多卡验收](ninfer-multigpu-validation-20261006.md)。这是源码能力，RC1 ZIP 不因此更新。多卡用于扩展容量，尚无本轮吞吐提升结论；`--cuda-memory-policy mixed/strict` 继续要求单卡，KVMem overlay Vision、DFlash、并行 prefill 和磁盘冷快照继续沿用当前限制。
+多卡范围与证据见 [多卡验收](validation/multi-backend/ninfer-multigpu-validation-20261006.md)。这是源码能力，RC1 ZIP 不因此更新。多卡用于扩展容量，尚无本轮吞吐提升结论；`--cuda-memory-policy mixed/strict` 继续要求单卡，KVMem overlay Vision、DFlash、并行 prefill 和磁盘冷快照继续沿用当前限制。
 
 llama.cpp 示例：
 
@@ -57,15 +57,15 @@ llama.cpp 示例：
 
 双 NVFP4 已接入源码，5050 上的聚焦数值／页搬运测试及 Bonsai B128/R128 ordinary、MTP1 eager、MTP4 Graph 功能检查已通过。
 两个 MTP 用例使用现有 D3D12/WDDM 选项、FP16 GDN 和关闭的 ngram；默认 CUDA 预算下 Q8 MTP 装载仍被容量检查拒绝。
-5060 Ti＋IQ3S 已通过双 NVFP4 的 229 组数值／功能／质量／故障注入检查：ordinary/MTP1–4 × eager/Graph、Host 会话、2/4 路文本、resident 图像、冷快照和最高 128K 档检索。三次独立 B32768/R16384、MTP4 Graph 服务启动及越窗 HTTP 请求也通过，ngram/lookup 均关闭。[完整记录](nvfp4-kvmem-validation-20261004.md)保留失败尝试与测试修正；这是本地源码验收，现有运行包不因此获得该能力。
+5060 Ti＋IQ3S 已通过双 NVFP4 的 229 组数值／功能／质量／故障注入检查：ordinary/MTP1–4 × eager/Graph、Host 会话、2/4 路文本、resident 图像、冷快照和最高 128K 档检索。三次独立 B32768/R16384、MTP4 Graph 服务启动及越窗 HTTP 请求也通过，ngram/lookup 均关闭。[完整记录](validation/kvmem/nvfp4-kvmem-validation-20261004.md)保留失败尝试与测试修正；这是本地源码验收，现有运行包不因此获得该能力。
 `-KvType nvfp4` 对 K/V 都使用 group-16 e2m1 packed codes 与 E4M3 scale 字节，
 Main 与 MTP 页池使用相同格式。参数组合与双 INT8 相同：ordinary 或固定 MTP1–15、
 1–4 条文本请求或一条 resident/CPU 图像请求、Host 会话复用；该历史验收中的冷快照目前已暂时禁用。
 ngram 默认关闭。
 
-`-KvType k8v4` 已接入 Main/MTP、Host 会话、文本并发和 resident 图像；此前已验证的冷快照入口当前暂时禁用。K 使用 FP8_E4M3FN codes 与一份 FP16 row scale，V 使用 NVFP4 codes 与 raw E4M3 group-16 scales；两者均沿用原生 D256 归一化 Hadamard。5060 Ti＋IQ3S 通过了精简的 26 次真实模型实验和 8 项基础检查，包括 MTP0 eager/Graph、MTP1–3 Graph、MTP4 eager/Graph、C4、图像、磁盘格式隔离、8K/32K 检索，以及 B32768/R16384 MTP4 Graph 服务。ngram/lookup 均关闭；本轮没有性能对比和全排列验收。[清单、配置与结果](k8v4-kvmem-validation-20261004.md)。
+`-KvType k8v4` 已接入 Main/MTP、Host 会话、文本并发和 resident 图像；此前已验证的冷快照入口当前暂时禁用。K 使用 FP8_E4M3FN codes 与一份 FP16 row scale，V 使用 NVFP4 codes 与 raw E4M3 group-16 scales；两者均沿用原生 D256 归一化 Hadamard。5060 Ti＋IQ3S 通过了精简的 26 次真实模型实验和 8 项基础检查，包括 MTP0 eager/Graph、MTP1–3 Graph、MTP4 eager/Graph、C4、图像、磁盘格式隔离、8K/32K 检索，以及 B32768/R16384 MTP4 Graph 服务。ngram/lookup 均关闭；本轮没有性能对比和全排列验收。[清单、配置与结果](validation/kvmem/k8v4-kvmem-validation-20261004.md)。
 
-新增参数采用 12 个组合的定向补测，另加原生视觉边界诊断，累计 18 次模型启动，使用 5060 Ti＋IQ3S，ngram/lookup 关闭。启动器增加 `-AdaptiveMtp`、`-FastPrefill`、`-VisionResidency cpu`，并将 `-MtpDrafts` 扩至 0–15。数值检查、失败尝试与最小重跑证据见 [参数补测记录](parameter-admission-validation-20261004.md)。这次没有性能对比或全排列验收。
+新增参数采用 12 个组合的定向补测，另加原生视觉边界诊断，累计 18 次模型启动，使用 5060 Ti＋IQ3S，ngram/lookup 关闭。启动器增加 `-AdaptiveMtp`、`-FastPrefill`、`-VisionResidency cpu`，并将 `-MtpDrafts` 扩至 0–15。数值检查、失败尝试与最小重跑证据见 [参数补测记录](validation/kvmem/parameter-admission-validation-20261004.md)。这次没有性能对比或全排列验收。
 
 ```powershell
 # 固定 MTP3，两个活动文本请求；B/R 是每请求预算，H 是全局预算。
@@ -107,7 +107,7 @@ ngram 默认关闭。
 - 未超过 B+R 的短输入保存输入末尾前一 token 的 Base 和正常生成结束时的执行端点。短转长时，越过新 query 探测起点且不具有同查询附件的旧检查点不被复用。
 - 复用与全量计算可能经过不同的原生分块边界，不能承诺两者浮点状态或所有 greedy tokens 完全相同。相同 checkpoint 的重复请求、取消恢复，以及明确答案的检索测试分别验收。
 
-本次同时修复了 IQ3_S 模型八路/ngram15/Graph 的原生预热启动缺陷；实际验证范围见 [ngram并发补测](ngram-concurrency-validation-20261006.md)。
+本次同时修复了 IQ3_S 模型八路/ngram15/Graph 的原生预热启动缺陷；实际验证范围见 [ngram并发补测](validation/ngram/ngram-concurrency-validation-20261006.md)。
 
 旧 `--lookup-ngram` 在 KVMem ninfer 中明确禁用，统一使用 `--ngram-draft-tokens` 与 `--ngram-min-match`；启动脚本对应 `-NgramDrafts` 和 `-NgramMinMatch`。经 `WorkerArgs` 传入旧参数也会被拦截。直接运行服务或调用 Engine 时，非零 lookup 配置会明确报错并指向新参数；未启用 MTP 或同时启用新 ngram 也不能放行旧路径。
 
@@ -149,8 +149,8 @@ H 必须容纳所有并发 lane 的基本工作区，H+D 还需为换页预留�
 
 在 VS 2022 Developer PowerShell 中运行 `scripts/windows/package-backends.ps1`，传入 `-LlamaWorker`、`-NinferWorker`、`-NinferSource`、`-OutputDir` 和 `-CudaPath`，可加 `-VcpkgInstalled` 与 `-ValidationReport`。输出目录必须不存在。脚本为每个 worker 收集 DLL，检查干净 PATH 下的启动，并写入许可文件、二进制校验值和验证报告；模型不会复制。打包成功只证明依赖可加载，推理结果以配套验证报告为准。
 
-自适应组合另补 10 次 IQ3S／5060 Ti 实验，覆盖快速 prefill、2/4 路、ngram31/63、resident/CPU 图片 query 边界、冷快照跨进程恢复；复用既有数值检查，不进行全排列或性能比较。范围和证据见 [自适应组合补测](adaptive-combinations-validation-20261005.md)。
+自适应组合另补 10 次 IQ3S／5060 Ti 实验，覆盖快速 prefill、2/4 路、ngram31/63、resident/CPU 图片 query 边界、冷快照跨进程恢复；复用既有数值检查，不进行全排列或性能比较。范围和证据见 [自适应组合补测](validation/kvmem/adaptive-combinations-validation-20261005.md)。
 
-图片＋MTP＋ngram 当前放行九种原生 KV，支持 resident/CPU 及1–8路；多路宽度16–63自动降至15。新增 `fp8`、`rk4v4`、`rk4v4-e8`、`rk2v4-e8` 只补格式身份和准入，复用原生量化与换页实现。范围与实测见 [新增KV准入补测](other-kv-admission-validation-20261006.md)；此前五种格式见 [图片ngram补测](vision-ngram-all-kv-validation-20261006.md)，首次K8V4换行差异及对照见 [初次图片ngram补测](vision-ngram-validation-20261005.md)。
+图片＋MTP＋ngram 当前放行九种原生 KV，支持 resident/CPU 及1–8路；多路宽度16–63自动降至15。新增 `fp8`、`rk4v4`、`rk4v4-e8`、`rk2v4-e8` 只补格式身份和准入，复用原生量化与换页实现。范围与实测见 [新增KV准入补测](validation/kvmem/other-kv-admission-validation-20261006.md)；此前五种格式见 [图片ngram补测](validation/ngram/vision-ngram-all-kv-validation-20261006.md)，首次K8V4换行差异及对照见 [初次图片ngram补测](validation/ngram/vision-ngram-validation-20261005.md)。
 
-快速 prefill 的新增 RK 格式与图片准入仅移除额外门禁，复用原生内核，验收范围见 [快速prefill准入补测](fast-prefill-admission-validation-20261006.md)。该开关影响符合原生路由条件的 prompt Attention，不负责并行 prefill，其他 KV 仍用各自原有路径。
+快速 prefill 的新增 RK 格式与图片准入仅移除额外门禁，复用原生内核，验收范围见 [快速prefill准入补测](validation/kvmem/fast-prefill-admission-validation-20261006.md)。该开关影响符合原生路由条件的 prompt Attention，不负责并行 prefill，其他 KV 仍用各自原有路径。

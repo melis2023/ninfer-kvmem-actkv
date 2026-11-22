@@ -848,7 +848,7 @@ serving and Engine validation with a pointer to `--ngram-draft-tokens` and
 `--ngram-min-match`. The Windows KVMem launcher also rejects explicit lookup flags.
 The additional profiles only register layout identities and relax admission; page
 transfers use the existing physical plane schemas without requantization. Representative
-functional qualification is recorded in the [additional KV report](../../../../docs/other-kv-admission-validation-20261006.md);
+functional qualification is recorded in the [additional KV report](../../../../docs/validation/kvmem/other-kv-admission-validation-20261006.md);
 unqualified combinations are not release capability claims. Post-RMS/pre-RoPE
 block sums feed the portable mean-K selector. The
 frontend supplies an exact last-user token span. When the input exceeds B+R, Program captures
@@ -867,7 +867,7 @@ and retrieval through the 128K target. Three B32768/R16384 MTP4 Graph cold start
 and long-input HTTP reuse/cancellation passed with FP16 GDN and default CUDA
 allocation. Ngram and lookup stayed disabled. These results apply to the tested
 local source/model/build; performance and package release are separate. See the
-[qualification report](../../../../docs/nvfp4-kvmem-validation-20261004.md).
+[qualification report](../../../../docs/validation/kvmem/nvfp4-kvmem-validation-20261004.md).
 It uses the existing
 native group-16 e2m1 codec for both Main and MTP K/V; each D256 head has two 128-byte
 code planes and two 16-byte raw E4M3 scale planes per token. The bridge advertises
@@ -891,7 +891,7 @@ MTP1..3 Graph, MTP4 eager/Graph, C4 pressure, vision, cold faults/format isolati
 8K/32K retrieval and one B32768/R16384 MTP4 Graph serving start. Ngram/lookup
 were disabled; this is functional qualification, not a complete Cartesian
 matrix or performance comparison. See the
-[K8V4 report](../../../../docs/k8v4-kvmem-validation-20261004.md).
+[K8V4 report](../../../../docs/validation/kvmem/k8v4-kvmem-validation-20261004.md).
 
 An input that fits B+R instead captures a reusable prefix immediately before its final input token
 when history reuse is enabled. This capture does not trigger Q probing or replay. Keeping one
@@ -992,7 +992,7 @@ the aligned native boundary and remaining KVMem CPU/MTP query cases passed. CPU/
 overflow was not rerun; it is covered by CPU ordinary in this campaign. Overlay remains rejected.
 That historical qualification used the then-enabled text/C1/profile-off cold-snapshot contract;
 those historical persistent snapshot entry points do not describe the current ephemeral tier.
-See the parent [qualification report](../../../../docs/parameter-admission-validation-20261004.md).
+See the parent [qualification report](../../../../docs/validation/kvmem/parameter-admission-validation-20261004.md).
 
 The fast-prompt admission extension changes only Engine/serving/launcher gates.
 The existing INT8-family prompt kernels support all five key/value profiles above;
@@ -1000,4 +1000,4 @@ BF16/FP8/NVFP4/K8V4 do not select that fast kernel. `ninfer_p1_sparse <format> f
 requires the actual prompt/fast route before comparing T65/127/128/129 sparse and
 page-boundary outputs to the maintained independent oracle. Real-model image,
 MTP/ngram, restoration and cancellation evidence is in the
-[fast-prefill report](../../../../docs/fast-prefill-admission-validation-20261006.md).
+[fast-prefill report](../../../../docs/validation/kvmem/fast-prefill-admission-validation-20261006.md).

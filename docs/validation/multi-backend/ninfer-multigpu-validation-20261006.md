@@ -21,7 +21,7 @@ Vision 补丁的 startup hunk 按当前 KVMem 代码手工合并；CPU Vision �
 
 一个逻辑历史、一个选页结果、一份 H 预算。Main 页池保留 C×(B+R)，各卡持有属于自己层的 KV；MTP 页池和草稿层留在 rank 0。每卡统计与 workspace 纳入该卡的精确容量曲线，最终容量受最紧张的卡约束。
 
-统一启动器使用 `-Gpu 'GPU-a,GPU-b'`，可选 `-StageLayers 40,24`；直接运行服务使用 `--devices 0,1`。UUID 顺序决定层顺序，resident Vision、MTP、embedding/head 都在第一张卡。`/props.execution` 返回最终设备和层数。启动例子见 [多后端说明](multi-backend.md)。
+统一启动器使用 `-Gpu 'GPU-a,GPU-b'`，可选 `-StageLayers 40,24`；直接运行服务使用 `--devices 0,1`。UUID 顺序决定层顺序，resident Vision、MTP、embedding/head 都在第一张卡。`/props.execution` 返回最终设备和层数。启动例子见 [多后端说明](../../multi-backend.md)。
 
 ## 验收环境与执行
 
@@ -67,7 +67,7 @@ python scripts/test-ninfer-multigpu.py --phase text `
 
 首次多图片并发测试误用 B1536，按既有合同拒绝保留总计 2048 个图片 tokens；保留拒绝日志，改为 B3072 后完成上述验收，没有改变预算算法。
 
-`memory_vision copy-compare` 的 RK8V4/fast/C1/自适应 MTP3/ngram15 诊断在双卡、同卡两段及单卡均失败：冷输出 token 1 为 271（两个换行），恢复为 198（一个换行），均为 91 tokens，正文和图片颜色相同。页数据与 GDN 状态搬运检查通过。该现象与已有 [单卡宽窗口记录](vision-ngram-all-kv-validation-20261006.md) 相同；根因尚未确定，不能宣称所有图文自由生成的冷／恢复输出位精确。关闭 fast 后，同一双卡复制诊断通过。保留全部失败日志和原断言；本轮没有更改算法或宽松比较来规避它。fast 图文/ngram 的并发资格另用现有 `memory_ngram` 源文件精确复制夹具检查，包含恢复、取消隔离及正文逐 token 断言。
+`memory_vision copy-compare` 的 RK8V4/fast/C1/自适应 MTP3/ngram15 诊断在双卡、同卡两段及单卡均失败：冷输出 token 1 为 271（两个换行），恢复为 198（一个换行），均为 91 tokens，正文和图片颜色相同。页数据与 GDN 状态搬运检查通过。该现象与已有 [单卡宽窗口记录](../ngram/vision-ngram-all-kv-validation-20261006.md) 相同；根因尚未确定，不能宣称所有图文自由生成的冷／恢复输出位精确。关闭 fast 后，同一双卡复制诊断通过。保留全部失败日志和原断言；本轮没有更改算法或宽松比较来规避它。fast 图文/ngram 的并发资格另用现有 `memory_ngram` 源文件精确复制夹具检查，包含恢复、取消隔离及正文逐 token 断言。
 
 HTTP 长自由回答的冷／恢复文字比较同样有差异：单卡 resident 两路均不相同，双卡 resident 为一相同一不同，双卡 CPU 两路均不相同；颜色和独立会话码均正确，搬运检查均通过。冷 prefill 与 warm compact decode 的 batch/verify 形状不同。此处只确认为单卡也能复现的数值／自由生成限制，没有宣称确定了全部根因。首次严格文字断言失败的请求及日志保留；HTTP 验收检查协议交付、语义身份、复用和预算，精确正文／token 恢复仍由 `memory_ngram` 夹具的原严格断言检查。没有修改生产算法。
 

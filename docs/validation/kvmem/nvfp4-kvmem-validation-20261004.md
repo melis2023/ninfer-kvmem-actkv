@@ -109,7 +109,7 @@ implementation change was required during the full qualification run.
 ## Reproduction and retained evidence
 
 The source fixtures and exact parameter syntax are documented in
-[`backends/ninfer/tests/README.md`](../backends/ninfer/tests/README.md#kvmem-nvfp4-integration).
+[`backends/ninfer/tests/README.md`](../../../backends/ninfer/tests/README.md#kvmem-nvfp4-integration).
 Build their affected targets with `cmake --build <build-dir> --parallel 8`.
 Select the artifact explicitly and the GPU by UUID; keep ngram/lookup disabled.
 The large service arguments are:

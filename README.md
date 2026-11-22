@@ -11,6 +11,153 @@ QQ 交流群：**1040777853**。本项目仅供研究学习，稳定使用请前
 
 **所有修补、测速与召回数据汇总在 [docs/CHANGELOG.md](docs/CHANGELOG.md)。**
 
+---
+
+## 三种推测解码模式（DFlash2 / DSpine / MTP）
+
+同一份 Qwen3.8-27B 目标工件可以搭配三种推测后端，按 `--spec` 切换。三者的
+`--draft-tokens` 都是一次推测的候选 token 数，`--ngram-draft-tokens` 是从上下文复制的
+ngram 宽度（12 表示开启混合复制，0 表示只用神经草稿）：
+
+| 模式 | `--spec` | 草稿来源 | 特点 |
+|---|---|---|---|
+| **DFlash2** | `dflash2` | 外挂 DFlash2 GGUF（`--draft-model`） | 速度最快，工具调用/agent 最稳；**推荐默认** |
+| **DSpine** | `dspine` | 外挂 DSpine GGUF（`--draft-model`） | 环按绝对位置读写，长上下文接受率高；**工具调用请用 DFlash2**（见下） |
+| **MTP** | `mtp` | 工件自带的 MTP 头，不需要 `--draft-model` | 无外挂文件，配置最简单 |
+
+目标工件：`I:\model\ninfer\Qwen3.8-27B-GSQ-RCO-IQ3_S-q4km-mtp-dflash2.ninfer`。
+三个模式各自的 128k 启动脚本见 `workers/ninfer/start-128k-{dflash2,dspine}.bat`
+（MTP 脚本参数见下表，可据此自建）。
+
+### 每种模式的具体参数
+
+```bat
+REM ===== 通用（三模式共享）=====
+  --model-id ninfer-27b --port 18200 --host 127.0.0.1 ^
+  --max-context 262144 --prefill-chunk 256 ^
+  --kvmem-budget 36834 --kvmem-gen-reserve 1024 --kvmem-host-mib 12288 ^
+  --kvmem-keep --ngram-draft-tokens 12 --kv-dtype rk8v4 ^
+  --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
+  --vision --vision-residency cpu --vision-max-merged 256 ^
+  --default-reasoning-effort xhigh
+
+REM ===== DFlash2（外挂草稿）=====
+  --draft-model I:\model\dflash2\Qwen3.8-27B-DFlash2-Q4_K_M.gguf ^
+  --spec dflash2 --draft-tokens 4
+
+REM ===== DSpine（外挂草稿，BF16 草稿 KV）=====
+  --draft-model I:\model\dflash2\Qwen3.8-27B-DSpine-b16-Q4_K_M.gguf ^
+  --spec dspine --draft-kv-dtype bf16 --draft-tokens 4
+
+REM ===== MTP（无外挂草稿，用工件内置头）=====
+  --spec mtp --draft-tokens 4 --adaptive-mtp --full-draft-head
+```
+
+> DSpine 草稿 GGUF 首次加载会在 CPU 派生约 1 GB 的 `sender_table`，耗时约 20 秒；
+> 首次之后会写入同目录的 `<gguf>.derived` 缓存（按 ArtifactId + mtime 校验），
+> 再次加载约 11 秒，输出逐字一致。
+
+### `--kvmem-keep` 的作用
+
+`--kvmem-keep`（旧名 `--kvmem-pin-answer`）把两类页**主动固定**在 KVMem 的选中窗口里，
+避免它们在 pressure 重选时被驱逐：
+
+- **sink**：取 `[0, first_user)` 的实际页（上限 10% B），也就是系统提示 + tools schema
+  这一整段「开头结构」，而不是写死的前 N 个 token；
+- **recent**：取最后 8 条消息对应的实际页（上限 15% B），**仅在请求带 tools 时启用**——
+  这样最近的工具结果 / todo 状态不会被挤掉；纯文本长对话回退固定 recent。
+
+实测（32 个工具、LRFU 动态 keep）：system 约 1,447 token / 23 页、tools 约 7,364 token /
+116 页，合计约 151 页（25% B），重选后 sink/recent 页全部保留。代价是纯文本长对话里
+动态 recent 会挤占检索页，所以做了 gating（只在带 tools 时启用）；192K LongMemEval
+20 题在 gating 后恢复 20/20。
+
+> `--ngram-draft-tokens` 的混合复制曾有一处 bug：copy round 把 verify 宽度放大到 ngram
+> 窗口，但 target 的有效列仍按神经草稿宽度计算，导致未验证 token 被接受，表现为 HTML
+> 断裂、对话丢失、工具参数损坏。现已把两处 `proposal_valid_columns` 统一为实际 verify
+> 宽度（`decode.cpp` / `graphs.cpp`），三模式在 ngram=12 下输出均逐字正确。
+
+---
+
+## 128k 实测（2026-11-23，RTX 5060 Ti 16 GB）
+
+同一 prompt（119,123 token）、同一工件，第一次请求做 prefill + 写入，第二次请求命中
+prefix cache，测 decode；输出为指定行重复 40 次，三模式均完整复现 22 行。
+
+| 模式 | `--spec` | decode（tok/s） | wall | 输出正确性 |
+|---|---|---:|---:|---|
+| **DFlash2** | `dflash2` | **159.6** | 3.6 s | 22/22 行 ✓ |
+| **MTP** | `mtp` | **155.9** | 3.7 s | 22/22 行 ✓ |
+| **DSpine** | `dspine` | **131.2** | 4.3 s | 22/22 行 ✓ |
+
+冷 prefill 约 1,000 tok/s（119k token 约 2 分钟），三模式基本持平；差异主要在 decode。
+DFlash2 略快于 MTP，DSpine 因草稿注意力开销稍慢但长上下文接受率更高。完整原始数据在
+`docs/validation/`（128k 对照）与历史 `docs/CHANGELOG.md`。
+
+## 长上下文实测（2026-11-23，DFlash2）
+
+### 220k LongMem 召回（NIAH）
+
+现成脚本：`build-backends/ninfer/run_recall_220k.py` + `build_recall_220k.py`
+（后者生成 220k prompt 与 needles）。8 个 needle 分散埋入约 81 万字符 / 212,695 token
+的源码型 haystack，逐题精确匹配。
+
+| 项 | 结果 |
+|---|---|
+| prompt | 212,695 token（冷 prefill 296.5 s） |
+| 严格召回（首轮） | **8/8** |
+| 重试后 union 召回 | **8/8** |
+
+### 220k Agent 工具调用召回
+
+现成脚本：`agent_256k_toolrecall.py`（30 轮真实 search → fetch → record_finding 循环，
+观察值把上下文推到 ~220k，末尾再分 6 批复核 30 个封存码）。
+
+| 项 | 结果 |
+|---|---|
+| 逐轮工具召回 | **30/30** |
+| 最终封存码召回 | **30/30** |
+| 工具调用总数 | 157 |
+| 记录 finding | 60 |
+
+> 工具调用/agent 场景请使用 **DFlash2**：DSpine 在处理结构化输出（工具调用）时仍有
+> 一个独立问题 `generated token 27 violates the structured output grammar`，与 ngram、
+> longmem 召回无关，尚未修复。
+
+---
+
+## 模型转换工具（GGUF → ninfer）
+
+图形界面工具 `gguf转ninfer工具`（当前版本 **1.8**）把 Qwen3.8-27B 的 GGUF 主模型 +
+可选视觉头 / MTP / DFlash2 / DSpine 草稿合并成一份 `.ninfer` 工件。所有路径必须是
+**英文路径**。
+
+**图形界面（推荐）**：双击 `NInfer-Tool.bat`，两个页签：
+
+- **合并 ninfer 模型**：下拉选 Jinja 模板、主模型、视觉头，按需勾选 MTP / DFlash2 /
+  **DSpine** 草稿，点「开始转换」。主模型自带 `blk.64.nextn.*` 时即使不勾选也会保留 MTP。
+- **提取 MTP 草稿**：从自带 MTP 头的 GGUF 里抽出 `blk.64.* + nextn.*`，只写 GGUF、不转换。
+
+DSpine 走独立转换器 `ninfer-convert\dspine\`（自带一份较新的 `tools/convert`），
+勾选「DSpine 草稿」并选 `Qwen3.8-27B-DSpine-b16-Q4_K_M.gguf` 即可；草稿 Q4_K 块按
+原块直通，产物约 13.8 GiB，CPU 转换约 60 秒。
+
+**命令行等价形式**（在转换器目录执行）：
+
+```powershell
+python -m tools.convert `
+  --model "<metadata 目录>" --recipe qwen3_5_dense_gguf `
+  --source "gguf=<目标 GGUF>" --source "dflash=<草稿 GGUF>" `
+  --components text,mtp,dflash `
+  --override tools/convert/recipes/dspine_gguf_q4.py `
+  --name qwen3.8-27b-iq3s-mtp-dspine-q4k --out model.ninfer
+```
+
+本仓库内的转换器源码在 `backends/ninfer/tools`，DSpine 合并的完整步骤见
+[docs/dspine-convert-guide.md](docs/dspine-convert-guide.md)。
+
+---
+
 ## 更新日志（2026-11-13）
 
 ### 1. DSpine 草案接入 KVMem
@@ -41,7 +188,7 @@ tok/s（+31%）**。llama.cpp 用卡片推荐的 `n-max 15` 在 16 GB 卡上因�
 - `tools/convert/dspine_gguf.py` + `recipes/dspine_gguf_q4.py`：草稿 Q4_K 块按原字节直通；
 - `gguf转ninfer工具` 新增「DSpine 草稿」勾选项（内置转换器 `ninfer-convert/dspine/`）；
 - 新增 [docs/dspine-convert-guide.md](docs/dspine-convert-guide.md)（转换全流程）与
-  [docs/dspine-port-20261111.md](docs/dspine-port-20261111.md)（移植与测量全记录）；
+  [docs/validation/dspine/dspine-port-20261111.md](docs/validation/dspine/dspine-port-20261111.md)（移植与测量全记录）；
 - 服务端在 WDDM 可见空闲显存 < 640 MiB 时打印 WARN（草稿常驻约 1.2 GiB，启动器需留余量）。
 
 ## 更新日志（2026-11-06）
@@ -495,7 +642,7 @@ python3 -m tools.convert \
 - `dflash2` 源支持 GGUF、ModelOpt NVFP4、BF16、per-row FP8；
 - 直通草稿用 `dflash2_gguf_blocks.py`（默认配方）；
 - NVFP4 草稿走 `--override tools/convert/recipes/dflash2_import_nvfp4.py`，
-  详见 [docs/dflash2-nvfp4-20261023.md](docs/dflash2-nvfp4-20261023.md)；
+  详见 [docs/validation/dflash2/dflash2-nvfp4-20261023.md](docs/validation/dflash2/dflash2-nvfp4-20261023.md)；
 - `kernel_projection` 与 conv 必须保持 BF16（prepare 路径没有量化内核）。
 
 ### DSpine 草稿
@@ -532,12 +679,15 @@ python3 -m tools.convert \
 | 文档 | 内容 |
 |---|---|
 | [docs/CHANGELOG.md](docs/CHANGELOG.md) | **所有修补、测速、召回总览** |
-| [docs/dflash2-passthrough-20261026.md](docs/dflash2-passthrough-20261026.md) | q3km 直通、draft 扫描、bypass/floor 细节 |
-| [docs/dflash2-kvmem-fixes-20261018.md](docs/dflash2-kvmem-fixes-20261018.md) | DFlash2 × KVMem 首次修复 |
-| [docs/kvmem-reselect-high-water-20261019.md](docs/kvmem-reselect-high-water-20261019.md) | 驱逐水位与 issue #6 |
-| [docs/kvmem-actkv-lrfu-20261020.md](docs/kvmem-actkv-lrfu-20261020.md) | ActKV LRFU 与 LongMemEval |
-| [docs/cuda-graph-calibration.md](docs/cuda-graph-calibration.md) | Graph 探针与启动数据 |
+| [docs/validation/](docs/validation/) | 分类验收日志：KVMem / GPU / DFlash2 / DSpine / ngram / vision / multi-backend / integration / session-cache |
+| [docs/fixes/](docs/fixes/) | 详细修复补丁日志：DFlash2 / DSpine / KVMem / DSH |
+| [docs/changelog/](docs/changelog/) | 历史变更日志归档 |
+| [docs/validation/dflash2/dflash2-passthrough-20261026.md](docs/validation/dflash2/dflash2-passthrough-20261026.md) | q3km 直通、draft 扫描、bypass/floor 细节 |
+| [docs/fixes/dflash2/dflash2-kvmem-fixes-20261018.md](docs/fixes/dflash2/dflash2-kvmem-fixes-20261018.md) | DFlash2 × KVMem 首次修复 |
+| [docs/fixes/kvmem/kvmem-reselect-high-water-20261019.md](docs/fixes/kvmem/kvmem-reselect-high-water-20261019.md) | 驱逐水位与 issue #6 |
+| [docs/fixes/kvmem/kvmem-actkv-lrfu-20261020.md](docs/fixes/kvmem/kvmem-actkv-lrfu-20261020.md) | ActKV LRFU 与 LongMemEval |
+| [docs/validation/gpu/cuda-graph-calibration.md](docs/validation/gpu/cuda-graph-calibration.md) | Graph 探针与启动数据 |
 | [docs/multi-backend.md](docs/multi-backend.md) | 后端能力与启动说明 |
 | [docs/multi-backend-repository.md](docs/multi-backend-repository.md) | 仓库结构与构建 |
 | [docs/dspine-convert-guide.md](docs/dspine-convert-guide.md) | **DSpine 草稿转 ninfer（GUI + CLI）** |
-| [docs/dspine-port-20261111.md](docs/dspine-port-20261111.md) | DSpine 移植与测量全记录 |
+| [docs/validation/dspine/dspine-port-20261111.md](docs/validation/dspine/dspine-port-20261111.md) | DSpine 移植与测量全记录 |

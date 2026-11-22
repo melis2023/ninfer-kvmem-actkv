@@ -160,4 +160,4 @@ ninfer 相关 thinking-control 专项通过；旧 frontend 总套件在已有 to
 `final-validation.json` 保存结构化证据，`package-p7-windows` 保存未压缩 Windows 包、
 `BUILD-INFO.json`、`provenance/validation.json` 和全文件 SHA256。
 SSD 是进程临时存储，不提供重启恢复或跨后端 KV 迁移；H/D 是原生字节与共享附件配额，
-不是进程 RSS 限制。新后端步骤见 [公共分层接入说明](active-kv-tiering.md)。
+不是进程 RSS 限制。新后端步骤见 [公共分层接入说明](../../active-kv-tiering.md)。

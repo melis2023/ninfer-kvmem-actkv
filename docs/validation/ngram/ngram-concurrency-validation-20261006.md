@@ -1,6 +1,6 @@
 # KVMem ngram 并发补测（2026-10-06）
 
-本报告的图片 ngram 范围是当时的五种 KV。九种 KV、快速 prefill 和多卡的当前边界见 [多后端运行](multi-backend.md)。
+本报告的图片 ngram 范围是当时的五种 KV。九种 KV、快速 prefill 和多卡的当前边界见 [多后端运行](../../multi-backend.md)。
 
 Engine、服务端和统一 Windows 启动器移除了 ngram 的额外单路门禁：需要 MTP，宽度1–15允许 C1–8；启动并发 C2–8 时，配置的16–63自动降至15并提示，C1保留原宽度；多路上限沿用原生 GDN 16列验证工作区。本轮文本准入包括 BF16/INT8/NVFP4/K8V4/RK8V4，resident/CPU 图片放开当时的五种 KV，后续五种 KV 验收见 [全部KV图片ngram补测](vision-ngram-all-kv-validation-20261006.md)。R 必须覆盖 `max(MTP drafts, ngram drafts) + MTP drafts`。默认并发仍为1，统一脚本默认 ngram0，快捷脚本仍是单路/ngram31、视觉1024。
 
@@ -15,7 +15,7 @@ Windows／CUDA13.2／MSVC2022 Release／SM120a，默认8个编译任务。功能
 - INT8／自适应MTP3／ngram4／C8／CPU视觉／Graph：完整验收通过，六路图片、两路文本混跑；冷启动峰值3，恢复/取消/恢复同伴均峰值8。恢复111轮/461行，七路复制共接受1428个ngram tokens；复制冷/恢复/取消后恢复逐token一致，八条后续红/蓝图片问答全部正确，Main/MTP结束页与活动Host预留为0。
 - 预热修复后，INT8／自适应MTP3／ngram15／C8／Graph 的完整文本复制、普通请求混跑、恢复、取消及恢复同伴通过；峰值8，恢复103轮/208行，复制接受1673个ngram tokens，冷/恢复/取消后恢复逐token一致。接受数及恢复轮/行数与同配置eager一致；没有跨进程导出token序列作逐token比较。
 
-图片测试使用512×512纯色PNG，每图实际256个 merged tokens，配置上限1024；B1536/R128。此前的实际1024-token图片并发测试见 [视觉并发验收](vision-concurrency-validation-20261006.md)，其 ngram 关闭，不混作本次证据。
+图片测试使用512×512纯色PNG，每图实际256个 merged tokens，配置上限1024；B1536/R128。此前的实际1024-token图片并发测试见 [视觉并发验收](../vision/vision-concurrency-validation-20261006.md)，其 ngram 关闭，不混作本次证据。
 
 ## 原生 Graph 启动缺陷与修复
 

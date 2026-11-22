@@ -60,7 +60,7 @@ POSIX NVMe tier or `KVMEM_ENABLE_NVME`.
 
 Without `--kvmem-session-nvme-gb`, the existing RAM-only PR #45 policy remains:
 the original RAM cap is a soft retention cap and allows a larger active store.
-The [NVMe-disabled IQ3 K8/V4 regression](session-nvme-off-regression.md) checks
+The [NVMe-disabled IQ3 K8/V4 regression](validation/session-cache/session-nvme-off-regression.md) checks
 the default single-session path and three RAM-only sessions on RTX 5060 Ti.
 
 ## Save and restore
@@ -172,7 +172,7 @@ write/rename/read/validation/deletion boundary, partial I/O within a multi-vecto
 chunk, failed temporary-file cleanup, wrong-session headers, bad checksums,
 decreasing available RAM, reverse recovery and exact packed KV restoration.
 For the opt-in **1:10** exchange and RTX 5060 Ti real-service stability check,
-see [1:10 multi-session exchange stability test](session-exchange-stability.md).
+see [1:10 multi-session exchange stability test](validation/session-cache/session-exchange-stability.md).
 
 Real model regression, including interleaved A/B/C histories, exact answers
 against a RAM reference, prefix cache hits, corruption fallback and eviction:
@@ -219,7 +219,7 @@ python scripts/test_server_session_multimodal.py --server PATH/llama-kvmem-serve
 
 ### Full validation (Windows, 2026-09-27 to 2026-09-28)
 
-See [the multi-session validation report](multi-session-validation-2026-09-27.md)
+See [the multi-session validation report](validation/multi-backend/multi-session-validation-2026-09-27.md)
 for the 5050 / 5060 Ti matrix, shared-root crash recovery, image sessions,
 three approximately 5 GiB sessions under a 10 GiB NVMe quota, and matched
 restore-versus-prefill timings.

@@ -105,7 +105,7 @@ and `scripts/test_server_session_multimodal.py` for image sessions. The large ru
 use `test_server_session_exchange_1to10.py --cycles 3`,
 `test_server_three_session_5g.py --cycles 5`, and
 `test_server_nvme_off_long.py` with the generated `cold-messages-A.json`.
-See [session cache usage and test commands](session-disk-cache.md).
+See [session cache usage and test commands](../../session-disk-cache.md).
 
 The tensor run sets `CUDA_VISIBLE_DEVICES` to 5060 Ti then 5050, with
 `LLAMA_ARG_DEVICE=CUDA0,CUDA1`, `LLAMA_ARG_SPLIT_MODE=tensor`, and

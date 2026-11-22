@@ -217,7 +217,7 @@ Copy-Item `
 
 - `workers/ninfer/start-kvmem-ninfer-dflash.bat`
 - `workers/ninfer/start-kvmem-ninfer.bat`
-- `docs/kvmem-update-20261026.html`
+- `docs/validation/kvmem/kvmem-update-20261026.html`
 
 这两个 bat 与 HTML PPT 是本次之前就存在的工作区改动，保持原样。
 

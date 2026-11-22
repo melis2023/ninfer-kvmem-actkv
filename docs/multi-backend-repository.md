@@ -21,7 +21,7 @@ builds, logs, session snapshots and personal DSH configuration are not.
 
 The migration candidate pins ninfer-all to `8319e8f512477d0cfdef89e16c17c1ba9f9bc7b3`.
 llama.cpp keeps its existing revision. Qualification progress and limits are in
-[the migration record](ninfer-all-migration-validation.md); the earlier dated
+[the migration record](validation/multi-backend/ninfer-all-migration-validation.md); the earlier dated
 qualification reports describe the Ryan baseline. New upstream releases are adopted
 deliberately, with an updated integration patch and prepared-tree hash.
 
@@ -136,6 +136,6 @@ layer pipeline. Active KV tiering replaces the disabled ninfer disk entry with
 process-local storage shared by active and idle histories; it does not support
 restart persistence. See [tiering qualification](active-kv-tiering-plan.md). The release
 matrix and a package that matches this source are not finished. Current patch
-hashes are in `backends/versions.json`. See [validation status](multi-backend-validation.md)
+hashes are in `backends/versions.json`. See [validation status](validation/multi-backend/multi-backend-validation.md)
 and [supported backend combinations](multi-backend.md). Once accepted, merge into
 `master` through normal Git history; do not force-replace the main branch.

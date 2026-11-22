@@ -1,6 +1,6 @@
 # 2026-10-25 更新日志
 
-> 已汇总到 [CHANGELOG.md](CHANGELOG.md)；本文保留原始细节与过程数据。
+> 已汇总到 [CHANGELOG.md](../CHANGELOG.md)；本文保留原始细节与过程数据。
 
 ## 概要
 
@@ -14,7 +14,7 @@
 | 测试 | 128K / 256K 速度、NIAH 召回、q3/q4/nvfp4、MTP vs DFlash2 |
 | 归档 | 本地 git 裸仓库 + 二进制备份 |
 
-详细数据见 `docs/integration-20261025.md`。
+详细数据见 `docs/validation/integration/integration-20261025.md`。
 
 ---
 

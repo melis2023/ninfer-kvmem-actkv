@@ -1,6 +1,6 @@
 # 全部KV的图片＋ngram＋并发（2026-10-06）
 
-本报告覆盖当时的五种 KV。其后 [新增 KV 准入](other-kv-admission-validation-20261006.md) 加入 fp8、rk4v4、rk4v4-e8、rk2v4-e8。当前边界见 [多后端运行](multi-backend.md)。
+本报告覆盖当时的五种 KV。其后 [新增 KV 准入](../kvmem/other-kv-admission-validation-20261006.md) 加入 fp8、rk4v4、rk4v4-e8、rk2v4-e8。当前边界见 [多后端运行](../../multi-backend.md)。
 
 按用户要求，Engine、服务端参数检查及统一 Windows 启动器在本轮允许 BF16、INT8、NVFP4、K8V4、RK8V4 的文本和 resident/CPU 图片＋MTP＋ngram，活动请求上限1–8。固定及自适应MTP1–15均可用。启动并发C2–8、请求ngram16–63时仍自动降至15，并记录原值与实际值；C1保留宽度，0保持关闭。
 

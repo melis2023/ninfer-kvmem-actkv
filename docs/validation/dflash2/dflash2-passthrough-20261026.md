@@ -1,6 +1,6 @@
 # DFlash2 直通草稿：统一量化精度（2026-10-26）
 
-> 已汇总到 [CHANGELOG.md](CHANGELOG.md)；本文保留原始细节与过程数据。
+> 已汇总到 [CHANGELOG.md](../../CHANGELOG.md)；本文保留原始细节与过程数据。
 
 ## 1. 结论
 

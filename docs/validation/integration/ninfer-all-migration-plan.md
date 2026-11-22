@@ -1,6 +1,6 @@
 # ninfer-all 上游迁移评估与实施计划
 
-日期：2026 年 10 月 7 日。状态：M0–M6 已完成，核心迁移验收通过。最终范围及覆盖边界见 [验收记录](ninfer-all-migration-validation.md)。
+日期：2026 年 10 月 7 日。状态：M0–M6 已完成，核心迁移验收通过。最终范围及覆盖边界见 [验收记录](../multi-backend/ninfer-all-migration-validation.md)。
 
 ## 建议与难度
 
@@ -57,7 +57,7 @@ ninfer-all 的 Host/disk prefix cache 不能替代 KVMem 的检索工作集。�
 - Main/MTP KV 与 GDN StateImage 的一致 checkpoint、提交、取消恢复和会话隔离。
 - 已放行的九种 KV 格式、MTP/ngram、resident/CPU Vision、C1–8 和同 compute capability 的多卡 layer pipeline。
 
-以上能力范围以当前[多后端运行](multi-backend.md)、[后端实现差异](multi-backend-differences.md)和对应验收记录为依据。历史结果作为旧基线证据保留，不能直接写成候选上游已经通过。原生容量约束见[上游 startup](https://github.com/iamwavecut/ninfer-all/blob/8319e8f512477d0cfdef89e16c17c1ba9f9bc7b3/src/models/qwen3_5/program/planning/startup.cpp)。
+以上能力范围以当前[多后端运行](../../multi-backend.md)、[后端实现差异](../../multi-backend-differences.md)和对应验收记录为依据。历史结果作为旧基线证据保留，不能直接写成候选上游已经通过。原生容量约束见[上游 startup](https://github.com/iamwavecut/ninfer-all/blob/8319e8f512477d0cfdef89e16c17c1ba9f9bc7b3/src/models/qwen3_5/program/planning/startup.cpp)。
 
 候选上游还新增独立的 `qwen4_exp` 模型族、模型 suspend/resume、router 和新的缓存行为。源码更新会带入这些能力，但本轮不承诺它们已支持 KVMem。尤其不能因为 Flash-Next 使用 Q2_0，就把“量化格式可计算”当作“该模型的稀疏 attention、状态和 KV 已接入 KVMem”。KVMem 开启时，应明确拒绝未适配的模型族及会绕过现有状态管理的新组合；原生非 KVMem 路径维持上游行为。[上游维护者说明](https://github.com/iamwavecut/ninfer-all/blob/8319e8f512477d0cfdef89e16c17c1ba9f9bc7b3/docs/maintainer/consolidated-line.md)
 
@@ -300,4 +300,4 @@ M0 仅做版本、快照和文件完整性核对，没有编译、GPU、模型�
 
 全部编译使用 8 并行。共执行 25 个选定核心程序调用及上述转换/互操作/交付检查，没有运行完整 CTest、全排列、长上下文扫描或性能实验。远端 CI 的源码准备校验已配置，未推送或运行远端 CI。
 
-迁移结果保存在隔离工作树 `ninfer-all-migration-20261007\kvmem`。原混合工作区及其两个后端保留；迁移阶段未替换运行服务、提交/推送或发布 ZIP。用户随后授权将验收后的源码推送到独立分支 `feat/ninfer-all-migration`；后续真实 Q2 制品与服务验证见验收记录。最终版本信息以该候选的 `backends/versions.json` 为准；详细失败修复、核心配置和限制见 [验收记录](ninfer-all-migration-validation.md)。
+迁移结果保存在隔离工作树 `ninfer-all-migration-20261007\kvmem`。原混合工作区及其两个后端保留；迁移阶段未替换运行服务、提交/推送或发布 ZIP。用户随后授权将验收后的源码推送到独立分支 `feat/ninfer-all-migration`；后续真实 Q2 制品与服务验证见验收记录。最终版本信息以该候选的 `backends/versions.json` 为准；详细失败修复、核心配置和限制见 [验收记录](../multi-backend/ninfer-all-migration-validation.md)。

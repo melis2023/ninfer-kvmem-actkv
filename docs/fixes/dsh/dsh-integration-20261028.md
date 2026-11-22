@@ -3,7 +3,7 @@
 本文档记录为 DeepSeek Harness（DSH）场景做的 KVMem / NInfer 代码改动，便于后续恢复、对比和回退。
 
 > 状态：**工作区改动，尚未编译**。分支 `exp/auto-pin`，基于 `main`（`69864b0`）。
-> 旧版 L1 文档：`docs/kvmem-l1-retention-20261026.md`。
+> 旧版 L1 文档：`docs/fixes/kvmem/kvmem-l1-retention-20261026.md`。
 
 ---
 

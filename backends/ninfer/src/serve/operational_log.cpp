@@ -591,7 +591,7 @@ void OperationalLog::engine_capacity(const GenerationService& service) const {
     // application takes a few hundred MiB the driver starts paging the weights to shared memory:
     // every decode step then reads them over PCIe. Measured on an RTX 5060 Ti at 67,584 tokens of
     // nvfp4 KV, 112 tok/s with ~660 MiB free against 72 tok/s after a 512 MiB allocation appeared
-    // in another process (docs/dspine-port-20261111.md 5g). Startup cannot prevent it after the
+    // in another process (docs/validation/dspine/dspine-port-20261111.md 5g). Startup cannot prevent it after the
     // fact, so the operator gets the one line that explains the slowdown.
 #if defined(_WIN32)
     constexpr std::size_t kMinimumVramHeadroomBytes = 640ULL << 20;

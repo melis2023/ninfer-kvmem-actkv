@@ -130,7 +130,7 @@ The GPU tests used an RTX 5060 Ti 16 GiB for the 27B target and synthetic color
 images; they verify correctness and overlap, not a throughput improvement.
 Linux builds and host tests remain covered by the repository's GitHub workflow.
 
-The [RTX 5050 stress-test report](multi-lane-stress-5050-2026-10-01.md) records
+The [RTX 5050 stress-test report](validation/multi-backend/multi-lane-stress-5050-2026-10-01.md) records
 2/4/8/16-client ramps and ten minutes of cache churn for P=2 and P=4, the
 decode-graph bug found under load, its correction and subsequent recovery/
 regression checks. The four-lane run completed 743 requests with zero errors;

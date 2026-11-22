@@ -129,5 +129,5 @@ git checkout -- kvmem/include/kvmem/lrfu.hpp kvmem/tests/kvmem_store_test.cpp
 ## 7. 相关文档
 
 - `docs/kvmem-lrfu-ema-20261020.md`：EMA 版本的动机与数据（历史记录）
-- `docs/kvmem-incremental-restore-20261020.md`：差异 restore
+- `docs/fixes/kvmem/kvmem-incremental-restore-20261020.md`：差异 restore
 - `docs/kvmem-actkv-query-20261020.md`：action-region query 的失败尝试

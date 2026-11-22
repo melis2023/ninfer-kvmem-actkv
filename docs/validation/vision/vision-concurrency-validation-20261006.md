@@ -2,7 +2,7 @@
 
 KVMem 的 Engine、服务端参数检查及 Windows 统一启动入口现已允许 1–8 条活动文本或 resident/CPU 图片请求，可混合图文。并发默认值仍为 1；`-Concurrency 8` 或 `--max-concurrency 8` 选择八路。启动脚本默认每图视觉上限由 256 改为 1024 merged tokens。
 
-本报告的多路验收关闭 ngram；统一启动入口的 `-NgramDrafts` 默认是 0。其后的 ngram、九种 KV、快速 prefill 和多卡见 [多后端运行](multi-backend.md)。本报告自身不放行冷磁盘、视频、overlay、并发 prefill 或快速图片 prefill。CPU 图片编码沿用原生串行编码器。当时的 ngram 和五种 KV 图片记录见 [ngram并发补测](ngram-concurrency-validation-20261006.md) 和 [全部KV图片ngram补测](vision-ngram-all-kv-validation-20261006.md)。
+本报告的多路验收关闭 ngram；统一启动入口的 `-NgramDrafts` 默认是 0。其后的 ngram、九种 KV、快速 prefill 和多卡见 [多后端运行](../../multi-backend.md)。本报告自身不放行冷磁盘、视频、overlay、并发 prefill 或快速图片 prefill。CPU 图片编码沿用原生串行编码器。当时的 ngram 和五种 KV 图片记录见 [ngram并发补测](../ngram/ngram-concurrency-validation-20261006.md) 和 [全部KV图片ngram补测](../ngram/vision-ngram-all-kv-validation-20261006.md)。
 
 ## 已完成检查
 

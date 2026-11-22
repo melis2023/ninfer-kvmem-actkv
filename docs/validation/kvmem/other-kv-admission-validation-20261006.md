@@ -1,6 +1,6 @@
 # 新增 KV 格式准入补测（2026-10-06）
 
-本报告记录九种 KV 的准入补测。写本报告时，快速 prefill 仍只允许 INT8/RK8V4 文本。该限制已由 [快速 prefill 准入补测](fast-prefill-admission-validation-20261006.md) 放宽。当前边界见 [多后端运行](multi-backend.md)。
+本报告记录九种 KV 的准入补测。写本报告时，快速 prefill 仍只允许 INT8/RK8V4 文本。该限制已由 [快速 prefill 准入补测](fast-prefill-admission-validation-20261006.md) 放宽。当前边界见 [多后端运行](../../multi-backend.md)。
 
 用户要求先测试能否简单放行，复杂修改另行确认。本轮补入 `fp8`、`rk4v4`、
 `rk4v4-e8`、`rk2v4-e8` 的 KVMem 格式身份，并扩展 Engine、服务端和 Windows
@@ -76,7 +76,7 @@ MTP15 的 E8 组合及 FP8 两路颜色、复制、恢复也全部通过。
 四个历史实验加四个图片/ngram 实验共 140 次模型请求（40 次历史、100 次并发/颜色）。
 
 此前 K8V4 CPU 图片/C1/自适应15/ngram63 的换行差异仍未解决，见
-[原始记录](vision-ngram-validation-20261005.md)。本轮没有改动该路径。
+[原始记录](../ngram/vision-ngram-validation-20261005.md)。本轮没有改动该路径。
 
 ## 程序和记录
 

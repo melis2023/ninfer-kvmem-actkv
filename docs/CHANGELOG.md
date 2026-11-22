@@ -512,17 +512,17 @@ DFlash2 行为 2026-10-26 复测（q3km、`ngram 0`、当前二进制）：报�
 
 | 文档 | 内容 |
 |---|---|
-| `docs/dflash2-kvmem-fixes-20261018.md` | DFlash2 × KVMem 首次修复（envelope/floor/slot） |
-| `docs/dflash2-kvmem-audit-20261019.md` | 代码审查 F1–F6 与 floor 修复 |
-| `docs/kvmem-recall-opt-20261019.md` | 召回传输优化与备份记录 |
-| `docs/kvmem-reselect-high-water-20261019.md` | 80% 水位与 issue #6 的完整过程 |
-| `docs/kvmem-actkv-lrfu-20261020.md` | ActKV LRFU 公式与 LongMemEval |
-| `docs/kvmem-incremental-restore-20261020.md` | 差异 restore 实现与 64K 数据 |
-| `docs/kvmem-layer-wise-scoring-20261022.md` | layer-wise 实验（已回退） |
-| `docs/kvmem-sm75-sm70-port-20261022.md` | sm70/sm75 移植与块大小结论 |
-| `docs/cuda-graph-calibration.md` | Graph 探针实现与启动数据 |
-| `docs/dflash2-nvfp4-20261023.md` | NVFP4 草稿导入路径 |
-| `docs/dflash2-passthrough-20261026.md` | q3km 直通、draft 扫描、floor/bypass 细节 |
-| `docs/integration-20261025.md` | 上游整合评估与 128K/256K 数据 |
-| `docs/CHANGELOG-20261025.md` | 10-25 当天的完整日志 |
+| `docs/fixes/dflash2/dflash2-kvmem-fixes-20261018.md` | DFlash2 × KVMem 首次修复（envelope/floor/slot） |
+| `docs/fixes/dflash2/dflash2-kvmem-audit-20261019.md` | 代码审查 F1–F6 与 floor 修复 |
+| `docs/fixes/kvmem/kvmem-recall-opt-20261019.md` | 召回传输优化与备份记录 |
+| `docs/fixes/kvmem/kvmem-reselect-high-water-20261019.md` | 80% 水位与 issue #6 的完整过程 |
+| `docs/fixes/kvmem/kvmem-actkv-lrfu-20261020.md` | ActKV LRFU 公式与 LongMemEval |
+| `docs/fixes/kvmem/kvmem-incremental-restore-20261020.md` | 差异 restore 实现与 64K 数据 |
+| `docs/fixes/kvmem/kvmem-layer-wise-scoring-20261022.md` | layer-wise 实验（已回退） |
+| `docs/validation/gpu/kvmem-sm75-sm70-port-20261022.md` | sm70/sm75 移植与块大小结论 |
+| `docs/validation/gpu/cuda-graph-calibration.md` | Graph 探针实现与启动数据 |
+| `docs/validation/dflash2/dflash2-nvfp4-20261023.md` | NVFP4 草稿导入路径 |
+| `docs/validation/dflash2/dflash2-passthrough-20261026.md` | q3km 直通、draft 扫描、floor/bypass 细节 |
+| `docs/validation/integration/integration-20261025.md` | 上游整合评估与 128K/256K 数据 |
+| `docs/changelog/CHANGELOG-20261025.md` | 10-25 当天的完整日志 |
 

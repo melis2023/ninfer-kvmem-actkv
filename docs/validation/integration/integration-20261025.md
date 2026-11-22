@@ -1,6 +1,6 @@
 # 2026-10-25 上游整合评估与进度
 
-> 已汇总到 [CHANGELOG.md](CHANGELOG.md)；本文保留原始细节与过程数据。
+> 已汇总到 [CHANGELOG.md](../../CHANGELOG.md)；本文保留原始细节与过程数据。
 
 ## 1. 基准
 
@@ -383,4 +383,4 @@ issue #6 的 80% 水位 thrash 最终按“回到满窗口触发”处理：
 - B/R=4.15、61K prompt：旧版 55 次 reselect / 82.2s → 新版 **0 次 / 75.8s**；
 - B/R=4.15、253K NIAH：3/3，触发点严格落在 `W=68,608` 和每次 `+R`。
 
-细节、崩溃日志与 5 轮 A/B 见 `docs/kvmem-reselect-high-water-20261019.md` 第 11 节。
+细节、崩溃日志与 5 轮 A/B 见 `docs/fixes/kvmem/kvmem-reselect-high-water-20261019.md` 第 11 节。

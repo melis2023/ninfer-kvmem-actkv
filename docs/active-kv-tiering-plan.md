@@ -6,7 +6,7 @@ fault/cancellation, patch reconstruction and Windows dependency packaging comple
 Llama 260K RAM long-prefill and physical cold-SSD/memory-pressure performance
 qualification remain open; native Linux GPU verification is unavailable locally.
 Measured results and qualifications are
-in [the final regression record](active-kv-tiering-validation-20261010.md).
+in [the final regression record](validation/kvmem/active-kv-tiering-validation-20261010.md).
 The dated checkpoints below retain earlier results and unresolved observations.
 
 ## Scope

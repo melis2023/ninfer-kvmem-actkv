@@ -490,7 +490,7 @@ text, resident vision, cold snapshots and 8K/32K/64K/128K NVFP4 retrieval. Three
 independent B32768/R16384 MTP4 Graph service starts and long-input HTTP reuse,
 output limits and cancellation also passed under the default CUDA policy. Exact
 commands, failed attempts and test corrections are in the local integration
-[qualification report](../../../docs/nvfp4-kvmem-validation-20261004.md).
+[qualification report](../../../docs/validation/kvmem/nvfp4-kvmem-validation-20261004.md).
 This qualifies the tested source/build/model combination, not an existing package.
 Use an explicit text+MTP artifact and a free GPU selected by UUID. Functional
 tests can use either local card; performance comparisons use the RTX 5060 Ti.
@@ -705,7 +705,7 @@ The 2026-10-04 real IQ3S/5060 Ti qualification deliberately uses 26 processes:
 one 32K/16K MTP4 Graph serving start. All ngram/lookup paths are disabled. Each
 process can issue several requests; foundational numerical cases are counted
 separately and no unrelated suite is repeated. Commands, scope and timings are
-in the [report](../../../docs/k8v4-kvmem-validation-20261004.md).
+in the [report](../../../docs/validation/kvmem/k8v4-kvmem-validation-20261004.md).
 
 
 ## KVMem parameter-extension qualification
@@ -725,7 +725,7 @@ The chat endpoint fixture honors model stop tokens and compares reuse with the a
 generated prefix, allowing its bounded template closure. Forcing a visible assistant response
 past EOS into new role tokens does not create a reconstructible chat prefix. Other history
 checks retain their exact output-budget assertions. Details and supported bounds are in the
-parent [report](../../../docs/parameter-admission-validation-20261004.md).
+parent [report](../../../docs/validation/kvmem/parameter-admission-validation-20261004.md).
 
 ## KVMem adaptive-combination follow-up
 
@@ -742,7 +742,7 @@ are separate processes sharing one dedicated directory. Fast prefill remains
 INT8/RK8V4 text-only without cold disk. Ngram supports one text or INT8/NVFP4 resident/CPU Vision lane, max63;
 That follow-up qualified one resident/CPU image lane; cold snapshots require profile off.
 The new bounds and measured configurations are recorded in the parent
-[report](../../../docs/adaptive-combinations-validation-20261005.md).
+[report](../../../docs/validation/kvmem/adaptive-combinations-validation-20261005.md).
 
 ## KVMem images with ngram
 
@@ -754,9 +754,9 @@ greedy and seeded-sampling comparisons, cancellation/recovery, output limits
 and edited-prefix rejection. Copy requests honor model stop tokens; the existing
 fixed-length color fixtures keep their original termination policy. Transfer
 verification logs must prove query replay, not merely a long input or an enabled
-flag. The parent [qualification report](../../../docs/vision-ngram-validation-20261005.md)
+flag. The parent [qualification report](../../../docs/validation/ngram/vision-ngram-validation-20261005.md)
 records the initial two admitted configurations, the K8V4 observation and controls.
-The current [all-KV qualification](../../../docs/vision-ngram-all-kv-validation-20261006.md)
+The current [all-KV qualification](../../../docs/validation/ngram/vision-ngram-all-kv-validation-20261006.md)
 records the subsequent admission of all five KV formats and concurrent checks.
 
 ## KVMem image concurrency (2026-10-06)
@@ -779,7 +779,7 @@ The fixture mixes red images, blue images and text, with distinct access codes,
 then checks lane isolation, cancellation, restored peers, image replacement
 under the same source name, compact batching, configured active lanes, global
 Host admission and resource retirement. The current build and validation limits
-are recorded in the parent [report](../../../docs/vision-concurrency-validation-20261006.md).
+are recorded in the parent [report](../../../docs/validation/vision/vision-concurrency-validation-20261006.md).
 
 For text SSD pressure checks, the optional final `disk-MiB` argument creates a process-local spill
 directory. Cold asynchronous reads may prevent short replies from overlapping; the cold phase
@@ -812,7 +812,7 @@ fused/standalone append byte parity; numerical criteria are unchanged.
 The Engine/serving/launcher tests admit all nine profiles, retain unknown-format
 rejection and preserve disabled cold snapshots and the fast-prefill restrictions.
 Representative real-model history, concurrent image/ngram and cancellation evidence
-is in the [additional KV report](../../../docs/other-kv-admission-validation-20261006.md).
+is in the [additional KV report](../../../docs/validation/kvmem/other-kv-admission-validation-20261006.md).
 
 ## KVMem fast-prefill admission (2026-10-06)
 
@@ -828,7 +828,7 @@ and MTP/ngram while preserving rejection of unsupported KV, concurrent prefill a
 Cold prefills are serialized, so `ninfer_memory_ngram` records their actual overlap without
 requiring it. Each of the three restored phases still requires full configured concurrency
 and more decode row-rounds than decode rounds; exact token/byte/resource checks remain unchanged.
-See the [fast-prefill report](../../../docs/fast-prefill-admission-validation-20261006.md).
+See the [fast-prefill report](../../../docs/validation/kvmem/fast-prefill-admission-validation-20261006.md).
 
 Native PTQ1 qualification: `ninfer_linear_ptq1_test` and `ninfer_linear_ptq1_a8_test` compare
 public Linear against the CPU FP64 oracle over real Bonsai shapes, route boundaries and graph

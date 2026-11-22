@@ -4,7 +4,7 @@
 服务参数和 Windows 启动器的快速 prefill 准入清单，复用已有原生 prompt
 Attention 内核，没有修改生产量化算法、Attention 算法或调度架构。
 本报告的 GPU 验收范围是单张物理 GPU。多卡 layer pipeline 的验收见
-[多卡验收](ninfer-multigpu-validation-20261006.md)，不能用本报告推断多卡结果。
+[多卡验收](../multi-backend/ninfer-multigpu-validation-20261006.md)，不能用本报告推断多卡结果。
 
 ## 准入范围
 
@@ -92,7 +92,7 @@ Engine options、服务参数、Windows 启动器测试通过：覆盖五种格�
 
 这是定向功能/数值验收，未进行性能比较、通用质量评测、完整组合全排列、
 每图实际 1024 tokens 或 HTTP 并发矩阵补测。此前 K8V4 CPU/C1/自适应15/ngram63
-的换行差异仍未处理，见 [原始记录](vision-ngram-validation-20261005.md)。
+的换行差异仍未处理，见 [原始记录](../ngram/vision-ngram-validation-20261005.md)。
 
 工作区原始日志、命令、退出码、程序哈希和修改前备份保存在
 `results/fast-prefill-admission-20261006/`。

@@ -64,7 +64,7 @@ log's `session_transfer` events show which route was used. The output retains
 - The pre-existing 5060 Ti service was restored on port 18200 and `/health`
   returned HTTP 200 after the run.
 
-Run the existing short [session disk regression](session-disk-cache.md) as a
+Run the existing short [session disk regression](../../session-disk-cache.md) as a
 separate gate for corruption, file locks, count LRU and small-quota behavior.
 The 1:10 check is deliberately focused on large session exchange and repeated
 service use.

@@ -6,7 +6,7 @@ it does not establish new GPU performance numbers.
 
 2026-10-10: The active KV tiering candidate replaces the disabled ninfer disk
 entry below with shared process-local RAM/SSD storage. Current qualification and
-remaining gates are in [the tiering plan](active-kv-tiering-plan.md). Earlier disk
+remaining gates are in [the tiering plan](../../active-kv-tiering-plan.md). Earlier disk
 results remain historical; they do not qualify this replacement.
 
 2026-10-06: KVMem cold snapshots in ninfer are temporarily disabled at the launcher,
@@ -316,7 +316,7 @@ qualification across the admitted combinations, and a package whose report
 matches this source. Cold snapshots stay disabled by request, so disk restart
 is not a current release gate. Parameter acceptance does not prove every
 combination. Video, live NVMe and cross-backend KV migration remain unsupported.
-See [the capability documentation](multi-backend.md).
+See [the capability documentation](../../multi-backend.md).
 
 The earlier llama.cpp MTP cold performance difference (approximately 3% in one
 comparison) remains an unresolved performance finding, not a confirmed logic bug.
@@ -324,20 +324,20 @@ The original mandatory_trim sink-page logging discrepancy was approved for a
 logging-only fix; the selection algorithm was preserved. Detailed provenance and
 other legacy findings remain in the experiment workspace's `legacy-findings.md`.
 
-早期图片＋MTP＋ngram 补测开放 INT8/NVFP4；当时记录的 K8V4 换行差异仍待定位，BF16/RK8V4 在后续补测中放行。该早期范围与复制/replay证据见 [图片ngram补测](vision-ngram-validation-20261005.md)，当前准入见 [能力说明](multi-backend.md)。
+早期图片＋MTP＋ngram 补测开放 INT8/NVFP4；当时记录的 K8V4 换行差异仍待定位，BF16/RK8V4 在后续补测中放行。该早期范围与复制/replay证据见 [图片ngram补测](../ngram/vision-ngram-validation-20261005.md)，当前准入见 [能力说明](../../multi-backend.md)。
 
-ngram1–15 的准入已从单路扩为1–8路。该轮文本及 resident/CPU 图片为五种 KV；启动并发大于1时，配置的16–63自动降至15并提示，单路保留原宽度。实际八路eager/ngram15及Graph验证见 [ngram并发补测](ngram-concurrency-validation-20261006.md)。其后四种 KV 见文末当前状态。
+ngram1–15 的准入已从单路扩为1–8路。该轮文本及 resident/CPU 图片为五种 KV；启动并发大于1时，配置的16–63自动降至15并提示，单路保留原宽度。实际八路eager/ngram15及Graph验证见 [ngram并发补测](../ngram/ngram-concurrency-validation-20261006.md)。其后四种 KV 见文末当前状态。
 
-图文活动请求上限已扩为八路，启动脚本默认视觉上限改为 1024。5060 Ti 上的 INT8 CPU视觉/自适应MTP3/Graph 和 resident视觉/ordinary/eager 八路 Engine 回归已通过，后者使用每图实际1024 tokens。CPU视觉实际1024-token图片的 HTTP 冷/缓存两轮共16请求也通过，缓存阶段峰值8路；范围见 [视觉并发调整](vision-concurrency-validation-20261006.md)。
+图文活动请求上限已扩为八路，启动脚本默认视觉上限改为 1024。5060 Ti 上的 INT8 CPU视觉/自适应MTP3/Graph 和 resident视觉/ordinary/eager 八路 Engine 回归已通过，后者使用每图实际1024 tokens。CPU视觉实际1024-token图片的 HTTP 冷/缓存两轮共16请求也通过，缓存阶段峰值8路；范围见 [视觉并发调整](../vision/vision-concurrency-validation-20261006.md)。
 
-2026-10-06 又以格式登记和准入改动放行 `fp8`、`rk4v4`、`rk4v4-e8`、`rk2v4-e8`，当时共九种原生 KV。新增四种的 360 项稀疏 Attention 数值检查、页搬运和 140 次真实模型请求全部通过；图片＋ngram 包含 resident C2、CPU C8、固定 MTP3/15 及自适应 MTP3，恢复阶段达到满配并发。冷快照保持禁用。写该记录时，快速 prefill 仍仅允许 INT8/RK8V4 文本；该限制随后被放宽。实测范围、首次夹具失败及重跑见 [新增KV准入补测](other-kv-admission-validation-20261006.md)。
+2026-10-06 又以格式登记和准入改动放行 `fp8`、`rk4v4`、`rk4v4-e8`、`rk2v4-e8`，当时共九种原生 KV。新增四种的 360 项稀疏 Attention 数值检查、页搬运和 140 次真实模型请求全部通过；图片＋ngram 包含 resident C2、CPU C8、固定 MTP3/15 及自适应 MTP3，恢复阶段达到满配并发。冷快照保持禁用。写该记录时，快速 prefill 仍仅允许 INT8/RK8V4 文本；该限制随后被放宽。实测范围、首次夹具失败及重跑见 [新增KV准入补测](../kvmem/other-kv-admission-validation-20261006.md)。
 
 ## Current source status — 2026-10-07
 
 上面各段保留当时的证据。当前源码边界是：
 
 - 九种 KV 用于文本和 resident/CPU 图片，C1–8，固定或自适应 MTP，以及带 C2–8 宽度钳制的 ngram。
-- 快速 prefill 允许 `int8`、`rk8v4`、`rk4v4`、`rk4v4-e8`、`rk2v4-e8` 的文本和 resident/CPU 图片，C1–8。见 [快速 prefill 准入补测](fast-prefill-admission-validation-20261006.md)。
-- ninfer 多卡使用 layer pipeline。5060 Ti 与 5050 Laptop 的验收见 [多卡验收](ninfer-multigpu-validation-20261006.md)。这是容量路径，该轮没有吞吐提升结论。`mixed`/`strict`、overlay Vision、DFlash、并行 prefill 和冷快照仍按 [能力说明](multi-backend.md) 限制。
+- 快速 prefill 允许 `int8`、`rk8v4`、`rk4v4`、`rk4v4-e8`、`rk2v4-e8` 的文本和 resident/CPU 图片，C1–8。见 [快速 prefill 准入补测](../kvmem/fast-prefill-admission-validation-20261006.md)。
+- ninfer 多卡使用 layer pipeline。5060 Ti 与 5050 Laptop 的验收见 [多卡验收](ninfer-multigpu-validation-20261006.md)。这是容量路径，该轮没有吞吐提升结论。`mixed`/`strict`、overlay Vision、DFlash、并行 prefill 和冷快照仍按 [能力说明](../../multi-backend.md) 限制。
 - 冷快照在启动器、CLI 和 Engine 入口保持关闭。旧 `--lookup-ngram` 保持拒绝。
 - 2026-10-07 的 `prepare-backends.py --check` 与 `backends/versions.json` 中的两棵准备后树一致。已发布 ZIP 没有按这棵源码重打。
