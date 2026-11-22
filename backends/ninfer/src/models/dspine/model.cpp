@@ -3,6 +3,7 @@
 #include "artifact/binder.h"
 #include "artifact/reader.h"
 #include "core/weight_view.h"
+#include "models/draft_reader.h"
 #include "models/qwen3_5/load/bindings.h"
 #include "ops/common/device_tier.h"
 
@@ -115,7 +116,7 @@ std::string Model::artifact_hex() const {
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, DeviceContext& device,
                                   const StartupObserver* observer,
                                   const artifact::MaterializeOptions& materialize) {
-    auto reader    = std::make_shared<const artifact::Reader>(path);
+    auto reader    = std::shared_ptr<const artifact::Reader>(open_drafter(path));
     auto model     = std::unique_ptr<Model>(new Model());
     model->config_ = read_config(*reader, path);
     artifact::Binder binder(*reader);

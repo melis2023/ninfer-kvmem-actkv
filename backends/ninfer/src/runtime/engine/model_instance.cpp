@@ -353,10 +353,12 @@ EngineOptions normalize_engine_options(EngineOptions options) {
         const bool fixed_mtp = memory_mtp && options.speculative.mtp_policy == MtpDraftPolicy::Fixed;
         const bool adaptive_mtp = memory_mtp &&
             options.speculative.mtp_policy == MtpDraftPolicy::Adaptive;
-        // DFlash2 uses the native lane capacity; target/draft execution stays on one GPU.
+        // DFlash, DFlash2 and DSpine use the native lane capacity; target/draft execution stays on
+        // one GPU. A DSpine drafter keeps its own ring, which startup sizes against this window.
         const bool memory_dflash2 =
             (options.speculative.backend == SpeculativeBackend::DFlash2 ||
-             options.speculative.backend == SpeculativeBackend::DFlash) &&
+             options.speculative.backend == SpeculativeBackend::DFlash ||
+             options.speculative.backend == SpeculativeBackend::DSpine) &&
             options.max_concurrency <= kMaximumConcurrency && options.devices.size() <= 1 &&
             options.speculative.draft_tokens >= 1 && options.speculative.draft_tokens <= 15;
         const bool memory_ngram_supported = options.speculative.ngram_draft_tokens == 0 ||
@@ -398,7 +400,7 @@ EngineOptions normalize_engine_options(EngineOptions options) {
              options.kv_cache != KvCacheStorage::RotatedInt4KeyInt4ValueE8 &&
              options.kv_cache != KvCacheStorage::RotatedE8RootKeyInt4Value)) {
             throw std::invalid_argument("KVMem requires explicit B+R page-aligned "
-                "capacity per lane, nonzero global H, aligned prefill <= R, BF16/INT8/FP8/NVFP4/K8V4/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8, 1..8 text or resident/CPU-vision lanes, ordinary/fixed/adaptive MTP1..15 or single-GPU DFlash2 1..15 with 1..8 lanes, ngram1..63 (automatically capped at 15 with 2..8 lanes), INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 fast prefill, "
+                "capacity per lane, nonzero global H, aligned prefill <= R, BF16/INT8/FP8/NVFP4/K8V4/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8, 1..8 text or resident/CPU-vision lanes, ordinary/fixed/adaptive MTP1..15 or single-GPU DFlash/DFlash2/DSpine 1..15 with 1..8 lanes, ngram1..63 (automatically capped at 15 with 2..8 lanes), INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 fast prefill, "
                 "and disabled prefix cache");
         }
     }
@@ -650,13 +652,18 @@ ModelInstance::ModelInstance(std::unique_ptr<models::qwen3_5::Model> source,
             options.speculative.draft_model.string().c_str(), config.num_hidden_layers,
             config.sliding_window, config.block_size, config.target_layer_ids.size(),
             config.rank, config.code_size);
-        // The artifact loads and checks out, but nothing drives dspine::Runtime yet: the decode
-        // path has no DSpine batch execution, so a round would have no drafts to verify. Refuse
-        // here rather than fail inside graph capture.
-        throw std::runtime_error(
-            "--spec dspine: the drafter loaded and matches this target, but this build has no "
-            "DSpine decode path (dspine::Runtime is not driven yet), so it would draft nothing. "
-            "Use --spec dflash2 or --spec mtp for now.");
+    }
+    if ((options.speculative.backend == SpeculativeBackend::DFlash ||
+         options.speculative.backend == SpeculativeBackend::DFlash2) &&
+        !options.speculative.draft_model.empty() && model->config().draft) {
+        // The drafter's weights came from its own artifact; say which one, since the target need
+        // not carry the component at all.
+        const auto& draft = *model->config().draft;
+        runtime::publish_diagnostic(
+            options.diagnostic_observer, DiagnosticLevel::Info,
+            "dflash: %s loaded (%u layers, window %u, %zu taps)",
+            options.speculative.draft_model.string().c_str(), draft.num_hidden_layers,
+            draft.sliding_window, draft.target_layer_ids.size());
     }
 }
 
@@ -879,8 +886,11 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     // An automatic draft head is the artifact's optimized proposal head when it stores one: it
     // projects drafts onto a shortlist of the vocabulary instead of all of it.
     if (options.speculative.proposal_head == ProposalHead::Auto) {
+        // A standalone DSpine drafter reads the target's own full head; an optimized proposal
+        // head is a shortlist the drafter was not trained against.
         const bool stored = options.purpose == EnginePurpose::Generation &&
                             options.speculative.backend != SpeculativeBackend::None &&
+                            options.speculative.backend != SpeculativeBackend::DSpine &&
                             reader.directory().component("text").proposal.has_value();
         options.speculative.proposal_head = stored ? ProposalHead::Optimized : ProposalHead::Full;
     }

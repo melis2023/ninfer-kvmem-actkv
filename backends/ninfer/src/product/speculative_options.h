@@ -54,6 +54,15 @@ inline void apply_automatic_speculation(SpeculativeOptions& options, bool backen
 }
 
 inline void validate_speculative_cli_options(const SpeculativeOptions& options) {
+    // --draft-model names a standalone drafter; only the backends that run one take it, and the
+    // automatic choice (no --spec) reads the artifact to pick between them.
+    if (!options.draft_model.empty() && !options.automatic &&
+        options.backend != SpeculativeBackend::DFlash &&
+        options.backend != SpeculativeBackend::DFlash2 &&
+        options.backend != SpeculativeBackend::DSpine) {
+        throw std::invalid_argument(
+            "--draft-model requires --spec dflash|dflash2|dspine, or no --spec at all");
+    }
     if (!std::isfinite(options.draft_min_p) || options.draft_min_p < 0 ||
         options.draft_min_p > 1 ||
         (options.draft_min_p != 0 && options.backend != SpeculativeBackend::Mtp)) {

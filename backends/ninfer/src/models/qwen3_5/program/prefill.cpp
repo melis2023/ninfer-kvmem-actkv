@@ -1079,7 +1079,7 @@ runtime::ExecutionTiming ProgramImpl::resolve_pending_raw(
         }
 
         // Sparse acceptance reads counts. Publish only the prefix licensed by the Frontend.
-        if (speculative_backend == SpeculativeBackend::DFlash2) {
+        if (is_sparse_draft_backend(speculative_backend)) {
             for (std::size_t row = 0; row < lanes.size(); ++row) {
                 if (cancelled[row] || !requests[lanes[row]].sampling_host.token_counts) {
                     continue;

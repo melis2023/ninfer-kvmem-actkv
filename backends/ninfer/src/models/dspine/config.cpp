@@ -1,6 +1,7 @@
 #include "models/dspine/config.h"
 
 #include "artifact/reader.h"
+#include "models/draft_reader.h"
 
 #include <algorithm>
 #include <cmath>
@@ -56,7 +57,11 @@ Config parse_config(const Json& value) {
     out.head_dim                = integer(value, "head_dim");
     out.max_position_embeddings = integer(value, "max_position_embeddings");
     out.vocab_size              = integer(value, "vocab_size");
-    out.num_target_layers       = integer(value, "num_target_layers");
+    // A GGUF states no target depth: the drafter was trained for one, but the file only names the
+    // taps, so zero means "the model checks it" (check_target).
+    out.num_target_layers = value.contains("num_target_layers")
+                                ? integer(value, "num_target_layers")
+                                : 0;
     out.block_size              = integer(value, "block_size");
     out.sliding_window          = integer(value, "sliding_window");
     out.rms_norm_eps            = real(value, "rms_norm_eps");
@@ -75,7 +80,9 @@ Config parse_config(const Json& value) {
     require(taps.is_array() && !taps.empty(), "target_layer_ids must name the taps");
     for (const auto& tap : taps) {
         const auto layer = artifact::require_u64(tap, "target_layer_ids", false);
-        require(layer < out.num_target_layers, "a tap lies outside the target's layers");
+        if (out.num_target_layers && layer >= out.num_target_layers) {
+            require(false, "a tap lies outside the target's layers");
+        }
         out.target_layer_ids.push_back(static_cast<std::uint32_t>(layer));
     }
     auto sorted = out.target_layer_ids;
@@ -129,7 +136,8 @@ Config read_config(const artifact::Reader& reader, const std::filesystem::path& 
 }
 
 Config read_config(const std::filesystem::path& path) {
-    return read_config(artifact::Reader(path), path);
+    const auto reader = open_drafter(path);
+    return read_config(*reader, path);
 }
 
 void check_target(const Config& config, std::uint64_t hidden_size, std::uint64_t vocab_size,
@@ -147,9 +155,17 @@ void check_target(const Config& config, std::uint64_t hidden_size, std::uint64_t
         fail("vocabulary " + std::to_string(config.vocab_size) + ", the model's " +
              std::to_string(vocab_size));
     }
-    if (config.num_target_layers != layers) {
+    // A GGUF drafter states no target depth: its taps are then the only claim to check, and they
+    // must all fall inside the model's layers.
+    const bool depth_stated = config.num_target_layers != 0;
+    if (depth_stated && config.num_target_layers != layers) {
         fail(std::to_string(config.num_target_layers) + " target layers, the model's " +
              std::to_string(layers));
+    }
+    for (const auto tap : config.target_layer_ids) {
+        if (tap >= layers) {
+            fail("a tap on layer " + std::to_string(tap) + ", the model's " + std::to_string(layers));
+        }
     }
 }
 
@@ -172,7 +188,8 @@ std::uint64_t head_write_bytes(const Config& config) {
 }
 
 std::uint64_t weight_bytes(const std::filesystem::path& path) {
-    return artifact::Reader(path).directory().payload_bytes;
+    const auto reader = open_drafter(path);
+    return reader->directory().payload_bytes;
 }
 
 } // namespace ninfer::models::dspine

@@ -206,6 +206,8 @@ public:
     std::optional<VisionParameters> vision;
     std::optional<DraftParameters> draft;
     std::optional<ProposalParameters> proposal;
+    // --spec dspine: the standalone drafter's operands (Model::dspine()); null otherwise.
+    const dspine::Model* dspine = nullptr;
 };
 
 } // namespace ninfer::models::qwen3_5::execution

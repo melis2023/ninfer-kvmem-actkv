@@ -205,11 +205,18 @@ std::string usage_text(const char* argv0) {
            std::string(product::kKvResidentHelp) +
            "\n"
            "SPECULATIVE DECODING\n"
-           "  --spec none|mtp|dflash|dflash2\n"
-           "                                speculative decoding backend (default: mtp with 3\n"
-           "                                drafts for Flash-Next and Gemma 4 host or disk\n"
-           "                                experts whose artifact has the drafter, else none)\n"
+           "  --spec none|mtp|dflash|dflash2|dspine\n"
+           "                                speculative decoding backend; without it the engine\n"
+           "                                chooses: a Qwen3.5 target drafts with the DSpine,\n"
+           "                                DFlash or DFlash2 artifact --draft-model names,\n"
+           "                                otherwise from its own dflash2 component (4 drafts);\n"
+           "                                Flash-Next and Gemma 4 host/disk experts use MTP\n"
+           "                                (3 drafts), else none\n"
            "  --draft-tokens N              drafts per round, 1..15\n"
+           "  --draft-model FILE            a standalone dspine, dflash or dflash2 drafter\n"
+           "                                artifact (one component, targeting nothing), or the\n"
+           "                                release's drafter .gguf, which is read in place; given\n"
+           "                                without --spec it selects the backend it names\n"
            "  --draft-min-p P              Flash-Next MTP confidence floor, 0..1 (default 0;\n"
            "                                0.5 when the engine chooses MTP)\n"
            "  --lm-head-draft               draft with the optimized proposal head, which\n"
@@ -444,6 +451,11 @@ Options parse_options(int argc, char** argv) {
         } else if (arg == "--spec") {
             options.speculative.backend = product::parse_speculative_backend(value(arg));
             spec_explicit               = true;
+        } else if (arg == "--draft-model") {
+            options.speculative.draft_model = value(arg);
+            if (options.speculative.draft_model.empty()) {
+                throw std::invalid_argument("--draft-model must not be empty");
+            }
         } else if (arg == "--draft-tokens") {
             options.speculative.draft_tokens = parse_u32(value(arg), "draft-tokens");
         } else if (arg == "--draft-min-p") {

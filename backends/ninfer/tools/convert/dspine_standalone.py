@@ -223,12 +223,21 @@ def recipe_q8(model, recipe, sources) -> None:
 
     The bridge writes into the residual and its tables are what the serial refinement chains, so
     they keep BF16; everything the drafter multiplies by an activation goes to Q8.
+
+    The attention query (query_width x hidden) and output (hidden x query_width) are the two
+    exceptions: for this checkpoint query_width=4096, and the q8 GEMM table has neither N=4096
+    with K=5120 nor N=5120 with K=4096. Keep them BF16 so the runtime can plan and capture the
+    graph; every other projection has a registered q8 kernel.
     """
-    from tools.convert.methods import grouped_absmax
+    from tools.convert.methods import cast_direct, grouped_absmax
 
     for name, parameter in model.parameters.items():
-        if parameter.projection and not name.startswith(COMPONENT + "/bridge/"):
-            recipe.assign(name, format="q8_g32_fp16", method=grouped_absmax)
+        if not parameter.projection or name.startswith(COMPONENT + "/bridge/"):
+            continue
+        if name.endswith("/attention/query") or name.endswith("/attention/output"):
+            recipe.assign(name, format="bf16", method=cast_direct)
+            continue
+        recipe.assign(name, format="q8_g32_fp16", method=grouped_absmax)
     _share_context(model, recipe)
 
 

@@ -249,6 +249,12 @@ private:
     [[nodiscard]] bool mtp_enabled() const noexcept {
         return mtp_kv_.valid() || batch_mtp_kv_ != nullptr;
     }
+    // A DSpine drafter keeps a dense cyclic ring, which KVMem's compact rebasing cannot follow:
+    // its ring is addressed by absolute positions, unlike DFlash/DFlash2's compact one.
+    [[nodiscard]] bool dspine_draft() const noexcept {
+        const auto& draft = parameters_.model.config().draft;
+        return draft.has_value() && draft->dspine.has_value();
+    }
 
     void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
     void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);

@@ -819,7 +819,10 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         if constexpr (Tap::enabled) { tap.begin(x); }
         run_layers(x, Phase::Verify, tap);
         if constexpr (requires { tap.capture_positions(cache_positions, stream); }) {
-            tap.capture_positions(cache_positions, stream);
+            // A DSpine ring is addressed by absolute positions: KVMem rebases the compact KV
+            // address on every reselection, so a compact ring mixes epochs and the draft reads
+            // slots holding features of tokens it can no longer condition on.
+            tap.capture_positions(dspine_draft() ? rope_positions : cache_positions, stream);
         }
         Tensor flat_hidden = hidden.view({dimension(config_.hidden_size), columns});
         Tensor flat_logits = logits.view({dimension(config_.vocab_size), columns});
@@ -2025,7 +2028,7 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             }
             run_layers(x, Phase::Prefill, tap);
             if constexpr (requires { tap.capture_positions(positions, s); }) {
-                tap.capture_positions(positions, s);
+                tap.capture_positions(dspine_draft() ? rope_positions : positions, s);
             }
 
             Tensor xf = prefill_hidden_.data != nullptr

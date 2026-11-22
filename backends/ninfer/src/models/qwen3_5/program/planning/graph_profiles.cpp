@@ -1,4 +1,5 @@
 #include "models/qwen3_5/program/planning/graph_profiles.h"
+#include "models/load_options.h"
 #include "ninfer/ops/softmax_attention.h"
 #include <algorithm>
 #include <limits>
@@ -198,7 +199,7 @@ std::vector<GraphExecutionProfile> dflash_graph_profiles(SpeculativeBackend back
         (draft_window > 15 && batch_size != 1)) {
         throw std::invalid_argument("invalid masked draft graph dimensions");
     }
-    if (backend == SpeculativeBackend::DFlash2) {
+    if (is_sparse_draft_backend(backend)) {
         auto profiles = graph_profiles_through(capacity - 1, {96, 511, 2047, 8191, 32767});
         for (std::size_t i = 0; i < profiles.size(); ++i) {
             profiles[i].topology_class = static_cast<std::uint32_t>(i);

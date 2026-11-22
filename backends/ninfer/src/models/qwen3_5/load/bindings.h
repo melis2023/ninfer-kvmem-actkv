@@ -57,6 +57,12 @@ public:
 
     [[nodiscard]] WeightUseId use(WeightId id, std::string_view input) const;
 
+    // Whether the parameter carries that Use. A target that never held a drafter declares none for
+    // it, so a drafter attached as --draft-model asks instead of demanding one: absent means the
+    // head reads its hidden state the way it reads the text's.
+    [[nodiscard]] bool has_use(WeightId id, std::string_view input) const;
+    [[nodiscard]] bool declares(std::string_view parameter, std::string_view input) const;
+
     // Requests that every stored object behind a parameter be materialized in `target` instead
     // (see artifact/transcode.h). Returns false, leaving the objects alone, when they already
     // store `target`; throws std::invalid_argument when they are not transcodable Q8.

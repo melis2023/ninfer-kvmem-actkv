@@ -6,6 +6,7 @@
 #include "core/gpu_clock_floor.h"
 #include "core/nvtx.h"
 #include "core/startup.h"
+#include "models/draft_artifact.h"
 #include "runtime/contract/sampling.h"
 #include "runtime/contract/request.h"
 #include "runtime/engine/causal_score_core.h"
@@ -51,23 +52,74 @@ EngineOptions with_family_context_cache(EngineOptions options) {
     return options;
 }
 
-// Without --spec (SpeculativeOptions::automatic), a Flash-Next or Gemma 4 artifact with host or
-// disk experts drafts with the MTP block or assistant it carries: a verification window's routes
-// share the layer's missing experts, which the CPU computes while the cached ones run.
+// The generic construct_model path serves the Qwen3.5 family; the other families dispatch to
+// their own cores before it. Read the pair the config parser itself keys on, so an automatic
+// choice here cannot pick a draft that a different family's loader would reject.
+bool is_qwen3_5_target(const artifact::Directory& directory) {
+    if (!directory.components.contains("text")) { return false; }
+    const auto& config = directory.component("text").config;
+    if (!config.contains("architectures") || !config.at("architectures").is_array() ||
+        config.at("architectures").empty() || !config.at("architectures")[0].is_string()) {
+        return false;
+    }
+    const auto architecture = config.at("architectures")[0].get<std::string>();
+    const auto model_type   = config.value("model_type", std::string{});
+    return (architecture == "Qwen3_5ForCausalLM" && model_type == "qwen3_5_text") ||
+           (architecture == "Qwen3_5MoeForCausalLM" && model_type == "qwen3_5_moe_text");
+}
+
+// Without --spec (SpeculativeOptions::automatic), a Qwen3.5 target drafts with the drafter
+// --draft-model attaches, whose own component names its backend, or else with the dflash2 component
+// the target carries. Explicit --spec sets automatic=false and never enters here. A Flash-Next or
+// Gemma 4 artifact with host or disk experts drafts with the MTP block or assistant it carries: a
+// verification window's routes share the layer's missing experts, which the CPU computes while the
+// cached ones run.
 EngineOptions with_family_speculation(EngineOptions options) {
     SpeculativeOptions& speculative = options.speculative;
     if (!speculative.automatic || speculative.backend != SpeculativeBackend::None ||
-        options.expert_residency == ExpertResidency::Device ||
         options.purpose != EnginePurpose::Generation) {
+        return options;
+    }
+    const artifact::Reader reader(options.artifact_path);
+    const auto& components = reader.directory().components;
+    if (is_qwen3_5_target(reader.directory())) {
+        if (!speculative.draft_model.empty()) {
+            // The drafter's own artifact reports which backend runs it: --draft-model alone is
+            // unambiguous, and one this family cannot run is refused here instead of at a
+            // component lookup later.
+            switch (models::draft_artifact_kind(speculative.draft_model)) {
+            case models::DraftArtifactKind::DSpine:
+                speculative.backend      = SpeculativeBackend::DSpine;
+                speculative.draft_tokens = SpeculativeOptions::kAutomaticDSpineTokens;
+                break;
+            case models::DraftArtifactKind::DFlash:
+                speculative.backend      = SpeculativeBackend::DFlash;
+                speculative.draft_tokens = SpeculativeOptions::kAutomaticDFlashTokens;
+                break;
+            case models::DraftArtifactKind::DFlash2:
+                speculative.backend      = SpeculativeBackend::DFlash2;
+                speculative.draft_tokens = SpeculativeOptions::kAutomaticDFlash2Tokens;
+                break;
+            case models::DraftArtifactKind::Unknown:
+                throw std::invalid_argument(
+                    "--draft-model: " + speculative.draft_model.string() +
+                    " is not a drafter artifact (its only component must be dspine, dflash or "
+                    "dflash2)");
+            }
+        } else if (components.contains("dflash2")) {
+            speculative.backend      = SpeculativeBackend::DFlash2;
+            speculative.draft_tokens = SpeculativeOptions::kAutomaticDFlash2Tokens;
+        }
+        return options;
+    }
+    if (options.expert_residency == ExpertResidency::Device) {
         return options;
     }
     if (!runtime::is_gemma4_artifact(options.artifact_path) &&
         !runtime::is_qwen4_exp_artifact(options.artifact_path)) {
         return options;
     }
-    if (!artifact::Reader(options.artifact_path).directory().components.contains("mtp")) {
-        return options;
-    }
+    if (!components.contains("mtp")) { return options; }
     speculative.backend      = SpeculativeBackend::Mtp;
     speculative.draft_tokens = SpeculativeOptions::kAutomaticDraftTokens;
     // Flash-Next's chain stops at an unlikely draft, which the round would likely reject.

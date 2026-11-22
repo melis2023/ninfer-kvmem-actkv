@@ -29,6 +29,8 @@ struct DFlashPersistentLayout {
     TensorLayout prefill_features;
     TensorLayout prefill_positions;
     TensorLayout pending_features;
+    // --spec dspine: the head-write table its Drafter derives from the target's head at startup.
+    std::optional<TensorLayout> dspine_head_write;
 
     [[nodiscard]] std::size_t kv_payload_bytes() const noexcept {
         return full ? full->payload_bytes() : 0;

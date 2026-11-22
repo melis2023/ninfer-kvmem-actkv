@@ -151,6 +151,7 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
     std::vector<std::vector<CopyRange>> ranges_by_rank(rank_count);
     std::vector<const DevicePlacement*> transcoded;
     std::vector<const DevicePlacement*> rebased;
+    std::vector<const DevicePlacement*> from_host;
     for (const auto& placement : placements) {
         if (placement.rank >= rank_count || bases[placement.rank] == nullptr) {
             throw ArtifactError("device placement names a rank the plan has no arena for");
@@ -168,6 +169,16 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
         if (placement.selection && placement.selection->rebase != 0) {
             rebased.push_back(&placement);
             continue;
+        }
+        // Bytes no file holds (a prepared payload's derived block) have no direct-I/O range: they
+        // are read from the Host like a transcoded object and uploaded the same way.
+        {
+            const auto& stored =
+                reader.directory().tensor(placement.source ? *placement.source : placement.object);
+            if (reader.derived(stored.offset, stored.bytes)) {
+                from_host.push_back(&placement);
+                continue;
+            }
         }
         if (placement.selection) {
             const auto& descriptor = reader.directory().tensor(*placement.source);
@@ -228,6 +239,31 @@ UploadTotals upload_device_bytes(const Reader& reader, std::span<const DevicePla
                               cudaMemcpyHostToDevice),
                    "upload rebased index bytes");
         transcoded_bytes = checked_add(transcoded_bytes, bytes.size(), "rebased bytes");
+    }
+    // Derived bytes already sit in Host memory: one copy per object, or a gather for a piece.
+    for (const DevicePlacement* placement : from_host) {
+        std::vector<std::byte> bytes;
+        if (placement->selection) {
+            const auto source = reader.read_object(*placement->source);
+            totals.read_bytes = checked_add(totals.read_bytes, source.size(), "derived read bytes");
+            bytes.resize(static_cast<std::size_t>(placement->bytes));
+            for (const SelectedRun& run :
+                 selected_runs(reader.geometry(*placement->source), *placement->selection)) {
+                std::memcpy(bytes.data() + run.destination, source.data() + run.source, run.bytes);
+            }
+        } else {
+            bytes = reader.read_object(placement->object);
+            totals.read_bytes = checked_add(totals.read_bytes, bytes.size(), "derived read bytes");
+        }
+        if (bytes.size() != placement->bytes) {
+            throw ArtifactError("derived object size differs from its placement");
+        }
+        const ScopedRank bound(device, placement->rank);
+        check_cuda(cudaMemcpy(bases[placement->rank] + placement->offset, bytes.data(), bytes.size(),
+                              cudaMemcpyHostToDevice),
+                   "upload derived weight bytes");
+        transcoded_bytes = checked_add(transcoded_bytes, bytes.size(), "derived bytes");
+        phase.progress(transcoded_bytes, total);
     }
     totals.h2d_bytes     = transcoded_bytes;
     std::uint64_t copied = 0;

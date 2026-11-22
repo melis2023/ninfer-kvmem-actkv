@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <filesystem>
 #include <string_view>
 #include <vector>
 
@@ -14,6 +15,8 @@ struct LoadOptions {
     EnginePurpose purpose          = EnginePurpose::Generation;
     bool vision                    = false;
     SpeculativeBackend speculative = SpeculativeBackend::None;
+    // --spec dspine: the standalone drafter artifact, loaded beside the model's own.
+    std::filesystem::path draft_model;
     ProposalHead proposal_head     = ProposalHead::Full;
     // Device-memory trades that store a stored Q8 vocabulary matrix (or the MoE MTP layer's routed
     // experts) at a narrower group-64 width while the weights load; the artifact is unchanged.
@@ -99,7 +102,7 @@ struct LoadOptions {
     // DFlash / DFlash2 share the target artifact's drafter component and its batched decode
     // machinery. A DSpine drafter is its own artifact with its own ring, so it does not: see
     // dspine() below.
-    [[nodiscard]] bool masked_draft() const noexcept { return dflash() || dflash2(); }
+    [[nodiscard]] bool masked_draft() const noexcept { return dflash() || dflash2() || dspine(); }
 
     [[nodiscard]] bool proposal_enabled() const noexcept {
         return purpose == EnginePurpose::Generation && speculative != SpeculativeBackend::None &&
@@ -130,6 +133,10 @@ struct LoadOptions {
            backend == SpeculativeBackend::DSpine;
 }
 
+[[nodiscard]] constexpr bool is_sparse_draft_backend(SpeculativeBackend backend) noexcept {
+    return backend == SpeculativeBackend::DFlash2 || backend == SpeculativeBackend::DSpine;
+}
+
 // The draft head a plan uses: an automatic head not yet resolved against an artifact
 // (runtime::construct_model resolves it before loading) is the full one.
 [[nodiscard]] constexpr ProposalHead planned_proposal_head(ProposalHead head) noexcept {
@@ -140,6 +147,7 @@ struct LoadOptions {
     return {.purpose        = options.purpose,
             .vision         = options.enable_vision,
             .speculative    = options.speculative.backend,
+            .draft_model    = options.speculative.draft_model,
             .proposal_head  = planned_proposal_head(options.speculative.proposal_head),
             .lm_head_q4     = options.lm_head_q4,
             .lm_head_q6     = options.lm_head_q6,

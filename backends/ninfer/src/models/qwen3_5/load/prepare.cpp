@@ -90,6 +90,18 @@ WeightUseId Bindings::use(WeightId id, std::string_view input) const {
                                   std::string(input));
 }
 
+bool Bindings::has_use(WeightId id, std::string_view input) const {
+    for (const auto& use : at(id).uses) {
+        if (use.input == input) { return true; }
+    }
+    return false;
+}
+
+bool Bindings::declares(std::string_view parameter, std::string_view input) const {
+    const auto& uses = binder.reader().directory().uses;
+    return uses.find({std::string(parameter), std::string(input)}) != uses.end();
+}
+
 WeightId Bindings::parameter(std::string name, artifact::Shape shape,
                              std::vector<std::string> inputs, std::optional<QType> exact_format,
                              artifact::Residency residency) {

@@ -295,9 +295,13 @@ TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& 
         b.parameter("text/token_embedding", {config.vocab_size, config.hidden_size});
     std::vector<std::string> head_inputs{"text/final_hidden"};
     // A standalone DSpine drafter reads the head through the target's own use of it, so the
-    // target artifact has no dspine/final_hidden input for it.
+    // target artifact has no dspine/final_hidden input for it. A DFlash drafter attached with
+    // --draft-model may likewise come from an artifact whose target never carried one, and then
+    // the head reads its hidden state through the text's use alone.
     if (options.speculative != SpeculativeBackend::None && !options.proposal_enabled() &&
-        !options.dspine()) {
+        !options.dspine() &&
+        b.declares("text/output_head",
+                   std::string(options.speculative_component()) + "/final_hidden")) {
         head_inputs.push_back(std::string(options.speculative_component()) + "/final_hidden");
     }
     out.output_head = b.parameter("text/output_head", {config.vocab_size, config.hidden_size},

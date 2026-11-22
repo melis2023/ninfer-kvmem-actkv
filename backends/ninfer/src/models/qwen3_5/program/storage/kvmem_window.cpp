@@ -1676,8 +1676,7 @@ void ProgramImpl::restore_memory_prefix(SequenceState& sequence, const KvmemPref
         if (slot && slot->prefix.size() > frontier) slot.reset();
     }
     sequence.text_kv_valid = frontier;
-    if (speculative_backend == SpeculativeBackend::DFlash2 ||
-        speculative_backend == SpeculativeBackend::DFlash) {
+    if (is_masked_draft_backend(speculative_backend)) {
         // DSpine shares DFlash2's all-sliding cyclic ring, so its frontier and floor
         // must be re-anchored after a query restore as well.
         sequence.dflash_context_frontier = frontier;

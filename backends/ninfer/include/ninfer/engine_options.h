@@ -78,6 +78,12 @@ struct SpeculativeOptions {
     bool automatic = false;
     static constexpr std::uint32_t kAutomaticDraftTokens = 3;
     static constexpr float kAutomaticDraftMinP           = 0.5F;
+    // Qwen3.5 targets: the drafter --draft-model attaches (a DSpine, DFlash or DFlash2 artifact,
+    // whichever its component names), or else their own dflash2 component, drafts this many tokens
+    // a round when the backend was left automatic.
+    static constexpr std::uint32_t kAutomaticDFlashTokens  = 4;
+    static constexpr std::uint32_t kAutomaticDFlash2Tokens = 4;
+    static constexpr std::uint32_t kAutomaticDSpineTokens  = 4;
 };
 
 enum class DiagnosticLevel : std::uint8_t {

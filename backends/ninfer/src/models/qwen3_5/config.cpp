@@ -1,14 +1,19 @@
 #include "models/qwen3_5/config.h"
 
 #include "artifact/schema.h"
+#include "models/draft_artifact.h"
+#include "models/draft_reader.h"
+#include "models/registry.h"
 #include "ninfer/ops/speculative_round.h"
 
 #include <algorithm>
 #include <cmath>
+#include <initializer_list>
 #include <limits>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace ninfer::models::qwen3_5 {
 namespace {
@@ -215,11 +220,23 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
                      "num_key_value_heads", "head_dim", "num_hidden_layers",
                      "max_position_embeddings", "rms_norm_eps", "rope_parameters", "layer_types",
                      "dflash_config"},
-                    {"sliding_window", "is_causal"}, "draft config");
+                    {"sliding_window", "is_causal", "hidden_size", "vocab_size",
+                     "num_target_layers"},
+                    "draft config");
     if (architecture(value) != (dflash2 ? "DFlash2DraftModel" : "DFlashDraftModel") ||
         value.at("model_type") != "qwen3") {
         throw ArtifactError("draft architecture/model_type mismatch");
     }
+    // A standalone drafter states the target it was trained for, since no text component sits
+    // beside it to read that from; the embedded one leaves the three implicit.
+    const auto agrees = [&](const char* field, std::uint32_t wanted) {
+        if (value.contains(field) && dimension(value, field) != wanted) {
+            throw ArtifactError(std::string("draft ") + field + " differs from the target's");
+        }
+    };
+    agrees("hidden_size", target.hidden_size);
+    agrees("vocab_size", target.vocab_size);
+    agrees("num_target_layers", target.num_hidden_layers);
     DraftConfig out;
     out.attention = attention(value);
     out.causal    = value.value("is_causal", false);
@@ -249,44 +266,6 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
         out.sliding_window = dimension(value, "sliding_window");
     }
     const auto& config = value.at("dflash_config");
-    if (config.contains("selected_prefix_code_bridge")) {
-        const auto& bridge = config.at("selected_prefix_code_bridge");
-        DSpineConfig extra;
-        extra.block_size = config.value("block_size", 0U);
-        extra.code_size  = dimension(bridge, "code_size");
-        extra.rank       = dimension(bridge, "rank");
-        extra.eps        = positive_float(bridge, "eps");
-        extra.kappa      = positive_float(bridge, "kappa");
-        if (config.contains("code_bridge_second_pass")) {
-            const auto& second = config.at("code_bridge_second_pass");
-            extra.first_exact = dimension(second, "first_exact");
-            if (second.contains("head_topk")) {
-                extra.head_topk = dimension(second, "head_topk");
-            }
-        }
-        if (config.contains("selected_prefix_last_write_refine") &&
-            config.at("selected_prefix_last_write_refine").contains("head_topk")) {
-            const auto refine_k =
-                dimension(config.at("selected_prefix_last_write_refine"), "head_topk");
-            if (refine_k != extra.head_topk) {
-                throw ArtifactError("DSpine refinement head_topk mismatch");
-            }
-        }
-        // The serial refinement kernel is compiled for the sparse verifier's
-        // 16-candidate, 15-row lattice; refuse a checkpoint that would be truncated.
-        if (!out.causal) {
-            throw ArtifactError("DSpine requires causal block attention");
-        }
-        if (extra.head_topk !=
-                static_cast<std::uint32_t>(ops::kSparseSpeculativeCandidates) ||
-            (extra.block_size != 0 &&
-             (extra.block_size < 2 ||
-              extra.block_size > static_cast<std::uint32_t>(ops::kSparseSpeculativeCandidates))) ||
-            (extra.first_exact != 0 && extra.first_exact + 1 != out.num_hidden_layers)) {
-            throw ArtifactError("unsupported DSpine refinement geometry");
-        }
-        out.dspine = extra;
-    }
     if (dflash2) {
         require_members(config,
                         {"target_layer_ids", "mask_token_id", "conv_kernel_size", "conv_group_size",
@@ -326,6 +305,63 @@ DraftConfig draft(const Json& value, const TextConfig& target, bool dflash2) {
         out.dflash2 = extra;
     }
     return out;
+}
+
+// A DSpine drafter's config as the masked-draft machinery reads a DFlash2 one: every layer
+// sliding at the trained window, the same taps and mask token.
+DraftConfig draft(const dspine::Config& value) {
+    DraftConfig out;
+    out.attention               = {value.num_attention_heads, value.num_key_value_heads,
+                                   value.head_dim};
+    out.intermediate_size       = value.intermediate_size;
+    out.num_hidden_layers       = value.num_hidden_layers;
+    out.max_position_embeddings = value.max_position_embeddings;
+    out.rms_norm_eps            = value.rms_norm_eps;
+    out.rope_theta              = value.rope_theta;
+    out.layer_types.assign(value.num_hidden_layers, DraftAttentionKind::SlidingAttention);
+    out.sliding_window   = value.sliding_window;
+    out.target_layer_ids = value.target_layer_ids;
+    out.mask_token_id    = value.mask_token_id;
+    out.dspine           = value;
+    return out;
+}
+
+// --draft-model for DFlash: the drafter's own artifact instead of a component of the target's. The
+// target's geometry is what the drafter was trained against, so a config that disagrees is refused
+// here, where the error can name the field and both values, rather than as a shape mismatch while
+// the weights load or -- worse -- a silently wrong draft.
+const Json& standalone_draft(const artifact::Reader& reader, const TextConfig& target,
+                             bool dflash2) {
+    const auto expected = dflash2 ? DraftArtifactKind::DFlash2 : DraftArtifactKind::DFlash;
+    const auto label    = std::string(draft_artifact_name(expected));
+    if (draft_artifact_kind(reader.directory()) != expected) {
+        throw ArtifactError("--draft-model: not a " + label +
+                            " drafter artifact (its only component must be " + label +
+                            " with the matching architecture)");
+    }
+    const auto& component = reader.directory().component(label);
+    if (component.target) {
+        throw ArtifactError("--draft-model: a standalone " + label +
+                            " drafter must not target another component");
+    }
+    const auto& config  = component.config;
+    const auto mismatch = [&](const char* field, std::uint32_t found, std::uint32_t wanted) {
+        throw ArtifactError("--draft-model: the " + label + " drafter's " + field + " is " +
+                            std::to_string(found) + ", the target's " + std::to_string(wanted));
+    };
+    // A drafter states the geometry it was trained against; one converted before that became the
+    // convention states only its taps, which `draft` still checks against the target's layers.
+    for (const auto& [field, wanted] :
+         std::initializer_list<std::pair<const char*, std::uint32_t>>{
+             {"hidden_size", target.hidden_size},
+             {"vocab_size", target.vocab_size},
+             {"num_target_layers", target.num_hidden_layers}}) {
+        if (!config.contains(field)) { continue; }
+        if (const auto found = dimension(config, field); found != wanted) {
+            mismatch(field, found, wanted);
+        }
+    }
+    return config;
 }
 
 } // namespace
@@ -400,16 +436,24 @@ Config parse_config(const artifact::Directory& directory, const LoadOptions& opt
         }
         if (options.speculative == SpeculativeBackend::DFlash ||
             options.speculative == SpeculativeBackend::DFlash2) {
-            out.draft = draft(companion(directory, options.speculative_component()).config,
-                              out.text, options.speculative == SpeculativeBackend::DFlash2);
+            const bool dflash2 = options.speculative == SpeculativeBackend::DFlash2;
+            if (options.draft_model.empty()) {
+                // The drafter rides in the target artifact as its dflash/dflash2 component.
+                out.draft = draft(companion(directory, options.speculative_component()).config,
+                                  out.text, dflash2);
+            } else {
+                // ... or comes from its own artifact, which the target need not carry at all.
+                const auto drafter = open_drafter(options.draft_model);
+                out.draft =
+                    draft(standalone_draft(*drafter, out.text, dflash2), out.text, dflash2);
+            }
         }
-        // DSpine's 16x16 transition lattice is built from top-16 rows of the full
-        // vocabulary head. An optimised shortlist head cannot produce the candidate
-        // frame the sparse verifier requires, so reject it at load time instead of
-        // letting a round consume uninitialised ids/q.
-        if (out.draft && out.draft->dspine && options.proposal_head != ProposalHead::Full) {
-            throw ArtifactError(
-                "DSpine requires the full draft proposal head (--full-draft-head)");
+        if (options.speculative == SpeculativeBackend::DSpine) {
+            const auto drafter = dspine::read_config(options.draft_model);
+            dspine::check_target(drafter, out.text.hidden_size, out.text.vocab_size,
+                                 out.text.num_hidden_layers,
+                                 architecture_name(out.text.architecture));
+            out.draft = draft(drafter);
         }
         return out;
     } catch (const std::exception& error) {

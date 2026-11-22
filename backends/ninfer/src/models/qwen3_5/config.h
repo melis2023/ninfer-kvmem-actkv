@@ -1,5 +1,6 @@
 #pragma once
 
+#include "models/dspine/config.h"
 #include "models/load_options.h"
 #include "models/registry.h"
 
@@ -109,16 +110,6 @@ struct DFlash2Config {
     std::uint32_t selector_top_k   = 0;
 };
 
-struct DSpineConfig {
-    std::uint32_t block_size  = 0;
-    std::uint32_t code_size   = 0;
-    std::uint32_t rank        = 0;
-    std::uint32_t first_exact = 0;
-    std::uint32_t head_topk   = 16;
-    float eps                 = 0;
-    float kappa               = 0;
-};
-
 struct DraftConfig {
     AttentionConfig attention;
     std::uint32_t intermediate_size       = 0;
@@ -132,7 +123,9 @@ struct DraftConfig {
     std::uint32_t mask_token_id = 0;
     bool causal = false;
     std::optional<DFlash2Config> dflash2;
-    std::optional<DSpineConfig> dspine;
+    // --spec dspine: the standalone drafter's config, which the fields above restate (every layer
+    // sliding, the trained window); its weights are not the model artifact's.
+    std::optional<dspine::Config> dspine;
 
     [[nodiscard]] std::uint32_t local_layer_count() const noexcept {
         return static_cast<std::uint32_t>(std::count(layer_types.begin(), layer_types.end(),

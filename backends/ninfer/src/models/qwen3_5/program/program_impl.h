@@ -3,6 +3,7 @@
 #include "runtime/contract/grammar_masks.h"
 #include "runtime/contract/mtp_adaptive.h"
 #include "models/qwen3_5/program/internal.h"
+#include "models/dspine/drafter.h"
 
 #include "core/arena.h"
 #include "core/device_snapshot.h"
@@ -1256,6 +1257,9 @@ public:
     std::vector<std::unique_ptr<GdnReplayRecords>> extra_replay_records;
     std::vector<std::unique_ptr<ops::GdnReplayFoldPlan>> extra_replay_fold;
     std::optional<DFlashPersistentState> dflash;
+    // --spec dspine: the standalone drafter over this Program's target, its ring the state
+    // images' local cache and its table dflash->dspine_head_write.
+    std::optional<dspine::Drafter> dspine_drafter;
     qwen3_5::RoundState io;
     Tensor prefill_hidden;
     std::optional<execution::MemoryStatistics> memory_statistics;

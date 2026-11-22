@@ -231,8 +231,7 @@ void complete_round_state_layout(LayoutBuilder& builder, RoundStateLayout& layou
                                              "target verify cache positions");
         // DFlash2 and DSpine (--spec dflash with a code bridge) both publish a
         // candidate lattice and its sampled proposal distribution to the verifier.
-        if (layout.spec.backend == SpeculativeBackend::DFlash2 ||
-            layout.spec.backend == SpeculativeBackend::DFlash) {
+        if (is_sparse_draft_backend(layout.spec.backend)) {
             decode.candidate_ids =
                 add_tensor(builder, DType::I32,
                            {ops::kSparseSpeculativeCandidates, verify_columns - 1, batch},

@@ -6,10 +6,16 @@
 #include "core/paged_kv_cache.h"
 #include "core/paged_kv_storage.h"
 #include "core/stage_plan.h"
+#include "models/dspine/config.h"
+#include "models/dspine/model.h"
+#include "models/draft_reader.h"
 #include "models/qwen3_5/load/bindings.h"
 #include "models/qwen3_5/load/vision_cpu_cache.h"
 
 #include <algorithm>
+#include <array>
+#include <memory>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -22,6 +28,12 @@ struct LoadPlan::Impl {
     ModelWeights weights;
     std::vector<loading::PendingWeight> pending;
     artifact::MaterializationPlan materialization;
+    // --draft-model on DFlash: the drafter's own artifact, its parameters and its plan. The drafter
+    // materializes as a second backing beside the target's; a DSpine drafter keeps its own Model
+    // instead (models/dspine), since it runs its own pipeline.
+    std::shared_ptr<artifact::Reader> draft_reader;
+    std::vector<loading::PendingWeight> draft_pending;
+    artifact::MaterializationPlan draft_materialization;
     FrontendResources resources;
     InstanceInfo info;
     std::shared_ptr<CpuVisionCache> cpu_vision;
@@ -122,7 +134,10 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
     }
     std::pair<std::size_t, std::size_t> draft_parameters{bindings.weights.size(),
                                                          bindings.weights.size()};
-    if (out->config.draft) {
+    // A DSpine drafter is its own artifact, which materialize_model loads beside this one, and a
+    // DFlash drafter given as --draft-model binds further down, once every target-side pass has
+    // run: none of them may read a handle numbered by another artifact.
+    if (out->config.draft && !out->config.draft->dspine && options.draft_model.empty()) {
         out->weights.draft =
             loading::bind_draft(bindings, *out->config.draft, text, out->weights.text,
                                 std::string(options.speculative_component()));
@@ -165,6 +180,34 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
             bindings.use(out->weights.draft->output_head,
                          std::string(options.speculative_component()) + "/final_hidden");
     }
+    // --draft-model on DFlash: the drafter's weights come from its own artifact, so they bind
+    // through a second binder and materialize as a second backing. Its embedding and head are the
+    // target's, which is why bind_draft takes the text weights either way.
+    if (out->config.draft && !out->config.draft->dspine && !options.draft_model.empty()) {
+        const std::string component(options.speculative_component());
+        out->draft_reader = open_drafter(options.draft_model);
+        artifact::Binder draft_binder(*out->draft_reader);
+        loading::Bindings draft_bindings(draft_binder, options);
+        out->weights.draft = loading::bind_draft(draft_bindings, *out->config.draft, text,
+                                                 out->weights.text, component);
+        // The drafter sits on rank 0, the head's device, where the round runs it.
+        if (rank_tiers.empty()) {
+            rank_tiers.assign(options.ranks, ops::current_device_tier());
+        }
+        const std::array tiers{rank_tiers.front()};
+        loading::apply_rank_policies(draft_bindings, tiers);
+        if (out->weights.proposal) { out->weights.draft->output_head = out->weights.proposal->head; }
+        // A target that never carried a drafter declares no use for the drafter's hidden state, so
+        // the head reads it through the text's own use instead.
+        const std::string head_input = component + "/final_hidden";
+        out->weights.draft->output_head_use =
+            bindings.use(out->weights.draft->output_head,
+                         bindings.has_use(out->weights.draft->output_head, head_input)
+                             ? head_input
+                             : std::string("text/final_hidden"));
+        out->draft_pending         = std::move(draft_bindings.weights);
+        out->draft_materialization = std::move(draft_binder).finish();
+    }
     out->pending         = std::move(bindings.weights);
     out->materialization = std::move(binder).finish(
         options.overlay_vision() ? EvictableWeightPool::kChunkBytes : 1);
@@ -193,6 +236,73 @@ std::uint64_t parameter_bytes(const artifact::Reader& reader, const loading::Bin
         total += reader.geometry(part.object).bytes;
     }
     return total;
+}
+
+// An external drafter's attributes number their weights from zero, inside its own artifact; in the
+// model's table they follow the target's, so each moves by one offset. Its token embedding and
+// output head are the target's and stay put, as does the head's Use. An unset handle keeps its
+// sentinel instead of wrapping.
+void shift_draft_ids(DraftWeights& draft, std::size_t offset) {
+    const auto move = [offset](WeightId& id) {
+        if (id.index != WeightId{}.index) { id.index += offset; }
+    };
+    move(draft.feature_projection);
+    move(draft.context_norm);
+    move(draft.final_norm);
+    for (auto& layer : draft.layers) {
+        move(layer.input_norm);
+        move(layer.post_attention_norm);
+        move(layer.attention.query);
+        move(layer.attention.key);
+        move(layer.attention.value);
+        move(layer.attention.context_key);
+        move(layer.attention.context_value);
+        move(layer.attention.query_norm);
+        move(layer.attention.key_norm);
+        move(layer.attention.output);
+        move(layer.mlp.gate);
+        move(layer.mlp.up);
+        move(layer.mlp.down);
+        if (layer.attention_conv) {
+            move(layer.attention_conv->base_kernel);
+            move(layer.attention_conv->kernel_projection);
+        }
+        if (layer.mlp_conv) {
+            move(layer.mlp_conv->base_kernel);
+            move(layer.mlp_conv->kernel_projection);
+        }
+    }
+    if (draft.selector) {
+        move(draft.selector->hidden_projection);
+        move(draft.selector->predecessor_codebook);
+        move(draft.selector->successor_codebook);
+    }
+    if (draft.dspine_bridge) {
+        auto& bridge = *draft.dspine_bridge;
+        move(bridge.codebook);
+        move(bridge.early_read_weights);
+        move(bridge.feature_write_weights);
+        move(bridge.gate_weight);
+        move(bridge.gate_bias);
+        move(bridge.out_weight);
+        move(bridge.prev_weight);
+        move(bridge.predecessor_gate_weight);
+        move(bridge.read_weight);
+    }
+}
+
+// The Uses an external drafter's parameters carry may name auxiliary weights of its own artifact
+// (a Hadamard sign vector, an input gather), and those handles move by the same offset.
+void shift_draft_uses(std::vector<BoundWeight>& draft, std::size_t offset) {
+    const auto move = [offset](std::optional<WeightId>& id) {
+        if (id && id->index != WeightId{}.index) { id->index += offset; }
+    };
+    for (auto& weight : draft) {
+        for (auto& use : weight.uses) {
+            move(use.hadamard_signs);
+            move(use.input_columns);
+        }
+    }
 }
 
 } // namespace
@@ -260,13 +370,29 @@ std::vector<std::uint32_t> default_stage_layers(const artifact::Reader& reader,
             head_bytes += parameter_bytes(reader, bindings, WeightId{index});
         }
     }
-    if (config.draft && options.masked_draft()) {
+    if (config.draft && config.draft->dspine) {
+        // A DSpine drafter's own artifact and the table it derives from the head.
+        head_bytes += dspine::weight_bytes(options.draft_model) +
+                      dspine::head_write_bytes(*config.draft->dspine);
+    } else if (config.draft && options.masked_draft()) {
         // The drafter shares the target's embedding and head, so only what it binds anew counts.
-        const std::size_t first = bindings.weights.size();
-        (void)loading::bind_draft(bindings, *config.draft, text, weights,
-                                  std::string(options.speculative_component()));
-        for (std::size_t index = first; index < bindings.weights.size(); ++index) {
-            head_bytes += parameter_bytes(reader, bindings, WeightId{index});
+        const std::string component(options.speculative_component());
+        if (options.draft_model.empty()) {
+            const std::size_t first = bindings.weights.size();
+            (void)loading::bind_draft(bindings, *config.draft, text, weights, component);
+            for (std::size_t index = first; index < bindings.weights.size(); ++index) {
+                head_bytes += parameter_bytes(reader, bindings, WeightId{index});
+            }
+        } else {
+            // An external drafter's own objects, sized against the container that stores them.
+            const auto drafter_reader = open_drafter(options.draft_model);
+            artifact::Binder drafter_binder(*drafter_reader);
+            loading::Bindings drafter_bindings(drafter_binder, options);
+            const std::size_t first = drafter_bindings.weights.size();
+            (void)loading::bind_draft(drafter_bindings, *config.draft, text, weights, component);
+            for (std::size_t index = first; index < drafter_bindings.weights.size(); ++index) {
+                head_bytes += parameter_bytes(*drafter_reader, drafter_bindings, WeightId{index});
+            }
         }
     }
     // A resident Vision tower sits on the primary device too. An overlay tower is pinned on the
@@ -335,17 +461,44 @@ std::unique_ptr<Model> materialize_model(LoadPlan&& plan, DeviceContext& device,
     auto experts = loading::expert_sources(reader, data->pending, data->weights, backing,
                                             data->options, data->artifact_path);
     auto bound   = loading::resolve_weights(std::move(data->pending), backing);
+    // --draft-model on DFlash: the drafter's own arena, materialized beside the target's. Its
+    // weights land after the target's in the model's weight table, so every handle the drafter
+    // already holds moves by that offset once; its embedding and head keep the target's.
+    std::optional<artifact::MaterializedArtifact> draft_backing;
+    if (data->draft_reader) {
+        draft_backing.emplace(artifact::materialize(
+            *data->draft_reader, std::move(data->draft_materialization), device, observer,
+            nullptr,
+            artifact::MaterializeOptions{
+                .suspendable     = materialize.suspendable,
+                .retained_reader = materialize.suspendable ? data->draft_reader : nullptr}));
+        auto draft               = loading::resolve_weights(std::move(data->draft_pending),
+                                                            *draft_backing);
+        const std::size_t offset = bound.size();
+        shift_draft_ids(*data->weights.draft, offset);
+        shift_draft_uses(draft, offset);
+        for (auto& weight : draft) { bound.push_back(std::move(weight)); }
+    }
     std::optional<VisionOverlayLayout> vision_overlay;
     if (data->options.overlay_vision()) {
         vision_overlay =
             loading::vision_overlay_layout(*data->weights.vision, bound, backing.pinned_block());
     }
     AuxiliaryReplicas replicas(bound, device);
-    return std::unique_ptr<Model>(
+    const bool dspine     = data->options.dspine();
+    const auto draft_path = data->options.draft_model;
+    auto model            = std::unique_ptr<Model>(
         new Model(std::move(data->config), data->options, std::move(data->weights),
                   std::move(bound), std::move(replicas), std::move(data->resources),
-                  std::move(data->info), std::move(backing), std::move(vision_overlay),
-                  std::move(data->cpu_vision), std::move(experts)));
+                  std::move(data->info), std::move(backing), std::move(draft_backing),
+                  std::move(vision_overlay), std::move(data->cpu_vision), std::move(experts)));
+    if (dspine) {
+        // On the head's device, where the drafts' embedding, head and round state are.
+        model->dspine_ = dspine::load_model(
+            draft_path, device, observer,
+            artifact::MaterializeOptions{.suspendable = materialize.suspendable});
+    }
+    return model;
 }
 
 std::unique_ptr<Model> load_model(const std::filesystem::path& path, LoadOptions options,

@@ -487,6 +487,34 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             throw std::logic_error("DFlash StateImage has no local fixed state");
         }
         dflash.emplace(backing, *plan.persistent.dflash, *local);
+        if (const dspine::Model* drafter = parameters.dspine) {
+            const auto& text   = parameters.text;
+            const auto& config = parameters.model.config().text;
+            dspine::Target target{
+                .hidden = config.hidden_size,
+                .vocab  = config.vocab_size,
+                .layers = config.num_hidden_layers,
+                .domain = static_cast<std::int32_t>(
+                    parameters.model.resources().public_token_count),
+                .logits = execution::target_logits_dtype(text.output_head),
+                .embed  = [&text](const Tensor& ids, Tensor& rows, cudaStream_t stream) {
+                    execution::embed_tokens(ids, text.token_embedding, text.token_embedding_signs,
+                                            rows, stream);
+                },
+                .head = [&text](const Tensor& hidden, Tensor& logits, WorkspaceArena& arena,
+                                cudaStream_t stream) {
+                    execution::project(hidden, text.output_head, logits, arena, stream);
+                }};
+            dspine_drafter.emplace(*drafter, std::move(target), dflash->dspine_head_write,
+                                   local->capacity(), capacity,
+                                   static_cast<std::int32_t>(max_concurrency),
+                                   static_cast<std::int32_t>(draft_window + 1U));
+            RankBinding bind(device, 0);
+            work.reset();
+            dspine_drafter->prepare(work, device.stream);
+            work.reset();
+            dflash->dspine = &*dspine_drafter;
+        }
     }
     if (dflash.has_value() != plan.features.masked_draft()) {
         throw std::logic_error("DFlash state does not match the frozen sequence plan");

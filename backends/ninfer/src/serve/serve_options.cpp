@@ -401,12 +401,17 @@ std::string serve_usage_text(const char* argv0) {
            "\n"
            "SPECULATIVE DECODING\n"
            "  --spec none|mtp|dflash|dflash2|dspine\n"
-           "                                speculative decoding backend (default: mtp with 3\n"
-           "                                drafts for Flash-Next and Gemma 4 host or disk\n"
-           "                                experts whose artifact has the drafter, else none)\n"
+           "                                speculative decoding backend; without it the engine\n"
+           "                                chooses: a Qwen3.5 target drafts with the DSpine,\n"
+           "                                DFlash or DFlash2 artifact --draft-model names,\n"
+           "                                otherwise from its own dflash2 component (4 drafts);\n"
+           "                                Flash-Next and Gemma 4 host/disk experts use MTP\n"
+           "                                (3 drafts), else none\n"
            "  --draft-tokens N              drafts per round, 1..15\n"
-           "  --draft-model FILE            the standalone DSpine drafter artifact --spec\n"
-           "                                dspine drafts with (a single dspine component)\n"
+           "  --draft-model FILE            a standalone dspine, dflash or dflash2 drafter\n"
+           "                                artifact (one component, targeting nothing), or the\n"
+           "                                release's drafter .gguf, which is read in place; given\n"
+           "                                without --spec it selects the backend it names\n"
            "  --draft-min-p P              Flash-Next MTP confidence floor, 0..1 (default 0;\n"
            "                                0.5 when the engine chooses MTP)\n"
            "  --lm-head-draft               draft with the optimized proposal head, which\n"
@@ -1987,10 +1992,13 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         const bool fixed_mtp = memory_mtp && options.speculative.mtp_policy == MtpDraftPolicy::Fixed;
         const bool adaptive_mtp = memory_mtp &&
             options.speculative.mtp_policy == MtpDraftPolicy::Adaptive;
-        // DFlash2 uses the native lane capacity; target/draft execution stays on one GPU.
+        // DFlash, DFlash2 and DSpine use the native lane capacity; target/draft execution stays
+        // on one GPU. A DSpine drafter is its own artifact with its own ring, which startup sizes
+        // against this window, so it takes the same gate as the target-carried drafters.
         const bool memory_dflash2 =
             (options.speculative.backend == SpeculativeBackend::DFlash2 ||
-             options.speculative.backend == SpeculativeBackend::DFlash) &&
+             options.speculative.backend == SpeculativeBackend::DFlash ||
+             options.speculative.backend == SpeculativeBackend::DSpine) &&
             options.max_concurrency <= kMaximumConcurrency && options.devices.size() <= 1 &&
             options.speculative.draft_tokens >= 1 && options.speculative.draft_tokens <= 15;
         const bool memory_ngram_supported = options.speculative.ngram_draft_tokens == 0 ||
@@ -2022,7 +2030,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
              options.kv_cache != KvCacheStorage::RotatedLloyd4KeyInt4Value &&
              options.kv_cache != KvCacheStorage::RotatedInt4KeyInt4ValueE8 &&
              options.kv_cache != KvCacheStorage::RotatedE8RootKeyInt4Value)) {
-            throw std::invalid_argument("KVMem requires ordinary/fixed/adaptive MTP1..15 or single-GPU DFlash2 1..15 with 1..8 lanes, ngram1..63 (automatically capped at 15 with 2..8 lanes), single-GPU or layer-pipeline BF16/INT8/FP8/NVFP4/K8V4/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 generation, 1..8 text or resident/CPU-vision lanes, INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 fast prefill, "
+            throw std::invalid_argument("KVMem requires ordinary/fixed/adaptive MTP1..15 or single-GPU DFlash/DFlash2/DSpine 1..15 with 1..8 lanes, ngram1..63 (automatically capped at 15 with 2..8 lanes), single-GPU or layer-pipeline BF16/INT8/FP8/NVFP4/K8V4/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 generation, 1..8 text or resident/CPU-vision lanes, INT8/RK8V4/RK4V4/RK4V4-E8/RK2V4-E8 fast prefill, "
                 "and exclusive ownership of history caching");
         }
         if (options.kvmem.recent_blocks() == 0) {

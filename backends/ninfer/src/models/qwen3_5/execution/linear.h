@@ -14,6 +14,12 @@ namespace ninfer::models::qwen3_5::execution {
     return head.weight.qtype == QType::BF16 || is_gguf(head.weight.qtype);
 }
 
+// The dtype the target output head writes logits in; the DSpine drafter reads them through
+// the same head and must be told which type its proposal operand is.
+[[nodiscard]] inline DType target_logits_dtype(const LinearParameters& head) {
+    return fp32_proposal_logits(head) ? DType::FP32 : DType::BF16;
+}
+
 inline void project(const Tensor& input, const LinearParameters& p, Tensor& output,
                     WorkspaceArena& workspace, cudaStream_t stream,
                     InputBasis basis = InputBasis::Primal) {

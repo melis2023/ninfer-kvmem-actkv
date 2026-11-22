@@ -12,6 +12,7 @@
 #include "models/qwen3_5/execution/workspace.h"
 
 #include "core/nvtx.h"
+#include "models/dspine/drafter.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/dynamic_grouped_conv.h"
 #include "ninfer/ops/context_kv_materialize.h"
@@ -55,9 +56,21 @@ namespace {
 using detail::DFlashPersistentState;
 
 void require_dflash_state(const PrefillContext& state) {
-    if (state.dflash == nullptr || !state.execution.parameters.draft.has_value()) {
+    if (state.dflash == nullptr || (!state.execution.parameters.draft.has_value() &&
+                                    state.dflash->dspine == nullptr)) {
         throw std::logic_error("masked draft schedule requires its weights and state");
     }
+}
+
+// The DSpine drafter's ring: every layer's view of the state images' local cache.
+std::vector<CyclicKVCacheLayerView> dspine_ring(const DFlashPersistentState& state,
+                                                std::uint32_t layers) {
+    std::vector<CyclicKVCacheLayerView> out;
+    out.reserve(layers);
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        out.push_back(state.local_layer(layer));
+    }
+    return out;
 }
 
 DFlashPersistentState& dflash_state(PrefillContext& state) {
@@ -119,6 +132,20 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
         const std::int32_t width   = features.ne[1];
         const std::int32_t batch   = features.ne[2];
         const std::int32_t columns = width * batch;
+        if (const auto* drafter = dflash_state(state).dspine) {
+            // The DSpine drafter projects, normalizes and stores the context itself; a single
+            // row wider than its ring keeps the last window, as below.
+            const auto ring = dspine_ring(dflash_state(state), config.num_hidden_layers);
+            drafter->materialize(
+                {.features  = features,
+                 .positions = positions,
+                 .counts    = commit_counts,
+                 .lanes     = lanes,
+                 .min_count = envelope.min_count,
+                 .max_count = envelope.max_count},
+                ring, state.execution.work, state.execution.device.stream);
+            return;
+        }
         nvtx::ScopedRange append_range(nvtx::Name::DFlashContextAppend, nvtx::Category::DFlash,
                                        static_cast<std::uint64_t>(columns));
         if (width <= 0 || batch <= 0 || features.dtype != DType::BF16 ||
@@ -483,9 +510,38 @@ DSpineRefinementTable& dspine_refinement_table(const execution::Parameters& para
     return table;
 }
 
+// The DSpine drafter's block over the frame's rows: its drafts, their 16 candidates and the
+// sampled proposal law the sparse verification reads.
+void propose_dspine_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame, int batch,
+                          int k) {
+    const auto& config = *state.execution.parameters.model.config().draft;
+    auto& work         = state.execution.work;
+    const auto ring    = dspine_ring(state.dflash, config.num_hidden_layers);
+    work.reset();
+    state.dflash.dspine->propose(
+        {.anchors = frame.anchors.slice(0, 0, batch),
+         // The block's RoPE frontier and the ring scan start from the model's logical
+         // position: KVMem rebases the compact KV address on every reselection, so an
+         // execution frontier here rotates the whole block once the context crosses B/R.
+         .frontiers     = frame.draft_frontiers.slice(0, 0, batch),
+         .valid_columns = frame.proposal_valid_columns.slice(0, 0, batch),
+         .lanes         = frame.state_destination_slots.slice(0, 0, batch),
+         .configs       = frame.sampling,
+         .batch         = batch,
+         .width         = k + 1,
+         .drafts        = frame.draft_tokens.slice(1, 0, batch),
+         .candidates    = frame.candidate_ids.slice(2, 0, batch),
+         .proposal_q    = frame.proposal_q.slice(2, 0, batch),
+         .confidence    = {}},
+        ring, work, state.execution.device.stream);
+    work.reset();
+}
+
 void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& frame,
                         std::int32_t batch_size, std::uint32_t k, DFlashEnvelopes envelopes) {
-    if (state.execution.parameters.model.config().draft->dflash2) {
+    if (state.dflash.dspine != nullptr) {
+        propose_dspine_batch(state, frame, batch_size, static_cast<int>(k));
+    } else if (state.execution.parameters.model.config().draft->dflash2) {
         nvtx::ScopedRange proposal_range(nvtx::Name::DFlashProposal, nvtx::Category::DFlash,
                                          static_cast<std::uint64_t>(k + 1U) * batch_size);
         propose_dflash2_batch(state, frame, batch_size, k, envelopes);
@@ -820,14 +876,14 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                 // The bridge's own eps governs the read RMS and the projected-code
                 // normalisation; the final RMSNorm uses the target norm's eps. Both
                 // are 1e-6 in the released checkpoint but are distinct config fields.
-                ops::dspine_bridge_read(residual, nullptr, extra.eps, raw, normalized, rms,
+                ops::dspine_bridge_read(residual, nullptr, extra.bridge_eps, raw, normalized, rms,
                                         state.execution.device.stream);
                 ops::dspine_bridge_read_proj(
                     normalized, bridge.early_read_weights, bridge.read_weight, layer, projected,
                     state.execution.device.stream);
                 ops::dspine_bridge_codes(
                     projected, bridge.codebook, anchors, width, batch_size,
-                    static_cast<float>(std::sqrt(double(code_size))), extra.eps, codes,
+                    static_cast<float>(std::sqrt(double(code_size))), extra.bridge_eps, codes,
                     state.execution.device.stream);
                 // Three GEMVs over the same codes, fused into one launch per layer.
                 // Saves two launches here (ten per round over five layers) with the
@@ -923,7 +979,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                 !frame.proposal_q.data) {
                 throw std::logic_error("DSpine draft is missing bridge weights or its sparse frame");
             }
-            if (config.dspine->head_topk != ops::kSparseSpeculativeCandidates) {
+            if (config.dspine->head_top_k != ops::kSparseSpeculativeCandidates) {
                 throw std::logic_error("DSpine head_topk disagrees with the sparse acceptance frame");
             }
             // The refinement lattice scores each (sender, candidate) pair against a
@@ -1117,9 +1173,12 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         Tensor accepted           = frame.accepted_drafts.slice(0, 0, batch_size);
 
         state.execution.work.reset();
+        const auto& draft_config = *state.execution.parameters.model.config().draft;
         Tensor compact_features = state.execution.work.alloc(
-            DType::BF16, {dimension(state.execution.parameters.draft->feature_projection.weight.k),
-                          frame.append_positions.ne[0], batch_size});
+            DType::BF16,
+            {dimension(state.execution.parameters.model.config().text.hidden_size *
+                       std::uint64_t(draft_config.target_layer_ids.size())),
+             frame.append_positions.ne[0], batch_size});
         ops::prepare_ragged_prefix(dflash_state(state).pending_features, active_lanes,
                                    context_starts, draft_frontiers, compact_features, append_positions,
                                    append_counts, state.execution.device.stream);
@@ -1164,10 +1223,11 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
             Tensor candidates;
             Tensor proposal_q;
             // DFlash keeps its deterministic-draft verifier and count publication contract.
-            // DFlash2 represents the same deterministic proposal as a one-hot sparse law.
-            if (state.execution.parameters.model.config().draft->dflash2.has_value()) {
+            // DFlash2 and DSpine represent the same deterministic proposal as a one-hot sparse
+            // law.
+            if (draft_cfg.dflash2.has_value() || draft_cfg.dspine.has_value()) {
                 if (!frame.candidate_ids.data || !frame.proposal_q.data) {
-                    throw std::logic_error("DFlash2 ngram requires a sparse acceptance frame");
+                    throw std::logic_error("sparse ngram copies require a sparse acceptance frame");
                 }
                 const std::initializer_list<std::int32_t> sparse_shape{
                     ops::kSparseSpeculativeCandidates, static_cast<std::int32_t>(k), batch_size};
@@ -1222,9 +1282,12 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                     .proposal_q = lattice_round && frame.proposal_q.data
                                       ? frame.proposal_q.slice(2, 0, batch_size)
                                       : Tensor{},
-                    // Sampling keys remain logical when KVMem compacts target KV positions.
-                    .frontiers = state.execution.parameters.model.config().draft->dflash2
-                                     ? draft_frontiers : frontiers,
+                    // Sampling keys remain logical when KVMem compacts target KV positions. The
+                    // key is (seed, length+i+1, decode), so a compacted length draws a different
+                    // token than the draft was drawn from and every draft is rejected. DSpine
+                    // publishes the same logical frontiers as DFlash2.
+                    .frontiers = (draft_cfg.dflash2 || draft_cfg.dspine) ? draft_frontiers
+                                                                        : frontiers,
                     .anchors         = anchors,
                     .licensed_tokens = licensed_tokens,
                     .licensed_counts = licensed_counts,

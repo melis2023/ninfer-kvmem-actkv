@@ -29,6 +29,7 @@
 #include "ninfer/ops/linear_swiglu.h"
 #include "ninfer/ops/sampling.h"
 #include "ninfer/ops/sliding_window_attention.h"
+#include "models/dspine/drafter.h"
 #include "ninfer/ops/softmax_attention.h"
 #include "ninfer/ops/speculative_round.h"
 #include "runtime/contract/rope_scaling.h"
@@ -244,8 +245,11 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             // approximation. Round UP to one of the capacities the cyclic-cache
             // append kernel registers (kv_cache_append.cpp: 2048/4096/8192).
             // With a normal window (>= trained_window) this is a no-op.
-            std::uint32_t ring_capacity = trained_window;
-            if (plan.kvmem_window_tokens && plan.kvmem_window_tokens < ring_capacity) {
+            std::uint32_t ring_capacity =
+                draft->dspine ? dspine::ring_capacity(*draft->dspine, plan.capacity)
+                              : trained_window;
+            if (!draft->dspine && plan.kvmem_window_tokens &&
+                plan.kvmem_window_tokens < ring_capacity) {
                 const std::uint32_t window = plan.kvmem_window_tokens;
                 ring_capacity = window <= 2048U ? 2048U : (window <= 4096U ? 4096U : 8192U);
             }
@@ -343,6 +347,12 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                  static_cast<std::int32_t>(widest_verify_window(plan) + 1U),
                  static_cast<std::int32_t>(plan.max_concurrency)},
                 "DFlash pending target features");
+            if (draft->dspine) {
+                dflash.dspine_head_write = add_tensor(
+                    builder, DType::BF16,
+                    {dimension(draft->dspine->rank), dimension(draft->dspine->vocab_size)},
+                    "DSpine head-write table");
+            }
         }
     }
 
@@ -841,7 +851,20 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
 
     if (plan.features.masked_draft()) {
         {
-            const auto* draft                  = &*parameters.model.config().draft;
+            const auto* draft = &*parameters.model.config().draft;
+            // DSpine: its Drafter's own workspace at the ring the state images hold, and the
+            // target head's at each call's columns.
+            const std::uint32_t dspine_ring =
+                draft->dspine ? dspine::ring_capacity(*draft->dspine, plan.capacity) : 0U;
+            if (draft->dspine && parameters.dspine == nullptr) {
+                throw std::logic_error("--spec dspine plans without its drafter");
+            }
+            const DType dspine_logits = execution::target_logits_dtype(parameters.text.output_head);
+            const auto dspine_head_bytes = [&](std::int32_t columns) {
+                WorkspaceLayoutBuilder head;
+                linear_scratch(head, parameters.text.output_head, 1, columns);
+                return finish(head);
+            };
             const auto dflash_context_capacity = [&](std::int32_t width, std::int32_t batch,
                                                      bool compact_input) {
                 const auto tokens = width * batch;
@@ -851,6 +874,11 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
                            dimension(config.hidden_size *
                                      std::uint64_t(draft->target_layer_ids.size())),
                            tokens);
+                }
+                if (draft->dspine.has_value()) {
+                    scratch(layout, dspine::Drafter::context_workspace_bytes(
+                                        *parameters.dspine, dspine_ring, width, batch));
+                    return finish(layout);
                 }
                 if (draft->dflash2.has_value()) {
                     const auto local_width =
@@ -874,6 +902,13 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
                 WorkspaceLayoutBuilder layout;
                 const std::int32_t tokens          = width * batch;
                 const std::int32_t proposal_drafts = width - 1;
+                if (draft->dspine.has_value()) {
+                    scratch(layout, dspine::Drafter::proposal_workspace_bytes(
+                                        *parameters.dspine, dspine_logits, dspine_ring,
+                                        plan.capacity, width, batch,
+                                        dspine_head_bytes(proposal_drafts * batch)));
+                    return finish(layout);
+                }
                 matrix(layout, DType::BF16, dimension(config.hidden_size), tokens);
                 if (draft->dflash2.has_value()) {
                     const auto prepare = [&] {
@@ -1032,6 +1067,16 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
             };
 
             out.dflash_context = dflash_context_capacity(chunk, 1, false);
+            if (draft->dspine.has_value()) {
+                // The head-write table's derivation at startup.
+                const auto concurrency = static_cast<std::int32_t>(plan.max_concurrency);
+                out.dflash_context = std::max(
+                    out.dflash_context,
+                    dspine::Drafter::prepare_workspace_bytes(
+                        *parameters.dspine, dspine_logits, concurrency, drafts + 1,
+                        dspine_head_bytes(dspine::Drafter::prepare_columns(
+                            *parameters.dspine, concurrency, drafts + 1))));
+            }
             for (std::int32_t batch = 1; batch <= static_cast<std::int32_t>(plan.max_concurrency);
                  ++batch) {
                 std::size_t target_bytes = 0;
@@ -1045,7 +1090,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
                     target_bytes = std::max(target_bytes, finish(target));
                 }
                 const std::size_t accept =
-                    draft->dflash2.has_value()
+                    draft->dflash2.has_value() || draft->dspine.has_value()
                         ? ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
                               dimension(parameters.model.resources().public_token_count), {false},
                               narrowest_drafts, verify_drafts, batch, batch)
@@ -1136,7 +1181,7 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
     // Past the native window positions run unscaled RoPE or YaRN, to four times the window: the
     // extension Qwen documents for these models (1,048,576 tokens on a 262,144-token window).
     constexpr std::uint64_t kPositionExtension = 4;
-    if (parameters.draft &&
+    if ((parameters.draft || parameters.dspine) &&
         options.max_context >
             kPositionExtension * parameters.model.config().draft->max_position_embeddings) {
         throw std::invalid_argument("max_context exceeds the selected draft position capacity");
@@ -1227,6 +1272,22 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
             throw std::invalid_argument("--tensor-parallel does not run a masked drafter");
         }
         break;
+    case SpeculativeBackend::DSpine: {
+        const auto& draft = parameters.model.config().draft;
+        if (parameters.dspine == nullptr || !draft || !draft->dspine) {
+            throw std::invalid_argument("--spec dspine needs its drafter artifact (--draft-model)");
+        }
+        if (options.speculative.draft_tokens == 0 ||
+            options.speculative.draft_tokens + 1 > draft->dspine->block_size ||
+            options.speculative.draft_tokens > 15) {
+            throw std::invalid_argument(
+                "the DSpine draft window must be in [1, min(15, block_size - 1)]");
+        }
+        if (parameters.text.tensor_parallel()) {
+            throw std::invalid_argument("--tensor-parallel does not run a DSpine drafter");
+        }
+        break;
+    }
     }
     // 12.0 is admitted alongside the qualified capabilities: consumer Blackwell runs the same
     // warp-level mma.sync schedules this family is written against, with the same 100 KiB of shared
