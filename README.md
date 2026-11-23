@@ -21,9 +21,9 @@ ngram 宽度（非 0 表示开启混合复制，0 表示只用神经草稿）：
 
 | 模式 | `--spec` | 草稿来源 | 特点 |
 |---|---|---|---|
-| **DFlash2** | `dflash2` | 外挂 DFlash2 GGUF（`--draft-model`） | 速度最快，工具调用/agent 最稳；**推荐默认** |
-| **DSpine** | `dspine` | 外挂 DSpine GGUF（`--draft-model`） | 环按绝对位置读写，长上下文接受率高；**工具调用请用 DFlash2**（见下） |
-| **MTP** | `mtp` | 工件自带的 MTP 头，不需要 `--draft-model` | 无外挂文件，配置最简单 |
+| **DFlash2** | `dflash2` | 外挂 DFlash2 GGUF（`--draft-model`） | 工具调用/agent 最稳，**推荐默认**；纯文本生成的接受率低于 DSpine |
+| **DSpine** | `dspine` | 外挂 DSpine GGUF（`--draft-model`） | 环按绝对位置读写，接受率更高（实测 75.5% vs 64.3%），本机纯文本生成更快；**工具调用请用 DFlash2**（见下） |
+| **MTP** | `mtp` | 工件自带的 MTP 头，不需要 `--draft-model` | 无外挂文件，配置最简单；`--adaptive-mtp` 下结果不可复现 |
 
 目标工件：`I:\model\ninfer\Qwen3.8-27B-GSQ-RCO-IQ3_S-q4km-mtp-dflash2.ninfer`。
 三个模式各自的 128k 启动脚本见 `workers/ninfer/start-128k-{dflash2,dspine}.bat`
@@ -137,6 +137,41 @@ token**：
 >
 > 注：窗口 12→20 是在「ngram 高命中的长输出」上调的；工具调用/agent 建议保持 12，宽窗口
 > 在 miss 时每轮要白读更多 KV 列。并发 C1 保留 16–63 宽度，C2–8 启动时自动降到 15。
+
+## 真实生成测速（2026-11-23，鹈鹕骑车 HTML）
+
+上一节压的是 ngram 复制路径；这一节换成真实创作型请求，让三种后端的草稿网络真正跑起来。
+
+提示词 `制作一个鹈鹕骑车的 html，画面美观，场景丰富`（prompt 共 82 token），
+`temperature 0`、`reasoning_effort none`、`max_tokens 16384`，三模式同一工件同一请求，
+每轮单独重启服务、交错跑两轮：
+
+| 轮 | 模式 | 输出 token | wall | decode | 草稿接受率 |
+|---|---|---:|---:|---:|---:|
+| c1 | DFlash2 | 10,310 | 124.3 s | 85.3 tok/s | 7,576/11,780（64.3%） |
+| c1 | DSpine | 11,920 | 125.8 s | 97.7 tok/s | 9,152/12,121（**75.5%**） |
+| c1 | MTP | 16,384（触顶） | 161.1 s | 104.4 tok/s | 13,367/17,030（78.5%） |
+| c2 | DFlash2 | 10,310 | 120.9 s | 87.9 tok/s | 7,576/11,780（64.3%） |
+| c2 | DSpine | 11,920 | 122.2 s | 100.6 tok/s | 9,152/12,121（**75.5%**） |
+| c2 | MTP | 12,572 | 164.2 s | 78.5 tok/s | 9,264/14,517（63.8%） |
+
+两轮中位 decode：**DSpine 99.2 > MTP 91.5 > DFlash2 86.6 tok/s**。
+
+- **差距来自接受率**：DSpine 75.5% vs DFlash2 64.3%，11 个百分点对应约 14% 的 decode 差。
+  这不是「某个模式天然快」，换题材换文本，接受率会变。
+- **DFlash2 / DSpine 两轮逐字节可复现**（10,310 与 11,920 token、26,371 与 28,067 字符
+  两次完全一致），噪声只剩 GPU 状态（差 3%）。
+- **MTP 不可复现**：c1 触顶 16,384、c2 自然收尾 12,572——`--adaptive-mtp` 的自适应草稿
+  长度改变了每轮提议宽度，进而改变采样路径，temp 0 也压不住。它的两行只能当参考。
+- 创作型文本上 ngram 复制率远低于重复行：DFlash2 只复制出 652/1,272（51%），
+  128k 重复行那轮是 434/434（100%）。
+- 正确性：DFlash2 / DSpine 的四份输出都是完整单文件 HTML（1 个 `<style>`、1 个 `<script>`、
+  5 个 `<svg>`、正常闭合）；MTP c1 触顶后在 SVG path 中间截断，c2 完整。样例
+  [pelican-bike-dspine-20261123.html](docs/validation/multi-backend/samples/pelican-bike-dspine-20261123.html)。
+
+> 该工件带 agent 微调痕迹：只给裸用户回合会去调 `list_files` / `read_file`，108 token 就
+> stop。测速请求必须加「只输出单个完整 HTML、不解释、不调工具」的 system 约束。
+> 详细数据见[三模式真实生成测速](docs/validation/multi-backend/mode-speed-real-generation-20261123.md)。
 
 ## 长上下文实测（2026-11-23，DFlash2）
 
