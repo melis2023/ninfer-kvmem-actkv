@@ -17,7 +17,7 @@ QQ 交流群：**1040777853**。本项目仅供研究学习，稳定使用请前
 
 同一份 Qwen3.8-27B 目标工件可以搭配三种推测后端，按 `--spec` 切换。三者的
 `--draft-tokens` 都是一次推测的候选 token 数，`--ngram-draft-tokens` 是从上下文复制的
-ngram 宽度（12 表示开启混合复制，0 表示只用神经草稿）：
+ngram 宽度（非 0 表示开启混合复制，0 表示只用神经草稿）：
 
 | 模式 | `--spec` | 草稿来源 | 特点 |
 |---|---|---|---|
@@ -36,7 +36,7 @@ REM ===== 通用（三模式共享）=====
   --model-id ninfer-27b --port 18200 --host 127.0.0.1 ^
   --max-context 262144 --prefill-chunk 256 ^
   --kvmem-budget 36834 --kvmem-gen-reserve 1024 --kvmem-host-mib 12288 ^
-  --kvmem-keep --ngram-draft-tokens 12 --kv-dtype rk8v4 ^
+  --kvmem-keep --ngram-draft-tokens 20 --kv-dtype rk8v4 ^
   --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
   --vision --vision-residency cpu --vision-max-merged 256 ^
   --default-reasoning-effort xhigh
@@ -53,6 +53,10 @@ REM ===== MTP（无外挂草稿，用工件内置头）=====
   --spec mtp --draft-tokens 4 --adaptive-mtp --full-draft-head
 ```
 
+> `--ngram-draft-tokens 20` 是按 128k 实测调过的值（见下文「128k 实测」）：每轮成本固定，
+> 窗口越大每轮提交越多，12 默认值在长上下文里白扔了 35–55% 的吞吐。注意并发门禁：C1 保留
+> 16–63 的原宽度，C2–8 启动时会自动降到 15。
+>
 > DSpine 草稿 GGUF 首次加载会在 CPU 派生约 1 GB 的 `sender_table`，耗时约 20 秒；
 > 首次之后会写入同目录的 `<gguf>.derived` 缓存（按 ArtifactId + mtime 校验），
 > 再次加载约 11 秒，输出逐字一致。
@@ -82,17 +86,35 @@ REM ===== MTP（无外挂草稿，用工件内置头）=====
 ## 128k 实测（2026-11-23，RTX 5060 Ti 16 GB）
 
 同一 prompt（119,123 token）、同一工件，第一次请求做 prefill + 写入，第二次请求命中
-prefix cache，测 decode；输出为指定行重复 40 次，三模式均完整复现 22 行。
+prefix cache，测 decode；输出为指定行重复 40 次，三模式均完整复现 22 行。冷 prefill
+约 750–810 tok/s（119k token 约 2.5 分钟），三模式持平；差异全在 decode。
 
-| 模式 | `--spec` | decode（tok/s） | wall | 输出正确性 |
-|---|---|---:|---:|---|
-| **DFlash2** | `dflash2` | **159.6** | 3.6 s | 22/22 行 ✓ |
-| **MTP** | `mtp` | **155.9** | 3.7 s | 22/22 行 ✓ |
-| **DSpine** | `dspine` | **131.2** | 4.3 s | 22/22 行 ✓ |
+**128k 下每轮成本基本固定**：一次权重全读 + 常驻 KV 扫描落在 83–106 ms，与模式无关，也
+不随 verify 宽度线性增长（DSpine 13 列 89 ms、21 列 93 ms，33 列才涨到 126 ms）。所以
+decode ≈ `(ngram 窗口 + 1) / 每轮成本`，真正决定速度的是**每轮能提交多少 token**，
+也就是 `--ngram-draft-tokens`：
 
-冷 prefill 约 1,000 tok/s（119k token 约 2 分钟），三模式基本持平；差异主要在 decode。
-DFlash2 略快于 MTP，DSpine 因草稿注意力开销稍慢但长上下文接受率更高。完整原始数据在
-`docs/validation/`（128k 对照）与历史 `docs/CHANGELOG.md`。
+| 模式 | `--ngram-draft-tokens 12`（旧默认） | 轮次 | `20` | 轮次 | 提升 |
+|---|---:|---:|---:|---:|---:|
+| **DSpine** | 155.4（8 次中位） | 37 | **239.7** | 23 | +54% |
+| **DFlash2** | 162.6（5 次中位） | 38 | **218.9** | 24 | +35% |
+| **MTP** | 146.7（4 次中位） | 38 | **202.2** | 24 | +38% |
+
+DSpine 窗口继续放大还有收益：16 → 172.4（29 轮）、20 → 239.7（23 轮）、32 → 254.7
+（16 轮，每轮涨到 126 ms 后开始摊薄）。ngram=20 的冷/暖两次几乎完全重合
+（239.9/239.7、218.9/218.9、202.9/202.2），轮次越多抖动越大。
+
+同窗口下三模式互差 5–8%，且**排序不稳定**：交错 A/B 里 DSpine 两次反超 DFlash2
+（165.4 vs 140.6、174.3 vs 162.2），说明这点差距是噪声而非结构差异——这块卡 decode 全程
+顶 180 W 功耗墙、sm 在 2500–2870 MHz 之间摆，同配置单次测量就能差 ±15%。所以上表用
+重复测量的中位数，不用单次样本。
+
+> 早期误记的 DSpine「131.2 tok/s」是一次最低样本（同配置 8 次实测 141.1–174.3），
+> 而「DSpine 因草稿注意力开销慢」也站不住：batch=1 的 ngram 轮次里
+> `dflash_decode_batch_body` 直接跳过神经草稿前向（`draft.cpp`
+> `if (!state.ngram || batch_size > 1)`），开启 ngram 后草稿前向根本不执行
+> （`NINFER_DSPINE_PROFILE=1` 全程零输出可证）。详细数据见
+> [ngram 窗口 128k 实测](docs/validation/ngram/ngram-window-128k-validation-20261123.md)。
 
 ## 长上下文实测（2026-11-23，DFlash2）
 
