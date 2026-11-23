@@ -39,7 +39,8 @@ REM ===== 通用（三模式共享）=====
   --kvmem-keep --ngram-draft-tokens 20 --kv-dtype rk8v4 ^
   --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
   --vision --vision-residency cpu --vision-max-merged 256 ^
-  --default-reasoning-effort xhigh
+  --default-reasoning-effort xhigh ^
+  --ngram-draft-tokens 20
 
 REM ===== DFlash2（外挂草稿）=====
   --draft-model I:\model\dflash2\Qwen3.8-27B-DFlash2-Q4_K_M.gguf ^
