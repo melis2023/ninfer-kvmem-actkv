@@ -32,7 +32,27 @@ ops::WeightInput Model::input(WeightUseId id) const {
     if (use.input_columns) {
         result.input_columns = replicas_.on_rank(bound_, *use.input_columns, parameter.rank);
     }
+    attach_trellis(result, use);
     return result;
+}
+
+void Model::attach_trellis(ops::WeightInput& result, const WeightUse& use) const {
+    const auto attach = [this](const std::optional<WeightId>& id, Tensor& target, bool host) {
+        if (!id) { return; }
+        const auto& auxiliary = weight(*id);
+        if (host) {
+            const auto count = static_cast<std::int32_t>(auxiliary.view.shape.front());
+            target          = weight_tensor(auxiliary.view, {count});
+        } else {
+            target = replicas_.on_rank(bound_, *id, 0);
+        }
+    };
+    attach(use.trellis_s16, result.trellis_s16, false);
+    attach(use.trellis_pre, result.trellis_pre, false);
+    attach(use.trellis_post, result.trellis_post, false);
+    attach(use.trellis_pin, result.trellis_pin, false);
+    attach(use.trellis_pout, result.trellis_pout, false);
+    attach(use.trellis_desc, result.trellis_desc, true);
 }
 
 ops::WeightInput Model::input(WeightId id) const {
@@ -58,6 +78,7 @@ ops::WeightInput Model::rotated_input(WeightUseId id) const {
     if (use.input_columns) {
         result.input_columns = replicas_.on_rank(bound_, *use.input_columns, parameter.rank);
     }
+    attach_trellis(result, use);
     return result;
 }
 

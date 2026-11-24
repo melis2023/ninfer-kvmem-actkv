@@ -234,6 +234,10 @@ def _side_specs(matrix: CodedMatrix) -> list[tuple[str, str, tuple[int, ...], np
         out.append((matrix.name + "~pin", "int32", matrix.pin.shape, matrix.pin))
     if matrix.pout is not None:
         out.append((matrix.name + "~pout", "int32", matrix.pout.shape, matrix.pout))
+    # The descriptor ships as an object of its own so the loader binds it as a Host-resident
+    # auxiliary instead of reaching into metadata (`trellis.descriptors` stays for tooling).
+    desc = np.ascontiguousarray(np.asarray(matrix.desc, dtype="<i4"))
+    out.append((matrix.name + "~desc", "int32", desc.shape, desc))
     return out
 
 
@@ -243,6 +247,7 @@ AUXILIARY_ROLES = {
     "~post": "post",
     "~pin": "pin",
     "~pout": "pout",
+    "~desc": "desc",
 }
 
 

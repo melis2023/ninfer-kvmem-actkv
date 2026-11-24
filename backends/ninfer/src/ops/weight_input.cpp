@@ -131,6 +131,41 @@ SingleProjectionWeight single(std::span<const WeightInput> inputs) {
                 "an input gather must be INT32 [K]");
         result.weight.input_columns = static_cast<const std::int32_t*>(columns.data);
     }
+    // A coded weight carries its own side planes and cannot be assembled from several parameters:
+    // its row Hadamard spans the whole matrix, so no consumer may slice it into logical pieces.
+    const Tensor& descriptor = inputs.front().trellis_desc;
+    for (const auto& input : inputs) {
+        require(input.trellis_desc.data == descriptor.data,
+                "a coded projection cannot be fused from several parameters");
+    }
+    if (descriptor.data != nullptr) {
+        require(inputs.size() == 1, "a coded projection is a single parameter");
+        require(is_coded(result.weight.qtype), "trellis side planes require a coded format");
+        const auto& s16  = inputs.front().trellis_s16;
+        const auto& pre  = inputs.front().trellis_pre;
+        const auto& post = inputs.front().trellis_post;
+        const auto& pin  = inputs.front().trellis_pin;
+        const auto& pout = inputs.front().trellis_pout;
+        require(s16.data != nullptr && s16.dtype == DType::FP32 && s16.numel() == result.weight.k / 16,
+                "a coded weight needs an FP32 [K/16] scale plane");
+        require(pre.data != nullptr && pre.dtype == DType::FP32 && pre.numel() == result.weight.k,
+                "a coded weight needs an FP32 [K] input diagonal");
+        require(post.data != nullptr && post.dtype == DType::FP32 && post.numel() == result.weight.n,
+                "a coded weight needs an FP32 [N] output diagonal");
+        require(pin.data == nullptr || (pin.dtype == DType::I32 && pin.numel() == result.weight.k),
+                "a coded input gather must be INT32 [K]");
+        require(pout.data == nullptr || (pout.dtype == DType::I32 && pout.numel() == result.weight.n),
+                "a coded output gather must be INT32 [N]");
+        require(descriptor.dtype == DType::I32 && descriptor.numel() >= 7,
+                "a coded descriptor must be INT32 [7 + parts]");
+        result.weight.trellis_s16   = s16.data;
+        result.weight.trellis_pre   = pre.data;
+        result.weight.trellis_post  = post.data;
+        result.weight.trellis_pin   = pin.data == nullptr ? nullptr : static_cast<const std::int32_t*>(pin.data);
+        result.weight.trellis_pout  = pout.data == nullptr ? nullptr : static_cast<const std::int32_t*>(pout.data);
+        result.weight.trellis_desc  = static_cast<const std::int32_t*>(descriptor.data);
+        result.weight.trellis_desc_len = static_cast<std::int32_t>(descriptor.numel());
+    }
     return result;
 }
 

@@ -32,6 +32,10 @@ struct WeightUse {
     std::optional<WeightId> hadamard_signs;
     // INT32 [K] input gather of a GGUF matrix stored over permuted input columns.
     std::optional<WeightId> input_columns;
+    // NariQ coded weight: per-tile FP32 scales, the two FP32 diagonals, the optional I32 gathers and
+    // the descriptor (host INT32 [7 + parts]). All bound as weights of their own.
+    std::optional<WeightId> trellis_s16, trellis_pre, trellis_post;
+    std::optional<WeightId> trellis_pin, trellis_pout, trellis_desc;
 };
 
 struct BoundWeight {

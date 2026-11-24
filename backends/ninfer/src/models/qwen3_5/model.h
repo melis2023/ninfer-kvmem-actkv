@@ -143,6 +143,9 @@ public:
     }
 
 private:
+    // Attaches a coded weight's side planes to its WeightInput: device planes through the replica
+    // helper, the descriptor straight from its host placement.
+    void attach_trellis(ops::WeightInput& result, const WeightUse& use) const;
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
                                                     const StartupObserver*,
                                                     const artifact::MaterializeOptions&);

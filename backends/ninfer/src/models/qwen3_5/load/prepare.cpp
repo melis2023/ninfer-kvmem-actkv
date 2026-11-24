@@ -301,6 +301,39 @@ void Bindings::add_uses(PendingWeight& pending, const std::string& name,
                 continue;
             }
             if (role != "activation_input_divisor") {
+                if (role == "s16" || role == "pre" || role == "post" || role == "pin" ||
+                    role == "pout" || role == "desc") {
+                    if (!whole_gathers) { continue; } // a coded weight is never a piece
+                    if (pending.reference.shape.size() != 2) {
+                        throw artifact::ArtifactError(name + "@" + input +
+                                                      ": a coded side plane requires a matrix");
+                    }
+                    const std::uint64_t k = pending.reference.shape[1];
+                    const std::uint64_t n = pending.reference.shape[0];
+                    const std::string where = name + "@" + input + "/" + role;
+                    if (role == "s16") {
+                        result.trellis_s16 = trellis_side(binding, artifact::Residency::Device,
+                                                          QType::FP32, k / 16, where);
+                    } else if (role == "pre") {
+                        result.trellis_pre = trellis_side(binding, artifact::Residency::Device,
+                                                          QType::FP32, k, where);
+                    } else if (role == "post") {
+                        result.trellis_post = trellis_side(binding, artifact::Residency::Device,
+                                                           QType::FP32, n, where);
+                    } else if (role == "pin") {
+                        result.trellis_pin = trellis_side(binding, artifact::Residency::Device,
+                                                          QType::INT32, k, where);
+                    } else if (role == "pout") {
+                        result.trellis_pout = trellis_side(binding, artifact::Residency::Device,
+                                                           QType::INT32, n, where);
+                    } else {
+                        // The dispatcher validates and plans on the host, so the descriptor has to
+                        // live in host memory; zero elements keeps its own length.
+                        result.trellis_desc = trellis_side(binding, artifact::Residency::Host,
+                                                           QType::INT32, 0, where);
+                    }
+                    continue;
+                }
                 throw artifact::ArtifactError(name + "@" + input + ": unknown auxiliary " + role);
             }
             const auto value = binder.values(binding, QType::FP32).scalar_f32();
@@ -366,6 +399,38 @@ WeightId Bindings::input_columns(const artifact::Binding& binding, std::uint64_t
     const WeightId id{weights.size()};
     weights.push_back(std::move(pending));
     columns_.emplace(std::move(key), id);
+    return id;
+}
+
+WeightId Bindings::trellis_side(const artifact::Binding& binding, artifact::Residency residency,
+                                QType format, std::uint64_t elements, const std::string& use) {
+    std::string key = std::to_string(static_cast<int>(residency)) + ":" +
+                      std::to_string(static_cast<int>(format)) + ":" + std::to_string(elements);
+    for (const auto& part : binding.parts) {
+        const auto& object = binder.reader().directory().object(part.object);
+        key += "|" + artifact::object_id(object) + ":" + std::to_string(part.begin) + "-" +
+               std::to_string(part.end);
+    }
+    if (const auto found = trellis_sides_.find(key); found != trellis_sides_.end()) {
+        return found->second;
+    }
+    if (binding.parts.empty()) {
+        throw artifact::ArtifactError(use + ": a coded side plane binds no object");
+    }
+    // A descriptor keeps its own length; every other plane must match the geometry it serves.
+    const std::uint64_t count =
+        elements != 0 ? elements
+                      : binder.geometry(binding.parts.front().object).elements;
+    PendingWeight pending;
+    pending.reference = binder.binding("trellis_side/" + std::to_string(trellis_sides_.size()),
+                                       binding, {count}, residency, format);
+    for (const auto& part : pending.reference.binding.parts) {
+        pending.source_objects.push_back(
+            artifact::object_id(binder.reader().directory().object(part.object)));
+    }
+    const WeightId id{weights.size()};
+    weights.push_back(std::move(pending));
+    trellis_sides_.emplace(std::move(key), id);
     return id;
 }
 

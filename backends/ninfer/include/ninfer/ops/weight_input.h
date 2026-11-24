@@ -23,6 +23,11 @@ struct WeightInput {
     // INT32 [K] input gather of a GGUF matrix stored over permuted input columns (see
     // Weight::input_columns). Empty for every other matrix.
     Tensor input_columns{};
+    // NariQ coded weight (Weight::trellis_*): the per-tile scale, the two side diagonals, the
+    // optional input/output gathers and the host-resident descriptor. All empty for a plain matrix.
+    Tensor trellis_s16{}, trellis_pre{}, trellis_post{};
+    Tensor trellis_pin{}, trellis_pout{};
+    Tensor trellis_desc{};
 };
 
 struct SingleProjectionWeight {

@@ -89,6 +89,10 @@ private:
     // One device weight per distinct input-gather binding, the same way.
     WeightId input_columns(const artifact::Binding& binding, std::uint64_t width,
                            const std::string& use);
+    // One weight per distinct NariQ side plane (and one host-resident descriptor), deduplicated by
+    // the bound objects so several Uses of one matrix share them.
+    WeightId trellis_side(const artifact::Binding& binding, artifact::Residency residency,
+                          QType format, std::uint64_t elements, const std::string& use);
     // A tensor-parallel piece's gather: the entries of `gather` at the stored `columns`, less
     // `base`, on `rank`.
     WeightId gather_piece(const artifact::Binding& gather,
@@ -99,6 +103,7 @@ private:
     std::map<std::string, WeightId, std::less<>> parameters_;
     std::map<std::string, WeightId, std::less<>> signs_;
     std::map<std::string, WeightId, std::less<>> columns_;
+    std::map<std::string, WeightId, std::less<>> trellis_sides_;
     std::map<std::string, WeightId, std::less<>> gather_pieces_;
     std::map<std::pair<std::size_t, std::size_t>, WeightId> auxiliary_ranks_;
 };
