@@ -22,7 +22,7 @@ ngram 宽度（非 0 表示开启混合复制，0 表示只用神经草稿）：
 | 模式 | `--spec` | 草稿来源 | 特点 |
 |---|---|---|---|
 | **DFlash2** | `dflash2` | 外挂 DFlash2 GGUF（`--draft-model`） | 工具调用/agent 最稳，**推荐默认**；纯文本生成的接受率低于 DSpine |
-| **DSpine** | `dspine` | 外挂 DSpine GGUF（`--draft-model`） | 环按绝对位置读写，接受率更高（实测 75.5% vs 64.3%），本机纯文本生成更快；**工具调用请用 DFlash2**（见下） |
+| **DSpine** | `dspine` | 外挂 DSpine GGUF（`--draft-model`） | 环按绝对位置读写，接受率更高（实测 75.5% vs 64.3%），本机纯文本生成更快；支持 `--adaptive-mtp` 自适应验证宽度 |
 | **MTP** | `mtp` | 工件自带的 MTP 头，不需要 `--draft-model` | 无外挂文件，配置最简单；`--adaptive-mtp` 下结果不可复现 |
 
 目标工件：`I:\model\ninfer\Qwen3.8-27B-GSQ-RCO-IQ3_S-q4km-mtp-dflash2.ninfer`。
@@ -48,7 +48,7 @@ REM ===== DFlash2（外挂草稿）=====
 
 REM ===== DSpine（外挂草稿，BF16 草稿 KV）=====
   --draft-model I:\model\dflash2\Qwen3.8-27B-DSpine-b16-Q4_K_M.gguf ^
-  --spec dspine --draft-kv-dtype bf16 --draft-tokens 4
+  --spec dspine --draft-kv-dtype bf16 --draft-tokens 4 --adaptive-mtp
 
 REM ===== MTP（无外挂草稿，用工件内置头）=====
   --spec mtp --draft-tokens 4 --adaptive-mtp --full-draft-head
@@ -76,11 +76,6 @@ REM ===== MTP（无外挂草稿，用工件内置头）=====
 116 页，合计约 151 页（25% B），重选后 sink/recent 页全部保留。代价是纯文本长对话里
 动态 recent 会挤占检索页，所以做了 gating（只在带 tools 时启用）；192K LongMemEval
 20 题在 gating 后恢复 20/20。
-
-> `--ngram-draft-tokens` 的混合复制曾有一处 bug：copy round 把 verify 宽度放大到 ngram
-> 窗口，但 target 的有效列仍按神经草稿宽度计算，导致未验证 token 被接受，表现为 HTML
-> 断裂、对话丢失、工具参数损坏。现已把两处 `proposal_valid_columns` 统一为实际 verify
-> 宽度（`decode.cpp` / `graphs.cpp`），三模式在 ngram=12 下输出均逐字正确。
 
 ---
 
@@ -118,7 +113,7 @@ REM ===== MTP（无外挂草稿，用工件内置头）=====
 > stop。测速请求必须加「只输出单个完整 HTML、不解释、不调工具」的 system 约束。
 > 详细数据见[三模式真实生成测速](docs/validation/multi-backend/mode-speed-real-generation-20261123.md)。
 
-## 长上下文实测（2026-11-23，DFlash2）
+## 长上下文实测（2026-11-23/24，DFlash2 / DSpine / MTP）
 
 ### 220k LongMem 召回（NIAH）
 
@@ -144,9 +139,22 @@ REM ===== MTP（无外挂草稿，用工件内置头）=====
 | 工具调用总数 | 157 |
 | 记录 finding | 60 |
 
-> 工具调用/agent 场景请使用 **DFlash2**：DSpine 在处理结构化输出（工具调用）时仍有
-> 一个独立问题 `generated token 27 violates the structured output grammar`，与 ngram、
-> longmem 召回无关，尚未修复。
+### LongMemEval 召回（2026-11-24，三模式）
+
+同一 harness（`I:\llama\LongMemEval\longmem-256k.py`：3 个 LongMemEval-S 实例、20 题，
+`--kvmem-budget 33920`、`--kv-dtype nvfp4`、`--ngram-draft-tokens 20`、`--adaptive-mtp`）：
+
+| 上下文 | DFlash2 | DSpine | MTP |
+|---|---|---|---|
+| ~204K（target 192000） | **20/20** | **20/20** | **20/20** |
+| ~255K（target 248000） | 14/20（70%） | 13/20（65%） | 14/20（70%） |
+
+204K 下三模式全部 20/20（2 original + 17 detail + 1 tail 全中）；255K 降到 65–70%，且 3 个
+original（问最新会话内容）在 DFlash2/MTP 上是 0/3，detail 题开始出现「我没有访问历史」的拒答。
+
+> **建议：长会话/召回场景把上下文控制在 220K 以内。** 204K 实测 100%，接近 262K 上限
+> 时降幅约 30 个百分点；256K 级场景优先缩短历史，而不是继续加大 `--kvmem-budget`——
+> 本机 16 GB 下 B=65536 已因显存不足无法启动。
 
 ---
 
@@ -693,8 +701,8 @@ python3 -m tools.convert \
 ## 快速开始
 
 1. 下载 `.ninfer` 工件，或按上文自行转换。
-2. 双击 `workers/ninfer/start-kvmem-ninfer-dspine.bat`（DSpine）、
-   `start-kvmem-ninfer-dflash.bat`（DFlash2）或 `start-kvmem-ninfer.bat`（MTP）。
+2. 双击 `workers/ninfer/start-128k-dspine.bat`（DSpine）、
+   `start-128k-dflash2.bat`（DFlash2）或 `start-kvmem-ninfer.bat`（MTP）。
    模型路径和参数都在 bat 里。
 3. 服务地址 `http://127.0.0.1:18200`，OpenAI 兼容 API。
 
