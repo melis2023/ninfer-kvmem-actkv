@@ -16,12 +16,14 @@ from typing import Sequence
 
 from .formats import (
     GGUF_FORMATS,
+    TRELLIS_FORMATS,
     DirectFormat,
     Fp8RowFormat,
     GgufFormat,
     Nvfp4Format,
     NumericFormat,
     QuantFormat,
+    TrellisFormat,
     get_format,
 )
 
@@ -90,6 +92,16 @@ class RowScaleGeometry:
 
 
 @dataclass(frozen=True, slots=True)
+class TrellisGeometry:
+    n: int
+    k: int
+    bits: int
+    k_tiles: int
+    tile_bytes: int  # 32*bits bytes per (input tile, output tile): 256 weights as 8*bits words
+    payload_bytes: int
+
+
+@dataclass(frozen=True, slots=True)
 class RowInterleavedGeometry:
     n: int
     k: int
@@ -117,6 +129,7 @@ ROW_INTERLEAVED_V1 = Layout(
     "row_interleaved_v1", 256, frozenset(("fp8_e4m3fn_row_fp16",))
 )
 GGUF_BLOCKS_V1 = Layout("gguf_blocks_v1", 256, frozenset(GGUF_FORMATS))
+TRELLIS_TILE16_V1 = Layout("trellis_tile16_v1", 256, frozenset(TRELLIS_FORMATS))
 
 LAYOUTS = MappingProxyType(
     {
@@ -128,6 +141,7 @@ LAYOUTS = MappingProxyType(
             ROW_SCALE_V1,
             ROW_INTERLEAVED_V1,
             GGUF_BLOCKS_V1,
+            TRELLIS_TILE16_V1,
         )
     }
 )
@@ -322,6 +336,25 @@ def gguf_blocks_geometry(
     )
 
 
+def trellis_geometry(format: str | TrellisFormat, shape: Sequence[int]) -> TrellisGeometry:
+    spec = _format(format)
+    if not isinstance(spec, TrellisFormat):
+        raise ValueError("trellis_tile16_v1 requires a coded tile format")
+    n, k = _shape(shape, rank=2)
+    if n % 16 or k % 16:
+        raise ValueError("trellis_tile16_v1 requires N and K divisible by 16")
+    k_tiles = k // 16
+    tile_bytes = 32 * spec.bits
+    return TrellisGeometry(
+        n=n,
+        k=k,
+        bits=spec.bits,
+        k_tiles=k_tiles,
+        tile_bytes=tile_bytes,
+        payload_bytes=(n // 16) * k_tiles * tile_bytes,
+    )
+
+
 def encoded_size(
     layout: str | Layout,
     format: str | NumericFormat,
@@ -363,4 +396,8 @@ def encoded_size(
         if not isinstance(numeric_spec, GgufFormat):
             raise ValueError("gguf_blocks_v1 requires a ggml block format")
         return gguf_blocks_geometry(numeric_spec, shape).payload_bytes
+    if layout_spec is TRELLIS_TILE16_V1:
+        if not isinstance(numeric_spec, TrellisFormat):
+            raise ValueError("trellis_tile16_v1 requires a coded tile format")
+        return trellis_geometry(numeric_spec, shape).payload_bytes
     raise ValueError(f"unsupported tensor layout: {layout_spec.name!r}")

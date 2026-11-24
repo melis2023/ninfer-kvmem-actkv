@@ -43,6 +43,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/linear_topk/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/rmsnorm_rope/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/softmax_attention/sources.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/sparse_moe/sources.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/trellis/sources.cmake")
 
 if(NINFER_COMPAT_PATH)
   # NVFP4 W4A4 uses mma.sync...kind::mxf4nvf4.block_scale; FP8 A8 uses

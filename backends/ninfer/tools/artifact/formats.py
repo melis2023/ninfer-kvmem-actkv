@@ -62,8 +62,20 @@ class GgufFormat:
     block_bytes: int
 
 
+@dataclass(frozen=True, slots=True)
+class TrellisFormat:
+    """NariQ coded tiles (nariq/FORMAT.md version 1): `bits` per weight, 16x16 output tiles.
+
+    A tile holds 16*16 weights as 8*bits little-endian words; the tile's bytes decode as one
+    circular stream, so a coded tensor is stored and read whole (`trellis_tile16_v1` only).
+    """
+
+    name: str
+    bits: int
+
+
 NumericFormat: TypeAlias = (
-    DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat | GgufFormat
+    DirectFormat | QuantFormat | Nvfp4Format | Fp8RowFormat | GgufFormat | TrellisFormat
 )
 
 
@@ -106,6 +118,30 @@ GGUF_Q4_0 = GgufFormat("gguf_q4_0", 2, 32, 18)
 GGUF_Q5_0 = GgufFormat("gguf_q5_0", 6, 32, 22)
 # Two-bit codes over {-1, 0, 1, 2} * d, 64 per block with one binary16 d (GSQ-RCO's Q2_0).
 GGUF_Q2_0 = GgufFormat("gguf_q2_0", 42, 64, 18)
+
+# NariQ coded tiles: 1..6 bits per weight. The GGUF ids are the fork's 44..49; a converter copies
+# the exporter's words unchanged rather than re-quantizing them.
+TRELLIS_TRL1 = TrellisFormat("trellis_trl1", 1)
+TRELLIS_TRL2 = TrellisFormat("trellis_trl2", 2)
+TRELLIS_TRL3 = TrellisFormat("trellis_trl3", 3)
+TRELLIS_TRL4 = TrellisFormat("trellis_trl4", 4)
+TRELLIS_TRL5 = TrellisFormat("trellis_trl5", 5)
+TRELLIS_TRL6 = TrellisFormat("trellis_trl6", 6)
+
+TRELLIS_FORMATS = MappingProxyType(
+    {
+        item.name: item
+        for item in (
+            TRELLIS_TRL1,
+            TRELLIS_TRL2,
+            TRELLIS_TRL3,
+            TRELLIS_TRL4,
+            TRELLIS_TRL5,
+            TRELLIS_TRL6,
+        )
+    }
+)
+TRELLIS_FORMATS_BY_GGML_TYPE = MappingProxyType({44 + i: fmt for i, fmt in enumerate(TRELLIS_FORMATS.values())})
 
 
 DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP32, INT32)})
@@ -154,6 +190,7 @@ NUMERIC_FORMATS = MappingProxyType(
         **NVFP4_FORMATS,
         **FP8_ROW_FORMATS,
         **GGUF_FORMATS,
+        **TRELLIS_FORMATS,
     }
 )
 
@@ -244,12 +281,15 @@ __all__ = [
     "FP8_ROW_FORMATS",
     "GGUF_FORMATS",
     "GGUF_FORMATS_BY_TYPE",
+    "TRELLIS_FORMATS",
+    "TRELLIS_FORMATS_BY_GGML_TYPE",
     "NUMERIC_FORMATS",
     "DirectFormat",
     "QuantFormat",
     "Nvfp4Format",
     "Fp8RowFormat",
     "GgufFormat",
+    "TrellisFormat",
     "NumericFormat",
     "get_format",
     "decode_e2m1_word",

@@ -40,6 +40,12 @@ constexpr std::array kFormats = {
     std::pair{QType::GGUF_Q4_0, std::string_view{"gguf_q4_0"}},
     std::pair{QType::GGUF_Q5_0, std::string_view{"gguf_q5_0"}},
     std::pair{QType::GGUF_Q2_0, std::string_view{"gguf_q2_0"}},
+    std::pair{QType::TRELLIS_1BIT, std::string_view{"trellis_trl1"}},
+    std::pair{QType::TRELLIS_2BIT, std::string_view{"trellis_trl2"}},
+    std::pair{QType::TRELLIS_3BIT, std::string_view{"trellis_trl3"}},
+    std::pair{QType::TRELLIS_4BIT, std::string_view{"trellis_trl4"}},
+    std::pair{QType::TRELLIS_5BIT, std::string_view{"trellis_trl5"}},
+    std::pair{QType::TRELLIS_6BIT, std::string_view{"trellis_trl6"}},
 };
 constexpr std::array kLayouts = {
     std::pair{QuantLayout::Contiguous, std::string_view{"contiguous_le_v1"}},
@@ -48,6 +54,7 @@ constexpr std::array kLayouts = {
     std::pair{QuantLayout::RowInterleaved, std::string_view{"row_interleaved_v1"}},
     std::pair{QuantLayout::BlockScaleK16M128x4, std::string_view{"block_scale_k16_m128x4_v1"}},
     std::pair{QuantLayout::GgufBlocks, std::string_view{"gguf_blocks_v1"}},
+    std::pair{QuantLayout::TrellisTile16, std::string_view{"trellis_tile16_v1"}},
 };
 
 // Layouts a device may hold but an artifact may never declare. They are produced by a load-time

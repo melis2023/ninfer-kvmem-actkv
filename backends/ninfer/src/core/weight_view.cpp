@@ -126,6 +126,18 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         out.code_bytes_per_row = mul(k / block.elements, block.bytes);
         out.code_bytes         = mul(n, out.code_bytes_per_row);
         out.scale_offset       = out.code_bytes;
+    } else if (layout == QuantLayout::TrellisTile16) {
+        // NariQ coded tiles: one 8*bits-word tile per (input tile, output tile), output-tile-major.
+        if (!is_coded(format) || k % 16 || n % 16) {
+            throw std::invalid_argument(
+                "TrellisTile16 requires a coded format with 16-divisible rows and columns");
+        }
+        const int bits = static_cast<int>(format) - static_cast<int>(QType::TRELLIS_1BIT) + 1;
+        out.group_size         = 16;
+        // One output-tile row holds (K/16) tiles of 32*bits bytes each; n rows of it is the plane.
+        out.code_bytes_per_row = mul(k / 16, 32 * bits);
+        out.code_bytes         = mul(n, out.code_bytes_per_row);
+        out.scale_offset       = out.code_bytes;
     } else if (layout == QuantLayout::RowScale) {
         if (format != QType::FP8_E4M3FN_ROW_BF16) {
             throw std::invalid_argument("RowScale requires row-scaled FP8");

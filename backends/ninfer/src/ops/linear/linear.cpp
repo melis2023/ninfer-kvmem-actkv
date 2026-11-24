@@ -2,6 +2,7 @@
 
 #include "core/weight.h"
 #include "ninfer/ops/linear.h"
+#include "ninfer/ops/trellis.h"
 
 #include "ops/linear/bf16/bf16_dispatch.h"
 #include "ops/linear/fp8/fp8_dispatch.h"
@@ -98,6 +99,16 @@ bool sm70_route(const Tensor& x, const Weight& w, const Tensor& out, LinearPolic
 
 void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy policy,
                      WorkspaceArena* workspace, cudaStream_t stream) {
+    // NariQ coded weights own a separate Op family: they rotate activations in FP32 and have no
+    // A8/A4 route of their own, so every policy resolves to the one trellis plan.
+    if (is_coded(w.qtype)) {
+        (void)policy;
+        if (workspace == nullptr) {
+            throw std::invalid_argument("linear: a coded weight needs the workspace overload");
+        }
+        trellis_linear(x, w, out, x.ne[1], *workspace, stream);
+        return;
+    }
     if (sm70_route(x, w, out, policy, workspace)) {
         const detail::sm70::Destination all{
             static_cast<__nv_bfloat16*>(out.data), w.n, 0, 0, w.n, false};
@@ -226,6 +237,18 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
     validate_linear_policy(policy);
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("linear workspace: invalid token interval");
+    }
+
+    // A coded weight rotates activations in FP32: rotated activation plane, the coded product, and
+    // two logical-order scratch planes, all `max_tokens` wide.
+    if (is_coded(qtype)) {
+        if (output_rows <= 0 || input_rows <= 0) {
+            throw std::invalid_argument("linear workspace: coded rows and columns must be positive");
+        }
+        const std::int64_t wider = std::max(output_rows, input_rows);
+        const std::int64_t floats =
+            (static_cast<std::int64_t>(output_rows) + input_rows + 2 * wider) * max_tokens;
+        return static_cast<std::size_t>(floats) * sizeof(float);
     }
 
     if (is_gguf(qtype)) {

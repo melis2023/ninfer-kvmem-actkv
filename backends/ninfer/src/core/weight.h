@@ -49,7 +49,21 @@ enum class QType : std::uint16_t {
     PTQ1_G128_FP16 = 30,
     // Exact ternary reordering: two 13-byte T5 units plus FP16 scale per 128.
     T5_G128_FP16 = 31,
+    // NariQ coded tiles (nariq/FORMAT.md version 1): 1..6 bits per weight in 16-row output tiles,
+    // decoded through a fixed INT8 grid. Stored whole in `trellis_tile16_v1`; see Weight's
+    // trellis_* side plane fields.
+    TRELLIS_1BIT = 32,
+    TRELLIS_2BIT = 33,
+    TRELLIS_3BIT = 34,
+    TRELLIS_4BIT = 35,
+    TRELLIS_5BIT = 36,
+    TRELLIS_6BIT = 37,
 };
+
+// Coded-tile formats: K and N multiples of 16, no per-row dequantization.
+[[nodiscard]] constexpr bool is_coded(QType format) {
+    return format >= QType::TRELLIS_1BIT && format <= QType::TRELLIS_6BIT;
+}
 
 [[nodiscard]] constexpr bool is_gguf(QType format) {
     return format >= QType::GGUF_Q8_0 && format <= QType::GGUF_Q2_0;
@@ -127,6 +141,10 @@ enum class QuantLayout : std::uint16_t {
     // Rows of whole ggml blocks, as a GGUF stores them.
     GgufBlocks = 5,
     RowInterleaved = 6,
+    // Coded 16x16 output tiles, byte for byte as the NariQ exporter wrote them: tile (i,J) for
+    // every input tile i of every output-tile row J, `2*bits` bytes per 16 weights. A row's bytes
+    // do not decode on their own, so a coded tensor is only ever stored or read whole.
+    TrellisTile16 = 7,
 };
 
 // Rows per stored panel. Four 32-byte records is exactly one 128-byte line, which is all the
@@ -179,6 +197,25 @@ struct Weight {
     // INT32 [K] input gather of a GGUF matrix whose stored columns are a permutation of its
     // input's: column c multiplies input element input_columns[c]. Null for every other matrix.
     const std::int32_t* input_columns = nullptr;
+
+    // --- NariQ coded weights (is_coded(qtype)) ------------------------------------------------
+    // Side planes of the coded-linear definition y = gather_pout(post * T_rows^T(W * T_cols(pre *
+    // gather_pin(x)))), laid out exactly as the artifact's Use auxiliaries:
+    //   trellis_s16  F16 [K/16]  one scale per input tile
+    //   trellis_pre  F32 [K]     input signs and scales
+    //   trellis_post F32 [N]     output signs and scales
+    //   trellis_pin  I32 [K]     optional input permutation
+    //   trellis_pout I32 [N]     optional output permutation
+    //   trellis_desc INT32 [7+nparts]  rows_kind, rows_block, rows_shards, cols_kind, cols_block,
+    //                                 cols_shards, nparts, part_0..part_n
+    // All are device pointers into the artifact payload; their lifetime follows the weight's.
+    const void* trellis_s16 = nullptr;
+    const void* trellis_pre = nullptr;
+    const void* trellis_post = nullptr;
+    const std::int32_t* trellis_pin = nullptr;
+    const std::int32_t* trellis_pout = nullptr;
+    const std::int32_t* trellis_desc = nullptr;
+    std::int32_t trellis_desc_len = 0;
 };
 
 } // namespace ninfer

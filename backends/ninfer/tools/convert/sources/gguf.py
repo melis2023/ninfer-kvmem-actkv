@@ -31,9 +31,13 @@ DEFAULT_ALIGNMENT = 32
 
 TYPE_F32 = 0
 TYPE_F16 = 1
+TYPE_I32 = 26
 TYPE_BF16 = 30
 TYPE_PQ2_0 = 142
 TYPE_PTQ1_0 = 143
+# NariQ coded tiles: fork-specific ids 44..49, 16-element blocks of 2*bits bytes.
+TYPE_TRL1 = 44
+TYPE_TRL6 = 49
 
 # ggml block types stored unchanged in a `gguf_blocks_v1` object, keyed by GGUF type id.
 BLOCK_FORMATS = {
@@ -46,6 +50,7 @@ TYPE_NAMES = {
     TYPE_BF16: "BF16",
     TYPE_PQ2_0: "PQ2_0",
     TYPE_PTQ1_0: "PTQ1_0",
+    **{TYPE_TRL1 + i: f"TRL{i + 1}" for i in range(6)},
     **{
         type_id: fmt.name.removeprefix("gguf_").upper()
         for type_id, fmt in BLOCK_FORMATS.items()
@@ -57,9 +62,12 @@ TYPE_IDS = {name: type_id for type_id, name in TYPE_NAMES.items()}
 BLOCK_GEOMETRY = {
     TYPE_F32: (1, 4),
     TYPE_F16: (1, 2),
+    TYPE_I32: (1, 4),
     TYPE_BF16: (1, 2),
     TYPE_PQ2_0: (128, 34),
     TYPE_PTQ1_0: (128, 28),
+    # NariQ coded tiles: one 16-weight tile per 2*bits bytes.
+    **{TYPE_TRL1 + i: (16, 2 * (i + 1)) for i in range(6)},
     **{
         type_id: (fmt.block_elements, fmt.block_bytes)
         for type_id, fmt in BLOCK_FORMATS.items()
