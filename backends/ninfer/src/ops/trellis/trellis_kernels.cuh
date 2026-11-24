@@ -48,4 +48,9 @@ void decode_row(const Tensor& ids, const Weight& w, float* g, int tokens, cudaSt
 void pre_and_gather_bf16(const float* g, const Weight& w, Tensor& rows, int tokens,
                          cudaStream_t stream);
 
+// dst[r][t] = src[index[r]][t] over BF16 rows of `tokens` entries: the banded head's final
+// vocab-order read (the artifact's `vocab_gather` is the vocab -> concatenated-band map).
+void gather_rows_bf16(const void* src, const std::int32_t* index, std::int64_t rows, int tokens,
+                      void* dst, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail::trellis

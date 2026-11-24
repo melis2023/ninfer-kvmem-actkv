@@ -230,6 +230,13 @@ ninfer_add_test(ninfer_trellis_real_test STANDALONE
   LIBRARIES ninfer_ops)
 set_tests_properties(ninfer_trellis_real_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
+# The banded head over two real shards of different widths and formats (concat offsets plus the
+# vocab row read); skips unless the same probe dump exists.
+ninfer_add_test(ninfer_trellis_head_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_trellis_head.cpp"
+  LIBRARIES ninfer_ops)
+set_tests_properties(ninfer_trellis_head_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
 ninfer_add_op_test(ninfer_gdn_input_small_t_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_small_t.cpp"
   LIBRARIES ninfer_ops)

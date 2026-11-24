@@ -62,8 +62,10 @@ workspace = `(K + N + 2·max(K,N)) · T · 4` 字节（旋转激活 + FP32 结�
   `metadata["trellis.descriptors"]`；`trellis.version` 必须是 1。
 - banded head：**16 个 band 各自单独成矩阵**（真实文件 band 位宽不同：`output.band00` 是 TRL6、
   尾部 band 是 TRL4/TRL3/TRL2，行数也不同），head 的 `vocab_gather` 单独成对象，band 布局
-  （offset/rows/bits）写进 `trellis.head_bands`。引擎按 ggml 的语义执行：逐 band 出 logits，
-  再按 `vocab_gather` 落到词表位置（scatter），等价于 `concat(bands)` + `get_rows(·, gather)`。
+  （offset/rows/bits）写进 `trellis.head_bands`。`vocab_gather` 的方向是 **vocab → 拼接行**
+  （实测：把 `g[v]` 按 band 偏移分桶，每个 band 命中的 vocab 个数恰好等于该 band 的行数），
+  所以读法就是 ggml 的 `get_rows(concat(bands), gather)`：`logits[v] = concat[g[v]]`，是 gather 不是 scatter。
+  引擎侧已落到 `ops::trellis_banded_head`（见 2.4）。
 
 ## 2.1 三处容易踩错的语义（已按 ggml-trellis.cpp 对齐）
 
@@ -117,15 +119,33 @@ trellis real-weight gate ok
 **注意**：主机参考是本分支对 `ggml-trellis.cpp` 的移植，因此这项门禁证明"设备 == 本移植定义"；
 与 `ggml` 原实现的逐元素对拍仍需编译 `libggml`（`decode_reference.py` 的 ctypes 路线）后补。
 
+### 3.4 banded head 门禁（真权重）
+
+```powershell
+build-backends\ninfer\tests\ninfer_trellis_head_test.exe I:\model\trellis-probe
+```
+
+```text
+bands 17408x5120 TRL2 + 15488x5120 TRL6
+ok   banded head: 32896 rows, 2 tokens, relative L2 0.00166186 absmax 0.0107117
+trellis banded-head gate ok
+```
+
+取真实文件里位宽与行数都不同的两个 shard 拼成 head，`vocab_gather` 用旋转模拟非恒等映射，
+逐行与主机参考比较：证明拼接偏移、每 band 的 K 一致性与最终行读都没错位。
+
 ## 4. 还缺什么（按顺序）
 
 | # | 内容 | 位置 |
 |---|---|---|
-| 1 | loader 把 Use auxiliaries 落进 `Weight::trellis_*`（s16/pre/post/pin/pout + desc）：binder 目前只认 `input_columns` 这一个 auxiliary | `src/artifact/binder.cpp`、`src/core/weight_view.cpp` |
-| 2 | 参数命名：本转换器沿用 GGUF 名（`blk.0.attn_qkv.weight`…），`qwen3_5` 引擎要的是 `text/layers/0/...` —— 需要一张映射表，且 **coded 投影是"整矩阵"**，不能像 `gguf_blocks.py` 那样把 `attn_qkv` 拆成 query/key/value、把 `attn_q` 拆成 query+gate 的交错行（拆分会破坏 16 行 tile 组） | `tools/convert/*`、`src/models/qwen3_5/load/prepare.cpp` |
-| 3 | 因此模型侧要能"一条 coded 投影 → 多路逻辑投影"：`attn_qkv`(10240) → q/k/v、`attn_q`(12288) → query/gate 交错、DeltaNet 的 value 头；这是把 ggml 图里 `split/reshape` 搬到 ninfer 的关键 | `src/models/qwen3_5/execution/text.cpp` |
-| 4 | banded head：16 个 band 各一次 coded linear，再按 `trellis.head_bands` + `vocab_gather` **scatter** 到 logits（需要一个新的落行步骤，或把 band 循环放进 head 的 executor） | 同上 + `src/ops/trellis` |
-| 5 | coded embedding（`token_embd`，TRL2、24.8 万行、CPU 查表是 nari-llama 已知瓶颈）接 `trellis_embedding` | 同上 |
+| 1 | ✅ loader 落 `Weight::trellis_*` 与 desc：`Bindings::trellis_side` 按绑定去重、`weight_input.cpp::single()` 校验几何并禁止 coded fused、`Model::attach_trellis` 上传平面（desc 走 host） | `src/models/qwen3_5/load/prepare.cpp`、`src/ops/weight_input.cpp`、`model.cpp`（`8198ff5b3`） |
+| 2 | ✅ 引擎命名：`I:\model\gguf转ninfer工具 dspine 1.8\convert_nariq.py` 生成 `text/layers/N/<角色>`、`text/output_head/bandNN`、`text/token_embedding` 与 `components.text.config`（866 参数、`missing: []`） | 该工具目录 |
+| 3 | **进行中**：一条 coded 投影 → 多路逻辑投影（`attn_qkv`(10240)→q/k/v、`attn_q`(12288)→query/gate 交错、DeltaNet value 头、`ssm_out` 分组）。行侧 Hadamard 跨整矩阵，不能像稠密那样拆行，做法是一次 `trellis_linear` 出 10240 行整块再切片 | `src/models/qwen3_5/execution/text.cpp` |
+| 4 | ✅ 算子：`ops::trellis_banded_head`（band 拼接 + vocab 行读）与门禁；剩执行层把 16 band 权重接进 head executor | `src/ops/trellis`、`execution/text.cpp` |
+| 5 | coded embedding：`ops::trellis_embedding` 已就绪，等执行层把 `token_embd` 的查表接到它 | 同上 |
+| 6 | KVMem / 白名单：`serve_options` 对 coded 权重的 target 放行 `--spec dflash2`；`--spec dspine` 仍要等 DSpine 自己的 KVMem 打通（`907ed3bb3` 之后仍被拒） | `src/serve/serve_options.cpp` |
+| 7 | 性能：当前 `tile_product` 是 smem int8 + FP32 SIMT，正确优先；decode 走 sm_80+ INT8 tensor core、prefill 复用 A8 主循环是后续 1.5–2 周的量 | `src/ops/trellis/trellis_kernels.cu` |
+| 8 | 视觉：NariQ 发布只有 BF16 mmproj，与"视觉必须 Q4"的约定冲突，需单独决策 | 转换路径 |
 | 6 | KVMem / 白名单：`serve_options` 对 coded 权重的 target 放行 `--spec dflash2`；`--spec dspine` 仍要等 DSpine 自己的 KVMem 打通（`907ed3bb3` 之后仍被拒） | `src/serve/serve_options.cpp` |
 | 7 | 性能：当前 `tile_product` 是 smem int8 + FP32 SIMT，正确优先；decode 走 sm_80+ INT8 tensor core、prefill 复用 A8 主循环是后续 1.5–2 周的量 | `src/ops/trellis/trellis_kernels.cu` |
 | 8 | 视觉：NariQ 发布只有 BF16 mmproj，与"视觉必须 Q4"的约定冲突，需单独决策 | 转换路径 |

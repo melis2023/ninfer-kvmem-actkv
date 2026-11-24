@@ -244,4 +244,84 @@ void trellis_embedding(const Tensor& ids, const Weight& table, Tensor& rows, cud
     detail::trellis::pre_and_gather_bf16(g, table, rows, tokens, stream);
 }
 
+std::size_t trellis_banded_head_workspace_bytes(const Weight* const* bands, std::size_t band_count,
+                                                std::int32_t max_tokens) {
+    if (bands == nullptr || band_count == 0) {
+        throw std::invalid_argument("trellis banded head: at least one band is required");
+    }
+    if (max_tokens <= 0) {
+        throw std::invalid_argument("trellis banded head: token count must be positive");
+    }
+    std::size_t bytes = 0;
+    for (std::size_t i = 0; i < band_count; ++i) {
+        if (bands[i] == nullptr) {
+            throw std::invalid_argument("trellis banded head: null band weight");
+        }
+        bytes = std::max(bytes, trellis_linear_workspace_bytes(*bands[i], max_tokens));
+    }
+    return bytes;
+}
+
+void trellis_banded_head(const Tensor& x, const Weight* const* bands, std::size_t band_count,
+                         const Tensor& vocab_gather, Tensor& logits, std::int32_t max_tokens,
+                         WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::size_t bytes = trellis_banded_head_workspace_bytes(bands, band_count, max_tokens);
+    if (workspace.capacity() < bytes) {
+        throw std::invalid_argument("trellis banded head: workspace is smaller than the bands need");
+    }
+    if (x.dtype != DType::BF16 || logits.dtype != DType::BF16 || vocab_gather.dtype != DType::I32) {
+        throw std::invalid_argument("trellis banded head: x/logits must be BF16 and the map I32");
+    }
+    if (x.ne[2] != 1 || x.ne[3] != 1 || logits.ne[2] != 1 || logits.ne[3] != 1) {
+        throw std::invalid_argument("trellis banded head: x and logits must be two-dimensional");
+    }
+    const int tokens = x.ne[1];
+    if (tokens > max_tokens || logits.ne[1] != tokens) {
+        throw std::invalid_argument("trellis banded head: token counts disagree or exceed capacity");
+    }
+    if (!x.is_contiguous() || !logits.is_contiguous() || !vocab_gather.is_contiguous()) {
+        throw std::invalid_argument("trellis banded head: tensors must be contiguous");
+    }
+    if (!aligned_to(logits.data, 16)) {
+        throw std::invalid_argument("trellis banded head: logits must be 16-byte aligned");
+    }
+    std::int64_t total_rows = 0;
+    for (std::size_t i = 0; i < band_count; ++i) {
+        validate_weight(*bands[i]);
+        if (bands[i]->k != x.ne[0]) {
+            throw std::invalid_argument("trellis banded head: bands disagree on K");
+        }
+        total_rows += bands[i]->n;
+    }
+    const std::int32_t vocabulary = logits.ne[0];
+    if (vocabulary <= 0 || vocabulary > total_rows || vocab_gather.ne[0] != vocabulary) {
+        throw std::invalid_argument("trellis banded head: the map must have one entry per logit row");
+    }
+
+    // The concatenated band plane is the head's size, not a step's: keep it in one growing scratch
+    // buffer instead of charging it to the per-step arena.
+    static std::mutex scratch_mutex;
+    static DeviceBuffer scratch;
+    const std::size_t concat_bytes =
+        static_cast<std::size_t>(total_rows) * static_cast<std::size_t>(tokens) * sizeof(std::uint16_t);
+    {
+        std::lock_guard<std::mutex> lock(scratch_mutex);
+        if (scratch.bytes < concat_bytes) {
+            scratch = DeviceBuffer(concat_bytes);
+        }
+    }
+    auto* concat = static_cast<unsigned char*>(scratch.p);
+
+    std::int64_t offset = 0;
+    for (std::size_t i = 0; i < band_count; ++i) {
+        const Weight& band = *bands[i];
+        Tensor slice(concat + static_cast<std::size_t>(offset) * tokens * sizeof(std::uint16_t),
+                     DType::BF16, {band.n, tokens});
+        trellis_linear(x, band, slice, max_tokens, workspace, stream);
+        offset += band.n;
+    }
+    detail::trellis::gather_rows_bf16(concat, static_cast<const std::int32_t*>(vocab_gather.data),
+                                      vocabulary, tokens, logits.data, stream);
+}
+
 } // namespace ninfer::ops

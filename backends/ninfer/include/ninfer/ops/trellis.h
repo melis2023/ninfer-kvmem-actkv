@@ -66,4 +66,37 @@ void trellis_linear(const Tensor& x, const Weight& w, Tensor& y, std::int32_t ma
  */
 void trellis_embedding(const Tensor& ids, const Weight& table, Tensor& rows, cudaStream_t stream);
 
+/**
+ * Op: trellis_banded_head
+ *
+ * The artifact splits the vocabulary head over shards of different widths and formats, each a coded
+ * matrix, plus one `vocab_gather` map. The shards are concatenated in band order and the map's
+ * per-vocab entry names the concatenated row that holds that vocab row:
+ *
+ *   concat[offset_b + i] = trellis_linear(x, band_b)[i],  offset_{b+1} = offset_b + band_b.N
+ *   logits[v][:]        = concat[vocab_gather[v]][:]
+ *
+ * `x` is the contiguous BF16 hidden state [K,T]; every band shares one K. `vocab_gather` is
+ * contiguous I32 [V] with every value in [0,sum(band.N)), read as host-model device data; `logits`
+ * is contiguous, 16-byte aligned BF16 [V,T]. This is the direction ggml uses (`get_rows` of the
+ * concatenated bands by the same map), not a scatter.
+ *
+ * Numeric: each band is one `trellis_linear` rounding, so a band row carries that Op's BF16 result;
+ * the final read is an exact BF16 copy.
+ *
+ * Workspace: caller-owned, sized by `trellis_banded_head_workspace_bytes`, which is the largest
+ * single band's `trellis_linear_workspace_bytes`. The concatenated band plane is a process-wide
+ * scratch buffer that grows to the largest head the engine has asked for.
+ */
+void trellis_banded_head(const Tensor& x, const Weight* const* bands, std::size_t band_count,
+                         const Tensor& vocab_gather, Tensor& logits, std::int32_t max_tokens,
+                         WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * Capacity for `trellis_banded_head` at every T in [1,max_tokens] for this band set.
+ */
+[[nodiscard]] std::size_t trellis_banded_head_workspace_bytes(const Weight* const* bands,
+                                                             std::size_t band_count,
+                                                             std::int32_t max_tokens);
+
 } // namespace ninfer::ops

@@ -256,6 +256,17 @@ int grid_for(std::int64_t total) {
     return static_cast<int>(blocks > 65535 ? 65535 : blocks);
 }
 
+// dst[r][t] = src[index[r]][t], BF16 rows of `tokens` entries; `index` is host-model I32.
+__global__ void gather_rows_kernel(const __nv_bfloat16* src, const std::int32_t* index,
+                                   __nv_bfloat16* dst, std::int64_t total, int tokens) {
+    for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < total;
+         i += static_cast<std::int64_t>(gridDim.x) * blockDim.x) {
+        const std::int64_t r = i / tokens;
+        const std::int64_t t = i - r * tokens;
+        dst[i] = src[static_cast<std::int64_t>(index[r]) * tokens + t];
+    }
+}
+
 } // namespace
 
 void gather_scale(const Tensor& x, const Weight& w, float* out, int tokens, std::int64_t K,
@@ -327,6 +338,13 @@ void pre_and_gather_bf16(const float* g, const Weight& w, Tensor& rows, int toke
     pre_gather_kernel<<<grid_for(static_cast<std::int64_t>(w.k) * tokens), kThreads, 0, stream>>>(
         g, static_cast<const float*>(w.trellis_pre), w.trellis_pin,
         static_cast<__nv_bfloat16*>(rows.data), w.k, static_cast<std::int64_t>(w.k) * tokens);
+}
+
+void gather_rows_bf16(const void* src, const std::int32_t* index, std::int64_t rows, int tokens,
+                      void* dst, cudaStream_t stream) {
+    gather_rows_kernel<<<grid_for(rows * tokens), kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(src), index, static_cast<__nv_bfloat16*>(dst), rows * tokens,
+        tokens);
 }
 
 } // namespace ninfer::ops::detail::trellis
