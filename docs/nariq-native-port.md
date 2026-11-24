@@ -140,17 +140,57 @@ trellis banded-head gate ok
 |---|---|---|
 | 1 | ✅ loader 落 `Weight::trellis_*` 与 desc：`Bindings::trellis_side` 按绑定去重、`weight_input.cpp::single()` 校验几何并禁止 coded fused、`Model::attach_trellis` 上传平面（desc 走 host） | `src/models/qwen3_5/load/prepare.cpp`、`src/ops/weight_input.cpp`、`model.cpp`（`8198ff5b3`） |
 | 2 | ✅ 引擎命名：`I:\model\gguf转ninfer工具 dspine 1.8\convert_nariq.py` 生成 `text/layers/N/<角色>`、`text/output_head/bandNN`、`text/token_embedding` 与 `components.text.config`（866 参数、`missing: []`） | 该工具目录 |
-| 3 | **进行中**：一条 coded 投影 → 多路逻辑投影（`attn_qkv`(10240)→q/k/v、`attn_q`(12288)→query/gate 交错、DeltaNet value 头、`ssm_out` 分组）。行侧 Hadamard 跨整矩阵，不能像稠密那样拆行，做法是一次 `trellis_linear` 出 10240 行整块再切片 | `src/models/qwen3_5/execution/text.cpp` |
-| 4 | ✅ 算子：`ops::trellis_banded_head`（band 拼接 + vocab 行读）与门禁；剩执行层把 16 band 权重接进 head executor | `src/ops/trellis`、`execution/text.cpp` |
-| 5 | coded embedding：`ops::trellis_embedding` 已就绪，等执行层把 `token_embd` 的查表接到它 | 同上 |
-| 6 | KVMem / 白名单：`serve_options` 对 coded 权重的 target 放行 `--spec dflash2`；`--spec dspine` 仍要等 DSpine 自己的 KVMem 打通（`907ed3bb3` 之后仍被拒） | `src/serve/serve_options.cpp` |
-| 7 | 性能：当前 `tile_product` 是 smem int8 + FP32 SIMT，正确优先；decode 走 sm_80+ INT8 tensor core、prefill 复用 A8 主循环是后续 1.5–2 周的量 | `src/ops/trellis/trellis_kernels.cu` |
-| 8 | 视觉：NariQ 发布只有 BF16 mmproj，与"视觉必须 Q4"的约定冲突，需单独决策 | 转换路径 |
+| 3 | ✅ 算子：`ops::trellis_input_proj`（一次 `trellis_linear` + 行映射分发，`0aa1f3b12`）与门禁；剩引擎把 coded 父矩阵当"一条绑定 + 多路 Part"接进 attention/GDN | `src/ops/trellis`、`load/prepare.cpp` |
+| 4 | ✅ 算子：`ops::trellis_banded_head`（band 拼接 + vocab 行读）与门禁（`419084c18`）；剩 head 绑定与 executor | `src/ops/trellis`、`execution/text.cpp` |
+| 5 | coded embedding：`ops::trellis_embedding` 已就绪，等执行层的查表接过来 | 同上 |
 | 6 | KVMem / 白名单：`serve_options` 对 coded 权重的 target 放行 `--spec dflash2`；`--spec dspine` 仍要等 DSpine 自己的 KVMem 打通（`907ed3bb3` 之后仍被拒） | `src/serve/serve_options.cpp` |
 | 7 | 性能：当前 `tile_product` 是 smem int8 + FP32 SIMT，正确优先；decode 走 sm_80+ INT8 tensor core、prefill 复用 A8 主循环是后续 1.5–2 周的量 | `src/ops/trellis/trellis_kernels.cu` |
 | 8 | 视觉：NariQ 发布只有 BF16 mmproj，与"视觉必须 Q4"的约定冲突，需单独决策 | 转换路径 |
 
-## 5. 已知风险
+## 5. 引擎侧两个结构性缺口（实测，2026-11-24）
+
+跑 `ninfer.exe I:\model\Qwen3.8-27B-NariQ-3.0bpw.engine.ninfer --prompt hi --max-context 256` 的结果：
+引擎起来了（DLL 需 `C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4\bin\x64` 在 PATH 里，
+`cublas64_13.dll` 只在那层），第一个失败点是 config：
+
+```text
+error: Qwen3.5 config: text config: missing max_position_embeddings
+```
+
+也就是说候选名的 config 必须按引擎的键重写，而不是 HF 原样：
+
+| 键 | 本模型取值 | 来源 |
+| --- | --- | --- |
+| `architectures` / `model_type` | `Qwen3_5ForCausalLM` / `qwen3_5_text` | 必须是 `resolve_architecture` 认的配对 |
+| `max_position_embeddings` | 262144 | `qwen35.context_length` |
+| `rms_norm_eps` | 1e-6 | `qwen35.attention.layer_norm_rms_epsilon` |
+| `rope_parameters` | `{rope_theta: 1e7, partial_rotary_factor: 0.25, mrope_section: [11,11,10]}` | `qwen35.rope.*`（`dimension_sections` 前 3 段和为 32 = rotary_dim/2） |
+| `linear_num_key_heads` / `linear_key_head_dim` | 16 / 128 | `ssm.group_count` / `ssm.state_size`（**不是** attention 头数） |
+| `linear_num_value_heads` / `linear_value_head_dim` | 48 / 128 | `ssm.time_step_rank` / `ssm.state_size`（48 % 16 == 0 才过引擎校验） |
+| `linear_conv_kernel_dim` | 4 | `ssm.conv_kernel` |
+
+由此推出的 GDN 几何：key_dim = 2048，value_dim = 6144，`attn_qkv` 10240 = `[q 2048 | k 2048 | v 6144]`；
+全注意力层 `attn_q` 12288 = query 6144 与 output-gate 6144 **按 256 行交错**（`dense_geometry.py::attention_rows`：
+`(r // 256) * 512 + (256 if gate else 0) + r % 256`），`attn_k` / `attn_v` 各 1024 独立。
+
+两个必须在引擎里改掉的结构：
+
+1. **head 在引擎里是单个 `text/output_head` `[vocab,hidden]` 对象**（`load/text.cpp:307`），而 NariQ 的 head
+   是 16 个位宽/行数各不相同的 band + 一张 vocab 映射，拼不成一张矩阵。要么给 `Bindings` 加
+   `trellis_head_bands(name)` 让 head 变成"多 band 绑定"，要么在 head executor 里直接走
+   `ops::trellis_banded_head`（算子已就绪）。
+2. **coded 父矩阵不能像稠密那样拆成 `attention/query`/`gate`/`key`/`value` 四个对象**：`bind_attention`
+   现在给四路各绑一个 `Parameter`，`prepare_attn_input_proj_weights` 再按"同一父矩阵的连续行段"融合。
+   coded 需要新路径：一条 `Parameter` 承载 12288 行的 coded 父矩阵，`AttentionWeights` 改为
+   "dense 四路 / coded 单父 + 行映射" 的两态，投影走 `ops::trellis_input_proj`（算子已就绪）。
+
+引擎参数清单（`load/text.cpp` 权威）：`text/token_embedding{vocab,h}`、`text/output_head{vocab,h}`、
+`text/final_norm{h}`、每层 `text/layers/N/{input_norm,post_attention_norm}`，注意力层
+`attention/{query{q,h},key{k,h},gate{q,h},value{k,h},query_norm{256},key_norm{256},output{h,q}}`，
+GDN 层 `gdn/{query{2048,h},key{2048,h},value{6144,h},z{6144,h},a_projection{48,h},b_projection{48,h},
+a_log{48},dt_bias{48},convolution{4,10240},norm{128},output{h,6144}}`，FFN `mlp/{gate,up,down}`。
+
+## 6. 已知风险
 
 - 官方 kernel 只在 RTX PRO 6000 上调过；本机（5060 Ti / sm_120）不要假设 88.9 tok/s 可复现。
 - 16 GB 显存：3.0bpw + BF16 视觉 + DFlash2 drafter ≈ 11.5 GB，KV 只剩约 4 GB；没有 KVMem 时
