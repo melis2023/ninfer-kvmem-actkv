@@ -53,4 +53,8 @@ void pre_and_gather_bf16(const float* g, const Weight& w, Tensor& rows, int toke
 void gather_rows_bf16(const void* src, const std::int32_t* index, std::int64_t rows, int tokens,
                       void* dst, cudaStream_t stream);
 
+// dst[dst_row + r][t] = src[index[r]][t]; `index` null means the identity (`index[r] = r`).
+void gather_rows_into_bf16(const void* src, const std::int32_t* index, std::int64_t rows,
+                           std::int64_t dst_row, int tokens, void* dst, cudaStream_t stream);
+
 } // namespace ninfer::ops::detail::trellis

@@ -324,4 +324,85 @@ void trellis_banded_head(const Tensor& x, const Weight* const* bands, std::size_
                                       vocabulary, tokens, logits.data, stream);
 }
 
+std::size_t trellis_input_proj_workspace_bytes(const TrellisProjectionPart* parts,
+                                               std::size_t part_count, std::int32_t max_tokens) {
+    if (parts == nullptr || part_count == 0) {
+        throw std::invalid_argument("trellis input proj: at least one part is required");
+    }
+    std::size_t bytes = 0;
+    for (std::size_t i = 0; i < part_count; ++i) {
+        if (parts[i].weight == nullptr) {
+            throw std::invalid_argument("trellis input proj: null part weight");
+        }
+        bytes = std::max(bytes, trellis_linear_workspace_bytes(*parts[i].weight, max_tokens));
+    }
+    return bytes;
+}
+
+void trellis_input_proj(const Tensor& x, const TrellisProjectionPart* parts, std::size_t part_count,
+                        Tensor* const* outputs, std::size_t output_count, std::int32_t max_tokens,
+                        WorkspaceArena& workspace, cudaStream_t stream) {
+    const std::size_t bytes = trellis_input_proj_workspace_bytes(parts, part_count, max_tokens);
+    if (workspace.capacity() < bytes) {
+        throw std::invalid_argument("trellis input proj: workspace is smaller than a parent needs");
+    }
+    if (x.dtype != DType::BF16 || outputs == nullptr || output_count == 0) {
+        throw std::invalid_argument("trellis input proj: BF16 activation and at least one output");
+    }
+    const int tokens = x.ne[1];
+    if (tokens > max_tokens || !x.is_contiguous()) {
+        throw std::invalid_argument("trellis input proj: tokens exceed capacity or x is not dense");
+    }
+    const std::int32_t k = x.ne[0];
+
+    // Distinct parents are projected once, in first-appearance order; the widest decides the
+    // process-wide parent plane.
+    std::int64_t widest = 0;
+    for (std::size_t i = 0; i < part_count; ++i) {
+        const Weight& w = *parts[i].weight;
+        validate_weight(w);
+        if (w.k != k) {
+            throw std::invalid_argument("trellis input proj: part K disagrees with the activation");
+        }
+        widest = std::max<std::int64_t>(widest, w.n);
+    }
+    static std::mutex scratch_mutex;
+    static DeviceBuffer scratch;
+    const std::size_t plane_bytes = static_cast<std::size_t>(widest) *
+                                    static_cast<std::size_t>(tokens) * sizeof(std::uint16_t);
+    {
+        std::lock_guard<std::mutex> lock(scratch_mutex);
+        if (scratch.bytes < plane_bytes) {
+            scratch = DeviceBuffer(plane_bytes);
+        }
+    }
+    auto* plane = static_cast<unsigned char*>(scratch.p);
+
+    std::vector<const Weight*> done;
+    for (std::size_t i = 0; i < part_count; ++i) {
+        const TrellisProjectionPart& part = parts[i];
+        if (part.output < 0 || static_cast<std::size_t>(part.output) >= output_count ||
+            outputs[part.output] == nullptr) {
+            throw std::invalid_argument("trellis input proj: part names an absent output");
+        }
+        Tensor& dst = *outputs[part.output];
+        if (dst.dtype != DType::BF16 || !dst.is_contiguous() || dst.ne[1] != tokens ||
+            !aligned_to(dst.data, 16)) {
+            throw std::invalid_argument("trellis input proj: outputs must be dense BF16 [rows,T]");
+        }
+        if (part.rows <= 0 || part.dst_row < 0 || part.dst_row + part.rows > dst.ne[0]) {
+            throw std::invalid_argument("trellis input proj: part rows fall outside its output");
+        }
+        const bool projected =
+            std::find(done.begin(), done.end(), part.weight) != done.end();
+        if (!projected) {
+            Tensor parent(plane, DType::BF16, {part.weight->n, tokens});
+            trellis_linear(x, *part.weight, parent, max_tokens, workspace, stream);
+            done.push_back(part.weight);
+        }
+        detail::trellis::gather_rows_into_bf16(plane, part.row_map, part.rows, part.dst_row, tokens,
+                                               dst.data, stream);
+    }
+}
+
 } // namespace ninfer::ops

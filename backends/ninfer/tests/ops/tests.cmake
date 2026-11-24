@@ -237,6 +237,12 @@ ninfer_add_test(ninfer_trellis_head_test STANDALONE
   LIBRARIES ninfer_ops)
 set_tests_properties(ninfer_trellis_head_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
+# Fused coded input projection over a real parent: one projection, three row-mapped outputs.
+ninfer_add_test(ninfer_trellis_proj_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_trellis_proj.cpp"
+  LIBRARIES ninfer_ops)
+set_tests_properties(ninfer_trellis_proj_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
 ninfer_add_op_test(ninfer_gdn_input_small_t_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_small_t.cpp"
   LIBRARIES ninfer_ops)

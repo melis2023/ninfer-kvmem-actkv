@@ -99,4 +99,48 @@ void trellis_banded_head(const Tensor& x, const Weight* const* bands, std::size_
                                                              std::size_t band_count,
                                                              std::int32_t max_tokens);
 
+/**
+ * Op: trellis_input_proj
+ *
+ * The coded form of a fused input projection. A coded parent cannot be sliced by rows the way a
+ * dense one can - its row side crosses the whole matrix (kind 1 in blocks of `rows_block`, kind 2
+ * over the whole slice) - so one band of the parent is projected once and its rows are then
+ * distributed to the logical outputs by a host-built row map:
+ *
+ *   parent = trellis_linear(x, part.weight)              // once per distinct parent weight
+ *   outputs[part.output][part.dst_row + i][:] = parent[part.row_map[i]][:]
+ *
+ * `row_map` is contiguous I32 [part.rows] on the device with every entry in [0,parent.N); a null
+ * map means the identity, i.e. `part.row_map[i] == i`. This covers both the block-aligned splits
+ * (a GDN qkv parent cut at 2048-row boundaries) and the interleaved ones (a full-attention parent
+ * storing query and output gate in 256-row turns) with one code path, and it never materialises a
+ * second copy of the parent beyond the row copy into the destination.
+ *
+ * `x` is contiguous BF16 [K,T] and shared by every part; each output is contiguous BF16 [rows,T]
+ * with 16-byte alignment, and the parts of one output must not overlap each other or each other's
+ * parents. Numeric: one `trellis_linear` BF16 rounding per parent, then exact BF16 row copies.
+ *
+ * Workspace: caller-owned, sized by `trellis_input_proj_workspace_bytes` (the largest single
+ * parent's `trellis_linear_workspace_bytes`). The packed parent plane is a process-wide scratch
+ * buffer sized by the widest parent.
+ */
+struct TrellisProjectionPart {
+    const Weight* weight  = nullptr;
+    std::int32_t output   = 0;
+    std::int32_t dst_row  = 0;
+    std::int32_t rows     = 0;
+    const std::int32_t* row_map = nullptr;
+};
+
+void trellis_input_proj(const Tensor& x, const TrellisProjectionPart* parts, std::size_t part_count,
+                        Tensor* const* outputs, std::size_t output_count, std::int32_t max_tokens,
+                        WorkspaceArena& workspace, cudaStream_t stream);
+
+/**
+ * Capacity for `trellis_input_proj` at every T in [1,max_tokens] for this part set.
+ */
+[[nodiscard]] std::size_t trellis_input_proj_workspace_bytes(const TrellisProjectionPart* parts,
+                                                            std::size_t part_count,
+                                                            std::int32_t max_tokens);
+
 } // namespace ninfer::ops

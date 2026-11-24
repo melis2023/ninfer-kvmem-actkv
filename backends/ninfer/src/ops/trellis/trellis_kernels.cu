@@ -256,7 +256,7 @@ int grid_for(std::int64_t total) {
     return static_cast<int>(blocks > 65535 ? 65535 : blocks);
 }
 
-// dst[r][t] = src[index[r]][t], BF16 rows of `tokens` entries; `index` is host-model I32.
+// dst[r][t] = src[index[r]][t], BF16 rows of `tokens` entries; `index` is I32 on the device.
 __global__ void gather_rows_kernel(const __nv_bfloat16* src, const std::int32_t* index,
                                    __nv_bfloat16* dst, std::int64_t total, int tokens) {
     for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < total;
@@ -264,6 +264,20 @@ __global__ void gather_rows_kernel(const __nv_bfloat16* src, const std::int32_t*
         const std::int64_t r = i / tokens;
         const std::int64_t t = i - r * tokens;
         dst[i] = src[static_cast<std::int64_t>(index[r]) * tokens + t];
+    }
+}
+
+// The same read, displaced by `dst_row` rows and with a null map meaning the identity.
+__global__ void gather_rows_into_kernel(const __nv_bfloat16* src, const std::int32_t* index,
+                                        __nv_bfloat16* dst, std::int64_t rows, std::int64_t dst_row,
+                                        int tokens) {
+    const std::int64_t total = rows * tokens;
+    for (std::int64_t i = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < total;
+         i += static_cast<std::int64_t>(gridDim.x) * blockDim.x) {
+        const std::int64_t r = i / tokens;
+        const std::int64_t t = i - r * tokens;
+        const std::int64_t from = index != nullptr ? static_cast<std::int64_t>(index[r]) : r;
+        dst[(dst_row + r) * tokens + t] = src[from * tokens + t];
     }
 }
 
@@ -345,6 +359,13 @@ void gather_rows_bf16(const void* src, const std::int32_t* index, std::int64_t r
     gather_rows_kernel<<<grid_for(rows * tokens), kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(src), index, static_cast<__nv_bfloat16*>(dst), rows * tokens,
         tokens);
+}
+
+void gather_rows_into_bf16(const void* src, const std::int32_t* index, std::int64_t rows,
+                           std::int64_t dst_row, int tokens, void* dst, cudaStream_t stream) {
+    gather_rows_into_kernel<<<grid_for(rows * tokens), kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(src), index, static_cast<__nv_bfloat16*>(dst), rows,
+        dst_row, tokens);
 }
 
 } // namespace ninfer::ops::detail::trellis
