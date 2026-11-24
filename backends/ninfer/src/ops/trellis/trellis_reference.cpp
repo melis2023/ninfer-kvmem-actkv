@@ -303,16 +303,16 @@ bool parse_desc(const Weight& w, std::int64_t K, std::int64_t N, Desc& out) {
 }
 
 void decode_rows(QType qtype, const void* data, std::int64_t K, std::int64_t n0, std::int64_t n_rows,
-                 const void* s16_f16, float* out) {
+                 const void* s16_f32, float* out) {
     const int k = bits_of(qtype);
     const int nw = 8 * k, total = 256 * k;
     const std::int64_t kt = K / 16;
     const std::uint32_t* words = static_cast<const std::uint32_t*>(data);
-    const std::uint16_t* scales = static_cast<const std::uint16_t*>(s16_f16);
+    const float* scales = static_cast<const float*>(s16_f32);
     for (std::int64_t J = n0 / 16; J < (n0 + n_rows) / 16; ++J) {
         for (std::int64_t i = 0; i < kt; ++i) {
             const std::uint32_t* t = words + (J * kt + i) * nw;  // tile (i,J), output-tile-major
-            const float s = scales != nullptr ? half_to_float(scales[i]) : 1.0f;
+            const float s = scales != nullptr ? scales[i] : 1.0f;
             for (int p = 0; p < 256; ++p) {
                 const int start = ((p + 1) * k - 16 + total) % total;
                 const int wi = start >> 5, o = start & 31;
@@ -506,3 +506,4 @@ bool build_side_plan(const Weight& w, std::int64_t n, bool rows_side, SidePlan& 
 }
 
 } // namespace ninfer::ops::detail::trellis
+

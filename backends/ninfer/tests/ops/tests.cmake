@@ -223,6 +223,13 @@ ninfer_add_op_test(ninfer_nvfp4_int8_real_test
   LIBRARIES ninfer_ops)
 set_tests_properties(ninfer_nvfp4_int8_real_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
+# The coded-linear Op against real NariQ tile bytes; skips unless
+# `python -m tools.trellis.dump_probe <converted .ninfer> I:\model\trellis-probe` has run.
+ninfer_add_test(ninfer_trellis_real_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_trellis_real.cpp"
+  LIBRARIES ninfer_ops)
+set_tests_properties(ninfer_trellis_real_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
 ninfer_add_op_test(ninfer_gdn_input_small_t_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gdn_input_small_t.cpp"
   LIBRARIES ninfer_ops)

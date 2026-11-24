@@ -201,7 +201,7 @@ struct Weight {
     // --- NariQ coded weights (is_coded(qtype)) ------------------------------------------------
     // Side planes of the coded-linear definition y = gather_pout(post * T_rows^T(W * T_cols(pre *
     // gather_pin(x)))), laid out exactly as the artifact's Use auxiliaries:
-    //   trellis_s16  F16 [K/16]  one scale per input tile
+    //   trellis_s16  F32 [K/16]  one scale per input tile (the GGUF's F16, promoted exactly)
     //   trellis_pre  F32 [K]     input signs and scales
     //   trellis_post F32 [N]     output signs and scales
     //   trellis_pin  I32 [K]     optional input permutation

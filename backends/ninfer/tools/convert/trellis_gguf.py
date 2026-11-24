@@ -10,13 +10,18 @@ What is written
 ---------------
 * every coded matrix (`GGML_TYPE_TRL1..TRL6`, ids 44..49) as one `trellis_tile16_v1` object, shape
   `[N,K]`, bytes = `N * (K/16) * 8*bits` exactly as stored;
-* its side planes as objects of their own: `trellis_s16` (F16 promoted to F32 without loss),
+* its side planes as objects of their own: `trellis_s16` (the GGUF's F16 promoted to F32, exact),
   `trellis_pre`/`trellis_post` (F32), and `trellis_pin`/`trellis_pout` (I32) when present;
 * the `trellis.desc.<w>` INT32 array into `metadata["trellis.descriptors"]`, keyed by parameter;
 * a banded head/embedding (`<w>.bandNN.weight` + `<w>.vocab_gather`) as one concatenated coded
-  matrix in band order plus a composed output permutation (`argsort(vocab_gather)`), because the
-  runtime's coded-linear Op carries one `pout` and the bands share `pre`, `s16` and the row
-  descriptor. A band set whose sides disagree is rejected rather than silently rewritten.
+  matrix in band order plus `pout = vocab_gather`, because the runtime's coded-linear Op carries
+  one `pout` and the bands share `pre`, `s16` and the row descriptor. `ggml` composes the bands as
+  `concat(band logits)` and then `get_rows(banded, vocab_gather)`, i.e. `logits[i] =
+  banded[vocab_gather[i]]`, which is exactly the Op's output gather. A band set whose sides
+  disagree is rejected rather than silently rewritten.
+
+The tile payload is streamed in 64 MB chunks per band tile tensor, so converting a 10 GB file
+costs neither the 10 GB copy in RAM nor a second pass.
 
 The artifact is a schema-valid weight pack: the coded tensors are bound by their GGUF names and
 their side planes are declared as Use auxiliaries. Model-role binding (`text/layers/...`,
@@ -59,8 +64,8 @@ class CodedMatrix:
     n: int
     k: int
     bits: int
-    codes: np.ndarray  # uint8 payload, exactly encoded_size()
-    s16: np.ndarray  # float32 [K/16]
+    segments: tuple[tuple[str, int], ...]  # GGUF tensor names and their byte counts, in code order
+    s16: np.ndarray  # float32 [K/16] (the GGUF's F16 promoted, which is exact)
     pre: np.ndarray  # float32 [K]
     post: np.ndarray  # float32 [N]
     pin: np.ndarray | None  # int32 [K]
@@ -75,6 +80,10 @@ class CodedMatrix:
     @property
     def shape(self) -> tuple[int, int]:
         return (self.n, self.k)
+
+    @property
+    def payload_bytes(self) -> int:
+        return sum(nbytes for _, nbytes in self.segments)
 
 
 def _permutation(values: np.ndarray, size: int, label: str) -> np.ndarray:
@@ -113,15 +122,17 @@ def _descriptor(source: GGUFFile, base: str) -> list[int]:
     return desc
 
 
-def _coded_matrix(source: GGUFFile, name: str, n: int, k: int, codes: np.ndarray, base: str,
-                  bits: int) -> CodedMatrix:
+def _coded_matrix(source: GGUFFile, name: str, n: int, k: int, segments: tuple[tuple[str, int], ...],
+                  base: str, bits: int) -> CodedMatrix:
     desc = _descriptor(source, base)
+    # The artifact stores only FP32/INT32 direct planes, so the F16 scale is promoted: fp16 -> fp32
+    # is exact, and every reader then multiplies by the same value ggml would.
     s16 = _side(source, base + ".trellis_s16", k // 16, base + ".trellis_s16")
     pre = _side(source, base + ".trellis_pre", k, base + ".trellis_pre")
     post = _side(source, base + ".trellis_post", n, base + ".trellis_post")
     if s16 is None or pre is None or post is None:
         raise ValueError(f"{base}: coded matrix without s16/pre/post")
-    for label, plane in (("s16", s16), ("pre", pre), ("post", post)):
+    for label, plane in (("pre", pre), ("post", post)):
         if not np.isfinite(plane).all():
             raise ValueError(f"{base}: nonfinite {label}")
     pin = _side(source, base + ".trellis_pin", k, base + ".trellis_pin")
@@ -130,11 +141,18 @@ def _coded_matrix(source: GGUFFile, name: str, n: int, k: int, codes: np.ndarray
         _permutation(pin, k, base + ".trellis_pin")
     if pout is not None:
         pout = _permutation(pout, n, base + ".trellis_pout")
-    return CodedMatrix(name, n, k, bits, codes, s16, pre, post, pin, pout, pout, desc)
+    return CodedMatrix(name, n, k, bits, segments, s16, pre, post, pin, pout, pout, desc)
 
 
-def _band_matrix(source: GGUFFile, head: str) -> CodedMatrix:
-    """Concatenates `<head>.bandNN.weight` in band order and composes the vocab permutation."""
+def band_plan(source: GGUFFile, head: str) -> dict[str, Any]:
+    """Validates a banded head/embedding and returns its band layout and vocabulary permutation.
+
+    The bands are kept as separate coded matrices: a real file mixes code widths per band
+    (`output.band00` is TRL6, the tail bands TRL2) and even row counts, so no single coded
+    matrix can carry the head. The engine runs one coded linear per band and scatters the
+    rows to `vocab_gather[offset + j]`, which is what `ggml` does with
+    `concat(band logits)` + `get_rows(banded, vocab_gather)`.
+    """
     bands: list[Any] = []
     for info in source.tensors.values():
         match = BAND_PATTERN.fullmatch(info.name)
@@ -149,8 +167,7 @@ def _band_matrix(source: GGUFFile, head: str) -> CodedMatrix:
     if head + ".weight" in source.tensors:
         raise ValueError(f"{head}: both bands and a dense matrix")
 
-    gather_info = source.tensors.get(head + ".vocab_gather")
-    if gather_info is None:
+    if head + ".vocab_gather" not in source.tensors:
         raise ValueError(f"{head}: bands without vocab_gather")
     rows = sum(int(np.prod(info.shape[:-1])) for info in bands)
     gather = _permutation(
@@ -160,65 +177,25 @@ def _band_matrix(source: GGUFFile, head: str) -> CodedMatrix:
     )
 
     k = int(bands[0].shape[-1])
-    if k % 16:
-        raise ValueError(f"{head}: K is not a multiple of 16")
-    bits = None
-    desc = None
-    s16 = pre = None
-    posts = []
-    payloads = []
+    offset = 0
+    layout = []
     for info in bands:
         if not TYPE_TRL1 <= info.type_id <= TYPE_TRL6:
             raise ValueError(f"{info.name}: not a coded tile tensor")
-        band_bits = info.type_id - TYPE_TRL1 + 1
-        if bits is None:
-            bits = band_bits
-        elif band_bits != bits:
-            raise ValueError(f"{head}: bands disagree on the code width")
         band_rows, band_k = (int(v) for v in info.shape)
         if band_k != k or band_rows % 16:
             raise ValueError(f"{info.name}: unexpected geometry {info.shape}")
-        base = info.name[: -len(".weight")]
-        band_desc = _descriptor(source, base)
-        band_s16 = _side(source, base + ".trellis_s16", k // 16, base + ".trellis_s16")
-        band_pre = _side(source, base + ".trellis_pre", k, base + ".trellis_pre")
-        band_post = _side(source, base + ".trellis_post", band_rows, base + ".trellis_post")
-        if band_s16 is None or band_pre is None or band_post is None:
-            raise ValueError(f"{info.name}: coded band without s16/pre/post")
-        if desc is None:
-            desc, s16, pre = band_desc, band_s16, band_pre
-        elif band_desc != desc or not np.array_equal(band_s16, s16) or not np.array_equal(band_pre, pre):
-            raise ValueError(
-                f"{info.name}: bands disagree on descriptor/pre/s16, which one coded-linear "
-                "cannot carry"
-            )
-        if _side(source, base + ".trellis_pin", k, base + ".trellis_pin") is not None:
-            raise ValueError(f"{info.name}: banded heads with an input gather are not supported")
-        posts.append(band_post)
-        payloads.append(np.ascontiguousarray(source.tensor_bytes(info.name)))
-
-    codes = np.concatenate(payloads)
-    post = np.concatenate(posts)
-    # Row r of the concatenated bands is vocabulary entry gather[r]; the Op's output gather is the
-    # inverse map, so out[v] = coded[argsort(gather)[v]].
-    pout = np.argsort(gather).astype(np.int32)
-    if len(post) != rows:
-        raise ValueError(f"{head}: band rows and post disagree")
-    return CodedMatrix(head + ".weight", rows, k, bits, codes, s16, pre, post, None, None, pout, desc)
+        layout.append({"tensor": info.name, "band": int(BAND_PATTERN.fullmatch(info.name).group("index")),
+                       "offset": offset, "rows": band_rows, "bits": info.type_id - TYPE_TRL1 + 1})
+        offset += band_rows
+    if offset != rows:
+        raise ValueError(f"{head}: band rows and vocab_gather disagree")
+    return {"head": head, "k": k, "rows": rows, "bands": layout, "gather": gather}
 
 
 def coded_matrices(source: GGUFFile) -> Iterable[CodedMatrix]:
-    heads: set[str] = set()
-    band_members: set[str] = set()
     for info in source.tensors.values():
-        match = BAND_PATTERN.fullmatch(info.name)
-        if match:
-            heads.add(match.group("head"))
-            band_members.add(info.name)
-    for info in source.tensors.values():
-        if info.name in band_members or ".trellis_" in info.name:
-            continue
-        if info.name.endswith(".vocab_gather"):
+        if ".trellis_" in info.name or info.name.endswith(".vocab_gather"):
             continue
         if TYPE_TRL1 <= info.type_id <= TYPE_TRL6:
             if len(info.shape) != 2:
@@ -228,12 +205,14 @@ def coded_matrices(source: GGUFFile) -> Iterable[CodedMatrix]:
                 raise ValueError(f"{info.name}: coded geometry must be 16-divisible")
             base = info.name[: -len(".weight")] if info.name.endswith(".weight") else info.name
             bits = info.type_id - TYPE_TRL1 + 1
-            codes = np.ascontiguousarray(source.tensor_bytes(info.name))
-            if codes.nbytes != n * (k // 16) * (2 * bits):
+            if info.nbytes != n * (k // 16) * (2 * bits):
                 raise ValueError(f"{info.name}: code payload does not match the geometry")
-            yield _coded_matrix(source, info.name, n, k, codes, base, bits)
-    for head in sorted(heads):
-        yield _band_matrix(source, head)
+            yield _coded_matrix(source, info.name, n, k, ((info.name, info.nbytes),), base, bits)
+
+
+def banded_heads(source: GGUFFile) -> dict[str, dict[str, Any]]:
+    heads = {m.group("head") for m in (BAND_PATTERN.fullmatch(n) for n in source.tensors) if m}
+    return {head: band_plan(source, head) for head in sorted(heads)}
 
 
 def _specs(matrices: list[CodedMatrix]) -> tuple[list[Any], dict[str, CodedMatrix]]:
@@ -288,6 +267,15 @@ def convert(source_path: str | Path, destination: str | Path, *,
                 specs.append(TensorSpec(object_id, shape, format_name, "contiguous_le_v1"))
                 side_payloads[object_id] = np.ascontiguousarray(values)
 
+        # A banded head keeps its bands as the separate coded matrices above; the composed
+        # vocabulary permutation becomes its own object so the engine can scatter band rows.
+        heads = banded_heads(source)
+        for head, plan in heads.items():
+            object_id = head + ".vocab_gather"
+            gather = plan["gather"]
+            specs.append(TensorSpec(object_id, gather.shape, "int32", "contiguous_le_v1"))
+            side_payloads[object_id] = np.ascontiguousarray(gather)
+
         bindings = {matrix.name: {"object": matrix.name} for matrix in matrices}
         uses = []
         for matrix in matrices:
@@ -302,12 +290,15 @@ def convert(source_path: str | Path, destination: str | Path, *,
             "name": source_path.stem,
             "trellis.version": 1,
             "trellis.descriptors": {matrix.name: matrix.desc for matrix in matrices},
+            "trellis.head_bands": {head: plan["bands"] for head, plan in heads.items()},
+            "trellis.head_vocab_gather": {head: head + ".vocab_gather" for head in heads},
         }
         components = {"text": {"config": {"architecture": source.kv.get("general.architecture", "qwen35")}}}
         for matrix in matrices:
-            if encoded_size("trellis_tile16_v1", matrix.format, matrix.shape) != matrix.codes.nbytes:
+            if encoded_size("trellis_tile16_v1", matrix.format, matrix.shape) != matrix.payload_bytes:
                 raise ValueError(f"{matrix.name}: encoded size disagrees with the payload")
 
+        chunk = 64 * 1024 * 1024
         with ArtifactWriter(destination, specs, components=components, bindings=bindings,
                             uses=uses, metadata=metadata,
                             provenance={"source": str(source_path),
@@ -315,12 +306,17 @@ def convert(source_path: str | Path, destination: str | Path, *,
                                         "coded_tensors": len(matrices)}) as writer:
             def write_bytes(object_id: str, data: np.ndarray) -> None:
                 view = memoryview(np.ascontiguousarray(data)).cast("B")
-                chunk = 64 * 1024 * 1024
                 for start in range(0, len(view), chunk):
                     writer.write_region(object_id, start, view[start : start + chunk])
 
             for matrix in matrices:
-                write_bytes(matrix.name, matrix.codes)
+                offset = 0
+                for tensor, nbytes in matrix.segments:
+                    for start in range(0, nbytes, chunk):
+                        end = min(nbytes, start + chunk)
+                        writer.write_region(matrix.name, offset + start,
+                                            source.tensor_bytes(tensor, start, end))
+                    offset += nbytes
             for object_id, values in side_payloads.items():
                 write_bytes(object_id, values)
 

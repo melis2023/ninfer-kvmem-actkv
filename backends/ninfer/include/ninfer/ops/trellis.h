@@ -25,8 +25,10 @@ namespace ninfer::ops {
  * whole-slice Hadamard with Paley factors H12/H20/H68 (kind 2, up to eight fused parts). The
  * output side uses the inverse of the same transform. Weight formats are TRL1..TRL6 (1..6 bits per
  * weight) with the `trellis_tile16_v1` layout; side tensors live in the artifact as the Use
- * auxiliaries `s16` (F16 [K/16]), `pre` (F32 [K]), `post` (F32 [N]), and optionally `pin` (I32 [K])
- * and `pout` (I32 [N]), with the descriptor in the parameter's `trellis_desc` metadata.
+ * auxiliaries `s16` (F32 [K/16], the GGUF's F16 promoted exactly), `pre` (F32 [K]), `post` (F32
+ * [N]), and optionally `pin` (I32 [K]) and `pout` (I32 [N]), with the descriptor in the parameter's
+ * `trellis_desc` metadata. The descriptor is host memory; the planes and the payload are device
+ * memory.
  *
  * Numeric: activations are rotated in FP32, the tile product accumulates in FP32, and the output
  * side runs in FP32 before one BF16 rounding of `y`. The ideal result is the definition above

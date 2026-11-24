@@ -60,45 +60,75 @@ workspace = `(K + N + 2·max(K,N)) · T · 4` 字节（旋转激活 + FP32 结�
 - `trellis_s16`（F16）升为 F32：fp16→fp32 是精确映射，数学不变。
 - 侧张量成为 Use 的 auxiliaries（`s16`/`pre`/`post`/`pin`/`pout`），desc 写入
   `metadata["trellis.descriptors"]`；`trellis.version` 必须是 1。
-- banded head：16 个 band 拼成一张矩阵（band 顺序），`pout = argsort(vocab_gather)`；
-  要求 band 之间 `pre`/`s16`/desc 完全一致，否则拒绝（一个 coded linear 只能带一套）。
+- banded head：**16 个 band 各自单独成矩阵**（真实文件 band 位宽不同：`output.band00` 是 TRL6、
+  尾部 band 是 TRL4/TRL3/TRL2，行数也不同），head 的 `vocab_gather` 单独成对象，band 布局
+  （offset/rows/bits）写进 `trellis.head_bands`。引擎按 ggml 的语义执行：逐 band 出 logits，
+  再按 `vocab_gather` 落到词表位置（scatter），等价于 `concat(bands)` + `get_rows(·, gather)`。
+
+## 2.1 三处容易踩错的语义（已按 ggml-trellis.cpp 对齐）
+
+1. **`post` 按存储行索引**，不是输出行：`y[i] = post[pout[i]] · Ŵ[pout[i]]`。ggml 是先在存储序
+   乘 `post` 再 `memcpy` 取 `pout[i]` 行。设备 kernel 早期按输出行取 `post`，实测与主机参考差
+   1.4×，已修。
+2. **`pout` 是 gather**（`out[i] = coded[pout[i]]`），不是 scatter、也不是 `argsort`。
+3. **`s16` 是每 16 个输入列一个标量**；artifact 只有 FP32/INT32 直接平面，所以写出时把 GGUF 的
+   F16 升为 F32（`fp16→fp32` 精确，数值与 ggml 完全一致）。读侧（主机参考、设备 kernel）都按
+   F32 取，早期按 half 解会把 5e-4 的 scale 读成垃圾，实测把权重放大 10⁶ 量级。
 
 ## 3. 已验证
 
+### 3.1 真实权重转换
+
 ```powershell
 cd backends\ninfer
-python -m tools.trellis.verify_trellis selftest     # 合成 NariQ GGUF → .ninfer → 读回 → 解码
+python -m tools.convert.trellis_gguf            # 或脚本里 convert(src, dst)
 ```
 
-当前输出：
+`I:\model\Qwen3.8-27B-NariQ-3.0bpw.gguf`（10.10 GB）→ `Qwen3.8-27B-NariQ-3.0bpw.ninfer`
+（10,102,881,536 字节，513 个 coded 矩阵：TRL2 82 / TRL3 199 / TRL4 99 / TRL5 132 / TRL6 1，
+另加 16 个 head band 与 1 个 `output.vocab_gather`），用时约 40 秒（tile 字节按 64 MB 分块流式拷贝，
+不在内存里拼 10 GB）。`trellis.head_bands` / `trellis.head_vocab_gather` / `trellis.descriptors`
+均已写进 metadata。
+
+### 3.2 真权重逐字节与解码一致性
+
+`python -m tools.trellis.check_real`：抽样 `blk.0.ffn_up` / `output.band00` / `output.band03` /
+`blk.0.attn_qkv` / `token_embd` / `blk.3.attn_q`，artifact 里的 tile 字节与源 GGUF **sha256 相同**，
+两套独立解码实现（word-window / bitstream）**逐位一致**，网格落在 `[-126,126]`。
+
+### 3.3 GPU 算子对拍（真权重）
+
+```powershell
+python -m tools.trellis.dump_probe I:\model\Qwen3.8-27B-NariQ-3.0bpw.ninfer I:\model\trellis-probe
+build-backends\ninfer\tests\ninfer_trellis_real_test.exe I:\model\trellis-probe
+```
 
 ```text
-converted 2 coded matrices -> 7808 bytes
-  blk.0.attn_q.weight: (32, 64) trellis_trl3 grid=[-111,105] w_std=0.7662
-  output.weight: (32, 64) trellis_trl3 grid=[-110,114] w_std=0.9570
-selftest ok
+ok   blk.0.ffn_up.weight: TRL2 17408x5120 relative L2 0.001664 absmax 0.0078
+ok   blk.0.attn_qkv.weight: TRL3 10240x5120 relative L2 0.001680 (pout)
+ok   output.band00.weight: TRL6 15488x5120 relative L2 0.001664
+trellis real-weight gate ok
 ```
 
-覆盖到的：GGUF 类型 44..49 的读取、desc/侧张量校验、banded head 拼接与 `pout` 组合、
-`.ninfer` 目录/对象/编码尺寸校验（`Artifact.open` 会拒绝任何尺寸不符）、
-**两种独立 tile 解码写法逐位一致**、解码网格落在 `[-126,126]`。
+相对 L2 只有 BF16 输出舍入（1/256 = 0.3%）的一半，说明设备时序与主机定义在同一 FP32 算术上重合；
+解码后的 `rms W` 为 0.010 / 0.016 / 0.014，与 Qwen3.8-27B 同类矩阵的量级一致（早期 `s16` 按 half
+读时这里是 6320，是发现该 bug 的入口）。
 
-未覆盖（下一步的门槛）：
-
-1. **主机参考 ↔ 设备实现逐元素一致**：`trellis_reference.cpp` 是权威，但目前没有编译好的
-   `trellis_reference_test`；需要在能出 `sm_120a` 的机器上核对 tile 乘、RHT、Paley 交叉。
-2. **真实权重**：本地没有 `Qwen3.8-27B-NariQ-*.gguf`，所有数字都来自合成 tile。
-3. **模型接线**：见下。
+**注意**：主机参考是本分支对 `ggml-trellis.cpp` 的移植，因此这项门禁证明"设备 == 本移植定义"；
+与 `ggml` 原实现的逐元素对拍仍需编译 `libggml`（`decode_reference.py` 的 ctypes 路线）后补。
 
 ## 4. 还缺什么（按顺序）
 
 | # | 内容 | 位置 |
 |---|---|---|
 | 1 | loader 把 Use auxiliaries 落进 `Weight::trellis_*`（s16/pre/post/pin/pout + desc）：binder 目前只认 `input_columns` 这一个 auxiliary | `src/artifact/binder.cpp`、`src/core/weight_view.cpp` |
-| 2 | `text/token_embedding`、`text/output_head` 接受 coded 权重；`embed_tokens` 加 coded 分支（`ops::trellis_embedding` 已就绪）；banded head 在 `project` 处改成"16 band + `pout`"（转换器已输出该语义的单张矩阵，引擎只需一次 Op） | `src/models/qwen3_5/load/text.cpp`、`execution/text.cpp` |
-| 3 | KVMem / 白名单：`serve_options` 对 coded 权重的 target 放行 `--spec dflash2`；`--spec dspine` 要等 DSpine 自己的 KVMem 打通（`907ed3bb3` 之后仍被拒） | `src/serve/serve_options.cpp` |
-| 4 | 性能：当前 `tile_product` 是 smem int8 + FP32 SIMT，正确优先；decode 走 sm_80+ INT8 tensor core、prefill 复用 A8 主循环是后续 1.5–2 周的量 | `src/ops/trellis/trellis_kernels.cu` |
-| 5 | 视觉：NariQ 发布只有 BF16 mmproj，与"视觉必须 Q4"的约定冲突，需单独决策 | 转换路径 |
+| 2 | 参数命名：本转换器沿用 GGUF 名（`blk.0.attn_qkv.weight`…），`qwen3_5` 引擎要的是 `text/layers/0/...` —— 需要一张映射表，且 **coded 投影是"整矩阵"**，不能像 `gguf_blocks.py` 那样把 `attn_qkv` 拆成 query/key/value、把 `attn_q` 拆成 query+gate 的交错行（拆分会破坏 16 行 tile 组） | `tools/convert/*`、`src/models/qwen3_5/load/prepare.cpp` |
+| 3 | 因此模型侧要能"一条 coded 投影 → 多路逻辑投影"：`attn_qkv`(10240) → q/k/v、`attn_q`(12288) → query/gate 交错、DeltaNet 的 value 头；这是把 ggml 图里 `split/reshape` 搬到 ninfer 的关键 | `src/models/qwen3_5/execution/text.cpp` |
+| 4 | banded head：16 个 band 各一次 coded linear，再按 `trellis.head_bands` + `vocab_gather` **scatter** 到 logits（需要一个新的落行步骤，或把 band 循环放进 head 的 executor） | 同上 + `src/ops/trellis` |
+| 5 | coded embedding（`token_embd`，TRL2、24.8 万行、CPU 查表是 nari-llama 已知瓶颈）接 `trellis_embedding` | 同上 |
+| 6 | KVMem / 白名单：`serve_options` 对 coded 权重的 target 放行 `--spec dflash2`；`--spec dspine` 仍要等 DSpine 自己的 KVMem 打通（`907ed3bb3` 之后仍被拒） | `src/serve/serve_options.cpp` |
+| 7 | 性能：当前 `tile_product` 是 smem int8 + FP32 SIMT，正确优先；decode 走 sm_80+ INT8 tensor core、prefill 复用 A8 主循环是后续 1.5–2 周的量 | `src/ops/trellis/trellis_kernels.cu` |
+| 8 | 视觉：NariQ 发布只有 BF16 mmproj，与"视觉必须 Q4"的约定冲突，需单独决策 | 转换路径 |
 
 ## 5. 已知风险
 

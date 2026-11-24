@@ -146,7 +146,7 @@ __global__ void paley_kernel(const float* in, float* out, const signed char* h, 
 // thread decodes one of the 256 tile positions per input tile and then multiplies the 16-row slab.
 template <int CHUNK>
 __global__ void tile_product_kernel(const float* xa, const std::uint32_t* codes,
-                                    const std::uint16_t* s16, float* yr, int K, int N, int T,
+                                    const float* s16, float* yr, int K, int N, int T,
                                     int bits, int kt_total) {
     __shared__ signed char tile[256];
     const int n0 = static_cast<int>(blockIdx.x) * 16;
@@ -168,7 +168,7 @@ __global__ void tile_product_kernel(const float* xa, const std::uint32_t* codes,
         tile_position(tid, row, col);
         tile[row * 16 + col] = static_cast<signed char>(grid_value(window(words, nw, bits, tid)));
         __syncthreads();
-        const float scale = __half2float(__ushort_as_half(s16[i]));
+        const float scale = s16[i];
         const std::int64_t kbase = static_cast<std::int64_t>(i) * 16;
 #pragma unroll
         for (int c = 0; c < CHUNK / 16; ++c) {
@@ -202,13 +202,15 @@ __global__ void post_gather_kernel(const float* yr, const float* post, const std
         const std::int64_t col = i / n;
         const std::int64_t row = i - col * n;
         const std::int32_t source = pout != nullptr ? pout[row] : static_cast<std::int32_t>(row);
-        out[i] = __float2bfloat16(post[row] * yr[static_cast<std::int64_t>(source) + col * n]);
+        // Both the row scale and the tile row are in storage order: `post` belongs to the stored row
+        // that `pout[row]` names, not to the output row (a banded head keeps one post per band row).
+        out[i] = __float2bfloat16(post[source] * yr[static_cast<std::int64_t>(source) + col * n]);
     }
 }
 
 // One coded row per CUDA block: decode the 16-row group holding the id, keep the wanted row.
 __global__ void decode_row_kernel(const std::int32_t* ids, const std::uint32_t* codes,
-                                  const std::uint16_t* s16, float* g, int K, int N, int bits,
+                                  const float* s16, float* g, int K, int N, int bits,
                                   int kt_total) {
     __shared__ signed char tile[256];
     const int t = blockIdx.x;
@@ -225,7 +227,7 @@ __global__ void decode_row_kernel(const std::int32_t* ids, const std::uint32_t* 
         tile_position(threadIdx.x, row, col);
         tile[row * 16 + col] = static_cast<signed char>(grid_value(window(words, nw, bits, threadIdx.x)));
         __syncthreads();
-        const float scale = __half2float(__ushort_as_half(s16[i]));
+        const float scale = s16[i];
         if (threadIdx.x < 16) {
             g[static_cast<std::int64_t>(i) * 16 + threadIdx.x +
               static_cast<std::int64_t>(K) * t] = static_cast<float>(tile[want * 16 + threadIdx.x]) * scale;
@@ -303,7 +305,7 @@ void tile_product(const float* xa, const Weight& w, float* yr, int tokens, cudaS
     const unsigned nx = static_cast<unsigned>(w.n / 16);
     const unsigned ny = static_cast<unsigned>((tokens + kChunk - 1) / kChunk);
     tile_product_kernel<kChunk><<<dim3(nx, ny), kThreads, 0, stream>>>(
-        xa, static_cast<const std::uint32_t*>(w.qdata), static_cast<const std::uint16_t*>(w.trellis_s16),
+        xa, static_cast<const std::uint32_t*>(w.qdata), static_cast<const float*>(w.trellis_s16),
         yr, w.k, w.n, tokens, bits, kt_total);
 }
 
@@ -317,7 +319,7 @@ void decode_row(const Tensor& ids, const Weight& w, float* g, int tokens, cudaSt
     const int bits = bits_of(w.qtype);
     decode_row_kernel<<<static_cast<unsigned>(tokens), kThreads, 0, stream>>>(
         static_cast<const std::int32_t*>(ids.data), static_cast<const std::uint32_t*>(w.qdata),
-        static_cast<const std::uint16_t*>(w.trellis_s16), g, w.k, w.n, bits, w.k / 16);
+        static_cast<const float*>(w.trellis_s16), g, w.k, w.n, bits, w.k / 16);
 }
 
 void pre_and_gather_bf16(const float* g, const Weight& w, Tensor& rows, int tokens,
@@ -328,3 +330,4 @@ void pre_and_gather_bf16(const float* g, const Weight& w, Tensor& rows, int toke
 }
 
 } // namespace ninfer::ops::detail::trellis
+
