@@ -212,10 +212,16 @@ class MtpAdaptiveBatchController final {
 public:
     // `floor_window` is the narrowest width the controller settles on while every row has that
     // many drafts ready: 3 where narrower widths cost about as much (the Qwen3.5 Programs, whose
-    // drafts are ready before the round), 1 where each draft is a step of its own.
-    void reset(std::uint32_t maximum_window, std::uint32_t floor_window = 3) noexcept {
+    // drafts are ready before the round), 1 where each draft is a step of its own. `startup`
+    // is the width the first cohort opens on; 0 keeps the upstream probe from three.
+    // `material_gain` is the score margin a move must clear: a round cost that barely varies
+    // with the width needs a wider margin so measured jitter cannot flip the selection.
+    void reset(std::uint32_t maximum_window, std::uint32_t floor_window = 3,
+               std::uint32_t startup = 0, float material_gain = 1.01F) noexcept {
         maximum_window_             = std::clamp(maximum_window, 1U, kAdaptiveMtpMaximumDrafts);
         floor_window_               = std::clamp(floor_window, 1U, maximum_window_);
+        startup_window_             = startup == 0 ? 0U : std::min(startup, maximum_window_);
+        material_gain_              = std::max(material_gain, 1.0F);
         selected_window_            = default_startup_window();
         candidate_window_           = selected_window_;
         rounds_at_window_           = 0;
@@ -330,7 +336,7 @@ public:
                 }
             }
         }
-        const bool material_gain = best_score > current_score * 1.01F;
+        const bool material_gain = best_score > current_score * material_gain_;
         if (best_window != selected_window_ && material_gain) {
             if (candidate_window_ == best_window) {
                 if (candidate_rounds_ != UINT8_MAX) { ++candidate_rounds_; }
@@ -375,7 +381,7 @@ public:
 
 private:
     [[nodiscard]] std::uint32_t default_startup_window() const noexcept {
-        return std::min(3U, maximum_window_);
+        return startup_window_ != 0 ? startup_window_ : std::min(3U, maximum_window_);
     }
 
     [[nodiscard]] std::uint32_t
@@ -455,6 +461,8 @@ private:
     MtpRoundCostModel costs_;
     std::uint32_t maximum_window_   = 1;
     std::uint32_t floor_window_     = 3;
+    std::uint32_t startup_window_   = 0;
+    float material_gain_            = 1.01F;
     std::uint32_t selected_window_  = 1;
     std::uint32_t candidate_window_ = 1;
     std::uint8_t rounds_at_window_  = 0;

@@ -824,9 +824,17 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             cudaMemsetAsync(sampling_config.data, 0, sampling_config.bytes(), device.stream));
     }
     device.synchronize();
-    if (speculative_backend == SpeculativeBackend::Mtp && mtp_policy == MtpDraftPolicy::Adaptive) {
+    if (mtp_policy == MtpDraftPolicy::Adaptive &&
+        (speculative_backend == SpeculativeBackend::Mtp ||
+         is_masked_draft_backend(speculative_backend))) {
         mtp_controller.emplace();
-        mtp_controller->reset(draft_window);
+        // A masked drafter's verify cost barely varies with the width (the target forward is
+        // memory-bound), so below three drafts a round keeps almost its cost while committing
+        // fewer tokens; and a move must clear a wider score margin, or measured jitter flips the
+        // width. The MTP programmes keep their upstream numbers.
+        const bool mtp_backend = speculative_backend == SpeculativeBackend::Mtp;
+        mtp_controller->reset(draft_window, 3U, mtp_backend ? 0U : draft_window,
+                              mtp_backend ? 1.01F : 1.03F);
     }
     if (use_cuda_graph) {
         StartupPhaseScope graph_phase(startup_observer, StartupPhase::CudaGraphPrepare);

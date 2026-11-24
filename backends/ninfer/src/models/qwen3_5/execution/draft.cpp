@@ -1142,8 +1142,35 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         const std::size_t ingress_bytes =
             state.ngram ? sizeof(qwen3_5::DFlashDecodeIngress)
                         : offsetof(qwen3_5::DFlashDecodeIngress, ngram_tokens);
+        // Round-level segments for NINFER_DSPINE_PROFILE=1 (pair with --no-cuda-graph:
+        // the stream syncs below cannot run inside a capture). Same host-clock,
+        // sync-boundary style as the drafter's [draft-prof-A] line: the absolute
+        // values carry the sync tax, the shares are the point.
+        const bool prof = std::getenv("NINFER_DSPINE_PROFILE") != nullptr;
+        double s_ingress = 0.0, s_taps = 0.0, s_append = 0.0, s_propose = 0.0, s_verify = 0.0,
+               s_egress = 0.0;
+        const double s_start = prof ? std::chrono::steady_clock::now().time_since_epoch()
+                                          .count() / 1e6
+                                    : 0.0;
+        const auto prof_now = [] {
+            return std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                .count();
+        };
+        double s_mark = prof ? prof_now() : 0.0;
+        // One stream sync per boundary: the delta measured here is the GPU work enqueued
+        // since the previous boundary, plus the round's host-side bookkeeping.
+        const auto prof_add = [&](double& sink) {
+            if (prof) {
+                CUDA_CHECK(cudaStreamSynchronize(state.execution.device.stream));
+                const double now = prof_now();
+                sink += now - s_mark;
+                s_mark = now;
+            }
+        };
         CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress, ingress_bytes,
                                    cudaMemcpyHostToDevice, state.execution.device.stream));
+        prof_add(s_ingress);
 
         Tensor anchors            = frame.anchors.slice(0, 0, batch_size);
         Tensor frontiers          = frame.execution_frontiers.slice(0, 0, batch_size);
@@ -1182,6 +1209,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         ops::prepare_ragged_prefix(dflash_state(state).pending_features, active_lanes,
                                    context_starts, draft_frontiers, compact_features, append_positions,
                                    append_counts, state.execution.device.stream);
+        prof_add(s_taps);
         if (const char* dump = std::getenv("NINFER_DSPINE_DUMP"); dump != nullptr) {
             dump_tensor(compact_features, dump, "compact_features",
                         state.execution.device.stream);
@@ -1198,6 +1226,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         append_context_impl(state, compact_features, append_positions, append_counts,
                             state_destinations, dflash_rows,
                             {0, static_cast<std::uint32_t>(frame.append_positions.ne[0])});
+        prof_add(s_append);
 
         const auto proposal_k = state.neural_proposal_drafts;
         if (proposal_k == 0 || proposal_k > kDFlashDecodeMaximumDrafts || proposal_k > k ||
@@ -1246,6 +1275,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         if (state.execution.io.structured) {
             state.execution.io.structured->enqueue_dflash(drafts, state.execution.device.stream);
         }
+        prof_add(s_propose);
         ops::speculative_prepare_verify_inputs(anchors, drafts, frontiers, extents, verify_ids,
                                                target_positions, state.execution.device.stream);
 
@@ -1328,9 +1358,22 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
                 trace_append(target_rows, trace, 9, stream);
             }
         }
+        prof_add(s_verify);
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    sizeof(qwen3_5::DFlashDecodeEgress), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));
+        prof_add(s_egress);
+        if (prof) {
+            CUDA_CHECK(cudaStreamSynchronize(state.execution.device.stream));
+            const double total = prof_now() - s_start;
+            std::fprintf(stderr,
+                         "[round-prof] k=%d b=%d drafter=%s ing=%.2f taps=%.2f app=%.2f "
+                         "prop=%.2f ver=%.2f egr=%.2f total=%.2f ms\n",
+                         static_cast<int>(k), batch_size,
+                         draft_cfg.dspine ? "dspine"
+                                          : (draft_cfg.dflash2 ? "dflash2" : "dflash"),
+                         s_ingress, s_taps, s_append, s_propose, s_verify, s_egress, total);
+        }
     };
 }
 

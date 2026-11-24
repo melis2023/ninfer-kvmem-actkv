@@ -485,18 +485,19 @@ void ProgramImpl::prepare_graphs() {
         }
     }
     if (is_masked_draft_backend(speculative_backend)) {
-        for (const bool copy : {false, true}) {
-            if (copy && ngram_draft_window == 0) { continue; }
-            // Each family verifies at its own window, on the one frame viewed at that width. A
-            // batch>1 copy round also runs the drafter so rows without a copy keep their neural
-            // proposal.
-            const std::uint32_t family_window = copy ? ngram_draft_window : draft_window;
-            // Profiles and target KV use the compact device window. The cyclic draft attention
-            // still receives the logical capacity in its captured envelope.
-            const std::uint32_t dflash_capacity =
-                kvmem_window_tokens ? kvmem_window_tokens : capacity;
-            DecodeGraphFamily& family         = copy ? ngram_graphs : dflash_graphs;
-            const std::uint32_t batch_limit   = copy && family_window > 15U ? 1U : max_concurrency;
+        // Adaptive width selects among 1..draft_window neural rounds, so each width needs its own
+        // graphs; a width is its own topology, since its kernels have other shapes.
+        const bool adaptive_width       = mtp_policy == MtpDraftPolicy::Adaptive;
+        const std::uint32_t first_width = adaptive_width ? 1U : draft_window;
+        // A width's planned classes stay below this stride, so no two widths share a class.
+        constexpr std::uint32_t kDflashClassesPerWidth = 64;
+        // Profiles and target KV use the compact device window. The cyclic draft attention
+        // still receives the logical capacity in its captured envelope.
+        const std::uint32_t dflash_capacity =
+            kvmem_window_tokens ? kvmem_window_tokens : capacity;
+        const auto capture_family = [&](bool copy, std::uint32_t family_window) {
+            DecodeGraphFamily& family       = copy ? ngram_graphs : dflash_graphs;
+            const std::uint32_t batch_limit = copy && family_window > 15U ? 1U : max_concurrency;
             const auto batch_one_profiles =
                 dflash_graph_profiles(speculative_backend, dflash_capacity, family_window, 1);
             validate_graph_profiles(batch_one_profiles, dflash_capacity - 1, "DFlash");
@@ -507,8 +508,8 @@ void ProgramImpl::prepare_graphs() {
                                                        *dflash_host_ingress,
                                                        *dflash_host_egress,
                                                        state_images->continuation_hidden_store()};
-            dflash_state.ngram                    = copy;
-            dflash_state.neural_proposal_drafts   = draft_window;
+            dflash_state.ngram                  = copy;
+            dflash_state.neural_proposal_drafts = copy ? draft_window : family_window;
             const GraphExecutionProfile code_warm = batch_one_profiles.front();
             const ops::CausalAttentionExecutionEnvelope code_warm_target{
                 1,
@@ -521,7 +522,8 @@ void ProgramImpl::prepare_graphs() {
                                            code_warm_target, nullptr);
             device.synchronize();
 
-            family.profiles.reserve(batch_one_profiles.size() * batch_limit);
+            family.profiles.reserve(family.profiles.size() +
+                                    batch_one_profiles.size() * batch_limit);
             for (std::uint32_t batch_size = 1; batch_size <= batch_limit; ++batch_size) {
                 const auto planned_profiles =
                     batch_size == 1 ? batch_one_profiles
@@ -534,9 +536,12 @@ void ProgramImpl::prepare_graphs() {
                     profile.batch_size             = batch_size;
                     profile.min_execution_frontier = planned.min;
                     profile.max_execution_frontier = planned.max;
-                    // Neural rounds select by frontier alone; copy rounds by their width.
-                    profile.verify_window = copy ? family_window : 0U;
+                    // Neural rounds select by frontier alone unless the controller picks the
+                    // width; copy rounds by their ngram window.
+                    profile.verify_window = copy ? family_window
+                                                 : (adaptive_width ? family_window : 0U);
                     profile.topology_class =
+                        (copy ? 0U : family_window * kDflashClassesPerWidth) +
                         planned.topology_class * max_concurrency + (batch_size - 1U);
                     const ops::CausalAttentionExecutionEnvelope target_envelope{
                         1, static_cast<std::uint32_t>(std::min<std::uint64_t>(
@@ -549,7 +554,15 @@ void ProgramImpl::prepare_graphs() {
                         profile.definition);
                 }
             }
+        };
+        if (adaptive_width) {
+            for (std::uint32_t width = first_width; width <= draft_window; ++width) {
+                capture_family(false, width);
+            }
+        } else {
+            capture_family(false, draft_window);
         }
+        if (ngram_draft_window != 0) { capture_family(true, ngram_draft_window); }
     }
 
     const auto prepare_profile = [&](const DecodeGraphProfile& profile) {

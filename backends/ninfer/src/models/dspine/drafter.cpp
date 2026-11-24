@@ -21,7 +21,10 @@
 #include "ninfer/ops/sliding_window_attention.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -233,6 +236,30 @@ void Drafter::propose(const ProposalCall& call, std::span<const CyclicKVCacheLay
     for (const auto& layer : ring) { require(layer.capacity == window_, "the ring's capacity"); }
     nvtx::ScopedRange range(nvtx::Name::DFlashProposal, nvtx::Category::DFlash,
                             static_cast<std::uint64_t>(columns));
+    // Temporary path-A latency breakdown (NINFER_DSPINE_PROFILE=1; pair with
+    // --no-cuda-graph, stream syncs cannot run inside a capture). Remove after
+    // the hotspot pass.
+    const bool prof = std::getenv("NINFER_DSPINE_PROFILE") != nullptr;
+    double p_prefix = 0.0, p_attn = 0.0, p_mlp = 0.0, p_bridge = 0.0;
+    double p_head = 0.0, p_refine = 0.0;
+    const auto prof_now = [] {
+        return std::chrono::duration<double, std::milli>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    };
+    double p_mark = prof ? prof_now() : 0.0;
+    const auto prof_sync = [&] {
+        if (prof) { CUDA_CHECK(cudaStreamSynchronize(stream)); }
+        p_mark = prof_now();
+    };
+    const auto prof_add = [&](double& sink) {
+        if (prof) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            const double now = prof_now();
+            sink += now - p_mark;
+            p_mark = now;
+        }
+    };
     auto scope       = work.scope();
     Tensor ids       = work.alloc(DType::I32, {w, b});
     Tensor positions = work.alloc(DType::I32, {w, b});
@@ -251,6 +278,7 @@ void Drafter::propose(const ProposalCall& call, std::span<const CyclicKVCacheLay
     Tensor normed_flat   = normed.view({h, columns});
     target_.embed(ids.view({columns}), residual_flat, stream);
     ops::rmsnorm(residual_flat, p.layers.front().input_norm, eps, false, normed_flat, stream);
+    prof_add(p_prefix);
     const ops::SlidingWindowAttentionExecutionEnvelope envelope{0, max_context_};
     const float scale = static_cast<float>(1.0 / std::sqrt(static_cast<double>(d)));
     const bool norm_rope = fused_norm_rope(c, w, b);
@@ -258,6 +286,7 @@ void Drafter::propose(const ProposalCall& call, std::span<const CyclicKVCacheLay
         const auto& layer = p.layers[l];
         const bool last   = l + 1 == p.layers.size();
         nvtx::ScopedRange layer_range(nvtx::Name::DFlashLayer, nvtx::Category::DFlash, l);
+        prof_sync();
         {
             // Attention over the normalized input, causal inside the block.
             auto branch   = work.scope();
@@ -308,6 +337,7 @@ void Drafter::propose(const ProposalCall& call, std::span<const CyclicKVCacheLay
                 ops::residual_add(output, residual_flat, stream);
             }
         }
+        prof_add(p_attn);
         {
             // The MLP over the post-attention norm; the residual then holds the bridge's raw row.
             auto branch    = work.scope();
@@ -333,6 +363,7 @@ void Drafter::propose(const ProposalCall& call, std::span<const CyclicKVCacheLay
                 ops::residual_add(down, residual_flat, stream);
             }
         }
+        prof_add(p_mlp);
         {
             // The bridge's write, and the next layer's (or the final) norm of its output.
             auto branch       = work.scope();
@@ -353,6 +384,7 @@ void Drafter::propose(const ProposalCall& call, std::span<const CyclicKVCacheLay
             ops::dspine_bridge_finish(residual, rms, delta, next, eps, residual, normed,
                                       last ? &denominator : nullptr, stream);
         }
+        prof_add(p_bridge);
     }
     // The mask columns' final hidden, packed row after row: the head's candidates, then the
     // refinement's walk over them.
@@ -375,6 +407,7 @@ void Drafter::propose(const ProposalCall& call, std::span<const CyclicKVCacheLay
         Tensor candidates = call.candidates;
         ops::candidate_topk(logits, target_.domain, candidates, scores, work, stream);
     }
+    prof_add(p_head);
     Tensor drafts     = call.drafts;
     Tensor proposal_q = call.proposal_q;
     Tensor confidence = call.confidence;
@@ -382,6 +415,14 @@ void Drafter::propose(const ProposalCall& call, std::span<const CyclicKVCacheLay
                      p.sender_table, p.gate_bias, call.anchors, call.frontiers, call.configs,
                      drafts, proposal_q, confidence.data != nullptr ? &confidence : nullptr, work,
                      stream);
+    prof_add(p_refine);
+    if (prof) {
+        std::fprintf(stderr,
+                     "[draft-prof-A] prefix %.2f layers %.2f (attn %.2f mlp %.2f bridge %.2f) "
+                     "head %.2f refine %.2f ms | k=%d cols=%d\n",
+                     p_prefix, p_attn + p_mlp + p_bridge, p_attn, p_mlp, p_bridge,
+                     p_head, p_refine, static_cast<int>(k), static_cast<int>(columns));
+    }
 }
 
 std::int32_t Drafter::prepare_columns(const Model& model, std::int32_t max_batch,
