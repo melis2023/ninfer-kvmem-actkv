@@ -410,12 +410,24 @@ void propose_dflash2_batch(DFlashBatchContext& state, qwen3_5::DFlashDecodeState
             work.alloc(DType::FP32, {dimension(config.dflash2->selector_top_k), mask_columns});
         // A rotated head reads its own copy: the selector projection below takes the primal hidden.
         if (state.execution.proposal_head == ProposalHead::Full) {
-            const auto& head        = state.execution.parameters.draft->output_head;
-            const Tensor head_input = rotated_input(hidden, head.hadamard_signs, work, stream);
-            ops::linear_topk(
-                head_input, head.weight,
-                dimension(state.execution.parameters.model.resources().public_token_count),
-                ids_flat, scores, work, stream);
+            const auto& target_head = state.execution.parameters.text.output_head;
+            if (target_head.banded()) {
+                // A NariQ target stores its vocabulary over coded bands, so the candidates come
+                // from dense logits: the banded head writes the public rows and candidate_topk
+                // reduces each column to its 16 best.
+                const auto vocab =
+                    dimension(state.execution.parameters.model.resources().public_token_count);
+                Tensor logits = work.alloc(DType::BF16, {vocab, mask_columns});
+                project(hidden, target_head, logits, work, stream);
+                ops::candidate_topk(logits, vocab, ids_flat, scores, work, stream);
+            } else {
+                const auto& head        = state.execution.parameters.draft->output_head;
+                const Tensor head_input = rotated_input(hidden, head.hadamard_signs, work, stream);
+                ops::linear_topk(
+                    head_input, head.weight,
+                    dimension(state.execution.parameters.model.resources().public_token_count),
+                    ids_flat, scores, work, stream);
+            }
         } else {
             const auto& head        = *state.execution.parameters.proposal;
             const Tensor head_input = rotated_input(hidden, head.head.hadamard_signs, work, stream);

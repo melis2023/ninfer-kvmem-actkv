@@ -681,7 +681,9 @@ public:
         out.final_norm         = tensor(w.final_norm);
         out.context_norm_offset = norm_offset(out.context_norm);
         out.final_norm_offset   = norm_offset(out.final_norm);
-        out.output_head        = head(w.output_head_use);
+        if (w.output_head_use.parameter != WeightId{}) {
+            out.output_head = head(w.output_head_use);
+        }
         out.layers.reserve(w.layers.size());
         for (std::size_t i = 0; i < w.layers.size(); ++i) {
             out.layers.push_back(with_context(

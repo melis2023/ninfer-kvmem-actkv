@@ -222,11 +222,16 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
         // A target that never carried a drafter declares no use for the drafter's hidden state, so
         // the head reads it through the text's own use instead.
         const std::string head_input = component + "/final_hidden";
+        // A banded head has no single `text/output_head` parameter and no Use of its own: the
+        // banded Op gathers the rows itself. Leave the handle empty instead of asking the binder
+        // for parameter SIZE_MAX.
         out->weights.draft->output_head_use =
-            bindings.use(out->weights.draft->output_head,
-                         bindings.has_use(out->weights.draft->output_head, head_input)
-                             ? head_input
-                             : std::string("text/final_hidden"));
+            out->weights.draft->output_head == WeightId{}
+                ? WeightUseId{}
+                : bindings.use(out->weights.draft->output_head,
+                               bindings.has_use(out->weights.draft->output_head, head_input)
+                                   ? head_input
+                                   : std::string("text/final_hidden"));
         out->draft_pending         = std::move(draft_bindings.weights);
         out->draft_materialization = std::move(draft_binder).finish();
     }
