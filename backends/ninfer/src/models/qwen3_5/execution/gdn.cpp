@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <vector>
 
 namespace ninfer::models::qwen3_5::execution {
 
@@ -75,15 +76,40 @@ std::size_t snapshot_scratch_bytes(const GdnParameters& parameters, const GdnCon
     return std::max(std::size_t{1}, bytes);
 }
 
+// The coded replay-record route exists but its verify numerics are still being validated, so it is
+// opt-in: by default a coded target refuses the replay-record GDN a DFlash2/DSpine round needs.
+bool coded_replay_record_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_CODED_REPLAY_RECORD");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
+
 std::size_t record_scratch_bytes(const GdnParameters& parameters, const GdnConfig& config,
                                  std::int32_t batch, std::int32_t first_width,
                                  std::int32_t last_width) {
     std::size_t bytes;
     if (const auto* coded = std::get_if<ops::CodedProjectionWeights>(&parameters.projection)) {
-        // The replay record's convolution is fused with the projection in every dense route; a
-        // coded parent has no such route, so the record path is refuse-only for now.
-        (void)coded;
-        throw std::invalid_argument("coded NariQ weights do not support replay-record GDN");
+        if (!coded_replay_record_enabled()) {
+            throw std::invalid_argument(
+                "coded NariQ weights do not support replay-record GDN "
+                "(set NINFER_CODED_REPLAY_RECORD=1 for the experimental route)");
+        }
+        // The coded route forms qkv and z itself, copies qkv to the replay record and runs the
+        // convolution from a copied state window, so its scratch is the coded projection plus the
+        // qkv/conv-output planes, z and one width-3 window.
+        const std::int32_t columns = std::max(batch, 1) * std::max(first_width, last_width);
+        const std::int32_t channels =
+            dimension(static_cast<std::uint64_t>(coded->parents.front().weight.n));
+        const std::int32_t value = dimension(static_cast<std::uint64_t>(config.value_width()));
+        bytes = ops::coded_projection_workspace_bytes(*coded, columns) +
+                static_cast<std::size_t>(channels) * static_cast<std::size_t>(columns) *
+                    sizeof(std::uint16_t) * 2 +
+                static_cast<std::size_t>(value) * static_cast<std::size_t>(columns) *
+                    sizeof(std::uint16_t) +
+                static_cast<std::size_t>(channels) * 3 * sizeof(std::uint16_t);
+        return std::max(std::size_t{1}, bytes);
     }
     if (const auto* gguf = std::get_if<ops::GgufProjectionWeights>(&parameters.projection)) {
         bytes = ops::gdn_input_proj_conv_record_workspace_capacity_bytes(*gguf, batch, first_width,
@@ -268,8 +294,54 @@ void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters
     WorkspaceArena scratch(workspace.alloc_bytes(
         record_scratch_bytes(parameters, config, hidden.ne[2], hidden.ne[1], hidden.ne[1])));
     if (const auto* coded = std::get_if<ops::CodedProjectionWeights>(&parameters.projection)) {
-        (void)coded;
-        throw std::invalid_argument("coded NariQ weights do not support replay-record GDN");
+        if (!coded_replay_record_enabled()) {
+            throw std::invalid_argument(
+                "coded NariQ weights do not support replay-record GDN "
+                "(set NINFER_CODED_REPLAY_RECORD=1 for the experimental route)");
+        }
+        // The coded route has no fused projection+convolution Op: form qkv and z with the coded
+        // projection, record the pre-convolution qkv (the replay input) and run the convolution
+        // from a copied state window so the persistent state stays untouched.
+        const std::int32_t width    = hidden.ne[1];
+        const std::int32_t batch    = hidden.ne[2];
+        const std::int32_t columns  = width * batch;
+        const std::int32_t channels = dimension(coded->parents.front().weight.n);
+        const std::int32_t value_rows = dimension(static_cast<std::uint64_t>(config.value_width()));
+        const std::int32_t key_rows   = dimension(static_cast<std::uint64_t>(config.key_width()));
+        Tensor qkv = scratch.alloc(DType::BF16, {channels, columns});
+        Tensor* const outputs[2] = {&qkv, &z};
+        ops::coded_projection(x.view({hidden.ne[0], columns}), *coded, outputs, 2, columns,
+                              scratch, stream);
+        CUDA_CHECK(cudaMemcpyAsync(conv_record.data, qkv.data, qkv.bytes(),
+                                   cudaMemcpyDeviceToDevice, stream));
+        Tensor conv_out  = scratch.alloc(DType::BF16, {channels, columns});
+        Tensor tmp_state = scratch.alloc(DType::BF16, {channels, 3});
+        std::vector<std::int32_t> slots(static_cast<std::size_t>(batch), 0);
+        if (initial_slots.data != nullptr) {
+            CUDA_CHECK(cudaMemcpy(slots.data(), initial_slots.data,
+                                  slots.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
+        }
+        for (std::int32_t b = 0; b < batch; ++b) {
+            Tensor state_in = conv_states.slice(2, slots[static_cast<std::size_t>(b)], 1)
+                                  .view({channels, 3});
+            Tensor xb = qkv.slice(1, b * width, width);
+            Tensor ob = conv_out.slice(1, b * width, width);
+            ops::causal_conv1d_silu(xb, parameters.convolution, state_in, tmp_state, ob, stream);
+        }
+        const auto copy_rows = [&](const Tensor& src, std::int32_t begin, const Tensor& dst) {
+            const std::size_t bytes = static_cast<std::size_t>(dst.ne[0]) *
+                                      static_cast<std::size_t>(columns) * sizeof(std::uint16_t);
+            CUDA_CHECK(cudaMemcpyAsync(
+                const_cast<void*>(dst.data),
+                static_cast<const std::uint8_t*>(src.data) +
+                    static_cast<std::size_t>(begin) * static_cast<std::size_t>(columns) *
+                        sizeof(std::uint16_t),
+                bytes, cudaMemcpyDeviceToDevice, stream));
+        };
+        copy_rows(conv_out, 0, query.view({key_rows, columns}));
+        copy_rows(conv_out, key_rows, key.view({key_rows, columns}));
+        copy_rows(conv_out, 2 * key_rows, value.view({value_rows, columns}));
+        return;
     }
     if (const auto* gguf = std::get_if<ops::GgufProjectionWeights>(&parameters.projection)) {
         ops::gdn_input_proj_conv_record(x, *gguf, parameters.convolution, conv_states,

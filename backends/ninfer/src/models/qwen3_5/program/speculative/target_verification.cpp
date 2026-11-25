@@ -29,19 +29,22 @@ void target_verify_accept(ExecutionCore& execution, Tensor& continuation_hidden_
     if (execution.io.structured != nullptr) { execution.io.structured->wait(execution.device.stream); }
     // Before acceptance adds this round's tokens to the penalty counts.
     gather_logprobs(execution, frame.target_logits, frame.sampling, &frame.drafts);
+    // The sparse accept op's workspace and sampling domain are fixed at the trained 248077 rows;
+    // a coded pack may carry the tokenizer's padded vocabulary (248320), so the accepted domain is
+    // the smaller of the two. physical_rows still comes from the logits plane.
+    const std::int32_t token_domain = std::min<std::int32_t>(
+        dimension(execution.parameters.model.resources().public_token_count), 248077);
     if (frame.proposal_q.data != nullptr) {
         ops::speculative_accept_sparse_drafts(
             frame.target_tokens, frame.target_logits, frame.drafts, frame.candidate_ids,
             frame.proposal_q, frame.current_extents, frame.frontiers, frame.anchors,
-            frame.licensed_tokens, frame.licensed_counts, frame.accepted_drafts,
-            dimension(execution.parameters.model.resources().public_token_count), frame.sampling,
-            {false}, execution.work, execution.device.stream);
+            frame.licensed_tokens, frame.licensed_counts, frame.accepted_drafts, token_domain,
+            frame.sampling, {false}, execution.work, execution.device.stream);
     } else {
         ops::speculative_accept_coupled_drafts(
             frame.target_tokens, frame.target_logits, frame.drafts, frame.current_extents,
             frame.frontiers, frame.anchors, frame.licensed_tokens, frame.licensed_counts,
-            frame.accepted_drafts,
-            dimension(execution.parameters.model.resources().public_token_count), frame.sampling,
+            frame.accepted_drafts, token_domain, frame.sampling,
             execution.work, execution.device.stream);
     }
     ops::speculative_select_accepted_hidden(frame.target_hidden, frame.accepted_drafts,

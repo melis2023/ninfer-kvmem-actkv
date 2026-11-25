@@ -994,12 +994,27 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
                     const auto& head = plan.proposal_head == ProposalHead::Optimized
                                            ? parameters.proposal->head
                                            : parameters.draft->output_head;
-                    if (execution::rotated(head.hadamard_signs)) {
-                        matrix(layout, DType::BF16, dimension(config.hidden_size), mask_columns);
+                    // A banded coded target has no single draft head: the draft takes the target's
+                    // banded head, writes dense logits and reduces them with candidate_topk.
+                    const bool banded_draft_head =
+                        plan.proposal_head != ProposalHead::Optimized &&
+                        parameters.text.output_head.banded();
+                    if (banded_draft_head) {
+                        head_scratch(layout, parameters.text.output_head, mask_columns,
+                                     mask_columns);
+                        matrix(layout, DType::BF16,
+                               dimension(parameters.model.resources().public_token_count),
+                               mask_columns);
+                        scratch(layout, ops::candidate_topk_workspace_capacity_bytes(mask_columns));
+                    } else {
+                        if (execution::rotated(head.hadamard_signs)) {
+                            matrix(layout, DType::BF16, dimension(config.hidden_size),
+                                   mask_columns);
+                        }
+                        scratch(layout, ops::linear_topk_workspace_capacity_bytes(
+                                            head.weight.qtype, head.weight.n, head.weight.k,
+                                            mask_columns, mask_columns));
                     }
-                    scratch(layout, ops::linear_topk_workspace_capacity_bytes(
-                                        head.weight.qtype, head.weight.n, head.weight.k,
-                                        mask_columns, mask_columns));
                     matrix(layout, DType::BF16, dimension(draft->dflash2->selector_rank),
                            mask_columns);
                     linear_scratch(layout, parameters.draft->selector->hidden_projection,
@@ -1116,14 +1131,18 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
                                 verify_envelope);
                     target_bytes = std::max(target_bytes, finish(target));
                 }
+                // The sparse accept op's workspace profile is the trained 248077-row domain; a
+                // coded pack may carry the tokenizer's padded vocabulary, so the accepted domain
+                // is the smaller of the two (the logits plane keeps its physical rows).
+                const std::int32_t accept_domain = std::min<std::int32_t>(
+                    dimension(parameters.model.resources().public_token_count), 248077);
                 const std::size_t accept =
                     draft->dflash2.has_value() || draft->dspine.has_value()
                         ? ops::speculative_accept_sparse_drafts_workspace_capacity_bytes(
-                              dimension(parameters.model.resources().public_token_count), {false},
-                              narrowest_drafts, verify_drafts, batch, batch)
+                              accept_domain, {false}, narrowest_drafts, verify_drafts, batch,
+                              batch)
                         : ops::speculative_accept_coupled_drafts_workspace_capacity_bytes(
-                              dimension(parameters.model.resources().public_token_count),
-                              narrowest_drafts, verify_drafts, batch, batch);
+                              accept_domain, narrowest_drafts, verify_drafts, batch, batch);
                 // A copy round above batch one also runs the drafter at its own window, and a
                 // round after a copy round appends up to the widest window of target features.
                 const std::size_t proposal = dflash_proposal_capacity(drafts + 1, batch);
