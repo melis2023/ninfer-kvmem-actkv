@@ -26,6 +26,7 @@ struct Arguments {
     float* state_out;
     __nv_bfloat16* out;
     int qk_heads, value_heads, tokens;
+    bool head_interleave;
     float scale;
 };
 

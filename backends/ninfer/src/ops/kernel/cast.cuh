@@ -41,4 +41,24 @@ __global__ void cast_fp32_to_bf16_scalar_kernel(const float* source, __nv_bfloat
     }
 }
 
+__global__ void cast_bf16_to_fp32_x4_kernel(const Bf16x4* source, float4* destination,
+                                            std::int64_t vectors) {
+    const std::int64_t start  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = start; i < vectors; i += stride) {
+        const Bf16x4 value = source[i];
+        destination[i]     = make_float4(__low2float(value.lo), __high2float(value.lo),
+                                     __low2float(value.hi), __high2float(value.hi));
+    }
+}
+
+__global__ void cast_bf16_to_fp32_scalar_kernel(const __nv_bfloat16* source, float* destination,
+                                                std::int64_t count) {
+    const std::int64_t start  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const std::int64_t stride = static_cast<std::int64_t>(gridDim.x) * blockDim.x;
+    for (std::int64_t i = start; i < count; i += stride) {
+        destination[i] = __bfloat162float(source[i]);
+    }
+}
+
 } // namespace ninfer::ops

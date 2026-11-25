@@ -883,6 +883,37 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     const auto retained_reader = std::make_shared<artifact::Reader>(options.artifact_path);
     const artifact::Reader& reader = *retained_reader;
     inspect.complete();
+    // A Trellis/NariQ coded artifact carries recurrent GDN state images that the decode CUDA Graph
+    // captures by physical slot. Replaying a graph that addresses a slot it did not capture faults
+    // with cudaErrorIllegalAddress. Two configurations are known to be safe (verified against the
+    // serve path; the CLI loads with context_cache.enabled=false and is always fine):
+    //   * graphs ON, context cache OFF (root state only) -- extra slots are simply never created;
+    //   * graphs OFF, context cache and/or KVMem ON -- eager decode reads slots at call time.
+    // KVMem re-creates the extra device states even after the context cache is dropped, so with
+    // KVMem the only safe choice is to turn graphs off as well.
+    bool has_trellis_weights = false;
+    for (const auto& object : reader.directory().objects) {
+        const auto* tensor = std::get_if<artifact::TensorObject>(&object);
+        if (tensor != nullptr && tensor->format.rfind("trellis", 0) == 0) {
+            has_trellis_weights = true;
+            break;
+        }
+    }
+    if (has_trellis_weights && options.use_cuda_graph) {
+        if (options.kvmem.selected_tokens != 0) {
+            publish_diagnostic(requested.diagnostic_observer, DiagnosticLevel::Warning, "%s",
+                               "NariQ coded weights with KVMem: disabling CUDA Graphs to avoid "
+                               "illegal state-slot access during graph replay");
+            options.use_cuda_graph = false;
+        } else if (options.context_cache.enabled) {
+            publish_diagnostic(requested.diagnostic_observer, DiagnosticLevel::Warning, "%s",
+                               "NariQ coded weights with CUDA Graphs: disabling the device/host "
+                               "context cache (root state only) to avoid illegal state-slot access");
+            options.context_cache.enabled                = false;
+            options.context_cache.host_state_slots       = 0;
+            options.context_cache.host_kv_capacity_bytes = 0;
+        }
+    }
     // An automatic draft head is the artifact's optimized proposal head when it stores one: it
     // projects drafts onto a shortlist of the vocabulary instead of all of it.
     if (options.speculative.proposal_head == ProposalHead::Auto) {

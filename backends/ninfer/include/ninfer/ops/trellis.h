@@ -55,7 +55,7 @@ void trellis_linear(const Tensor& x, const Weight& w, Tensor& y, std::int32_t ma
  *
  * Decodes the coded rows `ids[t]` of a coded table and restores them to the primal basis:
  *
- *   rows[:,t] = gather_pin(pre * T_cols^T row(ids[t]))
+ *   rows[:,t] = post[ids[t]] * gather_pin(pre * T_cols^T row(ids[t]))
  *
  * which is the row form of `trellis_linear`'s input side. `table` is a TRL1..TRL6 weight with
  * shape [vocab,K]; `ids` is contiguous I32 [T] with every id in [0,vocab); `rows` is contiguous,
@@ -114,7 +114,10 @@ void trellis_banded_head(const Tensor& x, const Weight* const* bands, std::size_
  * map means the identity, i.e. `part.row_map[i] == i`. This covers both the block-aligned splits
  * (a GDN qkv parent cut at 2048-row boundaries) and the interleaved ones (a full-attention parent
  * storing query and output gate in 256-row turns) with one code path, and it never materialises a
- * second copy of the parent beyond the row copy into the destination.
+ * second copy of the parent beyond the row copy into the destination. An interleaved split that is
+ * a pure stride pattern needs no map at all: a nonzero `part.src_group` reads
+ * `parent[(r / src_group) * src_stride + src_origin + r % src_group]`, which is the q|gate layout
+ * of a fused full-attention parent without any host-built alias.
  *
  * `x` is contiguous BF16 [K,T] and shared by every part; each output is contiguous BF16 [rows,T]
  * with 16-byte alignment, and the parts of one output must not overlap each other or each other's
@@ -130,6 +133,11 @@ struct TrellisProjectionPart {
     std::int32_t dst_row  = 0;
     std::int32_t rows     = 0;
     const std::int32_t* row_map = nullptr;
+    // When `row_map` is null, a nonzero `src_group` selects the interleaved pattern
+    // `parent[(r / src_group) * src_stride + src_origin + r % src_group]` instead of the identity.
+    std::int32_t src_group  = 0;
+    std::int32_t src_stride = 0;
+    std::int32_t src_origin = 0;
 };
 
 void trellis_input_proj(const Tensor& x, const TrellisProjectionPart* parts, std::size_t part_count,

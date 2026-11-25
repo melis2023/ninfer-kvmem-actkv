@@ -102,6 +102,10 @@ bool Bindings::declares(std::string_view parameter, std::string_view input) cons
     return uses.find({std::string(parameter), std::string(input)}) != uses.end();
 }
 
+bool Bindings::has_parameter(std::string_view parameter) const {
+    return binder.reader().directory().bindings.contains(std::string(parameter));
+}
+
 WeightId Bindings::parameter(std::string name, artifact::Shape shape,
                              std::vector<std::string> inputs, std::optional<QType> exact_format,
                              artifact::Residency residency) {

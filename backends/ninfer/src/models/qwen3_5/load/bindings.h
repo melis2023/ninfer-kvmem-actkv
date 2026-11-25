@@ -62,6 +62,8 @@ public:
     // head reads its hidden state the way it reads the text's.
     [[nodiscard]] bool has_use(WeightId id, std::string_view input) const;
     [[nodiscard]] bool declares(std::string_view parameter, std::string_view input) const;
+    // Whether the artifact declares that logical parameter at all, regardless of its Uses.
+    [[nodiscard]] bool has_parameter(std::string_view parameter) const;
 
     // Requests that every stored object behind a parameter be materialized in `target` instead
     // (see artifact/transcode.h). Returns false, leaving the objects alone, when they already

@@ -66,11 +66,16 @@ struct VisionOverlayLayout {
 
 struct AttentionWeights {
     WeightId query, key, gate, value;
+    // NariQ coded form: one parent carries `query|gate` in logical row order, so there is no
+    // separate query or gate parameter to bind.
+    std::optional<WeightId> packed;
     WeightId query_norm, key_norm, output;
 };
 
 struct GdnWeights {
     WeightId query, key, value, z;
+    // NariQ coded form: one parent carries `query|key|value` in logical row order; z stays its own.
+    std::optional<WeightId> packed;
     WeightId a_projection, b_projection, a_log, dt_bias;
     WeightId convolution, norm, output;
 };
@@ -104,6 +109,9 @@ struct RankLayerWeights {
 struct TextWeights {
     WeightId token_embedding, output_head, final_norm;
     WeightUseId output_head_use;
+    // NariQ: the head's coded bands and its INT32 [vocab] gather; empty and absent otherwise.
+    std::vector<WeightId> output_head_bands;
+    std::optional<WeightId> output_head_gather;
     // With tensor parallelism, rank 0's share of each layer's GDN heads and dense FFN rows beside
     // its whole attention.
     std::vector<BlockWeights> layers;

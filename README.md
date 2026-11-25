@@ -36,7 +36,7 @@ REM ===== 通用（三模式共享）=====
   --model-id ninfer-27b --port 18200 --host 127.0.0.1 ^
   --max-context 262144 --prefill-chunk 256 ^
   --kvmem-budget 36834 --kvmem-gen-reserve 1024 --kvmem-host-mib 12288 ^
-  --kvmem-keep --ngram-draft-tokens 20 --kv-dtype rk8v4 ^
+  --kvmem-keep --ngram-draft-tokens 12 --kv-dtype rk8v4 ^
   --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
   --vision --vision-residency cpu --vision-max-merged 256 ^
   --default-reasoning-effort xhigh ^
@@ -54,9 +54,10 @@ REM ===== MTP（无外挂草稿，用工件内置头）=====
   --spec mtp --draft-tokens 4 --adaptive-mtp --full-draft-head
 ```
 
-> `--ngram-draft-tokens 20` 是按 128k 实测调过的值（见下文「128k 速度对比」）：每轮成本固定，
-> 窗口越大每轮提交越多，12 默认值在长上下文里白扔了 35–55% 的吞吐。注意并发门禁：C1 保留
-> 16–63 的原宽度，C2–8 启动时会自动降到 15。
+> `--ngram-draft-tokens 12` 是工具调用/agent 的默认值：窗口越宽，miss 时每轮白读的 KV 列越多，
+> 12 在真实 agent 负载上最稳。只有在「ngram 高命中的长复制输出」（整段重复行、大段照抄上下文）
+> 上，12 → 20 才有实测 +35–54% 的吞吐（见下文「ngram 窗口曲线」），这类场景可临时调到 20。
+> 注意并发门禁：C1 保留 16–63 的原宽度，C2–8 启动时会自动降到 15。
 >
 > DSpine 草稿 GGUF 首次加载会在 CPU 派生约 1 GB 的 `sender_table`，耗时约 20 秒；
 > 首次之后会写入同目录的 `<gguf>.derived` 缓存（按 ArtifactId + mtime 校验），
@@ -722,4 +723,5 @@ python3 -m tools.convert \
 | [docs/multi-backend.md](docs/multi-backend.md) | 后端能力与启动说明 |
 | [docs/multi-backend-repository.md](docs/multi-backend-repository.md) | 仓库结构与构建 |
 | [docs/dspine-convert-guide.md](docs/dspine-convert-guide.md) | **DSpine 草稿转 ninfer（GUI + CLI）** |
+| [docs/nariq-port-analysis.md](docs/nariq-port-analysis.md) | NariQ（nari-llama.cpp）格式分析与移植路线 |
 | [docs/validation/dspine/dspine-port-20261111.md](docs/validation/dspine/dspine-port-20261111.md) | DSpine 移植与测量全记录 |

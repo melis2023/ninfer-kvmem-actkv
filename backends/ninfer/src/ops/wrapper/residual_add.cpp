@@ -30,8 +30,13 @@ std::int64_t numel_allow_zero(const Tensor& t) {
 } // namespace
 
 void residual_add(const Tensor& y, Tensor& x, cudaStream_t stream) {
-    if (y.dtype != x.dtype || (x.dtype != DType::BF16 && x.dtype != DType::FP32)) {
-        throw std::invalid_argument("residual_add: y/x must have the same BF16 or FP32 dtype");
+    // Same dtype (BF16 or FP32), or the wide-accumulator form: a BF16 update added into an FP32
+    // residual stream. Any other pairing is refused.
+    const bool same = y.dtype == x.dtype && (x.dtype == DType::BF16 || x.dtype == DType::FP32);
+    const bool wide_accum = y.dtype == DType::BF16 && x.dtype == DType::FP32;
+    if (!same && !wide_accum) {
+        throw std::invalid_argument(
+            "residual_add: y/x must be same-dtype BF16/FP32, or BF16 y into FP32 x");
     }
     for (int d = 0; d < 4; ++d) {
         if (y.ne[d] != x.ne[d]) {

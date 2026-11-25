@@ -533,9 +533,36 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
                             ops::linear_workspace_capacity_bytes(
                                 p.weight.qtype, p.weight.n, p.weight.k, p.policy, first, last)));
     };
+    // A NariQ banded head runs one coded linear per band into a concatenated plane and then
+    // gathers the vocabulary rows, so its scratch is the widest band's plus the caller's plane.
+    const auto head_scratch = [&](WorkspaceLayoutBuilder& layout,
+                                  const execution::HeadParameters& head, int first, int last) {
+        if (!head.banded()) {
+            linear_scratch(layout, head.single, first, last);
+            return;
+        }
+        std::size_t widest = 0;
+        std::vector<const Weight*> bands;
+        bands.reserve(head.bands.size());
+        for (const auto& band : head.bands) {
+            bands.push_back(&band.weight);
+            widest = std::max(widest, ops::trellis_linear_workspace_bytes(band.weight, last));
+        }
+        scratch(layout, widest);
+        (void)first;
+    };
     const auto add_scratch = [&](WorkspaceLayoutBuilder& layout,
                                  const execution::LinearParameters& p, int first, int last,
                                  bool wide_verification = false) {
+        if (is_coded(p.weight.qtype)) {
+            // A coded output projection forms its residual with the plain trellis linear plus a
+            // separate add, so it needs the coded workspace and one BF16 delta plane.
+            (void)matrix(layout, DType::BF16, p.weight.n, last);
+            scratch(layout, ops::linear_workspace_capacity_bytes(
+                                p.weight.qtype, p.weight.n, p.weight.k, ops::LinearPolicy::A16Only,
+                                first, last));
+            return;
+        }
         // A round's narrower families may resolve the ordinary policy at the same columns.
         const auto bytes = [&](bool wide) {
             return execution::rotated_workspace_bytes(
@@ -611,7 +638,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
         // every column.
         if (!plan.causal_scoring) {
             const std::int32_t head_last = phase == TextPhase::Prefill ? 1 : last;
-            linear_scratch(layout, parameters.text.output_head, std::min(first, head_last),
+            head_scratch(layout, parameters.text.output_head, std::min(first, head_last),
                            head_last);
         }
     };
@@ -747,7 +774,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
                static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::I32, 1, static_cast<std::int32_t>(kCausalScoreTile));
         matrix(causal_score, DType::FP32, 1, static_cast<std::int32_t>(kCausalScoreTile));
-        linear_scratch(causal_score, parameters.text.output_head, 1, kCausalScoreTile);
+        head_scratch(causal_score, parameters.text.output_head, 1, kCausalScoreTile);
         out.causal_score = finish(causal_score);
     }
 
@@ -862,7 +889,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
             const DType dspine_logits = execution::target_logits_dtype(parameters.text.output_head);
             const auto dspine_head_bytes = [&](std::int32_t columns) {
                 WorkspaceLayoutBuilder head;
-                linear_scratch(head, parameters.text.output_head, 1, columns);
+                head_scratch(head, parameters.text.output_head, 1, columns);
                 return finish(head);
             };
             const auto dflash_context_capacity = [&](std::int32_t width, std::int32_t batch,
@@ -1754,3 +1781,5 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl
 }
 
 } // namespace ninfer::models::qwen3_5::detail
+
+

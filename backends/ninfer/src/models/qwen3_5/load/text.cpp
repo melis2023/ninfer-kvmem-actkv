@@ -1,4 +1,5 @@
 #include "models/qwen3_5/load/bindings.h"
+#include "artifact/formats.h"
 
 #include <cstdlib>
 #include <limits>
@@ -14,9 +15,14 @@ AttentionWeights bind_attention(Bindings& b, const TextConfig& config, const std
     const auto q  = a.query_width();
     const auto k  = a.key_width();
     AttentionWeights out;
-    out.query      = b.parameter(p + "attention/query", {q, h}, {p + "mixer_input"});
+    if (b.declares(p + "attention/packed", p + "mixer_input")) {
+        // NariQ coded: query and gate share one parent, stored in logical row order.
+        out.packed = b.parameter(p + "attention/packed", {2 * q, h}, {p + "mixer_input"});
+    } else {
+        out.query = b.parameter(p + "attention/query", {q, h}, {p + "mixer_input"});
+        out.gate  = b.parameter(p + "attention/gate", {q, h}, {p + "mixer_input"});
+    }
     out.key        = b.parameter(p + "attention/key", {k, h}, {p + "mixer_input"});
-    out.gate       = b.parameter(p + "attention/gate", {q, h}, {p + "mixer_input"});
     out.value      = b.parameter(p + "attention/value", {k, h}, {p + "mixer_input"});
     out.query_norm = b.direct(p + "attention/query_norm", {a.head_dim});
     out.key_norm   = b.direct(p + "attention/key_norm", {a.head_dim});
@@ -42,9 +48,14 @@ GdnWeights bind_gdn(Bindings& b, const TextConfig& text, const std::string& p) {
     const auto v     = g.value_width();
     const auto heads = g.linear_num_value_heads;
     GdnWeights out;
-    out.query        = b.parameter(p + "gdn/query", {k, h}, {p + "mixer_input"});
-    out.key          = b.parameter(p + "gdn/key", {k, h}, {p + "mixer_input"});
-    out.value        = b.parameter(p + "gdn/value", {v, h}, {p + "mixer_input"});
+    if (b.declares(p + "gdn/packed", p + "mixer_input")) {
+        // NariQ coded: query|key|value share one parent, stored in logical row order.
+        out.packed = b.parameter(p + "gdn/packed", {2 * k + v, h}, {p + "mixer_input"});
+    } else {
+        out.query = b.parameter(p + "gdn/query", {k, h}, {p + "mixer_input"});
+        out.key   = b.parameter(p + "gdn/key", {k, h}, {p + "mixer_input"});
+        out.value = b.parameter(p + "gdn/value", {v, h}, {p + "mixer_input"});
+    }
     out.z            = b.parameter(p + "gdn/z", {v, h}, {p + "mixer_input"});
     out.a_projection = b.parameter(p + "gdn/a_projection", {heads, h}, {p + "mixer_input"});
     out.b_projection = b.parameter(p + "gdn/b_projection", {heads, h}, {p + "mixer_input"});
@@ -291,8 +302,20 @@ TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& 
         (void)tensor_parallel_share(config, options.ranks);
         out.rank_layers.resize(options.ranks - 1);
     }
-    out.token_embedding =
-        b.parameter("text/token_embedding", {config.vocab_size, config.hidden_size});
+    // A coded token table decodes its rows through the coded input side, so it needs a Use to carry
+    // the side planes; a dense one has none, exactly as before.
+    bool coded_table = false;
+    if (const auto found = b.binder.reader().directory().bindings.find("text/token_embedding");
+        found != b.binder.reader().directory().bindings.end() && !found->second.parts.empty()) {
+        coded_table = is_coded(artifact::parse_format(
+            b.binder.reader().directory().tensor(found->second.parts.front().object).format));
+    }
+    out.token_embedding = coded_table
+                              ? b.parameter("text/token_embedding",
+                                            {config.vocab_size, config.hidden_size},
+                                            {"text/token_ids"})
+                              : b.parameter("text/token_embedding",
+                                            {config.vocab_size, config.hidden_size});
     std::vector<std::string> head_inputs{"text/final_hidden"};
     // A standalone DSpine drafter reads the head through the target's own use of it, so the
     // target artifact has no dspine/final_hidden input for it. A DFlash drafter attached with
@@ -304,8 +327,30 @@ TextWeights bind_text(Bindings& b, const TextConfig& config, const LoadOptions& 
                    std::string(options.speculative_component()) + "/final_hidden")) {
         head_inputs.push_back(std::string(options.speculative_component()) + "/final_hidden");
     }
-    out.output_head = b.parameter("text/output_head", {config.vocab_size, config.hidden_size},
-                                  std::move(head_inputs));
+    // NariQ: the vocabulary head is split over coded bands of different widths and formats, and
+    // `text/output_head` itself does not exist. The band widths come from the artifact, so the
+    // loader probes band00.. in order and stops at the first absent one. Each band is a coded
+    // matrix whose Use names the same final-hidden input a single head would read: that Use is
+    // where the artifact carries the coded side planes, so the band needs it even though the
+    // banded op gathers the rows itself.
+    const bool banded_head = b.has_parameter("text/output_head/band00");
+    if (banded_head) {
+        for (std::uint32_t band = 0; band < 64; ++band) {
+            const std::string name =
+                std::string("text/output_head/band") + (band < 10 ? "0" : "") + std::to_string(band);
+            if (!b.has_parameter(name)) { break; }
+            const auto& binding = b.binder.reader().directory().bindings.at(name);
+            const auto& object  = b.binder.reader().directory().tensor(binding.parts.front().object);
+            out.output_head_bands.push_back(
+                b.parameter(name, {object.shape[0], config.hidden_size}, {"text/final_hidden"}));
+        }
+        out.output_head_gather =
+            b.direct("text/output_head/vocab_gather", {config.vocab_size}, QType::INT32);
+        out.output_head = WeightId{};
+    } else {
+        out.output_head = b.parameter("text/output_head", {config.vocab_size, config.hidden_size},
+                                      std::move(head_inputs));
+    }
     out.final_norm  = b.direct("text/final_norm", {config.hidden_size});
     out.layers.reserve(config.num_hidden_layers);
     for (std::uint32_t i = 0; i < config.num_hidden_layers; ++i) {

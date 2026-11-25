@@ -1,4 +1,5 @@
 #include "ninfer/ops/weight_input.h"
+#include "ninfer/ops/trellis.h"
 
 #include <algorithm>
 #include <array>
@@ -316,6 +317,126 @@ ProjectionWeights prepare_gdn_gating_proj_weights(const WeightInput& a, const We
     require(first.weight.qtype == QType::BF16 && second.weight.qtype == QType::BF16,
             "GDN control requires BF16 weights");
     return PairedProjectionWeights{first.weight, second.weight};
+}
+
+namespace {
+
+CodedProjectionWeights coded_form(std::vector<SingleProjectionWeight> parents,
+                                  std::vector<CodedProjectionReach> reaches) {
+    CodedProjectionWeights result;
+    result.parents = std::move(parents);
+    result.reaches = std::move(reaches);
+    if (result.parents.empty() || result.reaches.empty()) {
+        throw std::invalid_argument("a coded projection needs parents and destinations");
+    }
+    for (const auto& parent : result.parents) {
+        require(is_coded(parent.weight.qtype), "a coded projection needs coded parents");
+        require(!(parent.hadamard_signs.data != nullptr),
+                "a coded projection carries its rotation in the weight");
+    }
+    for (const auto& reach : result.reaches) {
+        require(reach.parent >= 0 && static_cast<std::size_t>(reach.parent) < result.parents.size() &&
+                    reach.output >= 0 && reach.dst_row >= 0 && reach.rows > 0,
+                "coded projection destination is out of range");
+    }
+    return result;
+}
+
+// Rows of one coded parent, `rows` of them starting at logical `first`.
+void reach_parent(CodedProjectionWeights& out, std::int32_t parent, std::int32_t output,
+                  std::int32_t dst_row, std::int32_t rows) {
+    out.reaches.push_back(CodedProjectionReach{parent, output, dst_row, rows});
+}
+
+// Rows of one coded parent read through a stride pattern: `rows` of them, interleaved head by head.
+void reach_parent_interleaved(CodedProjectionWeights& out, std::int32_t parent, std::int32_t output,
+                              std::int32_t rows, std::int32_t group, std::int32_t origin) {
+    out.reaches.push_back(
+        CodedProjectionReach{parent, output, 0, rows, group, 2 * group, origin});
+}
+
+} // namespace
+
+ProjectionWeights prepare_coded_attn_projection(const WeightInput& packed, const WeightInput& key,
+                                                const WeightInput& value, std::uint64_t query_rows,
+                                                std::uint64_t key_rows, std::uint64_t head_width) {
+    require(matrix(packed)[0] == 2 * query_rows && matrix(key)[0] == key_rows &&
+                matrix(value)[0] == key_rows && matrix(key)[1] == matrix(packed)[1] &&
+                matrix(value)[1] == matrix(packed)[1],
+            "coded attention projection: unsupported packed geometry");
+    require(head_width > 0 && query_rows % head_width == 0 && 2 * head_width <= matrix(packed)[0],
+            "coded attention projection: query rows do not tile the head width");
+    std::vector<SingleProjectionWeight> parents{prepare_linear_weight(packed),
+                                                prepare_linear_weight(key),
+                                                prepare_linear_weight(value)};
+    CodedProjectionWeights out;
+    // The fused parent stores the head's query block then its gate block, head after head.
+    reach_parent_interleaved(out, 0, 0, static_cast<std::int32_t>(query_rows),
+                             static_cast<std::int32_t>(head_width), 0);
+    reach_parent_interleaved(out, 0, 1, static_cast<std::int32_t>(query_rows),
+                             static_cast<std::int32_t>(head_width),
+                             static_cast<std::int32_t>(head_width));
+    reach_parent(out, 1, 2, 0, static_cast<std::int32_t>(key_rows));
+    reach_parent(out, 2, 3, 0, static_cast<std::int32_t>(key_rows));
+    out.hadamard_signs = packed.hadamard_signs;
+    return coded_form(std::move(parents), std::move(out.reaches));
+}
+
+ProjectionWeights prepare_coded_gdn_projection(const WeightInput& packed, const WeightInput& z,
+                                               std::uint64_t key_rows, std::uint64_t value_rows) {
+    require(matrix(packed)[0] == 2 * key_rows + value_rows && matrix(z)[0] == value_rows &&
+                matrix(z)[1] == matrix(packed)[1],
+            "coded GDN projection: unsupported packed geometry");
+    std::vector<SingleProjectionWeight> parents{prepare_linear_weight(packed),
+                                                prepare_linear_weight(z)};
+    CodedProjectionWeights out;
+    reach_parent(out, 0, 0, 0, static_cast<std::int32_t>(key_rows));
+    reach_parent(out, 0, 0, static_cast<std::int32_t>(key_rows),
+                 static_cast<std::int32_t>(key_rows));
+    reach_parent(out, 0, 0, static_cast<std::int32_t>(2 * key_rows),
+                 static_cast<std::int32_t>(value_rows));
+    reach_parent(out, 1, 1, 0, static_cast<std::int32_t>(value_rows));
+    out.hadamard_signs = packed.hadamard_signs;
+    return coded_form(std::move(parents), std::move(out.reaches));
+}
+
+ProjectionWeights prepare_coded_gating_projection(const WeightInput& a, const WeightInput& b) {
+    require(matrix(a) == matrix(b), "coded GDN control: A/B geometry differs");
+    require(matrix(a)[0] % 16 == 0 && matrix(a)[1] % 128 == 0,
+            "coded GDN control: unsupported A/B geometry");
+    std::vector<SingleProjectionWeight> parents{prepare_linear_weight(a),
+                                                prepare_linear_weight(b)};
+    CodedProjectionWeights out;
+    reach_parent(out, 0, 0, 0, static_cast<std::int32_t>(matrix(a)[0]));
+    reach_parent(out, 1, 1, 0, static_cast<std::int32_t>(matrix(b)[0]));
+    out.hadamard_signs = a.hadamard_signs;
+    return coded_form(std::move(parents), std::move(out.reaches));
+}
+
+std::size_t coded_projection_workspace_bytes(const CodedProjectionWeights& weights,
+                                             std::int32_t max_tokens) {
+    auto parts = std::vector<TrellisProjectionPart>(weights.reaches.size());
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        const auto& reach = weights.reaches[i];
+        parts[i] = TrellisProjectionPart{&weights.parents.at(reach.parent).weight, reach.output,
+                                         reach.dst_row, reach.rows, nullptr,
+                                         reach.src_group, reach.src_stride, reach.src_origin};
+    }
+    return trellis_input_proj_workspace_bytes(parts.data(), parts.size(), max_tokens);
+}
+
+void coded_projection(const Tensor& x, const CodedProjectionWeights& weights,
+                      Tensor* const* outputs, std::size_t output_count, std::int32_t max_tokens,
+                      WorkspaceArena& workspace, cudaStream_t stream) {
+    auto parts = std::vector<TrellisProjectionPart>(weights.reaches.size());
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        const auto& reach = weights.reaches[i];
+        parts[i] = TrellisProjectionPart{&weights.parents.at(reach.parent).weight, reach.output,
+                                         reach.dst_row, reach.rows, nullptr,
+                                         reach.src_group, reach.src_stride, reach.src_origin};
+    }
+    trellis_input_proj(x, parts.data(), parts.size(), outputs, output_count, max_tokens,
+                       workspace, stream);
 }
 
 SingleProjectionWeight prepare_linear_swiglu_weight(const WeightInput& gate,

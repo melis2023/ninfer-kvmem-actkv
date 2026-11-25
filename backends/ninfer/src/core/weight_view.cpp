@@ -134,9 +134,10 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
         }
         const int bits = static_cast<int>(format) - static_cast<int>(QType::TRELLIS_1BIT) + 1;
         out.group_size         = 16;
-        // One output-tile row holds (K/16) tiles of 32*bits bytes each; n rows of it is the plane.
+        // One tile covers 16 inputs x 16 outputs, and the plane is output-tile-major: a "row" of
+        // the plane is (K/16) tiles covering 16 output rows, so the plane holds N/16 of them.
         out.code_bytes_per_row = mul(k / 16, 32 * bits);
-        out.code_bytes         = mul(n, out.code_bytes_per_row);
+        out.code_bytes         = mul(n / 16, out.code_bytes_per_row);
         out.scale_offset       = out.code_bytes;
     } else if (layout == QuantLayout::RowScale) {
         if (format != QType::FP8_E4M3FN_ROW_BF16) {

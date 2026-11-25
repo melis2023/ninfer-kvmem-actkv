@@ -18,8 +18,13 @@ void residual_add_launch(const Tensor& y, Tensor& x, cudaStream_t stream) {
     constexpr int kMaxGrid = 4096;
     if (x.dtype == DType::FP32) {
         const auto grid = static_cast<int>(std::min<std::int64_t>(kMaxGrid, div_up(n, std::int64_t(kBlock))));
-        residual_add_f32_kernel<<<grid, kBlock, 0, stream>>>(
-            static_cast<const float*>(y.data), static_cast<float*>(x.data), n);
+        if (y.dtype == DType::FP32) {
+            residual_add_f32_kernel<<<grid, kBlock, 0, stream>>>(
+                static_cast<const float*>(y.data), static_cast<float*>(x.data), n);
+        } else {
+            residual_add_bf16y_f32x_kernel<<<grid, kBlock, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(y.data), static_cast<float*>(x.data), n);
+        }
         CUDA_CHECK(cudaGetLastError());
         return;
     }

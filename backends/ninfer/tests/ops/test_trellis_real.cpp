@@ -160,6 +160,60 @@ bool load(const std::string& directory, Probe& probe) {
 
 __nv_bfloat16 to_bf16(float value) { return __float2bfloat16_rn(value); }
 
+// Runs one `trellis_linear` at `tokens` and compares the device result to the host reference.
+// tokens == 1 exercises the split-K decode GEMV route; tokens > 1 exercises the prefill GEMM route.
+int check_tokens(const Probe& probe, int tokens, const Weight& host_weight, const Weight& device_weight) {
+    std::mt19937 rng(1234);
+    std::normal_distribution<float> normal(0.0f, 1.0f);
+    std::vector<float> x(static_cast<std::size_t>(probe.k) * tokens);
+    for (auto& value : x) { value = __bfloat162float(to_bf16(normal(rng))); }
+    std::vector<__nv_bfloat16> x_bf16(x.size());
+    for (std::size_t i = 0; i < x.size(); ++i) { x_bf16[i] = to_bf16(x[i]); }
+    DeviceBuffer d_x(x.size() * sizeof(__nv_bfloat16));
+    d_x.copy_from_host(x_bf16.data(), x.size() * sizeof(__nv_bfloat16));
+    DeviceBuffer d_y(static_cast<std::size_t>(probe.n) * tokens * sizeof(__nv_bfloat16));
+
+    WorkspaceArena workspace(ops::trellis_linear_workspace_bytes(device_weight, tokens));
+    cudaStream_t stream = nullptr;
+    cudaStreamCreate(&stream);
+    Tensor x_tensor(d_x.p, DType::BF16, {probe.k, tokens});
+    Tensor y_tensor(d_y.p, DType::BF16, {probe.n, tokens});
+    ops::trellis_linear(x_tensor, device_weight, y_tensor, tokens, workspace, stream);
+    const auto status = cudaStreamSynchronize(stream);
+    if (status != cudaSuccess) {
+        std::cout << "FAIL T=" << tokens << " " << probe.name << ": kernel " << cudaGetErrorString(status) << "\n";
+        cudaStreamDestroy(stream);
+        return 1;
+    }
+
+    std::vector<__nv_bfloat16> y_bf16(static_cast<std::size_t>(probe.n) * tokens);
+    d_y.copy_to_host(y_bf16.data(), y_bf16.size() * sizeof(__nv_bfloat16));
+    std::vector<float> y(static_cast<std::size_t>(probe.n) * tokens);
+    for (std::size_t i = 0; i < y.size(); ++i) { y[i] = __bfloat162float(y_bf16[i]); }
+
+    std::vector<float> reference(y.size());
+    if (!ops::detail::trellis::project_host(x.data(), tokens, host_weight, reference.data())) {
+        std::cout << "FAIL T=" << tokens << " " << probe.name << ": host reference rejected the weight\n";
+        cudaStreamDestroy(stream);
+        return 1;
+    }
+    double squared_error = 0, squared_reference = 0;
+    float largest = 0;
+    for (std::size_t i = 0; i < y.size(); ++i) {
+        const double error = double(y[i]) - double(reference[i]);
+        squared_error += error * error;
+        squared_reference += double(reference[i]) * double(reference[i]);
+        largest = std::max(largest, std::abs(static_cast<float>(error)));
+    }
+    const double relative = squared_reference > 0 ? std::sqrt(squared_error / squared_reference) : 0;
+    const double tolerance = 2.0 / 256.0;
+    const bool ok = relative <= tolerance;
+    std::cout << (ok ? "ok   " : "FAIL ") << probe.name << " T=" << tokens << " TRL" << probe.bits << " "
+              << probe.n << "x" << probe.k << " relative L2 " << relative << " absmax " << largest << "\n";
+    cudaStreamDestroy(stream);
+    return ok ? 0 : 1;
+}
+
 } // namespace
 
 int run(const std::string& root) {
@@ -179,79 +233,10 @@ int run(const std::string& root) {
         probe.upload();
         std::cout << "uploaded" << std::endl;
 
-        std::mt19937 rng(1234);
-        std::normal_distribution<float> normal(0.0f, 1.0f);
-        std::vector<float> x(static_cast<std::size_t>(probe.k) * kTokens);
-        for (auto& value : x) { value = __bfloat162float(to_bf16(normal(rng))); }
-        std::vector<__nv_bfloat16> x_bf16(x.size());
-        for (std::size_t i = 0; i < x.size(); ++i) { x_bf16[i] = to_bf16(x[i]); }
-        DeviceBuffer d_x(x.size() * sizeof(__nv_bfloat16));
-        d_x.copy_from_host(x_bf16.data(), x.size() * sizeof(__nv_bfloat16));
-        DeviceBuffer d_y(static_cast<std::size_t>(probe.n) * kTokens * sizeof(__nv_bfloat16));
-
         const Weight device_weight = probe.device_weight();
         const Weight host_weight   = probe.host_weight();
-        WorkspaceArena workspace(ops::trellis_linear_workspace_bytes(device_weight, kTokens));
-        cudaStream_t stream = nullptr;
-        cudaStreamCreate(&stream);
-        Tensor x_tensor(d_x.p, DType::BF16, {probe.k, kTokens});
-        Tensor y_tensor(d_y.p, DType::BF16, {probe.n, kTokens});
-        ops::trellis_linear(x_tensor, device_weight, y_tensor, kTokens, workspace, stream);
-        const auto status = cudaStreamSynchronize(stream);
-        if (status != cudaSuccess) {
-            std::cout << "FAIL " << name << ": kernel " << cudaGetErrorString(status) << "\n";
-            failures += 1;
-            cudaStreamDestroy(stream);
-            continue;
-        }
-
-        std::vector<__nv_bfloat16> y_bf16(static_cast<std::size_t>(probe.n) * kTokens);
-        d_y.copy_to_host(y_bf16.data(), y_bf16.size() * sizeof(__nv_bfloat16));
-        std::vector<float> y(static_cast<std::size_t>(probe.n) * kTokens);
-        for (std::size_t i = 0; i < y.size(); ++i) { y[i] = __bfloat162float(y_bf16[i]); }
-
-        // The dequantized matrix itself, so a scale defect can be told apart from a projection one.
-        std::vector<float> dense(static_cast<std::size_t>(probe.n) * probe.k);
-        if (!ops::detail::trellis::dequantize(host_weight, dense.data())) {
-            std::cout << "FAIL " << name << ": host dequantize rejected the weight" << std::endl;
-            failures += 1;
-            cudaStreamDestroy(stream);
-            continue;
-        }
-        double dense_norm = 0;
-        for (std::size_t i = 0; i < dense.size(); ++i) { dense_norm += double(dense[i]) * dense[i]; }
-        std::cout << "     rms W " << std::sqrt(dense_norm / dense.size()) << std::endl;
-        std::vector<float> reference(y.size());
-        if (!ops::detail::trellis::project_host(x.data(), kTokens, host_weight, reference.data())) {
-            std::cout << "FAIL " << name << ": host reference rejected the weight\n";
-            failures += 1;
-            cudaStreamDestroy(stream);
-            continue;
-        }
-        double squared_error = 0, squared_reference = 0;
-        float largest = 0;
-        for (std::size_t i = 0; i < y.size(); ++i) {
-            const double error = double(y[i]) - double(reference[i]);
-            squared_error += error * error;
-            squared_reference += double(reference[i]) * double(reference[i]);
-            largest = std::max(largest, std::abs(static_cast<float>(error)));
-        }
-        const double relative = squared_reference > 0 ? std::sqrt(squared_error / squared_reference) : 0;
-        double squared_y = 0;
-        for (std::size_t i = 0; i < y.size(); ++i) { squared_y += double(y[i]) * double(y[i]); }
-        std::cout << "     rms y " << std::sqrt(squared_y / y.size()) << " rms ref "
-                  << std::sqrt(squared_reference / y.size()) << " y[0..3] " << y[0] << " " << y[1]
-                  << " " << y[2] << " " << y[3] << " ref " << reference[0] << " " << reference[1]
-                  << " " << reference[2] << " " << reference[3] << std::endl;
-        // Both paths run the same FP32 arithmetic, so only the BF16 output rounding separates them.
-        const double tolerance = 2.0 / 256.0;
-        const bool ok = relative <= tolerance;
-        std::cout << (ok ? "ok   " : "FAIL ") << name << ": TRL" << probe.bits << " " << probe.n
-                  << "x" << probe.k << " relative L2 " << relative << " absmax " << largest
-                  << " pin " << (probe.pin.empty() ? "no" : "yes") << " pout "
-                  << (probe.pout.empty() ? "no" : "yes") << "\n";
-        failures += ok ? 0 : 1;
-        cudaStreamDestroy(stream);
+        failures += check_tokens(probe, kTokens, host_weight, device_weight);
+        failures += check_tokens(probe, 1, host_weight, device_weight);
     }
     std::cout << (failures == 0 ? "trellis real-weight gate ok\n"
                                 : "trellis real-weight gate FAILED\n");

@@ -2466,7 +2466,7 @@ struct Executor::Impl {
             }
         } else {
             const Tensor rope(const_cast<std::int32_t*>(in.rope), DType::I32, {t});
-            ops::rmsnorm_rope(rope, a.query_norm, a.key_norm, q3, k3, qo, ko, s);
+            ops::rmsnorm_rope(rope, a.query_norm, a.key_norm, q3, k3, qo, ko, s, true, true);
         }
         // The paged KV: device pages, or a streamed layer's host copy. A streamed layer's call of
         // at most stream_width tokens reads its device pool once kv_stream_resolve has made the

@@ -28,7 +28,8 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
          const ops::SparseMoeHints& hints, WorkspaceArena& workspace, cudaStream_t stream,
          bool mtp = false, bool verify = false, InputBasis basis = InputBasis::Primal,
          bool wide_verification = false, NativeExpertRuntime* experts = nullptr,
-         const InputNorm* input_norm = nullptr, Tensor* partial = nullptr);
+         const InputNorm* input_norm = nullptr, Tensor* partial = nullptr,
+         Tensor* accum = nullptr);
 // The sign vector of a rotated Dense FFN's input projection, or null.
 [[nodiscard]] const Tensor* ffn_input_signs(const FfnParameters& parameters);
 

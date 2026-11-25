@@ -1,15 +1,18 @@
 @echo off
 setlocal EnableExtensions
 
-title KVMem server (ninfer backend) - Qwen3.8-27B IQ3_S + DSpine Q4_K_M
+title KVMem server (ninfer backend) - Qwen3.8-27B NariQ 3.0bpw (native Trellis)
 
 REM launcher directory
 set "BIN=%~dp0"
 set "EXE=%BIN%ninfer-serve.exe"
 
-REM model
-set "MODEL=I:\model\ninfer\Qwen3.8-27B-GSQ-RCO-IQ3_S-q4km-mtp-dflash2.ninfer"
-set "DRAFT=I:\model\dflash2\Qwen3.8-27B-DSpine-b16-Q4_K_M.gguf"
+REM model: converted from I:\model\Qwen3.8-27B-NariQ-3.0bpw.gguf
+REM .ninfer is the raw conversion (incomplete config); engine10 is the loadable one.
+REM For coded Trellis weights the engine auto-avoids the CUDA-graph/state-slot fault:
+REM with KVMem it turns graphs off, otherwise it drops the device/host context cache.
+REM No manual --no-cuda-graph / --no-prefix-reuse needed.
+set "MODEL=I:\model\Qwen3.8-27B-NariQ-3.0bpw.engine10.ninfer"
 
 if not exist "%EXE%" (
     echo ERROR: worker missing: "%EXE%"
@@ -26,16 +29,13 @@ cd /d "%BIN%"
 
 "%EXE%" ^
   "%MODEL%" ^
-  --draft-model "%DRAFT%" ^
-  --port 18200 --model-id ninfer-27b --host 127.0.0.1 ^
+  --port 18200 --model-id ninfer-nariq-27b --host 127.0.0.1 ^
+  --spec none --ngram-draft-tokens 0 ^
   --max-context 262144 ^
   --prefill-chunk 256 ^
   --kvmem-budget 28672 --kvmem-gen-reserve 2048 --kvmem-host-mib 12288 ^
   --kvmem-lrfu --kvmem-keep ^
-  --spec dspine --draft-kv-dtype int8 --draft-tokens 4 --adaptive-mtp ^
-  --ngram-draft-tokens 0 ^
   --kv-dtype int8 --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
-  --vision --vision-residency cpu --vision-max-merged 256 ^
   --default-reasoning-effort xhigh
 
 set "RC=%ERRORLEVEL%"

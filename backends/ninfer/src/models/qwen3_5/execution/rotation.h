@@ -5,6 +5,7 @@
 #include "core/tensor.h"
 #include "core/weight.h"
 #include "ninfer/ops/embedding.h"
+#include "ninfer/ops/trellis.h"
 #include "ninfer/ops/hadamard_transform.h"
 #include "ninfer/ops/weight_input.h"
 
@@ -44,7 +45,11 @@ enum class InputBasis : std::uint8_t { Primal, Rotated };
 // The token rows of `ids`, restored to the primal basis when the table is stored rotated.
 inline void embed_tokens(const Tensor& ids, const Weight& table, const Tensor& signs, Tensor& out,
                          cudaStream_t stream) {
-    if (rotated(signs)) {
+    if (is_coded(table.qtype)) {
+        // A NariQ coded table decodes its rows through the coded input side; it is never stored
+        // rotated, so the signs never apply.
+        ops::trellis_embedding(ids, table, out, stream);
+    } else if (rotated(signs)) {
         ops::embedding_rotated(ids, table, signs, out, stream);
     } else {
         ops::embedding(ids, table, out, stream);

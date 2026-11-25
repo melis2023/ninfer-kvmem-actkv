@@ -635,8 +635,8 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             DecodeGraphProfile& profile =
                 select_graph_profile(ordinary_graphs, static_cast<std::uint32_t>(lanes.size()),
                                      maximum_frontier, "ordinary batch");
-            executable = &install_graph_profile(ordinary_graphs, profile, "ordinary batch");
             envelope   = {profile.min_execution_frontier + 1, profile.max_execution_frontier + 1};
+            executable = &install_graph_profile(ordinary_graphs, profile, "ordinary batch");
         }
 
         bool logprobs = false;
@@ -661,6 +661,23 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
             const StateImageSelectors selectors                 = state_selectors(sequence);
             ordinary_host_ingress->state_source_slots[row]      = selectors.source;
             ordinary_host_ingress->state_destination_slots[row] = selectors.destination;
+            // NINFER_TRACE_SLOTS=1: the indirect indices a captured decode graph reads back, so a
+            // replay-only fault can be told from a capture-time one. Host side, no sync.
+            static const bool trace_slots = [] {
+                const char* v = std::getenv("NINFER_TRACE_SLOTS");
+                return v != nullptr && v[0] != '\0' && v[0] != '0';
+            }();
+            if (trace_slots) {
+                std::fprintf(stderr,
+                             "slots | row %zu | tok %d | cache %d | rope %d | kv %d | src %d | dst %d"
+                             " | sample %d | frontier %u\n",
+                             row, static_cast<int>(ordinary_host_ingress->tokens[row]),
+                             ordinary_host_ingress->cache_positions[row],
+                             ordinary_host_ingress->rope_positions[row],
+                             ordinary_host_ingress->text_kv_table_rows[row], selectors.source,
+                             selectors.destination,
+                             ordinary_host_ingress->sample_positions[row], frontier);
+            }
             ordinary_host_ingress->sampling[row]                = request.sampling_host;
             if (request.grammar) {
                 if (auto ready = take_next_mask(request, sequence, 0)) {
@@ -690,6 +707,7 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
         mark_workspace_usage(workspace_plan.ordinary_round);
         execution::ordinary_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                          envelope, executable);
+        const auto launched = Clock::now();
         if (logprobs) { fetch_logprobs(static_cast<std::int32_t>(lanes.size())); }
         submit_range.reset();
         timing.begin_wait();
@@ -698,8 +716,22 @@ ProgramImpl::decode_ordinary_batch(std::span<const std::uint32_t> lanes,
                                          static_cast<std::uint64_t>(lanes.size()));
             device.synchronize();
         }
+        // NINFER_TRACE_STEP=1: split a decode round into host submit, device wait and bookkeeping.
+        static const bool trace_step = [] {
+            const char* v = std::getenv("NINFER_TRACE_STEP");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        const auto waited = Clock::now();
         check_masks();
         timing.end_wait();
+        if (trace_step) {
+            const auto done = Clock::now();
+            const auto ms = [](auto span) {
+                return std::chrono::duration<double, std::milli>(span).count();
+            };
+            std::fprintf(stderr, "step | submit %.2f ms | wait %.2f ms | bookkeeping %.2f ms\n",
+                         ms(launched - start), ms(waited - launched), ms(done - waited));
+        }
 
         read_memory_candidates();
         const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
