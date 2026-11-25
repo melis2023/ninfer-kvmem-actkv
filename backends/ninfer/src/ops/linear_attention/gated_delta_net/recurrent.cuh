@@ -498,6 +498,8 @@ struct FoldAccess {
     std::int32_t layer_stride_columns;
     std::int32_t width;
     GdnReplayFoldKernelRows rows;
+    // Which value-head -> q/k-head mapping the artifact uses; the record and the fold must agree.
+    bool head_interleave = false;
 
     __device__ __forceinline__ RecurrentCoordinates coordinates() const {
         const std::int32_t batch       = static_cast<std::int32_t>(blockIdx.y);
@@ -507,7 +509,8 @@ struct FoldAccess {
         const std::int32_t state_tile  = layer_tile & 7;
         const std::uint32_t value_head = static_cast<std::uint32_t>(blockIdx.x);
         constexpr std::uint32_t kGroup = Geometry::kValueHeads / Geometry::kQkHeads;
-        const std::uint32_t qk_head    = value_head / kGroup;
+        const std::uint32_t qk_head    = head_interleave ? value_head / kGroup
+                                                         : value_head % Geometry::kQkHeads;
         const std::uint32_t dv_base =
             static_cast<std::uint32_t>(state_tile * kBlockDv + warp * kDvPerWarp);
         return {lane,

@@ -175,6 +175,7 @@ void launch_replay_fold_typed(const GdnReplayRecords& records,
         records.spec.record_capacity * records.spec.width,
         active_width,
         rows,
+        head_interleave(),
     };
     const dim3 grid(static_cast<unsigned>(Geometry::kValueHeads),
                     static_cast<unsigned>(active_rows),
