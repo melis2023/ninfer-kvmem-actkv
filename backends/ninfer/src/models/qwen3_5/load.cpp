@@ -11,12 +11,15 @@
 #include "models/draft_reader.h"
 #include "models/qwen3_5/load/bindings.h"
 #include "models/qwen3_5/load/vision_cpu_cache.h"
+#include "ninfer/ops/gated_delta_net.h"
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 
 namespace ninfer::models::qwen3_5 {
@@ -77,6 +80,23 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
     auto out     = std::make_unique<LoadPlan::Impl>();
     out->options = options;
     out->artifact_path = std::move(artifact_path);
+    // The GDN value heads are stored either interleaved (older packs: h / group) or in HF's
+    // repeat order (h % H_qk). Coded NariQ artifacts carry the HF order; the historical ninfer-v3
+    // packs carry the interleaved one. An artifact may state the layout itself; an environment
+    // override exists for A/B runs.
+    {
+        const auto& metadata = reader.directory().metadata;
+        bool interleave      = !metadata.contains("trellis.version");
+        if (metadata.contains("gdn.head_layout")) {
+            interleave = metadata.at("gdn.head_layout").get<std::string>() == "repeat_interleave";
+        }
+        if (const char* forced = std::getenv("NINFER_GDN_HEAD_LAYOUT"); forced != nullptr) {
+            const std::string_view value(forced);
+            if (value == "repeat_interleave") { interleave = true; }
+            else if (value == "repeat") { interleave = false; }
+        }
+        ops::set_gdn_head_interleave(interleave);
+    }
     out->config  = parse_config(reader.directory(), options);
     artifact::Binder binder(reader);
     out->resources = loading::bind_resources(binder, out->config);
@@ -170,7 +190,9 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
                                                 draft_parameters);
     }
     out->weights.text.output_head_use =
-        bindings.use(out->weights.text.output_head, "text/final_hidden");
+        out->weights.text.output_head_bands.empty()
+            ? bindings.use(out->weights.text.output_head, "text/final_hidden")
+            : WeightUseId{};
     if (out->weights.mtp) {
         out->weights.mtp->output_head_use =
             bindings.use(out->weights.mtp->output_head, "mtp/final_hidden");

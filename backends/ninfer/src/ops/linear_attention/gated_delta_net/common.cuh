@@ -162,24 +162,27 @@ inline constexpr float kLog2E = 1.4426950408889634f;
 
 #endif // __CUDACC__
 
+// Two checkpoints of the same model can store the GDN value heads in either of the two layouts
+// HF's `q.repeat(...)` produces: the `repeat` layout (value head h reads q/k head h % H_qk) and
+// the older `repeat_interleave` layout (h / group). The artifact says which one it used; the
+// engine sets the flag once at load (common.h).
 struct head_map {
     int H_qk;
     int H_v;
-    uint3 group_magic;
+    bool interleave = false;
 
-    static head_map of(int H_qk_, int H_v_) {
-        const int G = H_v_ / H_qk_;
-        return head_map{H_qk_, H_v_, init_fastdiv_values(static_cast<std::uint64_t>(G))};
+    static head_map of(int H_qk_, int H_v_, bool interleave_ = head_interleave()) {
+        return head_map{H_qk_, H_v_, interleave_};
     }
 
     NINFER_KERNELS_HOST_DEVICE int group_size() const { return H_v / H_qk; }
 
     NINFER_KERNELS_HOST_DEVICE int qk_head(int h_v) const {
-#if defined(__CUDA_ARCH__)
-        return static_cast<int>(fastdiv(static_cast<std::uint32_t>(h_v), group_magic));
-#else
-        return h_v / group_size();
-#endif
+        return interleave ? h_v / group_size() : h_v % H_qk;
+    }
+
+    NINFER_KERNELS_HOST_DEVICE bool publishes_key(int value_head) const {
+        return interleave ? value_head % group_size() == 0 : value_head < H_qk;
     }
 };
 

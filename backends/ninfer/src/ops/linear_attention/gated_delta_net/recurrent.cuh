@@ -442,7 +442,7 @@ struct RecordAccess {
     __device__ __forceinline__ void store_key(const RecurrentCoordinates& coord, std::int32_t token,
                                               const RawQkLane& raw) const {
         if (coord.state_tile == 0 && coord.warp == 0 &&
-            static_cast<int>(coord.value_head) % heads.group_size() == 0) {
+            heads.publishes_key(static_cast<int>(coord.value_head))) {
             __nv_bfloat16* destination =
                 key_record + (column(coord, token) * heads.H_qk + coord.qk_head) * kStateDim;
             store_vec(destination + coord.dqk_base, raw.bits);

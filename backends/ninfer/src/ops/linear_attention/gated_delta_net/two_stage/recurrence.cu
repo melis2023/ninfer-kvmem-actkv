@@ -72,7 +72,8 @@ __device__ __forceinline__ void load_stage(typename RecurrenceShared<DV>::Stage&
                                            const Arguments& args, const QkChunk* qk_workspace,
                                            const ControlChunk* control_workspace, int head,
                                            int value_start, int chunk, int tid) {
-    const int qh       = head / (args.value_heads / args.qk_heads);
+    const int qh = args.head_interleave ? head / (args.value_heads / args.qk_heads)
+                                        : head % args.qk_heads;
     const int chunks   = chunk_count(args.tokens);
     const auto* qk_src = reinterpret_cast<const uint4*>(
         qk_workspace + static_cast<std::int64_t>(qh) * chunks + chunk);

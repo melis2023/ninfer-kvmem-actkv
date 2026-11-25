@@ -24,7 +24,8 @@ __launch_bounds__(256, 2) void prepare_kernel(Arguments args, QkChunk* __restric
     const int tid = threadIdx.x, lane = tid & 31;
     const int head = blockIdx.x % args.value_heads, chunk = blockIdx.x / args.value_heads;
     const int start = chunk * kChunkSize, length = min(kChunkSize, args.tokens - start);
-    const int group = args.value_heads / args.qk_heads, qh = head / group;
+    const int group = args.value_heads / args.qk_heads;
+    const int qh = args.head_interleave ? head / group : head % args.qk_heads;
     const int row = tid / 16, col = (tid & 15) * 8;
     const auto qo = (static_cast<std::int64_t>(start + row) * args.qk_heads + qh) * kStateDim;
 
@@ -137,9 +138,7 @@ __launch_bounds__(256, 2) void prepare_kernel(Arguments args, QkChunk* __restric
                                                 static_cast<std::int64_t>(head) * chunks + chunk);
     const auto* src  = reinterpret_cast<const uint4*>(&sm.control);
     if (tid < sizeof(ControlChunk) / 16) ctrl[tid] = src[tid];
-    // Only the first value head in a group publishes Q/K. Other producers never read this
-    // workspace; the following kernel supplies the only producer/consumer synchronization.
-    if (head % group == 0) {
+    if (args.head_interleave ? head % group == 0 : head < args.qk_heads) {
         auto* dst =
             reinterpret_cast<uint4*>(qk_workspace + static_cast<std::int64_t>(qh) * chunks + chunk);
         const auto* data = reinterpret_cast<const uint4*>(&sm.qk);

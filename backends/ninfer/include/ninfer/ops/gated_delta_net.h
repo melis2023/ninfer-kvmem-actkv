@@ -107,4 +107,10 @@ void gated_delta_net_replay_record(const Tensor& q, const Tensor& k, const Tenso
                                    Tensor& value_record, Tensor& gate_record, Tensor& out,
                                    cudaStream_t stream);
 
+// Which GDN value-head layout the loaded checkpoint uses: the `repeat_interleave` form older
+// packs store (value head h reads q/k head h / group) or the HF `repeat` form (h % H_qk). The
+// loader resolves it from the artifact; these set/get call it out for tools and tests.
+void set_gdn_head_interleave(bool interleave) noexcept;
+[[nodiscard]] bool gdn_head_interleave() noexcept;
+
 } // namespace ninfer::ops

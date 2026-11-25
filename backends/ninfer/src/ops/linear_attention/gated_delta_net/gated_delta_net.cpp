@@ -271,6 +271,7 @@ void run_two_stage(const Tensor& q, const Tensor& k, const Tensor& v, const Tens
         q.ne[1],
         v.ne[1],
         q.ne[2],
+        detail::gated_delta_net::head_interleave(),
         scale};
     two_stage::launch_prepare(args, qk, control, normalize_qk, stream);
     two_stage::launch_recurrence(args, qk, control, stream);
@@ -397,5 +398,11 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                                                         out_tail, stream);
     }
 }
+
+void set_gdn_head_interleave(bool interleave) noexcept {
+    detail::gated_delta_net::set_head_interleave(interleave);
+}
+
+bool gdn_head_interleave() noexcept { return detail::gated_delta_net::head_interleave(); }
 
 } // namespace ninfer::ops
