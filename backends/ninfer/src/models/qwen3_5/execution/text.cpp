@@ -404,11 +404,12 @@ TextContext::TextContext(DeviceContext& ctx, const execution::Parameters& weight
                          Tensor& prefill_hidden, std::uint32_t prefill_chunk,
                          std::uint32_t text_kv_base, qwen3_5::PagedKVCacheView mtp_kv,
                          const qwen3_5::PagedKVCache* batch_text_kv,
-                         const qwen3_5::PagedKVCache* batch_mtp_kv)
+                         const qwen3_5::PagedKVCache* batch_mtp_kv,
+                         const ninfer::CyclicKVCache* target_hot)
     : ctx_(ctx), parameters_(weights), config_(weights.model.config().text), work_(work), kv_(kv),
       mtp_kv_(mtp_kv), state_(state), io_(io), prefill_hidden_(prefill_hidden),
       prefill_chunk_(prefill_chunk), text_kv_base_(text_kv_base), batch_text_kv_(batch_text_kv),
-      batch_mtp_kv_(batch_mtp_kv) {
+      batch_mtp_kv_(batch_mtp_kv), target_hot_(target_hot) {
     if (prefill_chunk_ == 0 ||
         prefill_chunk_ > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
         throw std::invalid_argument("TextContext effective prefill chunk must fit positive int32");
@@ -974,6 +975,17 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         ScopedValue<const Tensor*> kv_binding(active_kv_table_rows_, &kv_table_rows);
         ScopedValue<const Tensor*> state_binding(active_linear_state_source_slots_,
                                                  &linear_state_source_slots);
+        // The record projection runs once per GDN layer; hand it the host slot values once for the
+        // whole verify batch instead of a device-to-host copy per layer.
+        std::vector<std::int32_t> source_slots_host(static_cast<std::size_t>(batch), 0);
+        if (linear_state_source_slots.data != nullptr) {
+            CUDA_CHECK(cudaMemcpyAsync(source_slots_host.data(), linear_state_source_slots.data,
+                                       batch * sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                                       stream));
+            cudaStreamSynchronize(stream);
+        }
+        ScopedValue<const std::vector<std::int32_t>*> state_host_binding(
+            active_linear_state_source_slots_host_, &source_slots_host);
         ScopedValue<const Tensor*> valid_binding(active_valid_columns_, &valid_columns);
         ScopedValue<std::int32_t> batch_binding(active_sequence_batch_, batch);
         ScopedValue<std::int32_t> width_binding(active_sequence_width_, width);
@@ -1220,6 +1232,30 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
                                            active_sequence_batch_});
         Tensor position_batch = cache_positions.view({width, active_sequence_batch_});
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
+        // DSpine-only FP16 hot ring: the same round's K/V that the target verify writes into the
+        // nvfp4 B/R cache is also written into the FP16 ring, so the next verify can read the most
+        // recent window at FP16 precision. Every other mode leaves target_hot_ null.
+        if (target_hot_ != nullptr && ph == Phase::Verify) {
+            auto hot_scope = work_.scope();
+            const auto hot_rows = static_cast<std::size_t>(active_sequence_batch_);
+            Tensor lanes   = work_.alloc(DType::I32, {active_sequence_batch_});
+            const std::array<std::int32_t, 8> host_lanes{0, 1, 2, 3, 4, 5, 6, 7};
+            CUDA_CHECK(cudaMemcpyAsync(lanes.data, host_lanes.data(),
+                                       hot_rows * sizeof(std::int32_t),
+                                       cudaMemcpyHostToDevice, s));
+            Tensor counts = valid;
+            if (counts.data == nullptr) {
+                counts = work_.alloc(DType::I32, {active_sequence_batch_});
+                const std::array<std::int32_t, 8> host_counts{
+                    width, width, width, width, width, width, width, width};
+                CUDA_CHECK(cudaMemcpyAsync(counts.data, host_counts.data(),
+                                           hot_rows * sizeof(std::int32_t),
+                                           cudaMemcpyHostToDevice, s));
+            }
+            ops::kv_cache_append_prefix(
+                k_batch, v_batch, position_batch, counts, lanes,
+                {0, static_cast<std::uint32_t>(width)}, target_hot_->layer_view(fidx), s);
+        }
         // The gate rides along with the attention call: where the route can, the reduce epilogue
         // applies it at the store, and every other route applies it inside the Op. One contract
         // either way, and the same bytes the standalone multiply produced. A rotated output
@@ -1368,10 +1404,14 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
             }
             GdnReplayRecordLayer records =
                 replay_layer(static_cast<std::uint32_t>(gidx), active_sequence_batch_, width);
+            const std::span<const std::int32_t> source_slots_host =
+                active_linear_state_source_slots_host_ != nullptr
+                    ? std::span<const std::int32_t>(*active_linear_state_source_slots_host_)
+                    : std::span<const std::int32_t>{};
             gdn_projection_record(projection_input, p, *config.gdn, conv_states, valid,
-                                  *active_linear_state_source_slots_, records.conv, query_output,
-                                  key_output, value_output, gate_output, work_, s,
-                                  projection_basis);
+                                  *active_linear_state_source_slots_, source_slots_host,
+                                  records.conv, query_output, key_output, value_output,
+                                  gate_output, work_, s, projection_basis);
         } else {
             gdn_projection_snapshot(
                 projection_input, p, *config.gdn, conv_states, valid,

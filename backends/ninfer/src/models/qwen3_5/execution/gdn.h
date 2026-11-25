@@ -4,6 +4,8 @@
 #include "models/qwen3_5/execution/rotation.h"
 #include "core/device.h"
 
+#include <span>
+
 namespace ninfer::models::qwen3_5::execution {
 
 [[nodiscard]] std::size_t gdn_projection_workspace_bytes(const GdnParameters& parameters,
@@ -33,6 +35,7 @@ void gdn_projection_snapshot(const Tensor& hidden, const GdnParameters& paramete
 void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters,
                            const GdnConfig& config, const Tensor& conv_states,
                            const Tensor& valid_columns, const Tensor& initial_slots,
+                           std::span<const std::int32_t> initial_slots_host,
                            Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                            Tensor& z, WorkspaceArena& workspace, cudaStream_t stream,
                            InputBasis basis = InputBasis::Primal);

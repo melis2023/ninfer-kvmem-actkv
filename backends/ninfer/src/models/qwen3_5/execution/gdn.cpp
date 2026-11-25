@@ -287,6 +287,7 @@ void gdn_projection_snapshot(const Tensor& hidden, const GdnParameters& paramete
 void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters,
                            const GdnConfig& config, const Tensor& conv_states,
                            const Tensor& valid_columns, const Tensor& initial_slots,
+                           std::span<const std::int32_t> initial_slots_host,
                            Tensor& conv_record, Tensor& query, Tensor& key, Tensor& value,
                            Tensor& z, WorkspaceArena& workspace, cudaStream_t stream,
                            InputBasis basis) {
@@ -318,7 +319,12 @@ void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters
                                    cudaMemcpyDeviceToDevice, stream));
         Tensor tmp_state = scratch.alloc(DType::BF16, {channels, 3});
         std::vector<std::int32_t> slots(static_cast<std::size_t>(batch), 0);
-        if (initial_slots.data != nullptr) {
+        if (!initial_slots_host.empty()) {
+            if (initial_slots_host.size() < static_cast<std::size_t>(batch)) {
+                throw std::invalid_argument("GDN record: host state slots do not cover the batch");
+            }
+            std::copy_n(initial_slots_host.begin(), batch, slots.begin());
+        } else if (initial_slots.data != nullptr) {
             CUDA_CHECK(cudaMemcpy(slots.data(), initial_slots.data,
                                   slots.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
         }

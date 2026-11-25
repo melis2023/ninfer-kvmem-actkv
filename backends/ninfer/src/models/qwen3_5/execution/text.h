@@ -4,6 +4,7 @@
 
 
 #include "core/arena.h"
+#include "core/cyclic_kv_cache.h"
 #include "core/device.h"
 #include "core/gdn_replay_records.h"
 #include "core/linear_attention_state.h"
@@ -121,7 +122,8 @@ public:
                 std::uint32_t text_kv_base,
                 qwen3_5::PagedKVCacheView mtp_kv           = qwen3_5::PagedKVCacheView(),
                 const qwen3_5::PagedKVCache* batch_text_kv = nullptr,
-                const qwen3_5::PagedKVCache* batch_mtp_kv  = nullptr);
+                const qwen3_5::PagedKVCache* batch_mtp_kv  = nullptr,
+                const ninfer::CyclicKVCache* target_hot    = nullptr);
     ~TextContext();
 
     void set_expert_runtime(NativeExpertRuntime* experts) noexcept { experts_ = experts; }
@@ -373,6 +375,9 @@ private:
     qwen3_5::PagedKVCacheView mtp_kv_;
     const qwen3_5::PagedKVCache* batch_text_kv_ = nullptr;
     const qwen3_5::PagedKVCache* batch_mtp_kv_  = nullptr;
+    // DSpine-only FP16 hot ring of the most recent target KV tokens (--kv-dspine-f16). Null for
+    // every other mode, where the target verify reads only batch_text_kv_.
+    const ninfer::CyclicKVCache* target_hot_ = nullptr;
     LinearAttentionStatePool& state_;
     qwen3_5::RoundState& io_;
     Tensor& prefill_hidden_;
@@ -385,6 +390,7 @@ private:
     const Tensor* active_rope_positions_                                           = nullptr;
     const Tensor* active_kv_table_rows_                                            = nullptr;
     const Tensor* active_linear_state_source_slots_                                = nullptr;
+    const std::vector<std::int32_t>* active_linear_state_source_slots_host_        = nullptr;
     const Tensor* active_linear_state_destination_slots_                           = nullptr;
     const Tensor* active_valid_columns_                                            = nullptr;
     const Tensor* active_memory_prefill_origin_                                    = nullptr;
