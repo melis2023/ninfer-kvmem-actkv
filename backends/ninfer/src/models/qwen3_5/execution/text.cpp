@@ -978,7 +978,10 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         // The record projection runs once per GDN layer; hand it the host slot values once for the
         // whole verify batch instead of a device-to-host copy per layer.
         std::vector<std::int32_t> source_slots_host(static_cast<std::size_t>(batch), 0);
-        if (linear_state_source_slots.data != nullptr) {
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+        if (linear_state_source_slots.data != nullptr &&
+            capture_status == cudaStreamCaptureStatusNone) {
             CUDA_CHECK(cudaMemcpyAsync(source_slots_host.data(), linear_state_source_slots.data,
                                        batch * sizeof(std::int32_t), cudaMemcpyDeviceToHost,
                                        stream));

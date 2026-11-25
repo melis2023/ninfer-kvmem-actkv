@@ -901,13 +901,18 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     }
     if (has_trellis_weights && options.use_cuda_graph) {
         if (options.speculative.backend != SpeculativeBackend::None) {
-            // The verification round formats q/k/v in a coded GDN record path that reads the state
-            // slot while the graph is being captured; a captured replay would keep the captured
-            // slot. Eager verify reads the slot at call time.
-            publish_diagnostic(requested.diagnostic_observer, DiagnosticLevel::Warning, "%s",
-                               "NariQ coded weights with speculative decoding: disabling CUDA "
-                               "Graphs to avoid a captured state-slot read during verification");
-            options.use_cuda_graph = false;
+            // Root-only MTP is safe: the verify path skips its host slot read while a graph is
+            // being captured, and every round addresses root state slot 0. Extra slots still need
+            // eager decode; other spec backends keep the conservative eager path until validated.
+            const bool mtp_root_only =
+                options.speculative.backend == SpeculativeBackend::Mtp &&
+                !options.context_cache.enabled && options.kvmem.selected_tokens == 0;
+            if (!mtp_root_only) {
+                publish_diagnostic(requested.diagnostic_observer, DiagnosticLevel::Warning, "%s",
+                                   "NariQ coded weights with speculative decoding and non-root "
+                                   "state slots: disabling CUDA Graphs");
+                options.use_cuda_graph = false;
+            }
         } else if (options.kvmem.selected_tokens != 0) {
             publish_diagnostic(requested.diagnostic_observer, DiagnosticLevel::Warning, "%s",
                                "NariQ coded weights with KVMem: disabling CUDA Graphs to avoid "
