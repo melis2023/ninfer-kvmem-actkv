@@ -10,6 +10,8 @@
 #include "ninfer/ops/weight_input.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdlib>
 #include <stdexcept>
 #include <vector>
 
@@ -76,12 +78,12 @@ std::size_t snapshot_scratch_bytes(const GdnParameters& parameters, const GdnCon
     return std::max(std::size_t{1}, bytes);
 }
 
-// The coded replay-record route exists but its verify numerics are still being validated, so it is
-// opt-in: by default a coded target refuses the replay-record GDN a DFlash2/DSpine round needs.
+// The coded replay-record route is validated for the MTP/DFlash verify window; the q|v|k split
+// below fixed its earlier numeric mismatch. NINFER_CODED_REPLAY_RECORD=0 opts out.
 bool coded_replay_record_enabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("NINFER_CODED_REPLAY_RECORD");
-        return value != nullptr && value[0] != '\0' && value[0] != '0';
+        return value == nullptr || value[0] == '\0' || value[0] != '0';
     }();
     return enabled;
 }
@@ -314,33 +316,25 @@ void gdn_projection_record(const Tensor& hidden, const GdnParameters& parameters
                               scratch, stream);
         CUDA_CHECK(cudaMemcpyAsync(conv_record.data, qkv.data, qkv.bytes(),
                                    cudaMemcpyDeviceToDevice, stream));
-        Tensor conv_out  = scratch.alloc(DType::BF16, {channels, columns});
         Tensor tmp_state = scratch.alloc(DType::BF16, {channels, 3});
         std::vector<std::int32_t> slots(static_cast<std::size_t>(batch), 0);
         if (initial_slots.data != nullptr) {
             CUDA_CHECK(cudaMemcpy(slots.data(), initial_slots.data,
                                   slots.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost));
         }
+        // The coded qkv plane is stored in the converter's linear-attention order (q|v|k), so a
+        // raw channel-block copy would swap key and value. Use the same split geometry the prefill
+        // path uses; it restores q/k/v and the value head layout.
         for (std::int32_t b = 0; b < batch; ++b) {
             Tensor state_in = conv_states.slice(2, slots[static_cast<std::size_t>(b)], 1)
                                   .view({channels, 3});
             Tensor xb = qkv.slice(1, b * width, width);
-            Tensor ob = conv_out.slice(1, b * width, width);
-            ops::causal_conv1d_silu(xb, parameters.convolution, state_in, tmp_state, ob, stream);
+            Tensor qb = query.slice(2, b, 1).view({key_rows, width});
+            Tensor kb = key.slice(2, b, 1).view({key_rows, width});
+            Tensor vb = value.slice(2, b, 1).view({value_rows, width});
+            ops::causal_conv1d_silu_split(xb, parameters.convolution, state_in, tmp_state, qb, kb,
+                                          vb, stream);
         }
-        const auto copy_rows = [&](const Tensor& src, std::int32_t begin, const Tensor& dst) {
-            const std::size_t bytes = static_cast<std::size_t>(dst.ne[0]) *
-                                      static_cast<std::size_t>(columns) * sizeof(std::uint16_t);
-            CUDA_CHECK(cudaMemcpyAsync(
-                const_cast<void*>(dst.data),
-                static_cast<const std::uint8_t*>(src.data) +
-                    static_cast<std::size_t>(begin) * static_cast<std::size_t>(columns) *
-                        sizeof(std::uint16_t),
-                bytes, cudaMemcpyDeviceToDevice, stream));
-        };
-        copy_rows(conv_out, 0, query.view({key_rows, columns}));
-        copy_rows(conv_out, key_rows, key.view({key_rows, columns}));
-        copy_rows(conv_out, 2 * key_rows, value.view({value_rows, columns}));
         return;
     }
     if (const auto* gguf = std::get_if<ops::GgufProjectionWeights>(&parameters.projection)) {

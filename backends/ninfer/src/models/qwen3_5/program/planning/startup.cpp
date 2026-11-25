@@ -652,11 +652,17 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& source_plan) {
             matrix(layout, execution::fp32_proposal_logits(head) ? DType::FP32 : DType::BF16,
                    dimension(parameters.proposal->rows), columns);
             linear_scratch(layout, head, columns, columns);
-        } else {
+        } else if (parameters.mtp->output_head.weight.qdata != nullptr) {
             if (execution::fp32_proposal_logits(parameters.mtp->output_head)) {
                 matrix(layout, DType::FP32, dimension(config.vocab_size), columns);
             }
             linear_scratch(layout, parameters.mtp->output_head, columns, columns);
+        } else {
+            // A banded coded target has no single MTP head; its proposal reads the target head.
+            if (execution::target_logits_dtype(parameters.text.output_head) == DType::FP32) {
+                matrix(layout, DType::FP32, dimension(config.vocab_size), columns);
+            }
+            head_scratch(layout, parameters.text.output_head, columns, columns);
         }
     };
     const auto mtp_stem = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,

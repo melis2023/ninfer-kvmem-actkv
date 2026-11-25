@@ -194,8 +194,12 @@ LoadPlan plan_load(const artifact::Reader& reader, LoadOptions options,
             ? bindings.use(out->weights.text.output_head, "text/final_hidden")
             : WeightUseId{};
     if (out->weights.mtp) {
+        // A banded coded target has no single output head; the MTP block shares the target's
+        // banded head, so its own handle stays empty.
         out->weights.mtp->output_head_use =
-            bindings.use(out->weights.mtp->output_head, "mtp/final_hidden");
+            out->weights.mtp->output_head == WeightId{}
+                ? WeightUseId{}
+                : bindings.use(out->weights.mtp->output_head, "mtp/final_hidden");
     }
     if (out->weights.draft) {
         out->weights.draft->output_head_use =

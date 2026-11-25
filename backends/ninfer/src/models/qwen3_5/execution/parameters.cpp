@@ -606,7 +606,9 @@ public:
         nvfp4_w4a16_route(out.output, 5120, 6144);
         nvfp4_int8_route(out.output, 5120, 6144);
         out.ffn         = ffn(w.layer);
-        out.output_head = head(w.output_head_use);
+        if (w.output_head_use.parameter != WeightId{}) {
+            out.output_head = head(w.output_head_use);
+        }
         return out;
     }
 

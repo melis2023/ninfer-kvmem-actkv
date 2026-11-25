@@ -791,11 +791,19 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
             ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_,
                                           ctx_.stream);
         }
-    } else {
+    } else if (mtp_->output_head.weight.qdata != nullptr) {
         Tensor output_logits = fp32_proposal_logits(mtp_->output_head)
                                    ? work_.alloc(DType::FP32, {dimension(config_.vocab_size), T})
                                    : matrix_window(logits, T);
         project(hidden, mtp_->output_head, output_logits, work_, ctx_.stream);
+        ops::argmax(output_logits, proposal_tokens,
+                    dimension(parameters_.model.resources().public_token_count), ctx_.stream);
+    } else {
+        // A banded coded target has no single MTP head; the MTP block shares the target's head.
+        Tensor output_logits = target_logits_dtype(*lm_head_) == DType::FP32
+                                   ? work_.alloc(DType::FP32, {dimension(config_.vocab_size), T})
+                                   : matrix_window(logits, T);
+        project(hidden, *lm_head_, output_logits, work_, ctx_.stream);
         ops::argmax(output_logits, proposal_tokens,
                     dimension(parameters_.model.resources().public_token_count), ctx_.stream);
     }
