@@ -748,3 +748,33 @@ fused D256 q/k norm 原本是编译期 `RmsEpilogue::Plain`，改成运行时
   `build-backends/ninfer/src/models`、`src/runtime`、`apps` 并重编，否则 Ninja 的增量依赖
   不会覆盖头文件布局变化。
 - `NINFER_NORM_TRACE=1` 打印每个 norm 的 `min` 与判定，是定位 norm 模式最快的入口。
+
+## decode 调优的下一步：本轮实测与结论
+
+### splits 自适应方向已证伪
+
+NariQ decode（481 提示 / 128 new）按 `NINFER_TRELLIS_SPLITS` 扫描：
+
+| splits | 4 | 8 | 12 | 16（默认） |
+| --- | ---: | ---: | ---: | ---: |
+| decode tok/s | 19.4 | 20.5 | 20.3 | **21.2** |
+
+profile 显示小 n 投影的固定开销很大（`n=48` 的 GDN gating 35.7 µs/call、`n=1024` 44.4 µs），
+但它们不是靠减少 split 能救的：全局降到 4/8/12 都会伤到大矩阵。按 n 自适应 split 的方向据此
+放弃，除非把 gather_scale / prologue / reduce 融合成一次 launch。
+
+### 剩余两项（未做）
+
+1. **1528 块和延后修正**：`decode_tile_proven` 目前每个 k-tile 做 4 条 `hsub2`；参考实现把
+   `4v+1528` 直接喂 MMA，在 epilogue 用 `(c - 1528·Σx)·2^-e` 修正。预期 2–5%。
+2. **最后 CTA 融合归约**：每个 coded linear 现在多一个 `reduce_split_kernel` 和 partials
+   平面往返；用 atomic counter 让最后一个 split 的 CTA 直接做 reduce + post。预期 2–3%。
+
+两项都不改变数学，但都要改热循环/启动器，建议单独一轮并用 `test_trellis_real` 与 PPL 双门禁。
+
+### decode 21.2 vs 参考 33.6 的差距在哪
+
+profile 的 T1 条目里，`lin ... T1` 的 product 阶段（gemv）只占约四分之一；其余是注意力、
+GDN 的小矩阵、gather/prologue/reduce/post 与 KV 读取。参考的 33.6 建立在其整套 decode 调度
+（多实例、形状专用、融合 prologue/epilogue）上，不是一个 GEMV 内核能补齐的。下一轮应先按
+形状列出 T1 的 per-call 预算，再决定是否值得继续往 coded 内核里投。
