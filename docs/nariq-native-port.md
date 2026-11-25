@@ -778,3 +778,49 @@ profile 的 T1 条目里，`lin ... T1` 的 product 阶段（gemv）只占约四
 GDN 的小矩阵、gather/prologue/reduce/post 与 KV 读取。参考的 33.6 建立在其整套 decode 调度
 （多实例、形状专用、融合 prologue/epilogue）上，不是一个 GEMV 内核能补齐的。下一轮应先按
 形状列出 T1 的 per-call 预算，再决定是否值得继续往 coded 内核里投。
+
+## NariQ 与 DFlash2 / MTP 的关系（2026-11-25 检查）
+
+### coded 量化不是挂载失败的原因
+
+DFlash2 只依赖 target 的三样东西：指定层的 hidden taps、token embedding、输出 head。NariQ 三样都支持
+（coded embedding 走 `trellis_embedding`，banded head 走 banded 投影 + `candidate_topk`）。真正的
+阻塞是 **replay-record GDN**：验证轮要求 GDN 只算不写状态。
+
+### 已修复：CUDA Graph 与 coded record
+
+`--no-cuda-graph` 下 NariQ + dflash2 的 verify 首轮输出正确（` Paris.`）；带 graph 时同一轮乱码。
+根因是 coded record 路径在 capture 期间做 device→host 读 state slot。修复：coded 权重 + 任意
+speculative 后端时关闭 CUDA Graph（单步 decode 的 graph 保留）。
+
+### 剩余：verify 后续轮次的状态折叠
+
+`--no-cuda-graph`、draft-tokens 2：前两个 token 正确（` Paris is`），第 3 个起乱，acceptance 0%。
+说明 `gdn_projection_record` 的首轮 q/k/v 与 replay 输出可用，但轮次间的状态更新（replay records /
+conv state）不正确。下一步应对比 `records.conv`（应为卷积输入 qkv）与 fold 后 `conv_layer0` 的
+`[C,3]` 窗口，以及 `key/value/gate` records 在 fold 中的消费。
+
+### MTP GGUF（`Qwen3.8-27B-NariQ-3.0bpw-MTP.gguf`）
+
+第 65 层是 `blk.64.nextn.*`，16 个参数与 GSQ 的 `mtp/...` 一一对应：
+
+| GGUF | engine |
+| --- | --- |
+| `blk.64.nextn.eh_proj` | `mtp/input_projection` |
+| `blk.64.nextn.enorm` / `hnorm` / `shared_head_norm` | `mtp/embedding_norm` / `hidden_norm` / `final_norm` |
+| `blk.64.attn_norm` / `post_attention_norm` | `mtp/layers/0/input_norm` / `post_attention_norm` |
+| `blk.64.attn_q` (12288x5120) | `mtp/layers/0/attention/packed` |
+| `blk.64.attn_k` / `attn_v` / `attn_output` | key / value / output |
+| `blk.64.attn_q_norm` / `attn_k_norm` | query_norm / key_norm |
+| `blk.64.ffn_gate` / `up` / `down` | mlp gate / up / down |
+| `blk.64.nextn.embed_tokens` / `shared_head_head` | 跳过（用 target 的） |
+
+当前 `convert_nariq.py` / `nariq_model.py` 还不能正确转：
+
+1. `text_config` 写 `num_hidden_layers = 65`，`blk.64` 被当成普通 text 层；
+2. `plan()` 没有 MTP 命名映射；
+3. MTP 权重是 Q4_K/Q6_K，`read_dense` 只支持 F32/F16/BF16/I32，需要 GGUF 块直传（engine 的
+   `bind_mtp` 支持 `is_gguf`）或解码后重量化。
+
+MTP 的验证同样走 `target_verify_batch` 的 `RecordForReplay`，所以即使转换器补齐，NariQ + MTP 仍受
+上面同一个 record 状态问题限制。
