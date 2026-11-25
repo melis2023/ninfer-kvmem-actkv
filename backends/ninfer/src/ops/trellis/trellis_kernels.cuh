@@ -34,8 +34,32 @@ void permute_side(const float* src, float* dst, const std::int32_t* perm, std::i
 void hadfull_pass(const float* src, float* dst, float* tmp, float* tmp2, const SidePlan& plan,
                   const DevicePlan& device, bool inverse, int columns, cudaStream_t stream);
 
-// Coded tile product: yr [N,T] FP32 = W_hat * xa.
-void tile_product(const float* xa, const Weight& w, float* yr, int tokens, cudaStream_t stream);
+// Coded tile product: yr [N,T] FP32 = W_hat * xa. `xf`/`xs` are the prefill prologue scratch
+// (fp16 B-fragment plane and per-token 2^-e scales); unused by the single-token split route.
+void tile_product(const float* xa, const Weight& w, float* yr, int tokens, std::uint16_t* xf,
+                  float* xs, cudaStream_t stream);
+
+// Number of K ranges the single-token route accumulates in parallel. One token only reaches N/16
+// warps, so the plain product is latency-bound; splitting K restores the parallelism.
+inline constexpr int kDecodeSplits = 16;
+
+// NINFER_TRELLIS_PFDECODE=1: single-token decode takes the staged prefill GEMM path instead of
+// the legacy split-K GEMV. Temporary A/B while the new decode kernel is validated.
+bool trellis_pf_decode_enabled();
+
+// Single-token coded tile product: `partials` holds kDecodeSplits [N] planes and receives the
+// reduced result in `yr`. Requires w.k >= 16 * kDecodeSplits * 2.
+void tile_product_split1(const float* xa, const Weight& w, float* yr, float* partials,
+                         cudaStream_t stream);
+
+// NINFER_TRELLIS_GEMV=1: single-token decode takes the reference-structured chunked GEMV (weights as
+// the A operand, the prologue's fp16 fragment as B, one MMA per k-tile, cp.async chunk ring).
+bool trellis_gemv_enabled();
+
+// The same single-token product through the new kernel; `xf`/`xs` are the prologue scratch and must
+// be at least trellis_linear_workspace_bytes' xf/xs planes for one token.
+void tile_product_split1_gemv(const float* xa, const Weight& w, float* yr, float* partials,
+                              std::uint16_t* xf, float* xs, cudaStream_t stream);
 
 // yr -> out: post scale, output gather, one BF16 rounding.
 void post_and_gather(const float* yr, const Weight& w, Tensor& out, int tokens,
@@ -45,16 +69,22 @@ void post_and_gather(const float* yr, const Weight& w, Tensor& out, int tokens,
 void decode_row(const Tensor& ids, const Weight& w, float* g, int tokens, cudaStream_t stream);
 
 // g -> rows: pre scale, input gather, BF16 rounding.
-void pre_and_gather_bf16(const float* g, const Weight& w, Tensor& rows, int tokens,
+void pre_and_gather_bf16(const float* g, const Weight& w, const Tensor& ids, Tensor& rows, int tokens,
                          cudaStream_t stream);
 
-// dst[r][t] = src[index[r]][t] over BF16 rows of `tokens` entries: the banded head's final
-// vocab-order read (the artifact's `vocab_gather` is the vocab -> concatenated-band map).
+// dst[r][t] = src[global row index[r]][t] over BF16 rows of `tokens` entries: the banded head's final
+// vocab-order read. The source plane is one token-major slab per band (`band_rows`/`band_count`
+// describe them), so the kernel resolves a global row to its slab, token and local row itself.
 void gather_rows_bf16(const void* src, const std::int32_t* index, std::int64_t rows, int tokens,
-                      void* dst, cudaStream_t stream);
+                      const std::int32_t* band_rows, std::int32_t band_count, void* dst,
+                      cudaStream_t stream);
 
-// dst[dst_row + r][t] = src[index[r]][t]; `index` null means the identity (`index[r] = r`).
+// dst[dst_row + r][t] = src[from(r)][t] with `from(r) = index[r]` when `index` is set, otherwise
+// `(r / group) * stride + origin + r % group` (an interleaved row pattern), and the identity
+// `dst_row + r` when `group` is zero as well. `src_rows`/`dst_rows` are the two planes' row counts.
 void gather_rows_into_bf16(const void* src, const std::int32_t* index, std::int64_t rows,
-                           std::int64_t dst_row, int tokens, void* dst, cudaStream_t stream);
+                           std::int64_t dst_row, std::int32_t group, std::int32_t stride,
+                           std::int32_t origin, int tokens, std::int64_t src_rows,
+                           std::int64_t dst_rows, void* dst, cudaStream_t stream);
 
 } // namespace ninfer::ops::detail::trellis
