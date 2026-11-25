@@ -77,6 +77,6 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, Tensor& x,
  */
 void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Tensor& k_norm_weight,
                   const Tensor& q_in, const Tensor& k_in, Tensor& q_out, Tensor& k_out,
-                  cudaStream_t stream);
+                  cudaStream_t stream, bool q_unit_offset = true, bool k_unit_offset = true);
 
 } // namespace ninfer::ops

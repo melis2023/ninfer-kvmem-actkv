@@ -199,7 +199,7 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 state.execution.parameters.draft->feature_projection, projected,
                 state.execution.work, state.execution.device.stream);
         ops::rmsnorm(projected, state.execution.parameters.draft->context_norm, config.rms_norm_eps,
-                     false, context, state.execution.device.stream);
+                     state.execution.parameters.draft->context_norm_offset, context, state.execution.device.stream);
         if (const char* dump = std::getenv("NINFER_DSPINE_DUMP"); dump != nullptr) {
             dump_tensor(projected, dump, "context_projected",
                         state.execution.device.stream);
@@ -260,7 +260,7 @@ void append_context_impl(Context& state, const Tensor& features, const Tensor& p
                 Tensor key = layer_roots.key.view({dimension(config.attention.head_dim),
                                                    dimension(config.attention.num_key_value_heads),
                                                    layer_columns});
-                ops::rmsnorm(key_raw, weight.key_norm, config.rms_norm_eps, false, key,
+                ops::rmsnorm(key_raw, weight.key_norm, config.rms_norm_eps, weight.key_norm_offset, key,
                              state.execution.device.stream);
                 ops::rope(layer_positions.view({layer_columns}),
                           dimension(config.attention.head_dim), config.rope_theta, key,
@@ -630,7 +630,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
         if (config.dspine) {
             ops::rmsnorm(
                 residual, state.execution.parameters.draft->layers.front().input_norm,
-                config.rms_norm_eps, false, layer_input, state.execution.device.stream);
+                config.rms_norm_eps,
+                state.execution.parameters.draft->layers.front().input_norm_offset, layer_input, state.execution.device.stream);
         }
         // The last bridge write keeps its pre-norm stream, RMS, and gate query for the
         // serial refinement tail that turns the proposal rows into draft tokens.
@@ -657,7 +658,7 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                 auto roots =
                     workspace::dflash_attention(state.execution.work, target, config, columns);
                 if (!config.dspine) {
-                    ops::rmsnorm(residual, weight.input_norm, config.rms_norm_eps, false,
+                    ops::rmsnorm(residual, weight.input_norm, config.rms_norm_eps, weight.input_norm_offset,
                                  roots.hidden, state.execution.device.stream);
                 }
                 const Tensor& attention_input = config.dspine ? layer_input : roots.hidden;
@@ -682,9 +683,9 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                 Tensor key =
                     roots.key.view({dimension(config.attention.head_dim),
                                     dimension(config.attention.num_key_value_heads), columns});
-                ops::rmsnorm(query_raw, weight.query_norm, config.rms_norm_eps, false, query,
+                ops::rmsnorm(query_raw, weight.query_norm, config.rms_norm_eps, weight.query_norm_offset, query,
                              state.execution.device.stream);
-                ops::rmsnorm(key_raw, weight.key_norm, config.rms_norm_eps, false, key,
+                ops::rmsnorm(key_raw, weight.key_norm, config.rms_norm_eps, weight.key_norm_offset, key,
                              state.execution.device.stream);
                 ops::rope(positions.view({columns}), dimension(config.attention.head_dim),
                           config.rope_theta, query, key, state.execution.device.stream);
@@ -840,8 +841,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                     const auto prefix = "layer" + std::to_string(layer) + "_h";
                     dump_tensor(residual, dump, prefix.c_str(), state.execution.device.stream);
                 }
-                ops::rmsnorm(residual, weight.post_attention_norm, config.rms_norm_eps, false,
-                             roots.hidden, state.execution.device.stream);
+                ops::rmsnorm(residual, weight.post_attention_norm, config.rms_norm_eps,
+                             weight.post_attention_norm_offset, roots.hidden, state.execution.device.stream);
                 project_swiglu(roots.hidden, weight.mlp.gate_up, roots.intermediate,
                                state.execution.work, state.execution.device.stream);
                 project_add(roots.intermediate, weight.mlp.down, residual, state.execution.work,
@@ -962,7 +963,8 @@ void propose_batch_impl(DFlashBatchContext& state, qwen3_5::DFlashDecodeState& f
                                               static_cast<std::int32_t>(k) * batch_size});
         if (!config.dspine) {
             ops::rmsnorm(packed, state.execution.parameters.draft->final_norm,
-                         config.rms_norm_eps, false, proposal_hidden,
+                         config.rms_norm_eps, state.execution.parameters.draft->final_norm_offset,
+                         proposal_hidden,
                          state.execution.device.stream);
         }
         Tensor flat_drafts = drafts.view({static_cast<std::int32_t>(k) * batch_size});

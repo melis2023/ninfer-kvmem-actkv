@@ -65,6 +65,10 @@ std::size_t attention_projection_workspace_bytes(const AttentionParameters& para
             ops::attn_input_proj_workspace_capacity_bytes(weight.qtype, weight.n, weight.k,
                                                           single->policy, first, last));
     }
+    if (const auto* coded = std::get_if<ops::CodedProjectionWeights>(&parameters.projection)) {
+        return rotated_workspace_bytes(signs, coded->leader().k, last,
+                                       ops::coded_projection_workspace_bytes(*coded, last));
+    }
     const auto& pair = std::get<ops::PairedProjectionWeights>(parameters.projection);
     return rotated_workspace_bytes(signs, pair.first.k, last,
                                    ops::attn_input_proj_split_workspace_capacity_bytes(
@@ -80,6 +84,10 @@ void attention_projection(const Tensor& hidden, const AttentionParameters& param
         rotated_input(hidden, projection_signs(parameters.projection), workspace, stream, basis);
     if (const auto* gguf = std::get_if<ops::GgufProjectionWeights>(&parameters.projection)) {
         ops::attn_input_proj(x, *gguf, query, gate, key, value, workspace, stream);
+    } else if (const auto* coded =
+                   std::get_if<ops::CodedProjectionWeights>(&parameters.projection)) {
+        Tensor* const outputs[4] = {&query, &gate, &key, &value};
+        ops::coded_projection(x, *coded, outputs, 4, x.ne[1], workspace, stream);
     } else if (const auto* pair =
                    std::get_if<ops::PairedProjectionWeights>(&parameters.projection)) {
         ops::attn_input_proj(x, pair->first, pair->second, query, gate, key, value, pair->policy,
@@ -108,17 +116,18 @@ void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
                        const Tensor& q_norm_weight, const Tensor& k_norm_weight,
                        const Tensor& query, const Tensor& key, Tensor& normalized_query,
                        Tensor& normalized_key, const ops::RopeYarn& yarn, cudaStream_t stream,
-                       const MemoryStatisticsShard* statistics, std::int32_t layer) {
+                       const MemoryStatisticsShard* statistics, std::int32_t layer,
+                       bool q_unit_offset, bool k_unit_offset) {
     require_rope_axes(positions, rope);
     // The fused Op rotates unscaled positions at the unscaled frequencies, so YaRN or position
     // interpolation keeps the three separate calls.
     if (statistics == nullptr && !yarn.active() && fused_text_qk_norm_rope(positions, rope, attention, rms_norm_eps, query.ne[2])) {
         ops::rmsnorm_rope(positions, q_norm_weight, k_norm_weight, query, key, normalized_query,
-                          normalized_key, stream);
+                          normalized_key, stream, q_unit_offset, k_unit_offset);
         return;
     }
-    ops::rmsnorm(query, q_norm_weight, rms_norm_eps, true, normalized_query, stream);
-    ops::rmsnorm(key, k_norm_weight, rms_norm_eps, true, normalized_key, stream);
+    ops::rmsnorm(query, q_norm_weight, rms_norm_eps, q_unit_offset, normalized_query, stream);
+    ops::rmsnorm(key, k_norm_weight, rms_norm_eps, k_unit_offset, normalized_key, stream);
     if (statistics != nullptr) {
         const auto tokens = query.ne[2];
         const auto block = static_cast<std::int32_t>(statistics->block_tokens);

@@ -112,7 +112,7 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& norm_weight, Tensor& x,
 
 void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Tensor& k_norm_weight,
                   const Tensor& q_in, const Tensor& k_in, Tensor& q_out, Tensor& k_out,
-                  cudaStream_t stream) {
+                  cudaStream_t stream, bool q_unit_offset, bool k_unit_offset) {
     const std::int32_t tokens      = q_in.ne[2];
     const std::int32_t query_heads = q_in.ne[1];
     const std::int32_t key_heads   = k_in.ne[1];
@@ -134,7 +134,7 @@ void rmsnorm_rope(const Tensor& positions, const Tensor& q_norm_weight, const Te
     require_tensor(positions, DType::I32, {tokens, 1, 1, 1}, "text positions");
     require_text_nonoverlap(positions, q_norm_weight, k_norm_weight, q_in, k_in, q_out, k_out);
     detail::rmsnorm_rope_text_launch(positions, q_norm_weight, k_norm_weight, q_in, k_in, q_out,
-                                     k_out, tokens, stream);
+                                     k_out, tokens, q_unit_offset, k_unit_offset, stream);
 }
 
 } // namespace ninfer::ops

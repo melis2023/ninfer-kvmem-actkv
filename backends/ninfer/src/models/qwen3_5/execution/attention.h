@@ -29,6 +29,7 @@ void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
                        const Tensor& q_norm_weight, const Tensor& k_norm_weight,
                        const Tensor& query, const Tensor& key, Tensor& normalized_query,
                        Tensor& normalized_key, const ops::RopeYarn& yarn, cudaStream_t stream,
-                       const MemoryStatisticsShard* statistics = nullptr, std::int32_t layer = 0);
+                       const MemoryStatisticsShard* statistics = nullptr, std::int32_t layer = 0,
+                       bool q_unit_offset = true, bool k_unit_offset = true);
 
 } // namespace ninfer::models::qwen3_5::execution

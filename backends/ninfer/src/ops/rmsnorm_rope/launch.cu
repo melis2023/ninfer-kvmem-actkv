@@ -30,7 +30,8 @@ constexpr int kTextHeadsPerBlock = 3;
 template <int QHeads, int KHeads>
 void launch_text(const Tensor& positions, const Tensor& q_norm_weight, const Tensor& k_norm_weight,
                  const Tensor& q_in, const Tensor& k_in, Tensor& q_out, Tensor& k_out,
-                 std::int32_t tokens, cudaStream_t stream) {
+                 std::int32_t tokens, bool q_unit_offset, bool k_unit_offset,
+                 cudaStream_t stream) {
     constexpr int kGroups = (QHeads + KHeads + kTextHeadsPerBlock - 1) / kTextHeadsPerBlock;
     CUDA_CHECK(pdl::launch_consumer(
         {dim3(static_cast<unsigned>(tokens * kGroups)), dim3(kTextHeadsPerBlock * 32), 0, stream},
@@ -40,7 +41,7 @@ void launch_text(const Tensor& positions, const Tensor& q_norm_weight, const Ten
         static_cast<const __nv_bfloat162*>(k_norm_weight.data),
         static_cast<const __nv_bfloat162*>(q_in.data),
         static_cast<const __nv_bfloat162*>(k_in.data), static_cast<__nv_bfloat162*>(q_out.data),
-        static_cast<__nv_bfloat162*>(k_out.data), tokens));
+        static_cast<__nv_bfloat162*>(k_out.data), tokens, q_unit_offset, k_unit_offset));
 }
 
 } // namespace
@@ -63,17 +64,17 @@ void rmsnorm_rope_single_launch(const Tensor& positions, const Tensor& norm_weig
 void rmsnorm_rope_text_launch(const Tensor& positions, const Tensor& q_norm_weight,
                               const Tensor& k_norm_weight, const Tensor& q_in, const Tensor& k_in,
                               Tensor& q_out, Tensor& k_out, std::int32_t tokens,
-                              cudaStream_t stream) {
+                              bool q_unit_offset, bool k_unit_offset, cudaStream_t stream) {
     if (q_in.ne[1] == 16) {
         launch_text<16, 2>(positions, q_norm_weight, k_norm_weight, q_in, k_in, q_out, k_out,
-                           tokens, stream);
+                           tokens, q_unit_offset, k_unit_offset, stream);
     } else if (k_in.ne[1] == 2) {
         // Qwen3.8-Flash-Next's sparse attention: 24 query heads over 2 KV heads.
         launch_text<24, 2>(positions, q_norm_weight, k_norm_weight, q_in, k_in, q_out, k_out,
-                           tokens, stream);
+                           tokens, q_unit_offset, k_unit_offset, stream);
     } else {
         launch_text<24, 4>(positions, q_norm_weight, k_norm_weight, q_in, k_in, q_out, k_out,
-                           tokens, stream);
+                           tokens, q_unit_offset, k_unit_offset, stream);
     }
     CUDA_CHECK(cudaGetLastError());
 }

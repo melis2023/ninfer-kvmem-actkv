@@ -21,9 +21,9 @@ void gdn_projection(const Tensor& hidden, const GdnParameters& parameters, Tenso
                     InputBasis basis = InputBasis::Primal);
 // Returns the basis `hidden` is written in: rotated when the input projection is.
 [[nodiscard]] InputBasis gdn_norm_control(const Tensor& residual, const Tensor& norm, float epsilon,
-                                          const GdnParameters& parameters, Tensor& hidden,
-                                          Tensor& g, Tensor& beta, WorkspaceArena& workspace,
-                                          DeviceExecutionView execution);
+                                          bool norm_unit_offset, const GdnParameters& parameters,
+                                          Tensor& hidden, Tensor& g, Tensor& beta,
+                                          WorkspaceArena& workspace, DeviceExecutionView execution);
 void gdn_projection_snapshot(const Tensor& hidden, const GdnParameters& parameters,
                              const GdnConfig& config, Tensor& conv_states,
                              const Tensor& valid_columns, const Tensor& initial_slots,

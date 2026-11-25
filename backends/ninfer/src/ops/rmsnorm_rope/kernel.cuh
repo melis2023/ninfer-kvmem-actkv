@@ -49,7 +49,8 @@ __global__ __launch_bounds__(HeadsPerBlock * 32) void rmsnorm_rope_d256_text_ker
     const std::int32_t* __restrict__ positions, const __nv_bfloat162* __restrict__ q_norm,
     const __nv_bfloat162* __restrict__ k_norm, const __nv_bfloat162* __restrict__ q_in,
     const __nv_bfloat162* __restrict__ k_in, __nv_bfloat162* __restrict__ q_out,
-    __nv_bfloat162* __restrict__ k_out, std::int32_t tokens) {
+    __nv_bfloat162* __restrict__ k_out, std::int32_t tokens, bool q_unit_offset,
+    bool k_unit_offset) {
     pdl::enter();
     constexpr int kPairs    = 128;
     constexpr int kHalfPair = 16;
@@ -72,7 +73,8 @@ __global__ __launch_bounds__(HeadsPerBlock * 32) void rmsnorm_rope_d256_text_ker
     __nv_bfloat162* __restrict__ output       = query ? q_out : k_out;
 
     const std::int64_t base = (static_cast<std::int64_t>(token) * heads + head) * kPairs;
-    const auto normalized   = detail::rmsnorm_rope_d256_normalize(input, weight, base, lane);
+    const auto normalized   = detail::rmsnorm_rope_d256_normalize(
+        input, weight, base, lane, query ? q_unit_offset : k_unit_offset);
 #pragma unroll
     for (int k = 1; k < 4; ++k) { output[base + lane + k * 32] = normalized.pair[k]; }
 

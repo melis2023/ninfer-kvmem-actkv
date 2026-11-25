@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -55,6 +56,12 @@ void rmsnorm_impl(const Tensor& x, const Tensor& weight, float eps, bool unit_of
     }
     if (!(eps > 0.0f) || !std::isfinite(eps)) {
         throw std::invalid_argument("rmsnorm: eps must be positive and finite");
+    }
+    // NINFER_FORCE_UNIT_OFFSET=1: probe only. Forces the 1+weight gain on every call so a tree
+    // whose call sites all pass false can still be measured against an artifact that needs it.
+    if (const char* forced = std::getenv("NINFER_FORCE_UNIT_OFFSET");
+        forced != nullptr && forced[0] == '1') {
+        unit_offset = true;
     }
 
     const std::int64_t n = numel_allow_zero(x, "x");

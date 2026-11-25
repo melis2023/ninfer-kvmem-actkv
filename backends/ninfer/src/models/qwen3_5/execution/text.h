@@ -256,10 +256,14 @@ private:
         return draft.has_value() && draft->dspine.has_value();
     }
 
-    void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
-    void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
+    // `accum`, when given by the layer loop, is an FP32 residual stream that receives every block delta
+    // beside the BF16 `x` the blocks read, so the accumulator keeps the low bits BF16 would round away.
+    void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase,
+                  Tensor* accum = nullptr);
+    void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase,
+                 Tensor* accum = nullptr);
     void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
-                  const ops::SparseMoeHints& hints);
+                  const ops::SparseMoeHints& hints, Tensor* accum = nullptr);
     [[nodiscard]] ops::SparseMoeHints next_projection_hints(int layer) const;
 
     // Per-request width of a bound sequence batch; an unbatched call is one row of all columns.
@@ -289,7 +293,7 @@ private:
     // A mixer's output projection: added to the residual, or in a tensor-parallel pass written to
     // the rank's FP32 partial, which the exchange adds.
     void project_residual(const Tensor& input, const LinearParameters& p, Tensor& x,
-                          InputBasis basis, bool wide_verification);
+                          InputBasis basis, bool wide_verification, Tensor* accum = nullptr);
     // The Linear Attention state pool holding GDN layer `layer`, and its index within that pool.
     struct GdnStateRef {
         LinearAttentionStatePool* pool;
@@ -402,7 +406,7 @@ private:
 
     const Weight* embed_                        = nullptr;
     const Tensor* final_norm_                   = nullptr;
-    const LinearParameters* lm_head_            = nullptr;
+    const HeadParameters* lm_head_              = nullptr;
     const LinearParameters* proposal_head_      = nullptr;
     const std::int32_t* proposal_head_ids_      = nullptr;
     int proposal_head_n_                        = 0;
@@ -420,3 +424,4 @@ private:
 };
 
 } // namespace ninfer::models::qwen3_5::execution
+

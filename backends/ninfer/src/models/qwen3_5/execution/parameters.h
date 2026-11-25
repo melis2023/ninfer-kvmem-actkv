@@ -54,6 +54,9 @@ using FfnParameters = std::variant<DenseParameters, ops::SparseMoeWeights, Strea
 struct AttentionParameters {
     ops::ProjectionWeights projection;
     Tensor query_norm, key_norm;
+    // A checkpoint stores a norm gain either as w (plain) or as w - 1 (offset); the loader resolves
+    // each parameter's mode from its own values, since one artifact can mix the two.
+    bool query_norm_offset = true, key_norm_offset = true;
     LinearParameters output;
 };
 
@@ -61,11 +64,13 @@ struct GdnParameters {
     ops::ProjectionWeights projection;
     ops::ProjectionWeights control;
     Tensor a_log, dt_bias, convolution, norm;
+    bool norm_offset = false;
     LinearParameters output;
 };
 
 struct BlockParameters {
     Tensor input_norm, post_attention_norm;
+    bool input_norm_offset = true, post_attention_norm_offset = true;
     std::variant<AttentionParameters, GdnParameters> mixer;
     FfnParameters ffn;
     ops::SparseMoeHints projection_prefetch;
@@ -74,13 +79,25 @@ struct BlockParameters {
     std::size_t rank = 0;
 };
 
+// The output head. A NariQ checkpoint splits the vocabulary over coded bands of different widths
+// and formats plus one `vocab_gather` map (`ops::trellis_banded_head`), so the head is either one
+// matrix or a band set; every other checkpoint loads the single form.
+struct HeadParameters {
+    LinearParameters single;
+    std::vector<LinearParameters> bands;
+    Tensor gather;
+
+    [[nodiscard]] bool banded() const noexcept { return !bands.empty(); }
+};
+
 struct TextParameters {
     Weight token_embedding;
     // A token table stored in the rotated basis (T2) is restored after the gather with the
     // hidden-width sign vector; empty for an ordinary table.
     Tensor token_embedding_signs;
-    LinearParameters output_head;
+    HeadParameters output_head;
     Tensor final_norm;
+    bool final_norm_offset = true;
     std::vector<BlockParameters> layers;
     // Tensor parallelism: `layers` holds rank 0's share of each layer and rank_layers[r - 1] rank
     // r's, whose attention layers carry no mixer (rank 0 runs attention alone). Empty otherwise.
@@ -121,8 +138,11 @@ struct MtpProjectionParameters {
 struct MtpParameters {
     LinearParameters input_projection;
     Tensor embedding_norm, hidden_norm, input_norm, post_attention_norm, final_norm;
+    bool embedding_norm_offset = true, hidden_norm_offset = true, input_norm_offset = true,
+         post_attention_norm_offset = true, final_norm_offset = true;
     MtpProjectionParameters projection;
     Tensor query_norm, key_norm;
+    bool query_norm_offset = true, key_norm_offset = true;
     LinearParameters output;
     FfnParameters ffn;
     LinearParameters output_head;
@@ -156,8 +176,10 @@ struct DynamicConvParameters {
 
 struct DraftBlockParameters {
     Tensor input_norm, post_attention_norm;
+    bool input_norm_offset = false, post_attention_norm_offset = false;
     LinearParameters query_key_value, context_key, context_value;
     Tensor query_norm, key_norm;
+    bool query_norm_offset = false, key_norm_offset = false;
     LinearParameters output;
     DenseParameters mlp;
     std::optional<DynamicConvParameters> attention_conv, mlp_conv;
@@ -177,6 +199,7 @@ struct DSpineBridgeParameters {
 struct DraftParameters {
     LinearParameters feature_projection;
     Tensor context_norm, final_norm;
+    bool context_norm_offset = false, final_norm_offset = false;
     std::vector<DraftBlockParameters> layers;
     std::optional<SelectorParameters> selector;
     std::optional<DSpineBridgeParameters> dspine_bridge;

@@ -1,4 +1,4 @@
-﻿#include "models/qwen3_5/program/internal.h"
+#include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/execution/text.h"
 #include "models/qwen3_5/execution/attention.h"
 #include "models/qwen3_5/execution/gdn.h"
@@ -11,6 +11,8 @@
 #include "models/qwen3_5/execution/visual_scatter.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_control.h"
+#include "ninfer/ops/cast.h"
+#include "ops/trellis/trellis_profile.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
@@ -48,6 +50,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -58,8 +62,156 @@
 namespace ninfer::models::qwen3_5::execution {
 namespace {
 
-void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {
-    if (source == nullptr || destination.dtype != DType::I32 || !destination.is_contiguous() ||
+// NINFER_TRACE_LOGITS=1: the top entries of a logits tensor's last column, printed to stderr. This
+// is the engine-side counterpart of an off-line recomputation, so a head divergence is visible
+// without dumping the whole vocabulary plane.
+void trace_logits(const Tensor& logits, cudaStream_t stream, const char* what) {
+    static const bool on = [] {
+        const char* value = std::getenv("NINFER_TRACE_LOGITS");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    if (!on || logits.data == nullptr) { return; }
+    const std::int64_t vocab = logits.ne[0];
+    if (logits.ne[1] < 1) { return; }
+    std::vector<std::uint16_t> host(static_cast<std::size_t>(vocab));
+    const void* source = static_cast<const std::uint8_t*>(logits.data) +
+                         static_cast<std::size_t>(logits.ne[1] - 1) * static_cast<std::size_t>(vocab) *
+                             sizeof(std::uint16_t);
+    cudaMemcpyAsync(host.data(), source, host.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost,
+                    stream);
+    cudaStreamSynchronize(stream);
+    std::vector<float> values(host.size());
+    for (std::size_t i = 0; i < host.size(); ++i) {
+        std::uint32_t word = static_cast<std::uint32_t>(host[i]) << 16;
+        std::memcpy(&values[i], &word, sizeof(float));
+    }
+    std::vector<std::size_t> order(values.size());
+    for (std::size_t i = 0; i < order.size(); ++i) { order[i] = i; }
+    const std::size_t shown = std::min<std::size_t>(8, order.size());
+    std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(shown), order.end(),
+                      [&](std::size_t a, std::size_t b) { return values[a] > values[b]; });
+    std::fprintf(stderr, "logits | %s | top:", what);
+    for (std::size_t i = 0; i < shown; ++i) {
+        std::fprintf(stderr, " %zu=%.5f", order[i], static_cast<double>(values[order[i]]));
+    }
+    std::fprintf(stderr, " | dtype %d bytes %zu | raw16:", static_cast<int>(logits.dtype),
+                 static_cast<std::size_t>(logits.bytes()));
+    for (std::size_t i = 0; i < 6 && i < host.size(); ++i) { std::fprintf(stderr, " %04x", host[i]); }
+    const float* wide = reinterpret_cast<const float*>(host.data());
+    std::fprintf(stderr, " | as-f32: %.5f %.5f %.5f\n", static_cast<double>(wide[0]),
+                 static_cast<double>(wide[1]), static_cast<double>(wide[2]));
+}
+
+// NINFER_TRACE_LOGITS=1: the embedding ids of one decode step, so a zero embedding can be pinned to
+// the row it asked for.
+void trace_ids(const Tensor& ids, cudaStream_t stream, const char* what) {
+    static const bool on = [] {
+        const char* value = std::getenv("NINFER_TRACE_LOGITS");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    if (!on || ids.data == nullptr || ids.dtype != DType::I32) { return; }
+    std::vector<std::int32_t> host(static_cast<std::size_t>(ids.ne[0] * ids.ne[1]));
+    cudaMemcpyAsync(host.data(), ids.data, host.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost,
+                    stream);
+    cudaStreamSynchronize(stream);
+    std::fprintf(stderr, "ids | %s |", what);
+    for (const auto id : host) { std::fprintf(stderr, " %d", id); }
+    std::fprintf(stderr, "\n");
+}
+
+// NINFER_TRACE_LOGITS=1: RMS of a BF16 tensor's last column, to tell a zero head input from a zero
+// head output.
+void trace_rms(const Tensor& t, cudaStream_t stream, const char* what) {
+    static const bool on = [] {
+        const char* value = std::getenv("NINFER_TRACE_LOGITS");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    if (!on || t.data == nullptr || t.ne[1] < 1) { return; }
+    std::vector<std::uint16_t> host(static_cast<std::size_t>(t.ne[0]));
+    const void* source = static_cast<const std::uint8_t*>(t.data) +
+                         static_cast<std::size_t>(t.ne[1] - 1) * static_cast<std::size_t>(t.ne[0]) *
+                             sizeof(std::uint16_t);
+    cudaMemcpyAsync(host.data(), source, host.size() * sizeof(std::uint16_t), cudaMemcpyDeviceToHost,
+                    stream);
+    cudaStreamSynchronize(stream);
+    double squares = 0;
+    for (const auto bits : host) {
+        std::uint32_t word = static_cast<std::uint32_t>(bits) << 16;
+        float value;
+        std::memcpy(&value, &word, sizeof(value));
+        squares += double(value) * value;
+    }
+    std::fprintf(stderr, "rms | %s | %.5f\n", what, std::sqrt(squares / double(host.size())));
+    // NINFER_TRACE_DUMP=<dir>: the column as FP32 for an off-line head check.
+    static const char* dump_dir = std::getenv("NINFER_TRACE_DUMP");
+    if (dump_dir != nullptr && dump_dir[0] != '\0') {
+        static std::uint32_t counter = 0;
+        std::vector<float> values(host.size());
+        for (std::size_t i = 0; i < host.size(); ++i) {
+            std::uint32_t word = static_cast<std::uint32_t>(host[i]) << 16;
+            std::memcpy(&values[i], &word, sizeof(float));
+        }
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s/%s-%03u.f32", dump_dir, what,
+                      static_cast<unsigned>(counter++));
+        if (std::FILE* file = std::fopen(path, "wb")) {
+            std::fwrite(values.data(), sizeof(float), values.size(), file);
+            std::fclose(file);
+        }
+    }
+}
+
+// NINFER_TRACE_DUMP=<dir>: every column of a BF16 or FP32 plane as
+// `<dir>/<what>-<tag>-<column>.f32`, so a whole prefill batch can be checked row by row off-line.
+// The element width has to follow the dtype: reading an FP32 plane as BF16 halves its columns and
+// splits each float into two garbage-looking lanes.
+void trace_dump_matrix(const Tensor& t, cudaStream_t stream, const char* what, const char* tag) {
+    static const char* dump_dir = std::getenv("NINFER_TRACE_DUMP");
+    if (dump_dir == nullptr || dump_dir[0] == '\0' || t.data == nullptr || t.ne[1] < 1) { return; }
+    const std::size_t element_bytes = t.dtype == DType::FP32  ? sizeof(float)
+                                      : t.dtype == DType::BF16 ? sizeof(std::uint16_t)
+                                                               : 0;
+    if (element_bytes == 0) { return; }
+    const std::size_t rows = static_cast<std::size_t>(t.ne[0]);
+    for (std::int32_t column = 0; column < t.ne[1]; ++column) {
+        const void* source = static_cast<const std::uint8_t*>(t.data) +
+                             static_cast<std::size_t>(column) * rows * element_bytes;
+        std::vector<float> values(rows);
+        if (t.dtype == DType::FP32) {
+            cudaMemcpy(values.data(), source, rows * sizeof(float), cudaMemcpyDeviceToHost);
+        } else {
+            std::vector<std::uint16_t> host(rows);
+            cudaMemcpy(host.data(), source, rows * sizeof(std::uint16_t), cudaMemcpyDeviceToHost);
+            for (std::size_t i = 0; i < rows; ++i) {
+                std::uint32_t word = static_cast<std::uint32_t>(host[i]) << 16;
+                std::memcpy(&values[i], &word, sizeof(float));
+            }
+        }
+        char path[512];
+        std::snprintf(path, sizeof(path), "%s/%s-%s-%03d.f32", dump_dir, what, tag, column);
+        if (std::FILE* file = std::fopen(path, "wb")) {
+            std::fwrite(values.data(), sizeof(float), values.size(), file);
+            std::fclose(file);
+        }
+    }
+    cudaStreamSynchronize(stream);
+}
+
+// NINFER_TRACE_LOGITS=1: the token an argmax/sampling call wrote, so the picked id can be compared
+// with the text the app prints for it.
+void trace_token(const Tensor& token, cudaStream_t stream) {
+    static const bool on = [] {
+        const char* value = std::getenv("NINFER_TRACE_LOGITS");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    if (!on || token.data == nullptr) { return; }
+    std::int32_t picked = -1;
+    cudaMemcpyAsync(&picked, token.data, sizeof(picked), cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+    std::fprintf(stderr, "pick | %d\n", picked);
+}
+
+void copy_i32(const std::int32_t* source, Tensor& destination, cudaStream_t stream) {    if (source == nullptr || destination.dtype != DType::I32 || !destination.is_contiguous() ||
         destination.data == nullptr) {
         throw std::invalid_argument("copy_i32: invalid host source or I32 destination");
     }
@@ -333,8 +485,8 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
 
     Tensor e = roots.normalized_embedding;
     Tensor h = roots.normalized_hidden;
-    ops::rmsnorm(emb, mtp_->embedding_norm, config_.rms_norm_eps, true, e, s);
-    ops::rmsnorm(flat_hidden, mtp_->hidden_norm, config_.rms_norm_eps, true, h, s);
+    ops::rmsnorm(emb, mtp_->embedding_norm, config_.rms_norm_eps, mtp_->embedding_norm_offset, e, s);
+    ops::rmsnorm(flat_hidden, mtp_->hidden_norm, config_.rms_norm_eps, mtp_->hidden_norm_offset, h, s);
 
     Tensor fc_in = roots.packed_input;
     ops::mtp_pack_fc_input(e, h, fc_in, s);
@@ -343,7 +495,7 @@ void TextContext::mtp_forward_stem(const Tensor& ids, const Tensor& hidden,
     project(fc_in, mtp_->input_projection, x, work_, s);
 
     ah = roots.attention_hidden;
-    ops::rmsnorm(x, mtp_->input_norm, config_.rms_norm_eps, true, ah, s);
+    ops::rmsnorm(x, mtp_->input_norm, config_.rms_norm_eps, mtp_->input_norm_offset, ah, s);
 }
 
 void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& positions,
@@ -379,7 +531,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
     text_qk_norm_rope(rope_for_op, *config_.rope_parameters, *config_.attention,
                       config_.rms_norm_eps, mtp_->query_norm, mtp_->key_norm, q, k, qn, kn,
-                      rope_yarn_, s);
+                      rope_yarn_, s, nullptr, 0, mtp_->query_norm_offset, mtp_->key_norm_offset);
 
     Tensor a = results.attention.view({dimension(config_.attention->head_dim),
                                        dimension(config_.attention->num_attention_heads), T});
@@ -439,7 +591,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     ops::residual_add(o, x, s);
 
     Tensor mh = post.post_mixer_hidden;
-    ops::rmsnorm(x, mtp_->post_attention_norm, config_.rms_norm_eps, true, mh, s);
+    ops::rmsnorm(x, mtp_->post_attention_norm, config_.rms_norm_eps, mtp_->post_attention_norm_offset, mh, s);
 
     {
         auto post_mixer_scope = work_.scope();
@@ -447,7 +599,7 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
     }
 
     Tensor flat_mtp_hidden = mtp_hidden.view({dimension(config_.hidden_size), T});
-    ops::rmsnorm(x, mtp_->final_norm, config_.rms_norm_eps, true, flat_mtp_hidden, s);
+    ops::rmsnorm(x, mtp_->final_norm, config_.rms_norm_eps, mtp_->final_norm_offset, flat_mtp_hidden, s);
 }
 
 // The MTP draft attends to one sink page and the newest window, so its read stops growing with
@@ -541,7 +693,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         Tensor kn =
             work_.alloc(DType::BF16, {dimension(config_.attention->head_dim),
                                       dimension(config_.attention->num_key_value_heads), T});
-        ops::rmsnorm(k, mtp_->key_norm, config_.rms_norm_eps, true, kn, s);
+        ops::rmsnorm(k, mtp_->key_norm, config_.rms_norm_eps, mtp_->key_norm_offset, kn, s);
         text_rope(rope_positions, *config_.rope_parameters, rope_yarn_, kn, s);
         ops::kv_cache_append(kn, v, positions, mtp_kv_.layer_view(0), s);
 
@@ -572,7 +724,7 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         Tensor qn =
             work_.alloc(DType::BF16, {dimension(config_.attention->head_dim),
                                       dimension(config_.attention->num_attention_heads), 1});
-        ops::rmsnorm(q, mtp_->query_norm, config_.rms_norm_eps, true, qn, s);
+        ops::rmsnorm(q, mtp_->query_norm, config_.rms_norm_eps, mtp_->query_norm_offset, qn, s);
         Tensor last_position = positions.slice(0, T - 1, 1);
         Tensor last_rope_position;
         if (rope_positions.ne[1] == 1) {
@@ -606,12 +758,12 @@ void TextContext::mtp_prefill_chunk(const Tensor& ids, const Tensor& hidden,
         ops::residual_add(o, x_last, s);
 
         Tensor mh = work_.alloc(DType::BF16, {dimension(config_.hidden_size), 1});
-        ops::rmsnorm(x_last, mtp_->post_attention_norm, config_.rms_norm_eps, true, mh, s);
+        ops::rmsnorm(x_last, mtp_->post_attention_norm, config_.rms_norm_eps, mtp_->post_attention_norm_offset, mh, s);
         {
             auto post_mixer_scope = work_.scope();
             ffn(mh, mtp_->ffn, x_last, {}, work_, s, true, false, InputBasis::Primal, false, experts_);
         }
-        ops::rmsnorm(x_last, mtp_->final_norm, config_.rms_norm_eps, true, *final_hidden, s);
+        ops::rmsnorm(x_last, mtp_->final_norm, config_.rms_norm_eps, mtp_->final_norm_offset, *final_hidden, s);
         proposal_argmax(*final_hidden, *logits, *draft_token);
     }
 }
@@ -760,11 +912,17 @@ void TextContext::ordinary_decode_batch(const Tensor& ids, const Tensor& cache_p
 
         Tensor x = work_.alloc(DType::BF16, {dimension(config_.hidden_size), batch});
         embed_tokens(ids, *embed_, parameters_.text.token_embedding_signs, x, stream);
+        trace_ids(ids, stream, "decode");
+        trace_rms(x, stream, "decode-embed");
         capture_attention_tokens(ids);
         NullTap tap;
         run_layers(x, Phase::Verify, tap);
-        ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, hidden, stream);
+        trace_rms(x, stream, "decode-residual");
+        ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, parameters_.text.final_norm_offset,
+                     hidden, stream);
+        trace_rms(hidden, stream, "decode-hidden");
         project(hidden, *lm_head_, logits, work_, stream);
+        trace_logits(logits, stream, "decode");
     }
     work_.reset();
 }
@@ -827,7 +985,8 @@ void TextContext::target_verify_batch_impl(const Tensor& ids, const Tensor& cach
         Tensor flat_hidden = hidden.view({dimension(config_.hidden_size), columns});
         Tensor flat_logits = logits.view({dimension(config_.vocab_size), columns});
         Tensor flat_tokens = target_tokens.view({columns});
-        ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, flat_hidden, stream);
+        ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, parameters_.text.final_norm_offset,
+                     flat_hidden, stream);
         project(flat_hidden, *lm_head_, flat_logits, work_, stream);
         ops::argmax(flat_logits, flat_tokens,
                     dimension(parameters_.model.resources().public_token_count), stream);
@@ -901,7 +1060,8 @@ void TextContext::mtp_propose_batch(const Tensor& hidden, Tensor& logits, Tensor
     proposal_argmax(hidden, logits, draft_tokens);
 }
 
-void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph) {
+void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase ph,
+                           Tensor* accum) {
     const auto& p  = std::get<AttentionParameters>(w.mixer);
     cudaStream_t s = ctx_.stream;
     const int T    = x.ne[1];
@@ -916,12 +1076,14 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     // the normalized hidden state, so only the other routes stage it.
     const auto* single     = std::get_if<LinearParameters>(&p.projection);
     const bool fused_nvfp4 = input_basis == InputBasis::Primal && single != nullptr &&
+                             w.input_norm_offset &&
                              ops::attn_input_proj_fused_rmsnorm_nvfp4_eligible(single->weight,
                                                                                single->policy, T);
     // The integer route carries the same edge: one pass over the residual row produces the s8 codes
     // and per-32 scales the grouped or narrow mainloop reads, so the rmsnorm below is skipped
     // rather than run and then re-read. The policies are disjoint, and the band decides the width.
     const bool fused_int8 = !fused_nvfp4 && input_basis == InputBasis::Primal && single != nullptr &&
+                            w.input_norm_offset &&
                             ops::attn_input_proj_fused_rmsnorm_int8_eligible(
                                 single->weight, single->policy, T);
     Tensor h;
@@ -929,9 +1091,10 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         h = workspace::matrix(work_, DType::BF16, dimension(config_.hidden_size), T);
     }
     if (input_basis == InputBasis::Rotated) {
-        ops::rmsnorm_hadamard(x, w.input_norm, config_.rms_norm_eps, true, input_signs, h, s);
+        ops::rmsnorm_hadamard(x, w.input_norm, config_.rms_norm_eps, w.input_norm_offset,
+                              input_signs, h, s);
     } else if (!fused_nvfp4 && !fused_int8) {
-        ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, true, h, s);
+        ops::rmsnorm(x, w.input_norm, config_.rms_norm_eps, w.input_norm_offset, h, s);
     }
 
     Tensor q         = projection.query.view({dimension(config_.attention->head_dim),
@@ -985,7 +1148,32 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     }
     text_qk_norm_rope(rope_for_op, *config_.rope_parameters, *config_.attention,
                       config_.rms_norm_eps, p.query_norm, p.key_norm, q, k, qn, kn, rope_yarn_,
-                      s, statistics, statistics_layer);
+                      s, statistics, statistics_layer, p.query_norm_offset, p.key_norm_offset);
+    static const std::int32_t trace_attn_layer = [] {
+        const char* v = std::getenv("NINFER_TRACE_ATTN");
+        return v != nullptr && v[0] != '\0' ? static_cast<std::int32_t>(std::atoi(v)) : -1;
+    }();
+    const bool tap_attn =
+        ph == Phase::Prefill && fidx == trace_attn_layer && std::getenv("NINFER_TRACE_DUMP") != nullptr;
+    if (tap_attn) {
+        const auto qw = dimension(config_.attention->query_width());
+        const auto kw = dimension(config_.attention->key_width());
+        // `x` is the residual row the output projection adds into. `h` below is only its
+        // RMSNorm, so comparing W@attention against resid-h was never the right target.
+        trace_dump_matrix(x, s, "attn-x", "prefill");
+        const Tensor& output_signs = p.output.hadamard_signs;
+        if (rotated(output_signs)) {
+            trace_dump_matrix(output_signs.view({output_signs.ne[0], 1}), s,
+                              "attn-out-signs", "prefill");
+        }
+        trace_dump_matrix(h, s, "attn-h", "prefill");
+        trace_dump_matrix(q_flat, s, "attn-q", "prefill");
+        trace_dump_matrix(qn.view({qw, T}), s, "attn-qn", "prefill");
+        trace_dump_matrix(k_flat, s, "attn-k", "prefill");
+        trace_dump_matrix(kn.view({kw, T}), s, "attn-kn", "prefill");
+        trace_dump_matrix(v_flat, s, "attn-v", "prefill");
+        trace_dump_matrix(gate_flat, s, "attn-gate", "prefill");
+    }
     if(statistics && statistics->attention_queries.data) {
         const std::int32_t selected[]{0,static_cast<std::int32_t>(config_.full_attention_layers/2),
             static_cast<std::int32_t>(config_.full_attention_layers-1)};
@@ -1067,19 +1255,31 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     }
     const bool wide = wide_residual_verification(ph, row_width(T), row_width(T));
     Tensor gated    = a.view({dimension(config_.attention->query_width()), T});
+    if (tap_attn) {
+        trace_dump_matrix(gated, s, "attn-a", "prefill");
+    }
     if (rotated_output) {
         ops::sigmoid_mul_hadamard(gate, a, p.output.hadamard_signs, gated, s);
-        project_residual(gated, p.output, x, InputBasis::Rotated, wide);
+        project_residual(gated, p.output, x, InputBasis::Rotated, wide, accum);
+        if (tap_attn) {
+            trace_dump_matrix(x, s, "attn-resid", "prefill");
+        }
         return;
     }
-    project_residual(gated, p.output, x, InputBasis::Primal, wide);
+    project_residual(gated, p.output, x, InputBasis::Primal, wide, accum);
+    if (tap_attn) {
+        trace_dump_matrix(x, s, "attn-resid", "prefill");
+    }
 }
 
 void TextContext::project_residual(const Tensor& input, const LinearParameters& p, Tensor& x,
-                                   InputBasis basis, bool wide_verification) {
+                                   InputBasis basis, bool wide_verification, Tensor* accum) {
     if (residual_partial_ == nullptr) {
-        project_add(input, p, x, work_, ctx_.stream, basis, wide_verification);
+        project_add(input, p, x, work_, ctx_.stream, basis, wide_verification, accum);
         return;
+    }
+    if (accum != nullptr) {
+        throw std::logic_error("project_residual: a wide accumulator has no tensor-parallel share");
     }
     auto scope     = work_.scope();
     const Tensor v = rotated_input(input, p.hadamard_signs, work_, ctx_.stream, basis);
@@ -1087,7 +1287,8 @@ void TextContext::project_residual(const Tensor& input, const LinearParameters& 
                 work_, ctx_.stream);
 }
 
-void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
+void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph,
+                          Tensor* accum) {
     const auto& p                = std::get<GdnParameters>(w.mixer);
     cudaStream_t s               = ctx_.stream;
     const int T                  = x.ne[1];
@@ -1098,8 +1299,9 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     Tensor h           = control.hidden;
     Tensor g           = control.g;
     Tensor beta        = control.beta;
-    const InputBasis projection_basis = gdn_norm_control(x, w.input_norm, config.rms_norm_eps, p,
-                                                         h, g, beta, work_, ctx_.execution_view());
+    const InputBasis projection_basis =
+        gdn_norm_control(x, w.input_norm, config.rms_norm_eps, w.input_norm_offset, p, h, g, beta,
+                         work_, ctx_.execution_view());
     if (&config != &config_) {
         const auto heads       = static_cast<std::size_t>(config.gdn->linear_num_value_heads);
         const auto all_heads   = static_cast<std::size_t>(config_.gdn->linear_num_value_heads);
@@ -1113,6 +1315,12 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         };
         g    = own_gates(g);
         beta = own_gates(beta);
+    }
+    if (ph == Phase::Prefill && gidx == 0) {
+        trace_dump_matrix(x, s, "gdn-x", "prefill");
+        trace_dump_matrix(h, s, "gdn-h", "prefill");
+        trace_dump_matrix(g, s, "gdn-g", "prefill");
+        trace_dump_matrix(beta, s, "gdn-beta", "prefill");
     }
 
     const auto projection = workspace::gdn_projection(work_, config, T);
@@ -1166,6 +1374,10 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
         Tensor qkv    = workspace::gdn_prefill_conv(work_, config, T);
         Tensor z_flat = z.view({dimension(config.gdn->value_width()), T});
         gdn_projection(h, p, qkv, z_flat, work_, s, projection_basis);
+        if (ph == Phase::Prefill && gidx == 0) {
+            trace_dump_matrix(qkv, s, "gdn-qkv0", "prefill");
+            trace_dump_matrix(z_flat, s, "gdn-z0", "prefill");
+        }
         const GdnStateRef gdn_pool = gdn_state(static_cast<std::uint32_t>(gidx));
         if (!active_segments_.empty()) {
             for (const SegmentBinding& segment : active_segments_) {
@@ -1192,6 +1404,13 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                 gdn_pool.pool->conv_slot(gdn_pool.local, linear_state_destination_slot_);
             ops::causal_conv1d_silu_split(qkv, p.convolution, conv_state_in, conv_state_out, qc,
                                           kc, vc, s);
+        }
+        if (ph == Phase::Prefill && gidx == 0) {
+            trace_dump_matrix(qkv, s, "gdn-qkv", "prefill");
+            trace_dump_matrix(z_flat, s, "gdn-z", "prefill");
+            trace_dump_matrix(qc, s, "gdn-q", "prefill");
+            trace_dump_matrix(kc, s, "gdn-k", "prefill");
+            trace_dump_matrix(vc, s, "gdn-v", "prefill");
         }
     }
 
@@ -1281,6 +1500,9 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                                std::sqrt(static_cast<double>(config.gdn->linear_key_head_dim))),
             /*normalize_qk=*/true, work_, recurrent_state_in, recurrent_state_out, o, s);
     }
+    if (ph == Phase::Prefill && gidx == 0) {
+        trace_dump_matrix(o.view({dimension(config.gdn->value_width()), T}), s, "gdn-o", "prefill");
+    }
 
     Tensor on = workspace::gdn_normalized_output(work_, config, T)
                     .view({dimension(config.gdn->linear_value_head_dim),
@@ -1289,12 +1511,18 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
     if (rotated(p.output.hadamard_signs)) {
         ops::gated_rmsnorm_hadamard(o, p.norm, z, config.rms_norm_eps, p.output.hadamard_signs,
                                     normalized, s);
-        project_residual(normalized, p.output, x, InputBasis::Rotated, false);
+        project_residual(normalized, p.output, x, InputBasis::Rotated, false, accum);
         return;
     }
     ops::gated_rmsnorm(o, p.norm, z, ops::GateActivation::Silu, config.rms_norm_eps, on, s);
+    if (ph == Phase::Prefill && gidx == 0) {
+        trace_dump_matrix(normalized, s, "gdn-norm", "prefill");
+    }
     project_residual(normalized, p.output, x, InputBasis::Primal,
-                     wide_residual_verification(ph, row_width(T), row_width(T)));
+                     wide_residual_verification(ph, row_width(T), row_width(T)), accum);
+    if (ph == Phase::Prefill && gidx == 0) {
+        trace_dump_matrix(x, s, "gdn-resid", "prefill");
+    }
 }
 
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
@@ -1304,14 +1532,26 @@ ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
 }
 
 void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
-                           const ops::SparseMoeHints& hints) {
+                           const ops::SparseMoeHints& hints, Tensor* accum) {
     const TextConfig& config = layer_config();
     Tensor h                 = workspace::post_mixer_hidden(work_, config, x.ne[1]);
+    if (phase == Phase::Prefill && std::getenv("NINFER_TRACE_DUMP") != nullptr) {
+        static bool once = false;
+        if (!once) {
+            once = true;
+            const Tensor& wn = weights.post_attention_norm;
+            trace_dump_matrix(wn.view({wn.ne[0], 1}), ctx_.stream, "wn-post", "prefill");
+            if (const Tensor* sg = ffn_input_signs(weights.ffn)) {
+                trace_dump_matrix(sg->view({sg->ne[0], 1}), ctx_.stream, "wn-signs", "prefill");
+            }
+        }
+    }
     if (const Tensor* signs = ffn_input_signs(weights.ffn)) {
-        ops::rmsnorm_hadamard(x, weights.post_attention_norm, config.rms_norm_eps, true, *signs, h,
+        ops::rmsnorm_hadamard(x, weights.post_attention_norm, config.rms_norm_eps,
+                              weights.post_attention_norm_offset, *signs, h,
                               ctx_.stream);
         ffn(h, weights.ffn, x, hints, work_, ctx_.stream, false, phase == Phase::Verify,
-            InputBasis::Rotated, false, experts_, nullptr, residual_partial_);
+            InputBasis::Rotated, false, experts_, nullptr, residual_partial_, accum);
         return;
     }
     // The integer gate_up route normalises while it quantises, so the BF16 normed row never exists:
@@ -1319,7 +1559,7 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase phas
     // the projection itself asks, evaluated with the policy this phase will pass down.
     const auto* dense = std::get_if<DenseParameters>(&weights.ffn);
     const bool fused_int8 =
-        dense != nullptr && !dense->up.has_value() &&
+        dense != nullptr && !dense->up.has_value() && weights.post_attention_norm_offset &&
         ops::linear_swiglu_fused_rmsnorm_int8_eligible(
             dense->gate_up.weight,
             phase == Phase::Verify ? dense->verify_gate_up_policy : dense->gate_up.policy,
@@ -1334,12 +1574,13 @@ void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase phas
         }
         const InputNorm norm{&weights.post_attention_norm, config.rms_norm_eps};
         ffn(x, weights.ffn, x, hints, work_, ctx_.stream, false, phase == Phase::Verify,
-            InputBasis::Primal, wide, experts_, &norm, nullptr);
+            InputBasis::Primal, wide, experts_, &norm, nullptr, accum);
         return;
     }
-    ops::rmsnorm(x, weights.post_attention_norm, config.rms_norm_eps, true, h, ctx_.stream);
+    ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps,
+                 weights.post_attention_norm_offset, h, ctx_.stream);
     ffn(h, weights.ffn, x, hints, work_, ctx_.stream, false, phase == Phase::Verify,
-        InputBasis::Primal, wide, experts_, nullptr, residual_partial_);
+        InputBasis::Primal, wide, experts_, nullptr, residual_partial_, accum);
 }
 
 TextContext::GdnShard TextContext::gdn_shard(std::uint32_t layer) const {
@@ -1371,11 +1612,35 @@ GdnReplayRecordLayer TextContext::replay_layer(std::uint32_t layer, std::int32_t
                                                         batch, width);
 }
 
+namespace {
+
+}
+
 // The layers of one stage, in order. On one device this is the whole model.
 template <class Tap>
 void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& tap) {
     const bool prefill      = ph == Phase::Prefill;
     const std::uint32_t end = parameters_.text.stage_end(stage);
+    // NINFER_ACTIVATION_F32=1 keeps the residual stream in FP32 and rounds every block's input back
+    // to BF16, which is the reference implementation's precision model: the BF16 stream alone
+    // rounds ~0.4 % per block into a direction this model amplifies (the ~170 wide dimension in the
+    // residual). Only the coded NariQ package sets it; unset, no allocation and no cast happens.
+    static const bool wide_accum = [] {
+        const char* v = std::getenv("NINFER_ACTIVATION_F32");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+    Tensor accum;
+    if (wide_accum) {
+        accum = work_.alloc(DType::FP32, {x.ne[0], x.ne[1]});
+        ops::cast_bf16_to_fp32(x, accum, ctx_.stream);
+        static bool announced = false;
+        if (!announced) {
+            announced = true;
+            std::fprintf(stderr, "wide-accum | residual stream FP32 | %dx%d\n",
+                         static_cast<int>(x.ne[0]), static_cast<int>(x.ne[1]));
+        }
+    }
+    Tensor* const accum_ptr = wide_accum ? &accum : nullptr;
     for (std::uint32_t layer = parameters_.text.stage_begin[stage]; layer < end; ++layer) {
         const auto& block  = parameters_.text.layers[layer];
         const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
@@ -1409,30 +1674,81 @@ void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& 
                     full ? (prefill ? nvtx::Name::PrefillAttention : nvtx::Name::VerifyAttention)
                          : (prefill ? nvtx::Name::PrefillGdn : nvtx::Name::VerifyGdn),
                     full ? nvtx::Category::Attention : nvtx::Category::Gdn, layer);
+                ops::detail::trellis::profile::Scope prof_mixer(
+                    std::string(prefill ? "mixer.pre " : "mixer.dec ") + (full ? "attn" : "gdn"),
+                    ctx_.stream);
                 auto scope = work_.scope();
                 if (full) {
-                    attn_mix(block, x, compact, ph);
+                    attn_mix(block, x, compact, ph, accum_ptr);
                 } else {
-                    gdn_mix(block, x, compact, ph);
+                    gdn_mix(block, x, compact, ph, accum_ptr);
                 }
             }
+            // The mixer's delta reached both streams; the BF16 copy is re-derived from the FP32
+            // accumulator so the next block reads the wide value, not its BF16 accumulation.
+            if (wide_accum) { ops::cast_fp32_to_bf16(accum, x, ctx_.stream); }
             {
                 nvtx::ScopedRange range(prefill ? nvtx::Name::PrefillPostMixer
                                                 : nvtx::Name::VerifyPostMixer,
                                         nvtx::Category::PostMixer, layer);
+                ops::detail::trellis::profile::Scope prof_mlp(
+                    prefill ? "mlp.pre" : "mlp.dec", ctx_.stream);
                 auto scope = work_.scope();
                 // The prefetch hint names pointers into the *next* layer's projection weights. It
                 // only helps when that layer runs next on this device, so it is dropped at the last
                 // layer of a stage exactly as it is at the last layer of the model.
                 mlp_tail(block, x, ph,
                          layer + 1 < end ? next_projection_hints(static_cast<int>(layer))
-                                         : ops::SparseMoeHints{});
+                                         : ops::SparseMoeHints{},
+                         accum_ptr);
             }
+            if (wide_accum) { ops::cast_fp32_to_bf16(accum, x, ctx_.stream); }
             // Layer-OUTPUT tap (NINFER_DSPINE_TAP_OUTPUT=1): `x` is now the residual
             // after this block, which is what the authors' MLX layer hook stores.
             if constexpr (Tap::enabled) {
                 if (tap_output) {
                     tap.capture_layer(static_cast<int>(layer), x, ctx_.stream);
+                }
+            }
+            // NINFER_TRACE_HIDDEN=1: the residual RMS and mean of the last column after each layer,
+            // which locates the first block whose output stops looking like a residual stream.
+            static const bool trace_hidden = [] {
+                const char* v = std::getenv("NINFER_TRACE_HIDDEN");
+                return v != nullptr && v[0] != '\0' && v[0] != '0';
+            }();
+            if (trace_hidden) {
+                std::vector<std::uint16_t> host(static_cast<std::size_t>(x.ne[0]));
+                const void* src = static_cast<const std::uint8_t*>(x.data) +
+                                  static_cast<std::size_t>(x.ne[1] - 1) * x.ne[0] * sizeof(std::uint16_t);
+                CUDA_CHECK(cudaMemcpyAsync(host.data(), src, host.size() * sizeof(std::uint16_t),
+                                           cudaMemcpyDeviceToHost, ctx_.stream));
+                CUDA_CHECK(cudaStreamSynchronize(ctx_.stream));
+                double sum = 0, squares = 0;
+                for (const auto bits : host) {
+                    std::uint32_t word = static_cast<std::uint32_t>(bits) << 16;
+                    float value;
+                    std::memcpy(&value, &word, sizeof(value));
+                    sum += value;
+                    squares += double(value) * value;
+                }
+                std::fprintf(stderr, "trace | layer %u | rms %.5f | mean %.5f | finite %s\n", layer,
+                             std::sqrt(squares / double(host.size())), sum / double(host.size()),
+                             std::isfinite(squares) ? "yes" : "no");
+                // NINFER_TRACE_DUMP=<dir>: the same column as FP32, for an off-line head check.
+                static const char* dump_dir = std::getenv("NINFER_TRACE_DUMP");
+                if (dump_dir != nullptr && dump_dir[0] != '\0') {
+                    std::vector<float> values(host.size());
+                    for (std::size_t i = 0; i < host.size(); ++i) {
+                        std::uint32_t word = static_cast<std::uint32_t>(host[i]) << 16;
+                        std::memcpy(&values[i], &word, sizeof(float));
+                    }
+                    char path[512];
+                    std::snprintf(path, sizeof(path), "%s/layer%02u.f32", dump_dir,
+                                  static_cast<unsigned>(layer));
+                    if (std::FILE* file = std::fopen(path, "wb")) {
+                        std::fwrite(values.data(), sizeof(float), values.size(), file);
+                        std::fclose(file);
+                    }
                 }
             }
         } catch (const std::exception& error) {
@@ -1992,6 +2308,9 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
 
             Tensor x = roots.residual;
             embed_tokens(ids_device, *embed_, parameters_.text.token_embedding_signs, x, s);
+            trace_ids(ids_device, s, "prefill");
+            trace_rms(x, s, "prefill-embed");
+            trace_dump_matrix(x, s, "embed", "prefill");
             capture_attention_tokens(ids_device);
             const auto visual_count = static_cast<std::int32_t>(local_scatter_indices.size());
             if (overlay_staging) {
@@ -2034,11 +2353,13 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
             Tensor xf = prefill_hidden_.data != nullptr
                             ? matrix_window(prefill_hidden_, len)
                             : work_.alloc(DType::BF16, {dimension(config_.hidden_size), len});
-            ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, xf, s);
+            ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, parameters_.text.final_norm_offset,
+                         xf, s);
 
             if (is_last) {
                 Tensor last_xf = xf.slice(1, len - 1, 1);
                 Tensor logits  = matrix_window(io_.logits, 1);
+                trace_rms(last_xf, s, "prefill-final-hidden");
                 project(last_xf, *lm_head_, logits, work_, s);
                 // The token's logprob records, gathered before sampling adds it to the penalty
                 // counts; a device no-op unless the request asked for them.
@@ -2069,6 +2390,8 @@ TextContext::prefill_impl(std::span<const int> ids, const TextPrefill* text_pref
                     ops::argmax(logits, io_.token,
                                 dimension(parameters_.model.resources().public_token_count), s);
                 }
+                trace_logits(logits, s, "prefill-final");
+                trace_token(io_.token, s);
                 if (first_token_hook_) {
                     first_token_hook_();
                     token_left = true;
@@ -2303,7 +2626,7 @@ PrefillChunkResult TextContext::prefill_final_batch(std::span<const PrefillSegme
     }
 
     Tensor xf = matrix_window(prefill_hidden_, columns);
-    ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, true, xf, s);
+    ops::rmsnorm(x, *final_norm_, config_.rms_norm_eps, parameters_.text.final_norm_offset, xf, s);
     const auto outputs = static_cast<std::int32_t>(output_segments.size());
     if (outputs != 0) {
         Tensor last = work_.alloc(DType::BF16, {dimension(config_.hidden_size), outputs});

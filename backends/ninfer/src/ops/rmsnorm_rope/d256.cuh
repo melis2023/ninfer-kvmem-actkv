@@ -17,7 +17,7 @@ struct RmsnormRopeD256Head {
 
 __device__ __forceinline__ RmsnormRopeD256Head rmsnorm_rope_d256_normalize(
     const __nv_bfloat162* __restrict__ input, const __nv_bfloat162* __restrict__ weight,
-    std::int64_t base, int lane) {
+    std::int64_t base, int lane, bool unit_offset) {
     constexpr int kHeadDim   = 256;
     constexpr float kEpsilon = kRmsnormRopeEpsilon;
     __nv_bfloat162 values[4];
@@ -36,13 +36,16 @@ __device__ __forceinline__ RmsnormRopeD256Head rmsnorm_rope_d256_normalize(
     inv       = __shfl_sync(kFullWarpMask, inv, 0);
 
     RmsnormRopeD256Head out;
+    // A checkpoint stores its norm gain either as w (plain) or as w - 1 (offset); the rest of the
+    // engine reads the parameter's resolved mode, so the fused form takes it at run time.
+    const float shift = unit_offset ? 1.0F : 0.0F;
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
         const float2 xf = __bfloat1622float2(values[k]);
         const float2 wf = __bfloat1622float2(weights[k]);
         out.pair[k] =
-            __floats2bfloat162_rn(rmsnorm_epilogue<RmsEpilogue::Offset>(xf.x, inv, wf.x, 0.0F),
-                                  rmsnorm_epilogue<RmsEpilogue::Offset>(xf.y, inv, wf.y, 0.0F));
+            __floats2bfloat162_rn(rmsnorm_epilogue<RmsEpilogue::Plain>(xf.x, inv, wf.x + shift, 0.0F),
+                                  rmsnorm_epilogue<RmsEpilogue::Plain>(xf.y, inv, wf.y + shift, 0.0F));
     }
     return out;
 }

@@ -2,13 +2,21 @@
 #include "models/qwen3_5/execution/rotation.h"
 
 #include "core/weight_view.h"
+#include "core/weight.h"
 
+#include <algorithm>
 #include <array>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <type_traits>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
+
+#include <cuda_runtime.h>
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
@@ -20,6 +28,42 @@ auto with_context(const std::string& context, Function&& function) {
     } catch (const std::invalid_argument& error) {
         throw std::invalid_argument(context + ": " + error.what());
     }
+}
+
+// Which storage form a checkpoint used for one RMSNorm gain: `w` (plain) or `w - 1` (offset).
+// A trained gain sits positive around one, so an offset-stored vector holds values below zero
+// while a plain one does not. One artifact can mix the two (the historical GSQ pack stores the
+// text norms offset and the GDN norm plain; the NariQ pack stores every norm plain), so the mode
+// is resolved per parameter instead of per model.
+bool norm_offset(const Tensor& t) {
+    if (t.data == nullptr || t.dtype != DType::BF16) { return false; }
+    const std::size_t count = static_cast<std::size_t>(t.bytes() / sizeof(std::uint16_t));
+    if (count == 0 || count > (std::size_t{1} << 20)) { return false; }
+    std::vector<std::uint16_t> host(count);
+    if (cudaMemcpy(host.data(), t.data, count * sizeof(std::uint16_t),
+                   cudaMemcpyDefault) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    float minimum = 1.0F;
+    for (const auto bits : host) {
+        const std::uint32_t word = static_cast<std::uint32_t>(bits) << 16;
+        float value = 0.0F;
+        std::memcpy(&value, &word, sizeof(value));
+        minimum = std::min(minimum, value);
+    }
+    static const bool trace = [] {
+        const char* value = std::getenv("NINFER_NORM_TRACE");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    if (trace) {
+        std::fprintf(stderr, "norm-offset | n=%zu min=%+.5f | %s\n", count,
+                     static_cast<double>(minimum), minimum < -0.08F ? "offset" : "plain");
+    }
+    // A plain gain is positive; an offset-stored one holds a trained `w - 1` whose low tail is well
+    // below zero. -0.08 separates the observed packs without mistaking a plain norm's slight
+    // negative tail for offset storage.
+    return minimum < -0.08F;
 }
 
 class Prepare {
@@ -144,6 +188,47 @@ public:
 
     // A ternary output or proposal head takes the integer route at decode, verify and draft widths
     // like the text projections (any row count of whole 64-row blocks at the hidden width).
+    HeadParameters head_parameters(const TextWeights& w) const {
+        HeadParameters out;
+        if (w.output_head_bands.empty()) {
+            out.single = head(w.output_head_use);
+            return out;
+        }
+        // NariQ: the vocabulary is split over coded bands; `output_head` itself carries no object.
+        out.bands.reserve(w.output_head_bands.size());
+        for (const auto band : w.output_head_bands) {
+            out.bands.push_back(rotated_linear(band));
+        }
+        out.single.hadamard_signs = out.bands.front().hadamard_signs;
+        out.gather = tensor(*w.output_head_gather);
+        // NINFER_TRACE_LOGITS=1: the band-0 coded planes as the engine actually holds them, so a
+        // missing or mis-scaled side plane is visible at load time rather than through logits.
+        static const bool trace_planes = [] {
+            const char* value = std::getenv("NINFER_TRACE_LOGITS");
+            return value != nullptr && value[0] != '\0' && value[0] != '0';
+        }();
+        if (trace_planes) {
+            const auto& band = out.bands.front().weight;
+            float s16[4] = {}, pre[2] = {}, post[2] = {};
+            const bool ok = band.trellis_s16 != nullptr && band.trellis_pre != nullptr &&
+                            band.trellis_post != nullptr;
+            if (ok) {
+                cudaMemcpy(s16, band.trellis_s16, sizeof(s16), cudaMemcpyDeviceToHost);
+                cudaMemcpy(pre, band.trellis_pre, sizeof(pre), cudaMemcpyDeviceToHost);
+                cudaMemcpy(post, band.trellis_post, sizeof(post), cudaMemcpyDeviceToHost);
+            }
+            std::fprintf(stderr,
+                         "planes | band0 n %lld k %lld | s16 %s %.6f %.6f %.6f | pre %.6f %.6f | "
+                         "post %.6f %.6f | desc_len %d\n",
+                         static_cast<long long>(band.n), static_cast<long long>(band.k),
+                         ok ? "yes" : "no", static_cast<double>(s16[0]), static_cast<double>(s16[1]),
+                         static_cast<double>(s16[2]), static_cast<double>(pre[0]),
+                         static_cast<double>(pre[1]), static_cast<double>(post[0]),
+                         static_cast<double>(post[1]), band.trellis_desc_len);
+        }
+        return out;
+    }
+
     LinearParameters head(WeightUseId id) const {
         LinearParameters out = rotated_linear(id);
         integer_route(out, QType::T2_G128_FP16, out.weight.n, 5120);
@@ -208,13 +293,21 @@ public:
                 return out;
             });
         }
-        DenseParameters out{with_context(model_.weight(w.gate).name,
-                                         [&] {
-                                             return ops::prepare_linear_swiglu_weight(
-                                                 model_.rotated_input(w.gate),
-                                                 model_.rotated_input(w.up));
-                                         }),
-                            rotated_linear(w.down)};
+        const auto gate_input = model_.rotated_input(w.gate);
+        // A coded gate/up pair cannot be fused: the fused swiglu op owns one contiguous plane, and
+        // two coded parents never are. Keep them separate and let the FFN run one trellis linear
+        // each.
+        const bool coded = !gate_input.weight.parts.empty() &&
+                           gate_input.weight.parts.front().parent != nullptr &&
+                           is_coded(gate_input.weight.parts.front().parent->geometry.format);
+        DenseParameters out;
+        out.gate_up = with_context(
+            model_.weight(w.gate).name, [&] {
+                if (coded) { return ops::prepare_linear_weight(gate_input); }
+                return ops::prepare_linear_swiglu_weight(gate_input, model_.rotated_input(w.up));
+            });
+        if (coded) { out.up = ops::prepare_linear_weight(model_.rotated_input(w.up)); }
+        out.down = rotated_linear(w.down);
         integer_route(out.gate_up, QType::Q4_G64_FP16, 34816, 5120);
         // The Q4 down projection (Q4 imatrix recipes) reaches the same A8 add route as Q5.
         integer_route(out.down, QType::Q4_G64_FP16, 5120, 17408);
@@ -326,6 +419,8 @@ public:
         BlockParameters out;
         out.input_norm          = tensor(w.input_norm);
         out.post_attention_norm = tensor(w.post_attention_norm);
+        out.input_norm_offset          = norm_offset(out.input_norm);
+        out.post_attention_norm_offset = norm_offset(out.post_attention_norm);
         out.ffn                 = ffn(w);
         if (const auto* a = std::get_if<AttentionWeights>(&w.mixer)) {
             LinearParameters attention_output = rotated_linear(a->output);
@@ -334,9 +429,19 @@ public:
             integer_route(attention_output, QType::T2_G128_FP16, 5120, 6144);
             nvfp4_w4a16_route(attention_output, 5120, 6144);
             nvfp4_int8_route(attention_output, 5120, 6144);
-            ops::ProjectionWeights attention_projection = ops::prepare_attn_input_proj_weights(
-                model_.rotated_input(a->query), model_.rotated_input(a->key),
-                model_.rotated_input(a->gate), model_.rotated_input(a->value));
+            ops::ProjectionWeights attention_projection;
+            if (a->packed) {
+                // NariQ coded: one parent holds query|gate fused head by head, as the GGUF does.
+                const auto& attn = model_.config().text.attention.value();
+                attention_projection = ops::prepare_coded_attn_projection(
+                    model_.rotated_input(*a->packed), model_.rotated_input(a->key),
+                    model_.rotated_input(a->value), attn.query_width(), attn.key_width(),
+                    attn.head_dim);
+            } else {
+                attention_projection = ops::prepare_attn_input_proj_weights(
+                    model_.rotated_input(a->query), model_.rotated_input(a->key),
+                    model_.rotated_input(a->gate), model_.rotated_input(a->value));
+            }
             nvfp4_w4a16_route_single(attention_projection, 14336, 5120);
             nvfp4_int8_route_single(attention_projection, 14336, 5120);
             integer_route_pair(attention_projection, QType::Q4_G64_FP16, 7168, QType::Q5_G64_FP16,
@@ -344,9 +449,15 @@ public:
             integer_route_pair(attention_projection, QType::T2_G128_FP16, 7168, QType::T2_G128_FP16,
                                7168, 5120);
             out.mixer = AttentionParameters{std::move(attention_projection), tensor(a->query_norm),
-                                            tensor(a->key_norm), std::move(attention_output)};
+                                            tensor(a->key_norm), true, true,
+                                            std::move(attention_output)};
+            {
+                auto& attention = std::get<AttentionParameters>(out.mixer);
+                attention.query_norm_offset = norm_offset(attention.query_norm);
+                attention.key_norm_offset   = norm_offset(attention.key_norm);
+            }
             out.projection_prefetch =
-                prefetch(std::get<AttentionParameters>(out.mixer).projection, a->query);
+                prefetch(std::get<AttentionParameters>(out.mixer).projection, a->packed ? *a->packed : a->query);
         } else {
             const auto& g              = std::get<GdnWeights>(w.mixer);
             LinearParameters gdn_output = rotated_linear(g.output);
@@ -355,9 +466,24 @@ public:
             integer_route(gdn_output, QType::T2_G128_FP16, 5120, 6144);
             nvfp4_w4a16_route(gdn_output, 5120, 6144);
             nvfp4_int8_route(gdn_output, 5120, 6144);
-            ops::ProjectionWeights gdn_projection = ops::prepare_gdn_input_proj_weights(
-                model_.rotated_input(g.query), model_.rotated_input(g.key),
-                model_.rotated_input(g.value), model_.rotated_input(g.z));
+            ops::ProjectionWeights gdn_projection;
+            ops::ProjectionWeights gdn_control;
+            if (g.packed) {
+                // NariQ coded: one parent holds query|key|value; z and the A/B router are coded
+                // matrices of their own.
+                const auto& gdn = model_.config().text.gdn.value();
+                gdn_projection  = ops::prepare_coded_gdn_projection(
+                    model_.rotated_input(*g.packed), model_.rotated_input(g.z), gdn.key_width(),
+                    gdn.value_width());
+                gdn_control = ops::prepare_coded_gating_projection(
+                    model_.rotated_input(g.a_projection), model_.rotated_input(g.b_projection));
+            } else {
+                gdn_projection = ops::prepare_gdn_input_proj_weights(
+                    model_.rotated_input(g.query), model_.rotated_input(g.key),
+                    model_.rotated_input(g.value), model_.rotated_input(g.z));
+                gdn_control = ops::prepare_gdn_gating_proj_weights(model_.input(g.a_projection),
+                                                                   model_.input(g.b_projection));
+            }
             nvfp4_w4a16_route_single(gdn_projection, 16384, 5120);
             nvfp4_int8_route_single(gdn_projection, 16384, 5120);
             integer_route_pair(gdn_projection, QType::Q4_G64_FP16, 4096, QType::Q5_G64_FP16, 12288,
@@ -366,15 +492,19 @@ public:
                                12288, 5120);
             out.mixer = GdnParameters{
                 std::move(gdn_projection),
-                ops::prepare_gdn_gating_proj_weights(model_.input(g.a_projection),
-                                                         model_.input(g.b_projection)),
+                std::move(gdn_control),
                 tensor(g.a_log),
                 tensor(g.dt_bias),
                 tensor(g.convolution),
                 tensor(g.norm),
+                false,
                 std::move(gdn_output)};
+            {
+                auto& gdn       = std::get<GdnParameters>(out.mixer);
+                gdn.norm_offset = norm_offset(gdn.norm);
+            }
             out.projection_prefetch =
-                prefetch(std::get<GdnParameters>(out.mixer).projection, g.query);
+                prefetch(std::get<GdnParameters>(out.mixer).projection, g.packed ? *g.packed : g.query);
         }
         return out;
     }
@@ -384,6 +514,8 @@ public:
         BlockParameters out;
         out.input_norm          = tensor(w.input_norm);
         out.post_attention_norm = tensor(w.post_attention_norm);
+        out.input_norm_offset          = norm_offset(out.input_norm);
+        out.post_attention_norm_offset = norm_offset(out.post_attention_norm);
         out.ffn                 = dense(w.ffn);
         if (w.gdn) {
             const GdnWeights& g = *w.gdn;
@@ -398,12 +530,22 @@ public:
                 tensor(g.dt_bias),
                 tensor(g.convolution),
                 tensor(g.norm),
+                false,
                 rotated_linear(g.output)};
+            {
+                auto& gdn       = std::get<GdnParameters>(out.mixer);
+                gdn.norm_offset = norm_offset(gdn.norm);
+            }
         }
         return out;
     }
 
     ops::SparseMoeHints prefetch(const ops::ProjectionWeights& projection, WeightId query) const {
+        if (const auto* coded = std::get_if<ops::CodedProjectionWeights>(&projection)) {
+            // A coded parent is already materialized; there is no async prefetch stream for it.
+            (void)coded;
+            return {};
+        }
         const Weight& weight = std::visit(
             [](const auto& p) -> const Weight& {
                 using Kind = std::decay_t<decltype(p)>;
@@ -411,6 +553,8 @@ public:
                     return p.weight;
                 } else if constexpr (std::is_same_v<Kind, ops::PairedProjectionWeights>) {
                     return p.first;
+                } else if constexpr (std::is_same_v<Kind, ops::CodedProjectionWeights>) {
+                    return p.leader();
                 } else {
                     return p.parts.front().weight;
                 }
@@ -451,6 +595,13 @@ public:
         }
         out.query_norm  = tensor(a.query_norm);
         out.key_norm    = tensor(a.key_norm);
+        out.embedding_norm_offset      = norm_offset(out.embedding_norm);
+        out.hidden_norm_offset         = norm_offset(out.hidden_norm);
+        out.input_norm_offset          = norm_offset(out.input_norm);
+        out.post_attention_norm_offset = norm_offset(out.post_attention_norm);
+        out.final_norm_offset          = norm_offset(out.final_norm);
+        out.query_norm_offset          = norm_offset(out.query_norm);
+        out.key_norm_offset            = norm_offset(out.key_norm);
         out.output      = linear(a.output);
         nvfp4_w4a16_route(out.output, 5120, 6144);
         nvfp4_int8_route(out.output, 5120, 6144);
@@ -528,6 +679,8 @@ public:
         out.feature_projection = linear(w.feature_projection);
         out.context_norm       = tensor(w.context_norm);
         out.final_norm         = tensor(w.final_norm);
+        out.context_norm_offset = norm_offset(out.context_norm);
+        out.final_norm_offset   = norm_offset(out.final_norm);
         out.output_head        = head(w.output_head_use);
         out.layers.reserve(w.layers.size());
         for (std::size_t i = 0; i < w.layers.size(); ++i) {
@@ -540,12 +693,16 @@ public:
                     DraftBlockParameters result;
                     result.input_norm          = tensor(layer.input_norm);
                     result.post_attention_norm = tensor(layer.post_attention_norm);
+                    result.input_norm_offset          = norm_offset(result.input_norm);
+                    result.post_attention_norm_offset = norm_offset(result.post_attention_norm);
                     result.query_key_value     = ops::prepare_attn_input_proj_weights(
                         model_.input(a.query), model_.input(a.key), model_.input(a.value));
                     result.context_key   = linear(a.context_key);
                     result.context_value = linear(a.context_value);
                     result.query_norm    = tensor(a.query_norm);
                     result.key_norm      = tensor(a.key_norm);
+                    result.query_norm_offset = norm_offset(result.query_norm);
+                    result.key_norm_offset   = norm_offset(result.key_norm);
                     result.output        = linear(a.output);
                     result.mlp           = dense(layer.mlp);
                     if (layer.attention_conv) {
@@ -578,20 +735,31 @@ private:
 
 Parameters::Parameters(const Model& source) : model(source) {
     const Prepare prepare(model);
-    const auto& w        = model.weights();
-    text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);
-    text.output_head     = prepare.head(w.text.output_head_use);
+    const auto& w = model.weights();
+    {
+        // A coded token table carries its side planes on its Use, so it is prepared the way every
+        // coded projection is; a dense one keeps the plain native view.
+        const auto& bound = model.weight(w.text.token_embedding);
+        const bool coded  = !bound.view.parts.empty() && bound.view.parts.front().parent != nullptr &&
+                           is_coded(bound.view.parts.front().parent->geometry.format);
+        text.token_embedding = coded
+                                   ? ops::prepare_linear_weight(model.input(w.text.token_embedding))
+                                         .weight
+                                   : native_weight(bound.view);
+    }
+    text.output_head = prepare.head_parameters(w.text);
     if (is_ternary(text.token_embedding.qtype)) {
         // A ternary checkpoint stores its token table rotated by the same hidden-width signs as
         // every 5120-wide input, the output head's among them; the table has no Use of its own.
-        if (!rotated(text.output_head.hadamard_signs) ||
-            text.output_head.hadamard_signs.ne[0] != text.token_embedding.k) {
+        if (!rotated(text.output_head.single.hadamard_signs) ||
+            text.output_head.single.hadamard_signs.ne[0] != text.token_embedding.k) {
             throw std::invalid_argument(
                 "a T2 token embedding needs a rotated output head carrying the hidden-width signs");
         }
-        text.token_embedding_signs = text.output_head.hadamard_signs;
+        text.token_embedding_signs = text.output_head.single.hadamard_signs;
     }
     text.final_norm      = prepare.tensor(w.text.final_norm);
+    text.final_norm_offset = norm_offset(text.final_norm);
     text.rank_count = w.text.stages.stages();
     text.stage_begin.clear();
     for (std::size_t stage = 0; stage < w.text.stages.stages(); ++stage) {
@@ -619,6 +787,30 @@ Parameters::Parameters(const Model& source) : model(source) {
     if (w.mtp) {
         mtp = with_context("mtp", [&] { return prepare.mtp(*w.mtp); });
     }
+    // One conversion writes one norm convention for the whole text stack (the GSQ pack stores
+    // `w - 1`, the NariQ pack `w`), so the first layer's input norm decides the mode and every
+    // text/MTP norm follows it. Per-weight inspection alone cannot separate a plain norm's small
+    // negative tail from offset storage; the component-level decision has no such ambiguity.
+    const bool text_norm_offset =
+        text.layers.empty() ? text.final_norm_offset : text.layers.front().input_norm_offset;
+    text.final_norm_offset = text_norm_offset;
+    for (auto& layer : text.layers) {
+        layer.input_norm_offset          = text_norm_offset;
+        layer.post_attention_norm_offset = text_norm_offset;
+        if (auto* attention = std::get_if<AttentionParameters>(&layer.mixer)) {
+            attention->query_norm_offset = text_norm_offset;
+            attention->key_norm_offset   = text_norm_offset;
+        }
+    }
+    if (mtp) {
+        mtp->embedding_norm_offset      = text_norm_offset;
+        mtp->hidden_norm_offset         = text_norm_offset;
+        mtp->input_norm_offset          = text_norm_offset;
+        mtp->post_attention_norm_offset = text_norm_offset;
+        mtp->final_norm_offset          = text_norm_offset;
+        mtp->query_norm_offset          = text_norm_offset;
+        mtp->key_norm_offset            = text_norm_offset;
+    }
     if (w.vision) {
         vision = with_context("vision", [&] { return prepare.vision(*w.vision); });
     }
@@ -635,3 +827,4 @@ Parameters::Parameters(const Model& source) : model(source) {
 }
 
 } // namespace ninfer::models::qwen3_5::execution
+
