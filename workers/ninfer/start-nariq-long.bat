@@ -33,7 +33,7 @@ cd /d "%BIN%"
   --prefill-chunk 256 ^
   --kvmem-budget 65536 --kvmem-gen-reserve 2048 --kvmem-host-mib 12288 ^
   --kvmem-lrfu --kvmem-keep ^
-  --spec mtp --draft-tokens 4 --adaptive-mtp ^
+  --spec mtp --draft-tokens 4 ^
   --ngram-draft-tokens 0 ^
   --kv-dtype int8 --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
   --default-reasoning-effort xhigh

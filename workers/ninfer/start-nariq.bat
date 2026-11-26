@@ -33,7 +33,7 @@ cd /d "%BIN%"
   "%MODEL%" ^
   --port 18200 --model-id ninfer-nariq-27b --host 127.0.0.1 ^
   --max-context 65536 --max-concurrency 1 ^
-  --spec mtp --draft-tokens 4 --adaptive-mtp ^
+  --spec mtp --draft-tokens 4 ^
   --ngram-draft-tokens 0 ^
   --kv-dtype int8 --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
   --default-reasoning-effort xhigh
