@@ -163,12 +163,13 @@ void launch_cyclic_profile(const Tensor& k, const Tensor& v, const Tensor& posit
         const auto* pos     = static_cast<const std::int32_t*>(positions.data);
         const auto* count   = static_cast<const std::int32_t*>(counts.data);
         const auto* lane    = static_cast<const std::int32_t*>(lanes.data);
-        constexpr int Threads  = 256;
-        constexpr int PerToken = kKVCacheAppendPrefixHeadDim * kKVCacheAppendPrefixHeads;
-        const dim3 grid((plan.max_count * PerToken + Threads - 1) / Threads, k.ne[3], 1);
+        constexpr int Threads = 256;
+        const int per_token   = cache.head_dim * cache.num_kv_heads;
+        const dim3 grid((plan.max_count * per_token + Threads - 1) / Threads, k.ne[3], 1);
         kv_cache_append_prefix_cyclic_f16_kernel<Capacity><<<grid, Threads, 0, stream>>>(
             input_k, input_v, pos, count, lane, cache_k, cache_v, plan.min_count, plan.max_count,
-            plan.tokens, static_cast<int>(cache.padded_capacity));
+            plan.tokens, static_cast<int>(cache.padded_capacity), cache.head_dim,
+            cache.num_kv_heads);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
