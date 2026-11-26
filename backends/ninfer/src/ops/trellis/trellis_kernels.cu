@@ -354,9 +354,18 @@ __device__ __forceinline__ void decode_tile_proven(const std::uint32_t* tw, int 
         const int at = wi0 + w;
         quad[w] = tile[at >= nw ? at - nw : at];
     }
+    // The window index is lane-dependent, so a bare `quad[dd >> 5]` makes the compiler spill the
+    // array to local memory (SASS showed 96 LDL + 16 STL per k-tile). Selecting from constant
+    // indices keeps every word in a register and costs one ISETP+SEL pair instead.
+    const auto pick = [&](int idx) {
+        std::uint32_t value = quad[0];
+#pragma unroll
+        for (int w = 1; w < kWL; ++w) { value = idx == w ? quad[w] : value; }
+        return value;
+    };
     const auto win = [&](int j) {
         const int dd = o0 + j * BITS;
-        return __funnelshift_l(quad[(dd >> 5) + 1], quad[dd >> 5], dd & 31) >> 16;
+        return __funnelshift_l(pick((dd >> 5) + 1), pick(dd >> 5), dd & 31) >> 16;
     };
     std::uint32_t f[8];
 #pragma unroll
