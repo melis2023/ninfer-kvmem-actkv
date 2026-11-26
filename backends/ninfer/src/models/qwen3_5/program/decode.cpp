@@ -5,6 +5,7 @@
 #include "models/qwen3_5/program/graph_execution.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
 #include "models/qwen3_5/program/speculative/mtp_trace.h"
+#include "models/qwen3_5/execution/token_dump.h"
 #include "core/nvtx.h"
 #include "core/device.h"
 #include "ninfer/ops/logprob_topk.h"
@@ -884,8 +885,10 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         execution::MtpCausalAttentionEnvelopes envelopes =
             mtp_causal_attention_envelopes(maximum_frontier, verify_window, draft_window, attention_capacity);
         // The event trace runs the eager body so its cudaEvent sections actually execute;
-        // eager and replayed graphs issue the same kernel sequence.
-        if (use_cuda_graph && !execution::mtp_trace_requested()) {
+        // eager and replayed graphs issue the same kernel sequence. The token dump needs the
+        // same: its host readback lives inside the proposal, which a captured graph never runs.
+        if (use_cuda_graph && !execution::mtp_trace_requested() &&
+            !token_dump_enabled()) {
             DecodeGraphFamily& family = copy_round ? ngram_graphs : mtp_graphs;
             DecodeGraphProfile& profile =
                 select_graph_profile(family, static_cast<std::uint32_t>(lanes.size()),
