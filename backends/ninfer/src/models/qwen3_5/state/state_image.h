@@ -29,10 +29,23 @@ struct DFlashLocalStateSpec {
     KvCacheStorage storage = KvCacheStorage::BFloat16;
 };
 
+// DSpine-only target KV hot ring (--kv-dspine-f16): the most recent N target KV tokens in FP16,
+// read by the target verify alongside the nvfp4 B/R window. DFlash2 and MTP never allocate it.
+struct TargetHotSpec {
+    std::uint32_t layers   = 0;
+    std::uint32_t capacity = 0;
+    std::int32_t kv_heads  = 0;
+    std::int32_t head_dim  = 0;
+    // DSpine runs at concurrency 1, so the hot ring keeps one lane. Using the state image's slot
+    // count here would multiply an 8K FP16 ring by eight (4 GiB) for lanes no request can reach.
+    std::uint32_t lane_capacity = 1;
+};
+
 struct StateImageSpec {
     LinearAttentionStatePoolSpec linear;
     std::int32_t hidden = 0;
     std::optional<DFlashLocalStateSpec> dflash_local;
+    std::optional<TargetHotSpec> target_hot;
 };
 
 struct StateImageHostLayout {
@@ -71,6 +84,7 @@ struct StateImageDeviceLayout {
     std::vector<LinearAttentionStatePoolLayout> linear;
     TensorRegion continuation_hidden;
     std::optional<CyclicKVCacheLayout> dflash_local;
+    std::optional<CyclicKVCacheLayout> target_hot;
     StateImageHostLayout host;
 };
 
@@ -148,6 +162,7 @@ struct StateImageDeviceSlotView {
     std::vector<LinearAttentionStateSlotView> linear;
     Tensor continuation_hidden;
     std::optional<CyclicKVCacheSlotView> dflash_local;
+    std::optional<CyclicKVCacheSlotView> target_hot;
 };
 
 // A part of one StateImage a consumer can take on its own: one linear-attention layer's conv and
@@ -206,6 +221,8 @@ public:
 
     [[nodiscard]] CyclicKVCache* dflash_local() noexcept;
     [[nodiscard]] const CyclicKVCache* dflash_local() const noexcept;
+    [[nodiscard]] CyclicKVCache* target_hot() noexcept;
+    [[nodiscard]] const CyclicKVCache* target_hot() const noexcept;
 
     [[nodiscard]] const StateImageHostLayout& host_layout() const noexcept { return host_layout_; }
 
@@ -250,6 +267,10 @@ private:
     std::vector<std::unique_ptr<LinearAttentionStatePool>> linear_;
     Tensor continuation_hidden_;
     std::optional<CyclicKVCache> dflash_local_;
+    // Device-only allocation for the DSpine hot ring; kept out of the state image backing so the
+    // host image (sized by host_state_slots) never grows by the ring's footprint.
+    DeviceBuffer target_hot_backing_;
+    std::optional<CyclicKVCache> target_hot_;
     StateImageHostLayout host_layout_;
 };
 

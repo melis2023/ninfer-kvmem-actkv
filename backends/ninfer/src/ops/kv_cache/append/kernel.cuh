@@ -514,6 +514,40 @@ __global__ void kv_cache_append_prefix_cyclic_kernel(
                                             padded_capacity);
 }
 
+// FP16 drafter ring: one thread per element, BF16 input rounded to FP16 once. The ring layout is
+// [head_dim, padded, kv_heads, lane], so an element (d, slot, head) sits at
+// d + head_dim * (slot + padded * head) inside a lane.
+template <int Capacity>
+__global__ void kv_cache_append_prefix_cyclic_f16_kernel(
+    const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+    const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ counts,
+    const std::int32_t* __restrict__ lanes, __half* __restrict__ cache_k,
+    __half* __restrict__ cache_v, int min_count, int max_count, int width, int padded_capacity) {
+    static_assert(Capacity == 2048 || Capacity == 4096 || Capacity == 8192);
+    static_assert((Capacity & (Capacity - 1)) == 0);
+    constexpr int HeadDim       = kKVCacheAppendPrefixHeadDim;
+    constexpr int Heads         = kKVCacheAppendPrefixHeads;
+    constexpr int PerToken      = HeadDim * Heads;
+    const int batch             = static_cast<int>(blockIdx.y);
+    const int count             = counts[batch];
+    const int unit              = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int token             = unit / PerToken;
+    if (count < min_count || count > max_count || token >= count) { return; }
+    const int e    = unit % PerToken;
+    const int d    = e % HeadDim;
+    const int head = e / HeadDim;
+    const int position = positions[static_cast<std::int64_t>(width) * batch + token];
+    const int slot     = position & (Capacity - 1);
+    const std::int64_t input =
+        static_cast<std::int64_t>(batch) * width * PerToken +
+        static_cast<std::int64_t>(token) * PerToken + e;
+    const std::int64_t output =
+        static_cast<std::int64_t>(lanes[batch]) * padded_capacity * PerToken + d +
+        static_cast<std::int64_t>(HeadDim) * (slot + static_cast<std::int64_t>(padded_capacity) * head);
+    cache_k[output] = __float2half(__bfloat162float(k[input]));
+    cache_v[output] = __float2half(__bfloat162float(v[input]));
+}
+
 __global__ void kv_cache_append_prefix_paged_kernel(
     const __nv_bfloat16* __restrict__ k, const __nv_bfloat16* __restrict__ v,
     const std::int32_t* __restrict__ positions, const std::int32_t* __restrict__ counts,

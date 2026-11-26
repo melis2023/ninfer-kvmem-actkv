@@ -83,7 +83,9 @@ CyclicKVCacheLayout plan_cyclic_kv_cache(LayoutBuilder& builder, std::uint32_t l
         const std::string prefix = "Cyclic KV layer " + std::to_string(layer);
         layout.k.push_back(add_vector(physical.key, prefix + " K"));
         layout.v.push_back(add_vector(physical.value, prefix + " V"));
-        if (physical.key.data_dtype != DType::BF16) {
+        // FP16 keeps its own precision and is read natively, so it needs no BF16 shadow; the
+        // quantized storages do.
+        if (physical.key.data_dtype != DType::BF16 && physical.key.data_dtype != DType::FP16) {
             layout.k_bf16.push_back(builder.add_tensor(
                 DType::BF16, {head_dim, padded, num_kv_heads, lane_capacity}, kArenaAlign,
                 prefix + " K shadow"));

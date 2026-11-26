@@ -5,6 +5,7 @@
 #include "core/weight.h"
 #include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/dspine.h"
+#include "ninfer/ops/dspine_bridge.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/kv_cache_append.h"
 #include "ninfer/ops/linear.h"
@@ -323,10 +324,20 @@ void Drafter::propose(const ProposalCall& call, std::span<const CyclicKVCacheLay
             Tensor attended = work.alloc(DType::BF16, {d, hq, w, b});
             // The bridge's rows are its own block, so a query row sees the rows at or before it;
             // no KVMem floor applies here (min_positions stays null).
-            ops::sliding_window_attention(q, key, value, positions, call.valid_columns,
-                                          call.lanes, Tensor{}, {d, hq, kv}, window_,
-                                          scale, ring[l], envelope, work, attended, stream,
-                                          ops::SlidingWindowMask::Causal);
+            if (ring[l].storage == KvCacheStorage::Float16) {
+                // --draft-kv-dtype f16: the dedicated DSpine kernel reads the ring natively
+                // instead of the generic sliding-window kernel's BF16 context.
+                ops::dspine_causal_attention(
+                    q, key, value, positions, call.valid_columns, Tensor{}, call.lanes, ring[l].k,
+                    ring[l].v, static_cast<std::int32_t>(ring[l].capacity),
+                    static_cast<std::int32_t>(ring[l].padded_capacity),
+                    static_cast<std::int32_t>(window_), scale, attended, stream);
+            } else {
+                ops::sliding_window_attention(q, key, value, positions, call.valid_columns,
+                                              call.lanes, Tensor{}, {d, hq, kv}, window_, scale,
+                                              ring[l], envelope, work, attended, stream,
+                                              ops::SlidingWindowMask::Causal);
+            }
             const Tensor attended_flat = attended.view({d * hq, columns});
             if (fused_add(layer.output)) {
                 ops::linear_add(attended_flat, layer.output.weight, residual_flat,

@@ -130,6 +130,8 @@ struct DFlashBatchContext {
     Tensor& continuation_hidden_store;
     bool ngram                           = false;
     std::uint32_t neural_proposal_drafts = 0;
+    // DSpine-only FP16 hot ring (--kv-dspine-f16); null in every other mode.
+    const ninfer::CyclicKVCache* target_hot = nullptr;
 };
 
 struct DFlashAppendContext {

@@ -447,6 +447,10 @@ struct KvmemOptions {
     // Draft ring KV storage, independent of the target's kv_cache. BF16 keeps proposal quality;
     // int8 trades some draft accuracy for capacity. There is no requirement to match the target.
     KvCacheStorage draft_kv_storage = KvCacheStorage::BFloat16;
+    // DSpine only (--spec dspine): a separate FP16 ring holding the most recent N target KV
+    // tokens, read by the target verify alongside the existing nvfp4 B/R window. Zero disables.
+    // DFlash2 and MTP never allocate or read it.
+    std::uint32_t dspine_f16_tokens = 0;
     bool query_meanq_cosine = false;
     double graph_alpha = 0.2;
     std::uint32_t selected_tokens = 0; // B; zero disables KVMem

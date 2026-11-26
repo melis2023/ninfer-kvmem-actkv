@@ -283,6 +283,8 @@ std::string kv_name(ninfer::KvCacheStorage value) {
     switch (value) {
     case ninfer::KvCacheStorage::BFloat16:
         return "bf16";
+    case ninfer::KvCacheStorage::Float16:
+        return "f16";
     case ninfer::KvCacheStorage::Int8Group64:
         return "int8-g64";
     case ninfer::KvCacheStorage::Fp8E4M3Row256:

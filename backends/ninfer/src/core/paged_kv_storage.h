@@ -65,6 +65,8 @@ struct PagedKVStorageLayout {
     switch (storage) {
     case KvCacheStorage::BFloat16:
         return symmetric({DType::BF16, head_dim, DType::U8, 0});
+    case KvCacheStorage::Float16:
+        return symmetric({DType::FP16, head_dim, DType::U8, 0});
     case KvCacheStorage::Int8Group64:
         // INT8-G64: one FP16 scale per 64 values. 256 is the target's full-attention dim; 128
         // is the DFlash2 draft ring.

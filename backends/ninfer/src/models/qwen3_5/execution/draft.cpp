@@ -1296,7 +1296,7 @@ auto dflash_decode_batch_body(DFlashBatchContext& state, std::int32_t batch_size
         TextContext card(state.execution.device, state.execution.parameters, state.execution.work,
                          {}, state.execution.linear_attention, state.execution.io,
                          state.execution.prefill_hidden, state.execution.prefill_chunk, 0, {},
-                         &state.text_cache);
+                         &state.text_cache, nullptr, state.target_hot);
         card.set_stage_runtime(state.execution.stages);
         card.set_expert_runtime(state.execution.experts);
         card.set_rope_yarn(state.execution.rope_yarn);

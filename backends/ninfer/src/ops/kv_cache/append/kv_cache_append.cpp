@@ -164,10 +164,12 @@ void validate_cyclic_cache(const CyclicKVCacheLayerView& cache,
             std::to_string(envelope.max_count));
     }
     const auto padded = static_cast<std::int32_t>(cache.padded_capacity);
-    const DType expected =
-        cache.storage == KvCacheStorage::Int8Group64 ? DType::I8 : DType::BF16;
+    const DType expected = cache.storage == KvCacheStorage::Int8Group64 ? DType::I8
+                           : cache.storage == KvCacheStorage::Float16 ? DType::FP16
+                                                                      : DType::BF16;
     if ((cache.storage != KvCacheStorage::BFloat16 &&
-         cache.storage != KvCacheStorage::Int8Group64) ||
+         cache.storage != KvCacheStorage::Int8Group64 &&
+         cache.storage != KvCacheStorage::Float16) ||
         cache.k.dtype != expected || cache.v.dtype != expected || cache.k.ne[0] != kHeadDim ||
         cache.k.ne[1] != padded || cache.k.ne[2] != kKVHeads || cache.v.ne[0] != kHeadDim ||
         cache.v.ne[1] != padded || cache.v.ne[2] != kKVHeads ||

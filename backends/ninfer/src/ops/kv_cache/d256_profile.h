@@ -46,6 +46,10 @@ inline constexpr D256KVCacheProfile d256_kv_cache_profile(DType dtype, DType val
         return {DType::BF16, DType::BF16, kD256KVCacheHeadDim, kD256KVCacheHeadDim,
                 0,           DType::FP16, 0,                   DType::FP16,
                 0};
+    case DType::FP16:
+        return {DType::FP16, DType::FP16, kD256KVCacheHeadDim, kD256KVCacheHeadDim,
+                0,           DType::FP16, 0,                   DType::FP16,
+                0};
     case DType::I8:
         if (value_code_dtype == DType::U8) {
             return {DType::I8, DType::U8,   kD256KVCacheHeadDim, kD256KVCacheHeadDim / 2,
@@ -87,6 +91,8 @@ inline constexpr D256KVCacheProfile d256_kv_cache_profile(ninfer::KvCacheStorage
     switch (storage) {
     case ninfer::KvCacheStorage::BFloat16:
         return d256_kv_cache_profile(DType::BF16);
+    case ninfer::KvCacheStorage::Float16:
+        return d256_kv_cache_profile(DType::FP16);
     case ninfer::KvCacheStorage::Int8Group64:
         return d256_kv_cache_profile(DType::I8, DType::I8);
     case ninfer::KvCacheStorage::Fp8E4M3Row256:

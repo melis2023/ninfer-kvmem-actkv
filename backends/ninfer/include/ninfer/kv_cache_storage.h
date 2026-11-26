@@ -31,6 +31,10 @@ enum class KvCacheStorage : std::uint8_t {
     // a residual axis (two bytes per block) over a group-64 scale, paired with the rk8v4 packed
     // int4 value plane. Opt-in through --kv-dtype rk2v4-e8.
     RotatedE8RootKeyInt4Value,
+    // IEEE FP16, symmetric K/V. Same 2 bytes as BFloat16 with two more mantissa bits. Currently
+    // only the drafter ring selects it (--draft-kv-dtype f16, DSpine's 8192 window); the target
+    // keeps whatever --kv-dtype asks for.
+    Float16,
 };
 
 } // namespace ninfer

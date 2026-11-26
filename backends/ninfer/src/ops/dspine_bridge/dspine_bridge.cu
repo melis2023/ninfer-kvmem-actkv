@@ -2,6 +2,7 @@
 #include "ninfer/ops/speculative_round.h"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include "ops/common/warp.cuh"
 #include "ops/kernel/sampling_device.cuh"
 
@@ -10,6 +11,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace ninfer::ops {
 namespace {
@@ -25,6 +27,17 @@ constexpr float kF32Tiny = 1.1754943508222875e-38f;
 __device__ __forceinline__ std::int64_t cm(std::int64_t row, std::int64_t rows,
                                            std::int64_t column) {
     return row + rows * column;
+}
+
+// The drafter ring is BF16 by default and FP16 when --draft-kv-dtype f16 asks for it; both are
+// 16-bit values, so one templated context reader serves both.
+template <typename T>
+__device__ __forceinline__ float to_float(T value) {
+    if constexpr (std::is_same_v<T, __half>) {
+        return __half2float(value);
+    } else {
+        return __bfloat162float(value);
+    }
 }
 
 __device__ __forceinline__ float block_sum(float value) {
@@ -308,11 +321,12 @@ __global__ void dspine_bridge_finish_kernel(const __nv_bfloat16* raw,
 // slice and the block merges the partial online-softmax states in shared memory.
 constexpr int kDSpineAttentionSplits = 8;
 
+template <typename ContextT>
 __global__ void dspine_causal_attention_kernel(
     const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
     const std::int32_t* positions, const std::int32_t* valid_columns,
     const std::int32_t* floors, const std::int32_t* lanes,
-    const __nv_bfloat16* context_k, const __nv_bfloat16* context_v, int capacity,
+    const ContextT* context_k, const ContextT* context_v, int capacity,
     int padded, int width, int batch, int head_dim, int query_heads, int kv_heads,
     int window, float scale, __nv_bfloat16* out) {
     const int block = static_cast<int>(blockIdx.x);
@@ -355,12 +369,11 @@ __global__ void dspine_causal_attention_kernel(
 
     const std::int64_t lane_base =
         static_cast<std::int64_t>(lanes[b]) * head_dim * padded * kv_heads;
-    const auto consume = [&](const __nv_bfloat16* key, const __nv_bfloat16* value,
-                             std::int64_t index) {
+    const auto consume = [&]<typename T>(const T* key, const T* value, std::int64_t index) {
         float score = 0.0f;
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
-            if (i < dims) { score += qv[i] * __bfloat162float(key[index + 32 * i]); }
+            if (i < dims) { score += qv[i] * to_float(key[index + 32 * i]); }
         }
 #pragma unroll
         for (int offset = 16; offset > 0; offset >>= 1) {
@@ -374,7 +387,7 @@ __global__ void dspine_causal_attention_kernel(
 #pragma unroll
         for (int i = 0; i < 8; ++i) {
             if (i < dims) {
-                acc[i] = acc[i] * scale_old + e * __bfloat162float(value[index + 32 * i]);
+                acc[i] = acc[i] * scale_old + e * to_float(value[index + 32 * i]);
             }
         }
         m = m_new;
@@ -1036,12 +1049,12 @@ struct DSpineRowSplit {
     static constexpr int warps = (32 / Rows) < 1 ? 1 : (32 / Rows);
 };
 
-template <int Rows, int RowWarps>
+template <int Rows, int RowWarps, typename ContextT>
 __global__ void dspine_causal_attention_rows_kernel(
     const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
     const std::int32_t* positions, const std::int32_t* valid_columns,
     const std::int32_t* floors, const std::int32_t* lanes,
-    const __nv_bfloat16* context_k, const __nv_bfloat16* context_v, int capacity,
+    const ContextT* context_k, const ContextT* context_v, int capacity,
     int padded, int width, int batch, int head_dim, int query_heads, int kv_heads,
     int window, float scale, __nv_bfloat16* out) {
     const int head  = static_cast<int>(blockIdx.x);
@@ -1068,8 +1081,8 @@ __global__ void dspine_causal_attention_rows_kernel(
     // Tile layout is [dim group][position][lane]: index i selects a group of 32 contiguous
     // head_dim values of one position, so a staging step is one coalesced 64-byte read and
     // the consuming warps read consecutive lanes out of consecutive banks.
-    __shared__ __align__(16) __nv_bfloat16 s_k[kDSpineRowDims * kDSpineTilePositions * 32];
-    __shared__ __align__(16) __nv_bfloat16 s_v[kDSpineRowDims * kDSpineTilePositions * 32];
+    __shared__ __align__(16) ContextT s_k[kDSpineRowDims * kDSpineTilePositions * 32];
+    __shared__ __align__(16) ContextT s_v[kDSpineRowDims * kDSpineTilePositions * 32];
     constexpr int kTileElements = kDSpineRowDims * kDSpineTilePositions * 32;
     // Staged 16 bytes per thread: one float4 covers eight contiguous head_dim values, so a
     // warp moves 512 B per instruction. Element-at-a-time staging moved 64 B per warp
@@ -1116,8 +1129,8 @@ __global__ void dspine_causal_attention_rows_kernel(
             float val[kDSpineRowDims];
 #pragma unroll
             for (int i = 0; i < kDSpineRowDims; ++i) {
-                key[i] = __bfloat162float(s_k[(i * kDSpineTilePositions + p) * 32 + lane]);
-                val[i] = __bfloat162float(s_v[(i * kDSpineTilePositions + p) * 32 + lane]);
+                key[i] = to_float(s_k[(i * kDSpineTilePositions + p) * 32 + lane]);
+                val[i] = to_float(s_v[(i * kDSpineTilePositions + p) * 32 + lane]);
             }
             float score = 0.0f;
 #pragma unroll
@@ -1229,8 +1242,12 @@ void dspine_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     require_bf16(q, "q");
     require_bf16(k, "k");
     require_bf16(v, "v");
-    require_bf16(context_k, "context_k");
-    require_bf16(context_v, "context_v");
+    // The ring is BF16 by default and FP16 with --draft-kv-dtype f16; the temporary block and
+    // the output stay BF16.
+    if ((context_k.dtype != DType::BF16 && context_k.dtype != DType::FP16) ||
+        context_v.dtype != context_k.dtype) {
+        throw std::invalid_argument("dspine_causal_attention: context must be BF16 or FP16");
+    }
     require_bf16(out, "out");
     const int head_dim    = q.ne[0];
     const int query_heads = q.ne[1];
@@ -1272,13 +1289,15 @@ void dspine_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         reinterpret_cast<std::uintptr_t>(context_v.data) % 16 == 0;
     const bool shared_rows = context_aligned && head_dim == 32 * kDSpineRowDims &&
                              width >= 2 && width <= kDSpineRowsMax;
+    const bool f16 = context_k.dtype == DType::FP16;
     if (shared_rows) {
         const dim3 grid(query_heads, batch);
         // Each Rows picks the widest per-row split that keeps the block within the
         // 1024-thread limit, so the warps scanning the context fill the SM.
+        const auto launch_rows = [&]<typename Ctx>() {
 #define NINFER_DSPINE_LAUNCH_ROWS(R)                                                    \
-    dspine_causal_attention_rows_kernel<R, DSpineRowSplit<R>::warps>                        \
-        <<<grid, 32 * R * DSpineRowSplit<R>::warps, 0, stream>>>(                          \
+    dspine_causal_attention_rows_kernel<R, DSpineRowSplit<R>::warps, Ctx>               \
+        <<<grid, 32 * R * DSpineRowSplit<R>::warps, 0, stream>>>(                       \
         static_cast<const __nv_bfloat16*>(q.data),                                      \
         static_cast<const __nv_bfloat16*>(k.data),                                      \
         static_cast<const __nv_bfloat16*>(v.data),                                      \
@@ -1286,35 +1305,41 @@ void dspine_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
         static_cast<const std::int32_t*>(valid_columns.data),                           \
         floors.data != nullptr ? static_cast<const std::int32_t*>(floors.data) : nullptr, \
         static_cast<const std::int32_t*>(lanes.data),                                   \
-        static_cast<const __nv_bfloat16*>(context_k.data),                              \
-        static_cast<const __nv_bfloat16*>(context_v.data), capacity, padded_capacity,    \
-        width, batch, head_dim, query_heads, kv_heads, window, scale,                    \
+        static_cast<const Ctx*>(context_k.data),                                        \
+        static_cast<const Ctx*>(context_v.data), capacity, padded_capacity,             \
+        width, batch, head_dim, query_heads, kv_heads, window, scale,                   \
         static_cast<__nv_bfloat16*>(out.data))
-        switch (width) {
-            case 2: NINFER_DSPINE_LAUNCH_ROWS(2); break;
-            case 3: NINFER_DSPINE_LAUNCH_ROWS(3); break;
-            case 4: NINFER_DSPINE_LAUNCH_ROWS(4); break;
-            case 5: NINFER_DSPINE_LAUNCH_ROWS(5); break;
-            case 6: NINFER_DSPINE_LAUNCH_ROWS(6); break;
-            case 7: NINFER_DSPINE_LAUNCH_ROWS(7); break;
-            default: NINFER_DSPINE_LAUNCH_ROWS(8); break;
-        }
+            switch (width) {
+                case 2: NINFER_DSPINE_LAUNCH_ROWS(2); break;
+                case 3: NINFER_DSPINE_LAUNCH_ROWS(3); break;
+                case 4: NINFER_DSPINE_LAUNCH_ROWS(4); break;
+                case 5: NINFER_DSPINE_LAUNCH_ROWS(5); break;
+                case 6: NINFER_DSPINE_LAUNCH_ROWS(6); break;
+                case 7: NINFER_DSPINE_LAUNCH_ROWS(7); break;
+                default: NINFER_DSPINE_LAUNCH_ROWS(8); break;
+            }
 #undef NINFER_DSPINE_LAUNCH_ROWS
+        };
+        if (f16) { launch_rows.template operator()<__half>(); }
+        else { launch_rows.template operator()<__nv_bfloat16>(); }
         return;
     }
-    const int grid    = width * batch * query_heads;
-    dspine_causal_attention_kernel<<<grid, threads, 0, stream>>>(
-        static_cast<const __nv_bfloat16*>(q.data),
-        static_cast<const __nv_bfloat16*>(k.data),
-        static_cast<const __nv_bfloat16*>(v.data),
-        static_cast<const std::int32_t*>(positions.data),
-        static_cast<const std::int32_t*>(valid_columns.data),
-        floors.data != nullptr ? static_cast<const std::int32_t*>(floors.data) : nullptr,
-        static_cast<const std::int32_t*>(lanes.data),
-        static_cast<const __nv_bfloat16*>(context_k.data),
-        static_cast<const __nv_bfloat16*>(context_v.data), capacity, padded_capacity, width,
-        batch, head_dim, query_heads, kv_heads, window, scale,
-        static_cast<__nv_bfloat16*>(out.data));
+    const int grid = width * batch * query_heads;
+    const auto launch_general = [&]<typename Ctx>() {
+        dspine_causal_attention_kernel<Ctx><<<grid, threads, 0, stream>>>(
+            static_cast<const __nv_bfloat16*>(q.data),
+            static_cast<const __nv_bfloat16*>(k.data),
+            static_cast<const __nv_bfloat16*>(v.data),
+            static_cast<const std::int32_t*>(positions.data),
+            static_cast<const std::int32_t*>(valid_columns.data),
+            floors.data != nullptr ? static_cast<const std::int32_t*>(floors.data) : nullptr,
+            static_cast<const std::int32_t*>(lanes.data),
+            static_cast<const Ctx*>(context_k.data), static_cast<const Ctx*>(context_v.data),
+            capacity, padded_capacity, width, batch, head_dim, query_heads, kv_heads, window,
+            scale, static_cast<__nv_bfloat16*>(out.data));
+    };
+    if (f16) { launch_general.template operator()<__half>(); }
+    else { launch_general.template operator()<__nv_bfloat16>(); }
 }
 
 void dspine_write_scaled(const Tensor& write, const Tensor& norm, std::int32_t layer,

@@ -260,6 +260,15 @@ StateImageDeviceLayout plan_state_image_device_pool(std::span<LayoutBuilder* con
             plan_cyclic_kv_cache(builder, dflash.layers, dflash.capacity, dflash.kv_heads,
                                  dflash.head_dim, spec.linear.slot_count, dflash.storage);
     }
+    if (spec.target_hot) {
+        // The DSpine hot ring is device-only and owns its own allocation; it must not consume
+        // space in the state image backing (whose host image is sized by host_state_slots).
+        const TargetHotSpec& hot = *spec.target_hot;
+        LayoutBuilder hot_builder;
+        out.target_hot = plan_cyclic_kv_cache(hot_builder, hot.layers, hot.capacity, hot.kv_heads,
+                                             hot.head_dim, hot.lane_capacity,
+                                             KvCacheStorage::Float16);
+    }
 
     out.host = plan_host_state_image(spec);
     return out;
@@ -443,6 +452,15 @@ StateImageDevicePool::StateImageDevicePool(std::span<const DeviceSpan> backings,
         }
         dflash_local_.emplace(backings.front(), *layout.dflash_local);
     }
+    if (layout.target_hot) {
+        if (layout.target_hot->lane_capacity == 0 ||
+            layout.target_hot->lane_capacity > linear_.front()->slot_count()) {
+            throw std::invalid_argument("StateImage target hot ring has too many lanes");
+        }
+        target_hot_backing_ = DeviceBuffer(layout.target_hot->payload_bytes());
+        target_hot_.emplace(DeviceSpan{target_hot_backing_.p, target_hot_backing_.bytes},
+                            *layout.target_hot);
+    }
 }
 
 LinearAttentionStatePool* StateImageDevicePool::single_shard() const {
@@ -458,6 +476,9 @@ StateImageDeviceSlotView StateImageDevicePool::slot_view(std::int32_t slot) cons
     };
     for (const auto& pool : linear_) { view.linear.push_back(pool->slot_view(slot)); }
     if (dflash_local_) { view.dflash_local = dflash_local_->slot_view(slot); }
+    if (target_hot_ && slot < static_cast<std::int32_t>(target_hot_->lane_capacity())) {
+        view.target_hot = target_hot_->slot_view(slot);
+    }
     return view;
 }
 
@@ -472,6 +493,14 @@ CyclicKVCache* StateImageDevicePool::dflash_local() noexcept {
 
 const CyclicKVCache* StateImageDevicePool::dflash_local() const noexcept {
     return dflash_local_ ? &*dflash_local_ : nullptr;
+}
+
+CyclicKVCache* StateImageDevicePool::target_hot() noexcept {
+    return target_hot_ ? &*target_hot_ : nullptr;
+}
+
+const CyclicKVCache* StateImageDevicePool::target_hot() const noexcept {
+    return target_hot_ ? &*target_hot_ : nullptr;
 }
 
 void StateImageDevicePool::zero_slot(std::int32_t slot, RankStreams streams) {
