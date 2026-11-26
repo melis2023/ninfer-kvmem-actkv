@@ -915,6 +915,15 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
                                    "NariQ coded weights with speculative decoding and non-root "
                                    "state slots: disabling CUDA Graphs");
                 options.use_cuda_graph = false;
+                // The context cache's default 8 GiB pinned host KV arena is poison on a 16 GB
+                // card: Windows charges pinned host bytes against the device budget and the
+                // weights page out to shared memory (decode drops 10x). Every speculative
+                // backend gives up more to that arena than the prefix reuse it buys back.
+                if (options.context_cache.enabled) {
+                    options.context_cache.enabled                = false;
+                    options.context_cache.host_state_slots       = 0;
+                    options.context_cache.host_kv_capacity_bytes = 0;
+                }
             } else if (options.context_cache.enabled) {
                 publish_diagnostic(requested.diagnostic_observer, DiagnosticLevel::Warning, "%s",
                                    "NariQ coded weights with MTP and CUDA Graphs: disabling the "

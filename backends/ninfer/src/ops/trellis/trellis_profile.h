@@ -91,7 +91,7 @@ struct Table {
         std::size_t done = 0;
         while (!pending.empty() && done < count) {
             const Pending item = pending.front();
-            pending.pop_front();
+            pending.pop_back();
             float ms = 0.0F;
             if (cudaEventSynchronize(item.end) == cudaSuccess &&
                 cudaEventElapsedTime(&ms, item.begin, item.end) == cudaSuccess) {
@@ -104,13 +104,28 @@ struct Table {
             free_events.push_back(item.end);
             ++done;
         }
+        if (done != 0 && enabled()) { emit("snapshot"); }
     }
 
     ~Table() {
         drain(pending.size());
-        std::fprintf(stderr,
-                     "\nprofile | scope | calls | device ms | host ms | device/call us | "
-                     "host/call us | GB/s-equiv\n");
+        emit("exit");
+    }
+
+    // NINFER_PROFILE_FILE also accepts a path: every drain rewrites the table there, so a
+    // server that gets killed instead of exiting still leaves its numbers behind.
+    void emit(const char* when) {
+        std::FILE* out = stderr;
+        const char* path = std::getenv("NINFER_PROFILE_FILE");
+        std::FILE* owned = nullptr;
+        if (path != nullptr && path[0] != '\0') {
+            owned = std::fopen(path, "w");
+            if (owned != nullptr) { out = owned; }
+        }
+        std::fprintf(out,
+                     "\nprofile %s | scope | calls | device ms | host ms | device/call us | "
+                     "host/call us\n",
+                     when);
         std::vector<const std::pair<const std::string, Row>*> order;
         for (const auto& item : rows) { order.push_back(&item); }
         std::sort(order.begin(), order.end(), [](const auto* a, const auto* b) {
@@ -122,13 +137,14 @@ struct Table {
             device_total += row.device_ms;
             host_total += row.host_ms;
             if (row.calls == 0) { continue; }
-            std::fprintf(stderr, "profile | %s | %llu | %.3f | %.3f | %.1f | %.1f\n",
+            std::fprintf(out, "profile | %s | %llu | %.3f | %.3f | %.1f | %.1f\n",
                          item->first.c_str(), static_cast<unsigned long long>(row.calls),
                          row.device_ms, row.host_ms, row.device_ms * 1000.0 / double(row.calls),
                          row.host_ms * 1000.0 / double(row.calls));
         }
-        std::fprintf(stderr, "profile | TOTAL | %llu | %.3f | %.3f\n",
+        std::fprintf(out, "profile | TOTAL | %llu | %.3f | %.3f\n",
                      static_cast<unsigned long long>(unread), device_total, host_total);
+        if (owned != nullptr) { std::fclose(owned); }
     }
 };
 
