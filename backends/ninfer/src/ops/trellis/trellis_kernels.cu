@@ -1130,12 +1130,12 @@ struct PfArgs {
 int pick_pf_tiling(int rows, int nt, int sms) {
     if (const char* forced = std::getenv("NINFER_TRELLIS_PFTILING")) {
         const int value = std::atoi(forced);
-        if (value >= 0 && value <= 6) { return value; }
+        if (value >= 0 && value <= 11) { return value; }
     }
     // Verify windows are a handful of tokens: the 64/128-token prefill tiles waste most of their
     // shared-memory stage. TT=8 (one m16n8k16 column tile) is the fastest measured small-T shape;
     // larger prefill chunks keep the original heuristic below.
-    if (rows <= 8) { return 6; }
+    if (rows <= 8) { return 7; }
     if (rows <= 16) { return 5; }
     const int cbs = (nt + kW5 - 1) / kW5;
     const int c128 = cbs * ((rows + 127) / 128), c64 = cbs * ((rows + 63) / 64);
@@ -1174,6 +1174,11 @@ void launch_pf_bits(const PfArgs& a, int tiling, cudaStream_t stream) {
         case 4: launch_pf<BITS, 32, 4, 2>(a, stream); break;
         case 5: launch_pf<BITS, 16, 8, 2>(a, stream); break;
         case 6: launch_pf<BITS, 8, 8, 2>(a, stream); break;
+        case 7: launch_pf<BITS, 8, 8, 4>(a, stream); break;
+        case 8: launch_pf<BITS, 8, 4, 2>(a, stream); break;
+        case 9: launch_pf<BITS, 8, 4, 4>(a, stream); break;
+        case 10: launch_pf<BITS, 8, 8, 5>(a, stream); break;
+        case 11: launch_pf<BITS, 8, 8, 6>(a, stream); break;
         default: launch_pf<BITS, 128, 4, 2>(a, stream); break;
     }
 }
