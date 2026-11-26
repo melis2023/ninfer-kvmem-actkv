@@ -20,7 +20,12 @@ constexpr const char* kPrefixAppendOp = "kv_cache_append_prefix";
 void require_shape(const Tensor& tensor, std::int32_t n0, std::int32_t n1, std::int32_t n2,
                    std::int32_t n3, const char* op, const char* name) {
     if (tensor.ne[0] != n0 || tensor.ne[1] != n1 || tensor.ne[2] != n2 || tensor.ne[3] != n3) {
-        throw std::invalid_argument(std::string(op) + ": invalid shape for " + name);
+        throw std::invalid_argument(
+            std::string(op) + ": invalid shape for " + name + " (got [" +
+            std::to_string(tensor.ne[0]) + "," + std::to_string(tensor.ne[1]) + "," +
+            std::to_string(tensor.ne[2]) + "," + std::to_string(tensor.ne[3]) + "], want [" +
+            std::to_string(n0) + "," + std::to_string(n1) + "," + std::to_string(n2) + "," +
+            std::to_string(n3) + "])");
     }
 }
 
@@ -108,8 +113,14 @@ detail::KVCacheAppendPrefixPlan validate_inputs(const Tensor& k, const Tensor& v
     if (batch < 1 || batch > 8) {
         throw std::invalid_argument("kv_cache_append_prefix: B must be 1..8");
     }
-    require_shape(k, kHeadDim, kKVHeads, tokens, batch, kPrefixAppendOp, "k");
-    require_shape(v, kHeadDim, kKVHeads, tokens, batch, kPrefixAppendOp, "v");
+    // DSpine's verify K/V arrive in the D256 packed layout ([256, 4] — two head dims per
+    // packed row pair, half the kv heads), the same layout the full-cache append writes;
+    // DFlash2 and MTP append the unpacked [128, 8]. The cache's own geometry decides which.
+    const bool packed_d256 = k.ne[0] == 2 * kHeadDim && k.ne[1] * 2 == kKVHeads;
+    const std::int32_t head_dim = packed_d256 ? 2 * kHeadDim : kHeadDim;
+    const std::int32_t kv_heads = packed_d256 ? kKVHeads / 2 : kKVHeads;
+    require_shape(k, head_dim, kv_heads, tokens, batch, kPrefixAppendOp, "k");
+    require_shape(v, head_dim, kv_heads, tokens, batch, kPrefixAppendOp, "v");
     require_shape(positions, tokens, batch, 1, 1, kPrefixAppendOp, "positions");
     require_shape(counts, batch, 1, 1, 1, kPrefixAppendOp, "counts");
     require_shape(selectors, batch, 1, 1, 1, kPrefixAppendOp, "selectors");
@@ -148,9 +159,14 @@ void validate_paged_cache(const PagedKVBatchLayerView& cache,
 
 void validate_cyclic_cache(const CyclicKVCacheLayerView& cache,
                            KVCacheAppendPrefixExecutionEnvelope envelope) {
+    // DSpine's ring is built in the D256 packed geometry ([256, 4]); the unpacked [128, 8]
+    // is the DFlash2/MTP shape. Both keep the registered sliding capacities.
+    const bool packed_d256 = cache.head_dim == 2 * kHeadDim && cache.num_kv_heads * 2 == kKVHeads;
+    const bool unpacked    = cache.head_dim == kHeadDim && cache.num_kv_heads == kKVHeads;
     const bool registered_capacity =
         cache.capacity == 2048 || cache.capacity == 4096 || cache.capacity == 8192;
-    if (cache.num_kv_heads != kKVHeads || cache.head_dim != kHeadDim || !registered_capacity ||
+    if ((packed_d256 && !unpacked && !registered_capacity) ||
+        (!packed_d256 && !unpacked) ||
         cache.padded_capacity < cache.capacity ||
         cache.padded_capacity >
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||

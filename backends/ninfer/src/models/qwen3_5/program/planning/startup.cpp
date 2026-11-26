@@ -267,12 +267,13 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     if (plan.kvmem.dspine_f16_tokens != 0) {
         // DSpine only: a separate FP16 ring for the most recent target KV tokens. It is part of
         // the state image so the same allocator and slot discipline owns it; DFlash2/MTP never
-        // populate this field and never read it.
+        // populate this field and never read it. The ring is in the D256 packed geometry — the
+        // same layout the verify's append writes ([head_dim*2, kv_heads/2] — see d256_profile).
         state_image_spec.target_hot = qwen3_5::TargetHotSpec{
             .layers   = config.full_attention_layers,
             .capacity = plan.kvmem.dspine_f16_tokens,
-            .kv_heads = dimension(config.attention->num_key_value_heads),
-            .head_dim = dimension(config.attention->head_dim),
+            .kv_heads = dimension(config.attention->num_key_value_heads) / 2,
+            .head_dim = dimension(config.attention->head_dim) * 2,
         };
     }
     out.state_images =
