@@ -430,7 +430,7 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
     state_images = std::make_unique<qwen3_5::StateImageDevicePool>(backings,
                                                                     plan.persistent.state_images);
-    if (plan.context_cache.host_state_slots != 0) {
+    if (context_cache.enabled && plan.context_cache.host_state_slots != 0) {
         const std::uint64_t host_state_bytes =
             static_cast<std::uint64_t>(state_images->host_layout().image_bytes) *
             context_cache.host_state_slots;
@@ -441,7 +441,8 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         host_state_phase.complete(host_state_bytes, host_state_bytes);
     }
     const std::uint64_t logical_state_capacity =
-        static_cast<std::uint64_t>(state_images->slot_count()) + context_cache.host_state_slots;
+        static_cast<std::uint64_t>(state_images->slot_count()) +
+        (host_state_images ? context_cache.host_state_slots : 0U);
     if (logical_state_capacity > std::numeric_limits<std::uint32_t>::max()) {
         throw std::overflow_error("Qwen3.5 logical StateImage capacity exceeds uint32");
     }
@@ -566,7 +567,10 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         pressure_backend_page_scratch_.resize(backend_kv_pages->capacity());
         pressure_backend_selected_pages_.reserve(backend_kv_pages->capacity());
     }
-    if (context_cache.host_kv_capacity_bytes != 0) {
+    // The host KV arena belongs to the prefix cache. A disabled cache still carries the struct's
+    // default 8 GiB capacity, and on Windows pinned host bytes are charged against the device
+    // budget, so allocating it beside KVMem (whose own H tier is separate) starves the weights.
+    if (context_cache.enabled && context_cache.host_kv_capacity_bytes != 0) {
         std::vector<HostKVPageLayout> layouts;
         layouts.push_back(plan_host_kv_page_layout(decoder->text_kv.page_pool().geometry()));
         if (const qwen3_5::PagedKVCache* backend = backend_kv_cache()) {

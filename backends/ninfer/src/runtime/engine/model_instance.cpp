@@ -904,14 +904,25 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
             // Root-only MTP is safe: the verify path skips its host slot read while a graph is
             // being captured, and every round addresses root state slot 0. Extra slots still need
             // eager decode; other spec backends keep the conservative eager path until validated.
+            // The context cache's checkpoints own state slots beside the root one, so a root-only
+            // MTP drops the cache instead of the graphs -- the same trade the None backend below
+            // makes. Only KVMem's paging window still forces eager decode.
             const bool mtp_root_only =
                 options.speculative.backend == SpeculativeBackend::Mtp &&
-                !options.context_cache.enabled && options.kvmem.selected_tokens == 0;
+                options.kvmem.selected_tokens == 0;
             if (!mtp_root_only) {
                 publish_diagnostic(requested.diagnostic_observer, DiagnosticLevel::Warning, "%s",
                                    "NariQ coded weights with speculative decoding and non-root "
                                    "state slots: disabling CUDA Graphs");
                 options.use_cuda_graph = false;
+            } else if (options.context_cache.enabled) {
+                publish_diagnostic(requested.diagnostic_observer, DiagnosticLevel::Warning, "%s",
+                                   "NariQ coded weights with MTP and CUDA Graphs: disabling the "
+                                   "context cache (root state only) to avoid illegal state-slot "
+                                   "access during graph replay");
+                options.context_cache.enabled                = false;
+                options.context_cache.host_state_slots       = 0;
+                options.context_cache.host_kv_capacity_bytes = 0;
             }
         } else if (options.kvmem.selected_tokens != 0) {
             publish_diagnostic(requested.diagnostic_observer, DiagnosticLevel::Warning, "%s",

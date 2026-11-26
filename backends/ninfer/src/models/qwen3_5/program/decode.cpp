@@ -874,6 +874,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
     const auto attention_capacity = kvmem_window_tokens ? kvmem_window_tokens : capacity;
 
     const auto started = Clock::now();
+    const Clock::time_point mtp_trace_anchor = started;
     try {
         std::optional<nvtx::ScopedRange> submit_range;
         submit_range.emplace(nvtx::Name::DecodeMtpSubmit, nvtx::Category::Mtp,
@@ -966,8 +967,25 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
         schedule_state.execution.memory_statistics = memory_candidate_statistics ? &*memory_candidate_statistics : nullptr;
         mark_workspace_usage(workspace_plan.mtp_round);
+        const bool mtp_trace = [] {
+            static const bool on = [] {
+                const char* flag = std::getenv("NINFER_MTP_TRACE");
+                return flag && flag[0] == '1';
+            }();
+            return on;
+        }();
+        const Clock::time_point mtp_trace_t0 = mtp_trace ? Clock::now() : Clock::time_point{};
         execution::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                     verify_window, draft_window, envelopes, executable);
+        if (mtp_trace) {
+            const auto submitted = Clock::now();
+            const auto ingress_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        mtp_trace_t0 - mtp_trace_anchor).count();
+            const auto batch_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      submitted - mtp_trace_t0).count();
+            std::fprintf(stderr, "MTP_TRACE window=%u ingress=%.3fms batch_submit=%.3fms\n",
+                         verify_window, double(ingress_ns) / 1e6, double(batch_ns) / 1e6);
+        }
         if (logprobs) { fetch_logprobs(static_cast<std::int32_t>(lanes.size() * width)); }
         submit_range.reset();
         timing.begin_wait();
@@ -1317,7 +1335,10 @@ ProgramImpl::decode_dflash_batch(std::span<const std::uint32_t> lanes,
             *io.dflash_decode,
             *dflash_host_ingress,
             *dflash_host_egress,
-            state_images->continuation_hidden_store()};
+            state_images->continuation_hidden_store(),
+            false,
+            0,
+            state_images->target_hot()};
         schedule_state.ngram                  = copy_round;
         schedule_state.neural_proposal_drafts = copy_round ? draft_window : verify_drafts;
 

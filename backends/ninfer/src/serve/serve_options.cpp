@@ -744,6 +744,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (arg == "--draft-kv-dtype") {
             const std::string value = require_value(arg.c_str());
             if (value == "bf16") options.kvmem.draft_kv_storage = KvCacheStorage::BFloat16;
+            // IEEE FP16 for the drafter ring only; the target keeps --kv-dtype.
+            else if (value == "f16") options.kvmem.draft_kv_storage = KvCacheStorage::Float16;
             else if (value == "int8") options.kvmem.draft_kv_storage = KvCacheStorage::Int8Group64;
             else throw std::invalid_argument("invalid draft-kv-dtype: " + value);
             continue;
@@ -1213,6 +1215,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         }
         if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
+            continue;
+        }
+        if (arg == "--kv-dspine-f16") {
+            options.kvmem.dspine_f16_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kv-dspine-f16"), "kv-dspine-f16"));
             continue;
         }
         if (arg == "--spec") {
