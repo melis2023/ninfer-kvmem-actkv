@@ -36,8 +36,12 @@ void hadfull_pass(const float* src, float* dst, float* tmp, float* tmp2, const S
 
 // Coded tile product: yr [N,T] FP32 = W_hat * xa. `xf`/`xs` are the prefill prologue scratch
 // (fp16 B-fragment plane and per-token 2^-e scales); unused by the single-token split route.
-void tile_product(const float* xa, const Weight& w, float* yr, int tokens, std::uint16_t* xf,
-                  float* xs, cudaStream_t stream);
+// `partials` holds kPfMaxSplits [N,T] FP32 planes when the small-T route splits K, else null.
+void tile_product(const float* xa, const Weight& w, float* yr, float* partials, int tokens,
+                  std::uint16_t* xf, float* xs, cudaStream_t stream);
+
+// Number of K ranges the small-T coded MMA may run in parallel; one plane per range.
+inline constexpr int kPfMaxSplits = 6;
 
 // Number of K ranges the single-token route accumulates in parallel. One token only reaches N/16
 // warps, so the plain product is latency-bound; splitting K restores the parallelism.

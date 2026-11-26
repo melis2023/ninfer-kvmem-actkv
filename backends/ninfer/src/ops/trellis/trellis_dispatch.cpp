@@ -211,9 +211,13 @@ std::size_t trellis_linear_workspace_bytes(const Weight& w, std::int32_t max_tok
     const std::size_t yr = round256(static_cast<std::size_t>(w.n * tok) * sizeof(float));
     const std::size_t tmp = round256(static_cast<std::size_t>(wider * tok) * sizeof(float));
     const std::size_t split = round256(static_cast<std::size_t>(split_floats) * sizeof(float));
+    // The small-T MMA may split K across up to kPfMaxSplits CTAs, one FP32 [N,T] plane each.
+    const std::size_t pf_split =
+        round256(static_cast<std::size_t>(detail::trellis::kPfMaxSplits) * w.n * tok *
+                 sizeof(float));
     const std::size_t xs = round256(static_cast<std::size_t>(xs_floats) * sizeof(float));
     const std::size_t xf = round256(static_cast<std::size_t>(xf_halves) * sizeof(std::uint16_t));
-    return xa + yr + tmp + tmp + split + xs + xf;
+    return xa + yr + tmp + tmp + split + pf_split + xs + xf;
 }
 
 void trellis_linear(const Tensor& x, const Weight& w, Tensor& y, std::int32_t max_tokens,
@@ -274,6 +278,12 @@ void trellis_linear(const Tensor& x, const Weight& w, Tensor& y, std::int32_t ma
     if (split_decode) {
         partials = workspace.alloc(DType::FP32, {w.n * detail::trellis::kDecodeSplits});
     }
+    // Multi-token coded MMA: small N runs K in parallel slices and reduces their FP32 planes.
+    Tensor pf_partials;
+    if (tokens > 1 && w.k % 128 == 0) {
+        pf_partials = workspace.alloc(DType::FP32,
+                                      {w.n, tokens, detail::trellis::kPfMaxSplits});
+    }
 
     {
         profile::Scope stage(prof_key + " gather", stream);
@@ -301,7 +311,11 @@ void trellis_linear(const Tensor& x, const Weight& w, Tensor& y, std::int32_t ma
         }
     } else {
         detail::trellis::tile_product(static_cast<const float*>(xa.data), w,
-                                      static_cast<float*>(yr.data), tokens,
+                                      static_cast<float*>(yr.data),
+                                      pf_partials.data != nullptr
+                                          ? static_cast<float*>(pf_partials.data)
+                                          : nullptr,
+                                      tokens,
                                       static_cast<std::uint16_t*>(xf_span.data),
                                       static_cast<float*>(xs.data), stream);
     }

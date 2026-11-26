@@ -437,7 +437,8 @@ template <int BITS, int TT, int CK, int CPS>
 __global__ void __launch_bounds__(256, CPS)
     pf_mma_kernel(const std::uint32_t* __restrict__ codes, int kt, int nt,
                   const std::uint32_t* __restrict__ xf, const float* __restrict__ xs, int rows,
-                  int groups, float* __restrict__ yr, int N) {
+                  int groups, float* __restrict__ yr, int N, float* __restrict__ partials,
+                  int splits) {
     using Tile = PfTile<BITS, TT, CK, CPS>;
     constexpr int WORDS = Tile::WORDS, CODE_W = Tile::CODE_W, STAGE = Tile::STAGE, S = Tile::S;
     constexpr int GT = Tile::GT;
@@ -487,9 +488,16 @@ __global__ void __launch_bounds__(256, CPS)
             if (aok[i]) cp16s(adst[i] + off, xc + asrc[i]);
         }
     };
+    // Small N leaves the grid short of the CTA slots (N/128 blocks), so a second/third slice of K
+    // runs in parallel and the epilogue writes one FP32 partial plane per slice; reduce_split_kernel
+    // adds them. splits == 1 keeps the single-pass behaviour and writes yr directly.
+    const int nch = kt / CK;
+    const int per = splits > 1 ? (nch + splits - 1) / splits : nch;
+    const int c0  = splits > 1 ? static_cast<int>(blockIdx.z) * per : 0;
+    const int c1  = splits > 1 ? (c0 + per < nch ? c0 + per : nch) : nch;
 #pragma unroll 1
     for (int s = 0; s < S - 1; ++s) {
-        if (s < kt / CK) issue(s, s);
+        if (c0 + s < c1) issue(c0 + s, s);
         cp_commit();
     }
     float acc[GT][4];
@@ -502,12 +510,12 @@ __global__ void __launch_bounds__(256, CPS)
         decode_tile_proven<BITS>(tw, d, lane, af);
     };
 
-    const int nch = kt / CK;
+    // The activation prologue staged tiles above; the loop below walks this slice's [c0, c1).
 #pragma unroll 1
-    for (int c = 0, cur = 0, next = S - 1; c < nch; ++c) {
+    for (int c = c0, cur = 0, next = S - 1; c < c1; ++c) {
         cp_wait<S - 2>();
         __syncthreads();
-        if (c + S - 1 < nch) issue(c + S - 1, next);
+        if (c + S - 1 < c1) issue(c + S - 1, next);
         cp_commit();
         const std::uint32_t* st = sm + cur * STAGE;
         cur = cur + 1 == S ? 0 : cur + 1;
@@ -565,7 +573,14 @@ __global__ void __launch_bounds__(256, CPS)
 #pragma unroll
             for (int m = 0; m < 4; ++m) {
                 if (lane + 32 * m < nv) {
-                    yr[(o0 + lane + 32 * m) + static_cast<std::int64_t>(N) * t] = v[m] * 0.25f * sc;
+                    const int o              = o0 + lane + 32 * m;
+                    const std::int64_t index = static_cast<std::int64_t>(N) * t + o;
+                    const float value        = v[m] * 0.25f * sc;
+                    if (splits == 1) {
+                        yr[index] = value;
+                    } else {
+                        partials[static_cast<std::int64_t>(blockIdx.z) * N * rows + index] = value;
+                    }
                 }
             }
         }
@@ -1124,8 +1139,23 @@ struct PfArgs {
     const std::uint16_t* xf;
     const float* xs;
     float* yr;
-    int K, N, rows, groups, kt, nt;
+    float* partials;
+    int K, N, rows, groups, kt, nt, splits;
 };
+
+// The small-T MMA leaves the grid at N/128 CTAs, so the wide FFN matrices reach ~136 blocks but
+// the 5K-12K projections reach 8-96 and the whole pass is latency-bound. Six K slices fill the
+// machine and measured fastest at every width; the wide prefill tiles keep one pass.
+int pf_split_count(int rows, int nt, int sms) {
+    if (const char* forced = std::getenv("NINFER_TRELLIS_PFSPLITS")) {
+        const int value = std::atoi(forced);
+        if (value >= 1 && value <= kPfMaxSplits) { return value; }
+    }
+    (void)nt;
+    (void)sms;
+    if (rows > 8) { return 1; }
+    return kPfMaxSplits;
+}
 
 int pick_pf_tiling(int rows, int nt, int sms) {
     if (const char* forced = std::getenv("NINFER_TRELLIS_PFTILING")) {
@@ -1159,10 +1189,14 @@ void launch_pf(const PfArgs& a, cudaStream_t stream) {
                              cudaFuncAttributeMaxDynamicSharedMemorySize, Tile::SMEM);
         configured = true;
     }
-    const dim3 grid((a.rows + TT - 1) / TT, (a.nt + kW5 - 1) / kW5, 1);
+    const dim3 grid((a.rows + TT - 1) / TT, (a.nt + kW5 - 1) / kW5, a.splits);
     pf_mma_kernel<BITS, TT, CK, CPS><<<grid, 256, Tile::SMEM, stream>>>(
         a.codes, a.kt, a.nt, reinterpret_cast<const std::uint32_t*>(a.xf), a.xs, a.rows, a.groups,
-        a.yr, a.N);
+        a.yr, a.N, a.partials, a.splits);
+    if (a.splits > 1) {
+        reduce_split_kernel<<<grid_for(static_cast<std::int64_t>(a.N) * a.rows), kThreads, 0,
+                              stream>>>(a.partials, a.yr, a.N * a.rows, a.splits);
+    }
 }
 
 template <int BITS>
@@ -1265,8 +1299,8 @@ void hadfull_pass(const float* src, float* dst, float* tmp, float* tmp2, const S
     permute_side(tmp2, dst, device.perm, n, columns, true, stream);
 }
 
-void tile_product(const float* xa, const Weight& w, float* yr, int tokens, std::uint16_t* xf,
-                  float* xs, cudaStream_t stream) {
+void tile_product(const float* xa, const Weight& w, float* yr, float* partials, int tokens,
+                  std::uint16_t* xf, float* xs, cudaStream_t stream) {
     const int kt_total = w.k / 16;
     const auto* codes = static_cast<const std::uint32_t*>(w.qdata);
     const auto* s16 = static_cast<const float*>(w.trellis_s16);
@@ -1284,9 +1318,10 @@ void tile_product(const float* xa, const Weight& w, float* yr, int tokens, std::
         const int groups = (tokens + 7) / 8;
         trellis_prologue_f32_kernel<<<tokens, 256, 0, stream>>>(
             xa, w.k, tokens, s16, reinterpret_cast<__half*>(xf), xs, groups);
-        const PfArgs a{xa, codes, s16, xf, xs,
-                       yr, w.k, w.n, tokens, groups, kt_total, w.n / 16};
         const int sms = ::ninfer::ops::detail::current_device_multiprocessors(36);
+        const int splits = partials != nullptr ? pf_split_count(tokens, w.n / 16, sms) : 1;
+        const PfArgs a{xa, codes, s16, xf, xs,
+                       yr, partials, w.k, w.n, tokens, groups, kt_total, w.n / 16, splits};
         const int tiling = pick_pf_tiling(tokens, w.n / 16, sms);
         switch (bits) {
 #define LAUNCH_PF(B) case B: launch_pf_bits<B>(a, tiling, stream); break
