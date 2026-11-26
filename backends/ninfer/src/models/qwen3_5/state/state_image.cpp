@@ -265,9 +265,14 @@ StateImageDeviceLayout plan_state_image_device_pool(std::span<LayoutBuilder* con
         // space in the state image backing (whose host image is sized by host_state_slots).
         const TargetHotSpec& hot = *spec.target_hot;
         LayoutBuilder hot_builder;
+        // NINFER_TARGET_HOT_BF16=1 builds the ring BF16 instead of FP16 - the A/B switch
+        // for the ring's own read/write path.
+        const char* bf16_env = std::getenv("NINFER_TARGET_HOT_BF16");
+        const KvCacheStorage ring_storage =
+            (bf16_env != nullptr && bf16_env[0] != '0') ? KvCacheStorage::BFloat16
+                                                        : KvCacheStorage::Float16;
         out.target_hot = plan_cyclic_kv_cache(hot_builder, hot.layers, hot.capacity, hot.kv_heads,
-                                             hot.head_dim, hot.lane_capacity,
-                                             KvCacheStorage::Float16);
+                                              hot.head_dim, hot.lane_capacity, ring_storage);
     }
 
     out.host = plan_host_state_image(spec);

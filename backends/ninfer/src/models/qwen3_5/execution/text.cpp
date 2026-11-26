@@ -42,6 +42,7 @@
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/sigmoid_mul.h"
+#include "ninfer/ops/dspine_bridge.h"
 #include "ninfer/ops/silu_mul.h"
 #include "ninfer/ops/softmax_attention.h"
 
@@ -1295,32 +1296,58 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
         const Tensor valid = active_valid_columns_ != nullptr ? *active_valid_columns_ : Tensor{};
         // DSpine-only FP16 hot ring: the same round's K/V that the target verify writes into the
         // nvfp4 B/R cache is also written into the FP16 ring, so the next verify can read the most
-        // recent window at FP16 precision. Every other mode leaves target_hot_ null.
-        if (target_hot_ != nullptr && ph == Phase::Verify) {
+        // recent window at FP16 precision. Every other mode leaves target_hot_ null. The verify's
+        // attention then reads the ring itself — the sliding window's every column is resident
+        // there at FP16, so the quantized-page dequant never runs — and the gate, which the
+        // dspine kernel has no parameter for, applies as the bit-identical separate sigmoid_mul.
+        // DSpine-only FP16 hot ring: every verify round's K/V (and every prefill chunk's)
+        // lands in the ring as a copy, so the sliding verify *can* read the whole window at
+        // FP16 precision. NINFER_TARGET_HOT_READ=1 switches the verify's attention onto the
+        // ring; until that read path's numbers are verified the verify keeps reading the
+        // int8 pages (correct, slower). Every other mode leaves target_hot_ null. The gate,
+        // which the dspine kernel has no parameter for, applies as the bit-identical
+        // separate sigmoid_mul.
+        const bool hot_ring_read = [] {
+            const char* v = std::getenv("NINFER_TARGET_HOT_READ");
+            return v != nullptr && v[0] == '1';
+        }();
+        Tensor ring_counts{};
+        Tensor ring_lanes{};
+        if (target_hot_ != nullptr) {
             auto hot_scope = work_.scope();
             const auto hot_rows = static_cast<std::size_t>(active_sequence_batch_);
-            Tensor lanes   = work_.alloc(DType::I32, {active_sequence_batch_});
+            ring_lanes     = work_.alloc(DType::I32, {active_sequence_batch_});
             const std::array<std::int32_t, 8> host_lanes{0, 1, 2, 3, 4, 5, 6, 7};
-            CUDA_CHECK(cudaMemcpyAsync(lanes.data, host_lanes.data(),
+            CUDA_CHECK(cudaMemcpyAsync(ring_lanes.data, host_lanes.data(),
                                        hot_rows * sizeof(std::int32_t),
                                        cudaMemcpyHostToDevice, s));
-            Tensor counts = valid;
-            if (counts.data == nullptr) {
-                counts = work_.alloc(DType::I32, {active_sequence_batch_});
+            ring_counts = valid;
+            if (ring_counts.data == nullptr) {
+                ring_counts = work_.alloc(DType::I32, {active_sequence_batch_});
                 const std::array<std::int32_t, 8> host_counts{
                     width, width, width, width, width, width, width, width};
-                CUDA_CHECK(cudaMemcpyAsync(counts.data, host_counts.data(),
+                CUDA_CHECK(cudaMemcpyAsync(ring_counts.data, host_counts.data(),
                                            hot_rows * sizeof(std::int32_t),
                                            cudaMemcpyHostToDevice, s));
             }
             ops::kv_cache_append_prefix(
-                k_batch, v_batch, position_batch, counts, lanes,
+                k_batch, v_batch, position_batch, ring_counts, ring_lanes,
                 {0, static_cast<std::uint32_t>(width)}, target_hot_->layer_view(fidx), s);
         }
-        // The gate rides along with the attention call: where the route can, the reduce epilogue
-        // applies it at the store, and every other route applies it inside the Op. One contract
-        // either way, and the same bytes the standalone multiply produced. A rotated output
-        // projection takes the ungated attention, gated and rotated in one pass below.
+        if (target_hot_ != nullptr && ph == Phase::Verify && hot_ring_read) {
+            const auto ring  = target_hot_->layer_view(fidx);
+            const auto scale = static_cast<float>(
+                1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim)));
+            ops::dspine_causal_attention(q_batch, k_batch, v_batch, position_batch, ring_counts,
+                                         Tensor{}, ring_lanes, ring.k, ring.v,
+                                         static_cast<std::int32_t>(ring.capacity),
+                                         static_cast<std::int32_t>(ring.padded_capacity),
+                                         static_cast<std::int32_t>(ring.capacity), scale,
+                                         a_batch, s);
+            if (!rotated_output) {
+                ops::sigmoid_mul(gate_batch, a_batch, s);
+            }
+        } else {
         ops::causal_softmax_attention(
             q_batch, k_batch, v_batch, position_batch, valid, kv_table_rows,
             {dimension(config_.attention->head_dim),
@@ -1329,6 +1356,7 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
             batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_,
             a_batch, s, rotated_output ? nullptr : &gate_batch);
+        }
     } else if (!active_segments_.empty()) {
         // Each segment attends over its own sequence exactly as its prefill alone would.
         for (const SegmentBinding& segment : active_segments_) {
@@ -1357,6 +1385,28 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
             static_cast<float>(1.0 / std::sqrt(static_cast<double>(config_.attention->head_dim))),
             batch_text_kv_->batch_layer_view(fidx), *active_causal_attention_envelope_, work_, a, s,
             rotated_output ? nullptr : &gate);
+        // The prefill's K/V must land in the FP16 ring too: the verify reads every column
+        // of the sliding window from it, and a prompt token missing from the ring reads
+        // garbage. The prefill planes have no batch axis, so the append runs as one lane.
+        if (target_hot_ != nullptr) {
+            auto hot_scope = work_.scope();
+            Tensor k_lane   = kn.view({dimension(config_.attention->head_dim),
+                                       dimension(config_.attention->num_key_value_heads), T, 1});
+            Tensor v_lane   = v.view({dimension(config_.attention->head_dim),
+                                      dimension(config_.attention->num_key_value_heads), T, 1});
+            Tensor pos_lane = cache_positions.view({T, 1});
+            Tensor counts   = work_.alloc(DType::I32, {1});
+            Tensor lanes    = work_.alloc(DType::I32, {1});
+            const std::array<std::int32_t, 1> host_one{T};
+            const std::array<std::int32_t, 1> host_lane{0};
+            CUDA_CHECK(cudaMemcpyAsync(counts.data, host_one.data(), sizeof(std::int32_t),
+                                       cudaMemcpyHostToDevice, s));
+            CUDA_CHECK(cudaMemcpyAsync(lanes.data, host_lane.data(), sizeof(std::int32_t),
+                                       cudaMemcpyHostToDevice, s));
+            ops::kv_cache_append_prefix(
+                k_lane, v_lane, pos_lane, counts, lanes,
+                {0, static_cast<std::uint32_t>(T)}, target_hot_->layer_view(fidx), s);
+        }
     }
     const bool wide = wide_residual_verification(ph, row_width(T), row_width(T));
     Tensor gated    = a.view({dimension(config_.attention->query_width()), T});
