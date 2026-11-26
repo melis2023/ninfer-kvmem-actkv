@@ -212,8 +212,10 @@ std::size_t trellis_linear_workspace_bytes(const Weight& w, std::int32_t max_tok
     const std::size_t tmp = round256(static_cast<std::size_t>(wider * tok) * sizeof(float));
     const std::size_t split = round256(static_cast<std::size_t>(split_floats) * sizeof(float));
     // The small-T MMA may split K across up to kPfMaxSplits CTAs, one FP32 [N,T] plane each.
+    // Splits only run for windows of at most eight tokens, so the capacity stops growing there.
+    const std::int64_t pf_tok = tok < 8 ? tok : 8;
     const std::size_t pf_split =
-        round256(static_cast<std::size_t>(detail::trellis::kPfMaxSplits) * w.n * tok *
+        round256(static_cast<std::size_t>(detail::trellis::kPfMaxSplits) * w.n * pf_tok *
                  sizeof(float));
     const std::size_t xs = round256(static_cast<std::size_t>(xs_floats) * sizeof(float));
     const std::size_t xf = round256(static_cast<std::size_t>(xf_halves) * sizeof(std::uint16_t));
@@ -280,7 +282,7 @@ void trellis_linear(const Tensor& x, const Weight& w, Tensor& y, std::int32_t ma
     }
     // Multi-token coded MMA: small N runs K in parallel slices and reduces their FP32 planes.
     Tensor pf_partials;
-    if (tokens > 1 && w.k % 128 == 0) {
+    if (tokens > 1 && tokens <= 8 && w.k % 128 == 0) {
         pf_partials = workspace.alloc(DType::FP32,
                                       {w.n, tokens, detail::trellis::kPfMaxSplits});
     }
