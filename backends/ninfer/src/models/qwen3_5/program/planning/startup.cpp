@@ -267,13 +267,13 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
     if (plan.kvmem.dspine_f16_tokens != 0) {
         // DSpine only: a separate FP16 ring for the most recent target KV tokens. It is part of
         // the state image so the same allocator and slot discipline owns it; DFlash2/MTP never
-        // populate this field and never read it. The ring is in the D256 packed geometry — the
-        // same layout the verify's append writes ([head_dim*2, kv_heads/2] — see d256_profile).
+        // populate this field and never read it. The ring keeps the target's own attention
+        // geometry — for Qwen3.8-27B that is [256, 4] (head_dim 256), already the D256 form.
         state_image_spec.target_hot = qwen3_5::TargetHotSpec{
             .layers   = config.full_attention_layers,
             .capacity = plan.kvmem.dspine_f16_tokens,
-            .kv_heads = dimension(config.attention->num_key_value_heads) / 2,
-            .head_dim = dimension(config.attention->head_dim) * 2,
+            .kv_heads = dimension(config.attention->num_key_value_heads),
+            .head_dim = dimension(config.attention->head_dim),
         };
     }
     out.state_images =
@@ -1307,8 +1307,8 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
             throw std::invalid_argument("--kv-dspine-f16 requires --spec dspine");
         }
         if (options.kvmem.dspine_f16_tokens % 64 != 0 ||
-            options.kvmem.dspine_f16_tokens > 4096) {
-            throw std::invalid_argument("--kv-dspine-f16 must be a multiple of 64 up to 4096");
+            options.kvmem.dspine_f16_tokens > 8192) {
+            throw std::invalid_argument("--kv-dspine-f16 must be a multiple of 64 up to 8192");
         }
     }
     switch (options.speculative.backend) {

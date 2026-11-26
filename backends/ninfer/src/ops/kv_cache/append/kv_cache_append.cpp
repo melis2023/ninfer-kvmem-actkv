@@ -113,14 +113,14 @@ detail::KVCacheAppendPrefixPlan validate_inputs(const Tensor& k, const Tensor& v
     if (batch < 1 || batch > 8) {
         throw std::invalid_argument("kv_cache_append_prefix: B must be 1..8");
     }
-    // DSpine's verify K/V arrive in the D256 packed layout ([256, 4] — two head dims per
-    // packed row pair, half the kv heads), the same layout the full-cache append writes;
-    // DFlash2 and MTP append the unpacked [128, 8]. The cache's own geometry decides which.
-    const bool packed_d256 = k.ne[0] == 2 * kHeadDim && k.ne[1] * 2 == kKVHeads;
-    const std::int32_t head_dim = packed_d256 ? 2 * kHeadDim : kHeadDim;
-    const std::int32_t kv_heads = packed_d256 ? kKVHeads / 2 : kKVHeads;
-    require_shape(k, head_dim, kv_heads, tokens, batch, kPrefixAppendOp, "k");
-    require_shape(v, head_dim, kv_heads, tokens, batch, kPrefixAppendOp, "v");
+    // The head geometry belongs to the model, not to a compile-time constant: NariQ's
+    // attention runs [256, 4] (head_dim 256), DFlash2's draft rings [128, 8]. The cache
+    // side checks the geometry against these planes.
+    if (k.ne[0] != v.ne[0] || k.ne[1] != v.ne[1]) {
+        throw std::invalid_argument("kv_cache_append_prefix: k and v layouts disagree");
+    }
+    require_shape(k, k.ne[0], k.ne[1], tokens, batch, kPrefixAppendOp, "k");
+    require_shape(v, v.ne[0], v.ne[1], tokens, batch, kPrefixAppendOp, "v");
     require_shape(positions, tokens, batch, 1, 1, kPrefixAppendOp, "positions");
     require_shape(counts, batch, 1, 1, 1, kPrefixAppendOp, "counts");
     require_shape(selectors, batch, 1, 1, 1, kPrefixAppendOp, "selectors");
@@ -157,16 +157,13 @@ void validate_paged_cache(const PagedKVBatchLayerView& cache,
     require_contiguous_nonnull(cache.block_tables, kPrefixAppendOp, "cache block tables");
 }
 
-void validate_cyclic_cache(const CyclicKVCacheLayerView& cache,
-                           KVCacheAppendPrefixExecutionEnvelope envelope) {
-    // DSpine's ring is built in the D256 packed geometry ([256, 4]); the unpacked [128, 8]
-    // is the DFlash2/MTP shape. Both keep the registered sliding capacities.
-    const bool packed_d256 = cache.head_dim == 2 * kHeadDim && cache.num_kv_heads * 2 == kKVHeads;
-    const bool unpacked    = cache.head_dim == kHeadDim && cache.num_kv_heads == kKVHeads;
+void validate_cyclic_cache(const CyclicKVCacheLayerView& cache, std::int32_t head_dim,
+                           std::int32_t kv_heads, KVCacheAppendPrefixExecutionEnvelope envelope) {
+    // The cache keeps the model's own head geometry ([256, 4] for NariQ, [128, 8] for the
+    // DFlash2 rings) and one of the registered sliding capacities.
     const bool registered_capacity =
         cache.capacity == 2048 || cache.capacity == 4096 || cache.capacity == 8192;
-    if ((packed_d256 && !unpacked && !registered_capacity) ||
-        (!packed_d256 && !unpacked) ||
+    if (cache.head_dim != head_dim || cache.num_kv_heads != kv_heads || !registered_capacity ||
         cache.padded_capacity < cache.capacity ||
         cache.padded_capacity >
             static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
@@ -186,9 +183,9 @@ void validate_cyclic_cache(const CyclicKVCacheLayerView& cache,
     if ((cache.storage != KvCacheStorage::BFloat16 &&
          cache.storage != KvCacheStorage::Int8Group64 &&
          cache.storage != KvCacheStorage::Float16) ||
-        cache.k.dtype != expected || cache.v.dtype != expected || cache.k.ne[0] != kHeadDim ||
-        cache.k.ne[1] != padded || cache.k.ne[2] != kKVHeads || cache.v.ne[0] != kHeadDim ||
-        cache.v.ne[1] != padded || cache.v.ne[2] != kKVHeads ||
+        cache.k.dtype != expected || cache.v.dtype != expected || cache.k.ne[0] != head_dim ||
+        cache.k.ne[1] != padded || cache.k.ne[2] != kv_heads || cache.v.ne[0] != head_dim ||
+        cache.v.ne[1] != padded || cache.v.ne[2] != kv_heads ||
         cache.v.ne[3] != cache.lane_capacity || cache.lane_capacity <= 0 ||
         cache.k.ne[3] != cache.lane_capacity) {
         throw std::invalid_argument("kv_cache_append_prefix: invalid cyclic cache tensors");
@@ -240,7 +237,7 @@ void kv_cache_append_prefix(const Tensor& k, const Tensor& v, const Tensor& posi
                             KVCacheAppendPrefixExecutionEnvelope envelope,
                             CyclicKVCacheLayerView cache, cudaStream_t stream) {
     const auto plan = validate_inputs(k, v, positions, counts, lanes, envelope);
-    validate_cyclic_cache(cache, envelope);
+    validate_cyclic_cache(cache, k.ne[0], k.ne[1], envelope);
     detail::kv_cache_append_prefix_launch(k, v, positions, counts, lanes, cache, plan, stream);
 }
 
