@@ -201,8 +201,8 @@ std::size_t trellis_coded_workspace_bytes(std::int32_t n, std::int32_t k,
     // group holds 1024 halves) + per-token 2^-e row scales.
     const std::int64_t groups = (tok + 7) / 8;
     const std::int64_t xf_half = static_cast<std::int64_t>(k / 128) * groups * 1024;
-    // Splits only run for windows of at most eight tokens, so that plane stops growing there.
-    const std::int64_t pf_tok = tok < 8 ? tok : 8;
+    // Splits run for verify windows of up to sixteen tokens; larger prefill chunks stop growing.
+    const std::int64_t pf_tok = tok < 16 ? tok : 16;
     // Every arena plane is 256-byte aligned, so round each plane's size up independently; the
     // packed raw byte count otherwise under-reserves and the last alloc throws bad_alloc.
     const std::size_t xa       = round256(static_cast<std::size_t>(static_cast<std::int64_t>(k) * tok * 4));
@@ -282,7 +282,7 @@ void trellis_linear(const Tensor& x, const Weight& w, Tensor& y, std::int32_t ma
     }
     // Multi-token coded MMA: small N runs K in parallel slices and reduces their FP32 planes.
     Tensor pf_partials;
-    if (tokens > 1 && tokens <= 8 && w.k % 128 == 0) {
+    if (tokens > 1 && tokens <= 16 && w.k % 128 == 0) {
         pf_partials = workspace.alloc(DType::FP32,
                                       {w.n, tokens, detail::trellis::kPfMaxSplits});
     }

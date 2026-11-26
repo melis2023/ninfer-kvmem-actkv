@@ -4,6 +4,7 @@
 #include "models/qwen3_5/program/context.h"
 #include "models/qwen3_5/program/graph_execution.h"
 #include "models/qwen3_5/program/planning/graph_profiles.h"
+#include "models/qwen3_5/program/speculative/mtp_trace.h"
 #include "core/nvtx.h"
 #include "core/device.h"
 #include "ninfer/ops/logprob_topk.h"
@@ -882,7 +883,9 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
         DecodeGraphExecutable* executable = nullptr;
         execution::MtpCausalAttentionEnvelopes envelopes =
             mtp_causal_attention_envelopes(maximum_frontier, verify_window, draft_window, attention_capacity);
-        if (use_cuda_graph) {
+        // The event trace runs the eager body so its cudaEvent sections actually execute;
+        // eager and replayed graphs issue the same kernel sequence.
+        if (use_cuda_graph && !execution::mtp_trace_requested()) {
             DecodeGraphFamily& family = copy_round ? ngram_graphs : mtp_graphs;
             DecodeGraphProfile& profile =
                 select_graph_profile(family, static_cast<std::uint32_t>(lanes.size()),
@@ -967,13 +970,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
 
         schedule_state.execution.memory_statistics = memory_candidate_statistics ? &*memory_candidate_statistics : nullptr;
         mark_workspace_usage(workspace_plan.mtp_round);
-        const bool mtp_trace = [] {
-            static const bool on = [] {
-                const char* flag = std::getenv("NINFER_MTP_TRACE");
-                return flag && flag[0] == '1';
-            }();
-            return on;
-        }();
+        const bool mtp_trace = execution::mtp_trace_requested();
         const Clock::time_point mtp_trace_t0 = mtp_trace ? Clock::now() : Clock::time_point{};
         execution::mtp_decode_batch(schedule_state, static_cast<std::int32_t>(lanes.size()),
                                     verify_window, draft_window, envelopes, executable);
@@ -994,6 +991,7 @@ ProgramImpl::decode_mtp_batch(std::span<const std::uint32_t> lanes,
                                          static_cast<std::uint64_t>(lanes.size()));
             device.synchronize();
         }
+        if (mtp_trace) { execution::mtp_trace::report(verify_window); }
         check_masks();
         timing.end_wait();
 

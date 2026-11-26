@@ -1187,7 +1187,7 @@ int pf_split_count(int rows, int nt, int sms) {
     }
     (void)nt;
     (void)sms;
-    if (rows > 8) { return 1; }
+    if (rows > 16) { return 1; }
     return kPfMaxSplits;
 }
 
@@ -1197,9 +1197,9 @@ int pick_pf_tiling(int rows, int nt, int sms) {
         if (value >= 0 && value <= 11) { return value; }
     }
     // Verify windows are a handful of tokens: the 64/128-token prefill tiles waste most of their
-    // shared-memory stage. TT=8 (one m16n8k16 column tile) is the fastest measured small-T shape;
-    // larger prefill chunks keep the original heuristic below.
-    if (rows <= 8) { return 7; }
+    // shared-memory stage. Up to the sixteen-token verify width the whole window fits one TT tile,
+    // so the coded stream is read once and the K-split fills the grid; larger prefill chunks keep
+    // the original heuristic below.
     if (rows <= 16) { return 5; }
     const int cbs = (nt + kW5 - 1) / kW5;
     const int c128 = cbs * ((rows + 127) / 128), c64 = cbs * ((rows + 63) / 64);

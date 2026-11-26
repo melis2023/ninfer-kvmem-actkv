@@ -2,6 +2,7 @@
 #include "models/qwen3_5/program/graph_execution.h"
 #include "models/qwen3_5/program/internal.h"
 #include "models/qwen3_5/program/context.h"
+#include "models/qwen3_5/program/speculative/mtp_trace.h"
 #include "core/nvtx.h"
 #include "ninfer/ops/mtp_round.h"
 #include "ninfer/ops/scatter.h"
@@ -82,9 +83,11 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size,
             state.frame.current_drafts.ne[0] != static_cast<std::int32_t>(verify_window)) {
             throw std::logic_error("MTP decode batch state is incomplete");
         }
+        const bool trace = mtp_trace_requested();
 
         qwen3_5::MtpDecodeState& frame = state.frame;
         const std::int32_t width       = static_cast<std::int32_t>(verify_window) + 1;
+        if (trace) { mtp_trace::record(0, state.execution.device.stream); }
         CUDA_CHECK(cudaMemcpyAsync(frame.ingress.data, &state.host_ingress,
                                    sizeof(qwen3_5::MtpDecodeIngress), cudaMemcpyHostToDevice,
                                    state.execution.device.stream));
@@ -159,6 +162,7 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size,
                                  },
                                  envelopes.target_verify);
         }
+        if (trace) { mtp_trace::record(1, state.execution.device.stream); }
 
         {
             nvtx::ScopedRange draft_range(nvtx::Name::DecodeMtpDraft, nvtx::Category::Mtp,
@@ -208,6 +212,10 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size,
         CUDA_CHECK(cudaMemcpyAsync(&state.host_egress, frame.egress.data,
                                    sizeof(qwen3_5::MtpDecodeEgress), cudaMemcpyDeviceToHost,
                                    state.execution.device.stream));
+        if (trace) {
+            mtp_trace::record(2, state.execution.device.stream);
+            mtp_trace::record(3, state.execution.device.stream);
+        }
     };
 }
 
