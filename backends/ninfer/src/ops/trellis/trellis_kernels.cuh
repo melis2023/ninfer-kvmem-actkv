@@ -24,6 +24,10 @@ void gather_scale(const Tensor& x, const Weight& w, float* out, int tokens, std:
 // Per-column Sylvester RHT of `block` entries, in place, FP32 [n,columns].
 void rht_inplace(float* v, std::int64_t n, int block, int columns, cudaStream_t stream);
 
+// gather_scale followed by the column-side RHT, one pass: BF16 x -> FP32 rotated plane.
+void gather_scale_rht(const Tensor& x, const Weight& w, float* out, int tokens, int block,
+                      cudaStream_t stream);
+
 // Per-column permutation gather (dir=0: dst[d]=src[perm[d]]) or scatter (dir=1).
 void permute_side(const float* src, float* dst, const std::int32_t* perm, std::int64_t n,
                   int columns, bool scatter, cudaStream_t stream);

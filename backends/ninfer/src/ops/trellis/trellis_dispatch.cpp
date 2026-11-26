@@ -287,12 +287,20 @@ void trellis_linear(const Tensor& x, const Weight& w, Tensor& y, std::int32_t ma
                                       {w.n, tokens, detail::trellis::kPfMaxSplits});
     }
 
+    // A kind-1 column side is a plain RHT, so the gather/scale folds into the same kernel. Kind 2
+    // needs the gathered plane for its shard/paley passes and keeps the two stages.
+    const bool fused_col = plans.cols.kind == 1;
     {
-        profile::Scope stage(prof_key + " gather", stream);
-        detail::trellis::gather_scale(x, w, static_cast<float*>(xa.data), tokens, w.k, stream);
+        profile::Scope stage(prof_key + (fused_col ? " gather+colside" : " gather"), stream);
+        if (fused_col) {
+            detail::trellis::gather_scale_rht(x, w, static_cast<float*>(xa.data), tokens,
+                                              plans.cols.block, stream);
+        } else {
+            detail::trellis::gather_scale(x, w, static_cast<float*>(xa.data), tokens, w.k, stream);
+        }
         dump_plane(xa.data, static_cast<std::int64_t>(w.k) * tokens, "gather", w.n, w.k, stream);
     }
-    if (plans.cols.kind != 0) {
+    if (plans.cols.kind == 2) {
         profile::Scope stage(prof_key + " colside", stream);
         apply_column_side(w, plans, static_cast<float*>(xa.data), static_cast<float*>(tmp.data),
                       static_cast<float*>(tmp2.data), tokens, stream);

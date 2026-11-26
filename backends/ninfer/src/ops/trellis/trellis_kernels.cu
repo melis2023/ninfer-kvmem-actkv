@@ -95,6 +95,40 @@ __global__ void rht_kernel(float* v, std::int64_t n, int block, int columns) {
     }
 }
 
+// gather_scale followed by the column-side RHT in one pass: the columns this stage owns are
+// loaded straight from BF16 into shared memory, so the FP32 plane is written once instead of
+// round-tripping through a separate kernel.
+__global__ void rht_gather_scale_kernel(const __nv_bfloat16* __restrict__ x,
+                                        const float* __restrict__ pre,
+                                        const std::int32_t* __restrict__ pin,
+                                        float* __restrict__ v, std::int64_t n, int block) {
+    extern __shared__ float s[];
+    const int col = blockIdx.x;
+    const std::int64_t b0 = static_cast<std::int64_t>(blockIdx.y) * block;
+    const __nv_bfloat16* src = x + static_cast<std::int64_t>(col) * n;
+    for (int i = threadIdx.x; i < block; i += blockDim.x) {
+        const std::int64_t j = b0 + i;
+        const std::int64_t source = pin != nullptr ? pin[j] : j;
+        s[i]                      = pre[j] * __bfloat162float(src[source]);
+    }
+    __syncthreads();
+    for (int h = 1; h < block; h <<= 1) {
+        for (int i = threadIdx.x; i < block / 2; i += blockDim.x) {
+            const int group = i / h, j = i - group * h;
+            const int p = group * 2 * h + j;
+            const float a = s[p], b = s[p + h];
+            s[p] = a + b;
+            s[p + h] = a - b;
+        }
+        __syncthreads();
+    }
+    const float c = rsqrtf(static_cast<float>(block));
+    float* base = v + static_cast<std::int64_t>(col) * n + b0;
+    for (int i = threadIdx.x; i < block; i += blockDim.x) {
+        base[i] = s[i] * c;
+    }
+}
+
 __global__ void permute_kernel(const float* src, float* dst, const std::int32_t* perm, std::int64_t n,
                                int columns, bool scatter) {
     const std::int64_t total = n * columns;
@@ -1269,6 +1303,15 @@ void gather_scale(const Tensor& x, const Weight& w, float* out, int tokens, std:
 void rht_inplace(float* v, std::int64_t n, int block, int columns, cudaStream_t stream) {
     rht_kernel<<<dim3(static_cast<unsigned>(columns), static_cast<unsigned>(n / block)), 128,
                  static_cast<std::size_t>(block) * sizeof(float), stream>>>(v, n, block, columns);
+}
+
+void gather_scale_rht(const Tensor& x, const Weight& w, float* out, int tokens, int block,
+                      cudaStream_t stream) {
+    rht_gather_scale_kernel<<<dim3(static_cast<unsigned>(tokens),
+                                   static_cast<unsigned>(w.k / block)),
+                              128, static_cast<std::size_t>(block) * sizeof(float), stream>>>(
+        static_cast<const __nv_bfloat16*>(x.data), static_cast<const float*>(w.trellis_pre),
+        w.trellis_pin, out, w.k, block);
 }
 
 void permute_side(const float* src, float* dst, const std::int32_t* perm, std::int64_t n, int columns,
