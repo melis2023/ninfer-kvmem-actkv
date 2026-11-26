@@ -101,7 +101,8 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base,
                      state.drafter ? state.mtp_kv : qwen3_5::PagedKVCacheView{},
-                     &state.text_cache, state.drafter ? state.mtp_cache : nullptr);
+                     &state.text_cache, state.drafter ? state.mtp_cache : nullptr,
+                     state.target_hot);
     card.set_stage_runtime(state.execution.stages);
     card.set_expert_runtime(state.execution.experts);
     card.set_rope_yarn(state.execution.rope_yarn);
@@ -140,7 +141,8 @@ PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const Prepare
                      state.execution.prefill_hidden, state.execution.prefill_chunk,
                      state.text_kv_base,
                      state.drafter ? state.mtp_kv : qwen3_5::PagedKVCacheView{},
-                     &state.text_cache, state.drafter ? state.mtp_cache : nullptr);
+                     &state.text_cache, state.drafter ? state.mtp_cache : nullptr,
+                     state.target_hot);
     card.set_stage_runtime(state.execution.stages);
     card.set_expert_runtime(state.execution.experts);
     card.set_rope_yarn(state.execution.rope_yarn);
@@ -1445,6 +1447,9 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             staged.initial_mtp_extent,
             0};
         schedule_state.cache_position_shift = sequence.window.removed_tokens;
+        // DSpine's FP16 hot ring receives the prefill's K/V too: the sliding verify reads the
+        // prompt tokens from it.
+        schedule_state.target_hot = state_images->target_hot();
         set_device_i32(io.rope_delta, sequence.rope_delta +
             checked_i32(sequence.window.removed_tokens, "prefill cache shift"));
         schedule_state.execution.memory_statistics = memory_statistics ? &*memory_statistics : nullptr;

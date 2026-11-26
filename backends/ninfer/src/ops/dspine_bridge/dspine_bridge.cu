@@ -1032,11 +1032,11 @@ void dspine_bridge_finish(const Tensor& raw, const Tensor& delta, const Tensor& 
 // Partial online-softmax states are merged in shared memory with the lane dimension
 // preserved, because each lane owns a different head_dim slice.
 //
-// Restricted to head_dim == 128 and Rows <= 8; the caller falls back to the general
-// per-row kernel otherwise.
+// Restricted to head_dim 128 (RowDims 4) or 256 (RowDims 8) and Rows <= 8; the caller
+// falls back to the general per-row kernel otherwise. The tile's positions shrink with the
+// row dims so the two staging buffers stay within the static shared-memory budget.
 constexpr int kDSpineRowsMax       = 8;
 constexpr int kDSpineRowDims       = 4;
-
 constexpr int kDSpineTilePositions = 48;
 
 // One block per head is all the parallelism a 32-head draft has, and a 32-block grid on a
@@ -1049,7 +1049,7 @@ struct DSpineRowSplit {
     static constexpr int warps = (32 / Rows) < 1 ? 1 : (32 / Rows);
 };
 
-template <int Rows, int RowWarps, typename ContextT>
+template <int Rows, int RowWarps, int RowDims, int TilePositions, typename ContextT>
 __global__ void dspine_causal_attention_rows_kernel(
     const __nv_bfloat16* q, const __nv_bfloat16* k, const __nv_bfloat16* v,
     const std::int32_t* positions, const std::int32_t* valid_columns,
@@ -1081,19 +1081,19 @@ __global__ void dspine_causal_attention_rows_kernel(
     // Tile layout is [dim group][position][lane]: index i selects a group of 32 contiguous
     // head_dim values of one position, so a staging step is one coalesced 64-byte read and
     // the consuming warps read consecutive lanes out of consecutive banks.
-    __shared__ __align__(16) ContextT s_k[kDSpineRowDims * kDSpineTilePositions * 32];
-    __shared__ __align__(16) ContextT s_v[kDSpineRowDims * kDSpineTilePositions * 32];
-    constexpr int kTileElements = kDSpineRowDims * kDSpineTilePositions * 32;
+    __shared__ __align__(16) ContextT s_k[RowDims * TilePositions * 32];
+    __shared__ __align__(16) ContextT s_v[RowDims * TilePositions * 32];
+    constexpr int kTileElements = RowDims * TilePositions * 32;
     // Staged 16 bytes per thread: one float4 covers eight contiguous head_dim values, so a
     // warp moves 512 B per instruction. Element-at-a-time staging moved 64 B per warp
     // instruction and left the tiles latency bound at 664 us per call.
     constexpr int kStageVector   = 8;
     constexpr int kStageVectors  = kTileElements / kStageVector;
 
-    float qv[kDSpineRowDims];
-    float acc[kDSpineRowDims];
+    float qv[RowDims];
+    float acc[RowDims];
 #pragma unroll
-    for (int i = 0; i < kDSpineRowDims; ++i) {
+    for (int i = 0; i < RowDims; ++i) {
         qv[i]  = __bfloat162float(q[row_base + 32 * i]);
         acc[i] = 0.0f;
     }
@@ -1105,13 +1105,13 @@ __global__ void dspine_causal_attention_rows_kernel(
         static_cast<std::int64_t>(lanes[b]) * head_dim * padded * kv_heads;
     const std::int64_t head_stride =
         static_cast<std::int64_t>(head_dim) * padded * kv_head;
-    for (int tile = begin; tile < frontier; tile += kDSpineTilePositions) {
-        const int count = min(kDSpineTilePositions, frontier - tile);
+    for (int tile = begin; tile < frontier; tile += TilePositions) {
+        const int count = min(TilePositions, frontier - tile);
         for (int v = static_cast<int>(threadIdx.x); v < kStageVectors; v += threads) {
             const int i = v * kStageVector;
-            const int p = (i >> 5) % kDSpineTilePositions;
+            const int p = (i >> 5) % TilePositions;
             if (p >= count) { continue; }
-            const int group = i / (kDSpineTilePositions * 32);
+            const int group = i / (TilePositions * 32);
             const std::int64_t base = lane_base + head_stride +
                 static_cast<std::int64_t>(head_dim) * ((tile + p) % capacity) +
                 group * 32 + (i & 31);
@@ -1125,16 +1125,16 @@ __global__ void dspine_causal_attention_rows_kernel(
         const int p0    = sub * share;
         const int p1    = min(count, p0 + share);
         for (int p = p0; p < p1; ++p) {
-            float key[kDSpineRowDims];
-            float val[kDSpineRowDims];
+            float key[RowDims];
+            float val[RowDims];
 #pragma unroll
-            for (int i = 0; i < kDSpineRowDims; ++i) {
-                key[i] = to_float(s_k[(i * kDSpineTilePositions + p) * 32 + lane]);
-                val[i] = to_float(s_v[(i * kDSpineTilePositions + p) * 32 + lane]);
+            for (int i = 0; i < RowDims; ++i) {
+                key[i] = to_float(s_k[(i * TilePositions + p) * 32 + lane]);
+                val[i] = to_float(s_v[(i * TilePositions + p) * 32 + lane]);
             }
             float score = 0.0f;
 #pragma unroll
-            for (int i = 0; i < kDSpineRowDims; ++i) { score += key[i] * qv[i]; }
+            for (int i = 0; i < RowDims; ++i) { score += key[i] * qv[i]; }
 #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
                 score += __shfl_xor_sync(kFullWarpMask, score, offset);
@@ -1145,7 +1145,7 @@ __global__ void dspine_causal_attention_rows_kernel(
             const float scale_old = expf(m - m_new);
             l = l * scale_old + e;
 #pragma unroll
-            for (int i = 0; i < kDSpineRowDims; ++i) {
+            for (int i = 0; i < RowDims; ++i) {
                 acc[i] = acc[i] * scale_old + e * val[i];
             }
             m = m_new;
@@ -1160,16 +1160,16 @@ __global__ void dspine_causal_attention_rows_kernel(
             const std::int64_t base =
                 static_cast<std::int64_t>(head_dim) *
                     (kv_head + kv_heads * (j + width * b)) + lane;
-            float key[kDSpineRowDims];
-            float val[kDSpineRowDims];
+            float key[RowDims];
+            float val[RowDims];
 #pragma unroll
-            for (int i = 0; i < kDSpineRowDims; ++i) {
+            for (int i = 0; i < RowDims; ++i) {
                 key[i] = __bfloat162float(k[base + 32 * i]);
                 val[i] = __bfloat162float(v[base + 32 * i]);
             }
             float score = 0.0f;
 #pragma unroll
-            for (int i = 0; i < kDSpineRowDims; ++i) { score += key[i] * qv[i]; }
+            for (int i = 0; i < RowDims; ++i) { score += key[i] * qv[i]; }
 #pragma unroll
             for (int offset = 16; offset > 0; offset >>= 1) {
                 score += __shfl_xor_sync(kFullWarpMask, score, offset);
@@ -1180,7 +1180,7 @@ __global__ void dspine_causal_attention_rows_kernel(
             const float scale_old = expf(m - m_new);
             l = l * scale_old + e;
 #pragma unroll
-            for (int i = 0; i < kDSpineRowDims; ++i) {
+            for (int i = 0; i < RowDims; ++i) {
                 acc[i] = acc[i] * scale_old + e * val[i];
             }
             m = m_new;
@@ -1191,7 +1191,7 @@ __global__ void dspine_causal_attention_rows_kernel(
     // so it must be part of the shared index -- collapsing it makes every lane write
     // the same slot and the draft silently degenerates. Sized by Rows rather than by the
     // dispatch maximum so the context tiles and the merge fit in 48 KB together.
-    __shared__ float s_acc[Rows * RowWarps * 32 * kDSpineRowDims];
+    __shared__ float s_acc[Rows * RowWarps * 32 * RowDims];
     __shared__ float s_m[Rows * RowWarps];
     __shared__ float s_l[Rows * RowWarps];
     const int slot_index = row * RowWarps + sub;
@@ -1200,8 +1200,8 @@ __global__ void dspine_causal_attention_rows_kernel(
         s_l[slot_index] = l;
     }
 #pragma unroll
-    for (int i = 0; i < kDSpineRowDims; ++i) {
-        s_acc[(slot_index * 32 + lane) * kDSpineRowDims + i] = acc[i];
+    for (int i = 0; i < RowDims; ++i) {
+        s_acc[(slot_index * 32 + lane) * RowDims + i] = acc[i];
     }
     __syncthreads();
     if (sub == 0) {
@@ -1218,13 +1218,13 @@ __global__ void dspine_causal_attention_rows_kernel(
         }
         const float inverse = denom > 0.0f ? 1.0f / denom : 0.0f;
 #pragma unroll
-        for (int i = 0; i < kDSpineRowDims; ++i) {
+        for (int i = 0; i < RowDims; ++i) {
             float sum = 0.0f;
             for (int s = 0; s < RowWarps; ++s) {
                 const float ms = s_m[row * RowWarps + s];
                 if (ms > -INFINITY) {
                     sum += s_acc[((row * RowWarps + s) * 32 + lane) *
-                                     kDSpineRowDims + i] * expf(ms - peak);
+                                     RowDims + i] * expf(ms - peak);
                 }
             }
             out[row_base + 32 * i] = __float2bfloat16(sum * inverse);
@@ -1271,6 +1271,13 @@ void dspine_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     if (bad_geometry ||
         (floors.data != nullptr &&
          (floors.dtype != DType::I32 || floors.ne[0] != batch))) {
+        fprintf(stderr, "DSPINE_ATTN geom: hd=%d qh=%d kvh=%d w=%d b=%d ck=[%d,%d,%d] cv=[%d,%d,%d] out=[%d,%d,%d] pos=%d/%d vc=%d/%d ln=%d/%d cap=%d win=%d\n",
+                head_dim, query_heads, kv_heads, width, batch,
+                context_k.ne[0], context_k.ne[1], context_k.ne[2],
+                context_v.ne[0], context_v.ne[1], context_v.ne[2],
+                out.ne[0], out.ne[1], out.ne[2],
+                positions.ne[0], positions.ne[1], valid_columns.ne[0], valid_columns.ne[1],
+                lanes.ne[0], lanes.ne[1], capacity, window);
         throw std::invalid_argument("dspine_causal_attention: invalid geometry");
     }
     // The warp-per-row kernel holds head_dim/32 values per lane, so head_dim must
@@ -1287,41 +1294,68 @@ void dspine_causal_attention(const Tensor& q, const Tensor& k, const Tensor& v,
     const bool context_aligned =
         reinterpret_cast<std::uintptr_t>(context_k.data) % 16 == 0 &&
         reinterpret_cast<std::uintptr_t>(context_v.data) % 16 == 0;
-    const bool shared_rows = context_aligned && head_dim == 32 * kDSpineRowDims &&
-                             width >= 2 && width <= kDSpineRowsMax;
+    // Two supported row-dim widths: the draft's 128 (RowDims 4) and the target's 256
+    // (RowDims 8, with halved tiles so the two staging buffers stay in static shared).
+    const int row_dims      = head_dim == 128 ? 4 : (head_dim == 256 ? 8 : 0);
+    const int tile_positions = row_dims == 8 ? 24 : kDSpineTilePositions;
+    const bool shared_rows  = row_dims != 0 && context_aligned &&
+                              width >= 2 && width <= kDSpineRowsMax;
     const bool f16 = context_k.dtype == DType::FP16;
     if (shared_rows) {
         const dim3 grid(query_heads, batch);
         // Each Rows picks the widest per-row split that keeps the block within the
-        // 1024-thread limit, so the warps scanning the context fill the SM.
-        const auto launch_rows = [&]<typename Ctx>() {
-#define NINFER_DSPINE_LAUNCH_ROWS(R)                                                    \
-    dspine_causal_attention_rows_kernel<R, DSpineRowSplit<R>::warps, Ctx>               \
+        // 1024-thread limit, so the warps scanning the context fill the SM. The row-dim
+        // width and its tile are compile-time: 128 heads run RowDims 4 with 48-position
+        // tiles, 256 runs RowDims 8 with 24.
+        const auto* q_ptr      = static_cast<const __nv_bfloat16*>(q.data);
+        const auto* k_ptr      = static_cast<const __nv_bfloat16*>(k.data);
+        const auto* v_ptr      = static_cast<const __nv_bfloat16*>(v.data);
+        const auto* pos_ptr    = static_cast<const std::int32_t*>(positions.data);
+        const auto* valid_ptr  = static_cast<const std::int32_t*>(valid_columns.data);
+        const auto* lane_ptr   = static_cast<const std::int32_t*>(lanes.data);
+        const auto* floor_ptr  = floors.data != nullptr
+                                    ? static_cast<const std::int32_t*>(floors.data)
+                                    : nullptr;
+        auto* out_ptr          = static_cast<__nv_bfloat16*>(out.data);
+#define NINFER_DSPINE_LAUNCH_ROWS(R, RD, TP, CTX)                                       \
+    dspine_causal_attention_rows_kernel<R, DSpineRowSplit<R>::warps, RD, TP, CTX>       \
         <<<grid, 32 * R * DSpineRowSplit<R>::warps, 0, stream>>>(                       \
-        static_cast<const __nv_bfloat16*>(q.data),                                      \
-        static_cast<const __nv_bfloat16*>(k.data),                                      \
-        static_cast<const __nv_bfloat16*>(v.data),                                      \
-        static_cast<const std::int32_t*>(positions.data),                               \
-        static_cast<const std::int32_t*>(valid_columns.data),                           \
-        floors.data != nullptr ? static_cast<const std::int32_t*>(floors.data) : nullptr, \
-        static_cast<const std::int32_t*>(lanes.data),                                   \
-        static_cast<const Ctx*>(context_k.data),                                        \
-        static_cast<const Ctx*>(context_v.data), capacity, padded_capacity,             \
-        width, batch, head_dim, query_heads, kv_heads, window, scale,                   \
-        static_cast<__nv_bfloat16*>(out.data))
+        q_ptr, k_ptr, v_ptr, pos_ptr, valid_ptr, floor_ptr, lane_ptr,                   \
+        static_cast<const CTX*>(context_k.data),                                        \
+        static_cast<const CTX*>(context_v.data), capacity, padded_capacity,             \
+        width, batch, head_dim, query_heads, kv_heads, window, scale, out_ptr)
+#define NINFER_DSPINE_LAUNCH_ALL(R, RD, TP)                                             \
+    do {                                                                                \
+        if (f16) { NINFER_DSPINE_LAUNCH_ROWS(R, RD, TP, __half); }                      \
+        else { NINFER_DSPINE_LAUNCH_ROWS(R, RD, TP, __nv_bfloat16); }                   \
+    } while (false)
+        if (head_dim == 256) {
             switch (width) {
-                case 2: NINFER_DSPINE_LAUNCH_ROWS(2); break;
-                case 3: NINFER_DSPINE_LAUNCH_ROWS(3); break;
-                case 4: NINFER_DSPINE_LAUNCH_ROWS(4); break;
-                case 5: NINFER_DSPINE_LAUNCH_ROWS(5); break;
-                case 6: NINFER_DSPINE_LAUNCH_ROWS(6); break;
-                case 7: NINFER_DSPINE_LAUNCH_ROWS(7); break;
-                default: NINFER_DSPINE_LAUNCH_ROWS(8); break;
+                case 2: NINFER_DSPINE_LAUNCH_ALL(2, 8, 24); break;
+                case 3: NINFER_DSPINE_LAUNCH_ALL(3, 8, 24); break;
+                case 4: NINFER_DSPINE_LAUNCH_ALL(4, 8, 24); break;
+                case 5: NINFER_DSPINE_LAUNCH_ALL(5, 8, 24); break;
+                case 6: NINFER_DSPINE_LAUNCH_ALL(6, 8, 24); break;
+                case 7: NINFER_DSPINE_LAUNCH_ALL(7, 8, 24); break;
+                default: NINFER_DSPINE_LAUNCH_ALL(8, 8, 24); break;
             }
+        } else {
+            switch (width) {
+                case 2: NINFER_DSPINE_LAUNCH_ALL(2, 4, 48); break;
+                case 3: NINFER_DSPINE_LAUNCH_ALL(3, 4, 48); break;
+                case 4: NINFER_DSPINE_LAUNCH_ALL(4, 4, 48); break;
+                case 5: NINFER_DSPINE_LAUNCH_ALL(5, 4, 48); break;
+                case 6: NINFER_DSPINE_LAUNCH_ALL(6, 4, 48); break;
+                case 7: NINFER_DSPINE_LAUNCH_ALL(7, 4, 48); break;
+                default: NINFER_DSPINE_LAUNCH_ALL(8, 4, 48); break;
+            }
+        }
+#undef NINFER_DSPINE_LAUNCH_ALL
 #undef NINFER_DSPINE_LAUNCH_ROWS
-        };
-        if (f16) { launch_rows.template operator()<__half>(); }
-        else { launch_rows.template operator()<__nv_bfloat16>(); }
+        const cudaError_t launch_err = cudaGetLastError();
+        if (launch_err != cudaSuccess) {
+            fprintf(stderr, "DSPINE_ATTN launch failed: %s\n", cudaGetErrorString(launch_err));
+        }
         return;
     }
     const int grid = width * batch * query_heads;

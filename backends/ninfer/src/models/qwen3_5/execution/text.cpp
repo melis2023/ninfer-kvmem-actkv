@@ -1406,6 +1406,33 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
             ops::kv_cache_append_prefix(
                 k_lane, v_lane, pos_lane, counts, lanes,
                 {0, static_cast<std::uint32_t>(T)}, target_hot_->layer_view(fidx), s);
+            {
+                static int append_dumps = 0;
+                if (++append_dumps <= 2) {
+                    const auto ring_now = target_hot_->layer_view(fidx);
+                    std::vector<__nv_bfloat16> first8(8), last8(8);
+                    std::vector<std::int32_t> pos_host(T);
+                    CUDA_CHECK(cudaMemcpyAsync(first8.data(), ring_now.k.data,
+                                               8 * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost, s));
+                    CUDA_CHECK(cudaMemcpyAsync(pos_host.data(), pos_lane.data,
+                                               T * sizeof(std::int32_t), cudaMemcpyDeviceToHost, s));
+                    CUDA_CHECK(cudaStreamSynchronize(s));
+                    const int last_slot = pos_host[T - 1] & (ring_now.capacity - 1);
+                    CUDA_CHECK(cudaMemcpyAsync(
+                        last8.data(),
+                        static_cast<const __nv_bfloat16*>(ring_now.k.data) +
+                            last_slot * dimension(config_.attention->head_dim),
+                        8 * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost, s));
+                    CUDA_CHECK(cudaStreamSynchronize(s));
+                    std::fprintf(stderr,
+                                 "PREFILL_RING fidx=%u T=%d pos0=%d posT=%d slot0=[%.4f,%.4f] "
+                                 "last(slot %d)=[%.4f,%.4f]\n",
+                                 fidx, T, pos_host[0], pos_host[T - 1],
+                                 __bfloat162float(first8[0]), __bfloat162float(first8[1]),
+                                 last_slot, __bfloat162float(last8[0]),
+                                 __bfloat162float(last8[1]));
+                }
+            }
         }
     }
     const bool wide = wide_residual_verification(ph, row_width(T), row_width(T));

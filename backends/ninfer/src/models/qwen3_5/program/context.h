@@ -95,6 +95,9 @@ struct PrefillContext {
     // False runs the chunk without the drafter's prompt work (MTP KV, DFlash features), past a
     // request's drafter frontier.
     bool drafter = true;
+    // DSpine's FP16 hot ring, so the prefill's K/V lands in it as well — the sliding verify
+    // reads the whole window from the ring, prompt tokens included. Null elsewhere.
+    const ninfer::CyclicKVCache* target_hot = nullptr;
     // Enqueues the first token's copies to the host as soon as a text chunk samples it; the chunk
     // then returns without waiting for the drafter's work behind them. Empty waits for everything.
     std::function<void()> first_token;

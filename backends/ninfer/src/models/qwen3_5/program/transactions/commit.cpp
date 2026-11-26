@@ -437,6 +437,8 @@ runtime::ExecutionTiming ProgramImpl::append_forced_tokens(
                     sequence.kv->backend ? backend_kv_addresses->bound_row(*sequence.kv->backend)
                                          : 0};
                 schedule_state.cache_position_shift = sequence.window.removed_tokens;
+                // DSpine's FP16 hot ring receives these chunks' K/V as well.
+                schedule_state.target_hot = state_images->target_hot();
                 schedule_state.execution.memory_statistics = memory_statistics ? &*memory_statistics : nullptr;
                 mark_workspace_usage(speculative_backend == SpeculativeBackend::Mtp
                                          ? workspace_plan.mtp_prefill
