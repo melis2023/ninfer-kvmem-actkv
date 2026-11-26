@@ -1220,6 +1220,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         if (arg == "--kv-dspine-f16") {
             options.kvmem.dspine_f16_tokens = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--kv-dspine-f16"), "kv-dspine-f16"));
+            options.kvmem.dspine_f16_explicit = true;
             continue;
         }
         if (arg == "--spec") {

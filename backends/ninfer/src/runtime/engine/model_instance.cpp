@@ -938,6 +938,15 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
             options.context_cache.host_kv_capacity_bytes = 0;
         }
     }
+    // A DSpine request without an explicit --kv-dspine-f16 runs the sliding window out of
+    // an FP16 hot ring sized to it: the ring covers every KV column the all-sliding verify
+    // reads (~302 MiB at 8192 on nine attention layers), and no other backend allocates one.
+    if (options.speculative.backend == SpeculativeBackend::DSpine &&
+        !options.kvmem.dspine_f16_explicit) {
+        options.kvmem.dspine_f16_tokens = 8192;
+        publish_diagnostic(requested.diagnostic_observer, DiagnosticLevel::Info, "%s",
+                           "DSpine: FP16 hot ring 8192 tokens (default; --kv-dspine-f16 0 disables)");
+    }
     // An automatic draft head is the artifact's optimized proposal head when it stores one: it
     // projects drafts onto a shortlist of the vocabulary instead of all of it.
     if (options.speculative.proposal_head == ProposalHead::Auto) {
