@@ -448,8 +448,9 @@ __global__ void __launch_bounds__(256, CPS)
     const bool active = j0 + warp < nt;
 
     constexpr int UT = CK * WORDS / 4, UC = kW5 * UT, NC = (UC + 255) / 256;
-    constexpr int UA = CK * 16, NA = GT * UA / 256;
-    static_assert(GT * UA % 256 == 0, "stage copies");
+    constexpr int UA = CK * 16;
+    constexpr int NA = (GT * UA + 255) / 256;
+    static_assert(GT * UA <= NA * 256, "stage copies");
     const std::uint32_t base = static_cast<std::uint32_t>(__cvta_generic_to_shared(sm));
     const std::uint32_t* csrc[NC];
     std::uint32_t cdst[NC];
@@ -538,11 +539,12 @@ __global__ void __launch_bounds__(256, CPS)
 
     // Epilogue: 32 tokens at a time through shared memory; yr[n + N*t] = acc * 1/4 * xs[t].
     constexpr int RED5 = 132;
+    constexpr int kEpilogueTokens = TT < 32 ? TT : 32;
     const int n = nt * 16, o0 = cb * 128, nv = min(128, n - o0);
     float* red = reinterpret_cast<float*>(sm);
     __syncthreads();
 #pragma unroll
-    for (int p = 0; p < TT / 32; ++p) {
+    for (int p = 0; p < (TT + 31) / 32; ++p) {
 #pragma unroll
         for (int r = 0; r < GT; ++r) {
             if (r / 4 != p) continue;
@@ -553,7 +555,7 @@ __global__ void __launch_bounds__(256, CPS)
             red[(tl + 1) * RED5 + ol + 8] = acc[r][3];
         }
         __syncthreads();
-        for (int tl = warp; tl < 32; tl += kW5) {
+        for (int tl = warp; tl < kEpilogueTokens; tl += kW5) {
             const int t = tb * TT + p * 32 + tl;
             if (t >= rows) break;
             float v[4];
@@ -1126,6 +1128,15 @@ struct PfArgs {
 };
 
 int pick_pf_tiling(int rows, int nt, int sms) {
+    if (const char* forced = std::getenv("NINFER_TRELLIS_PFTILING")) {
+        const int value = std::atoi(forced);
+        if (value >= 0 && value <= 6) { return value; }
+    }
+    // Verify windows are a handful of tokens: the 64/128-token prefill tiles waste most of their
+    // shared-memory stage. TT=8 (one m16n8k16 column tile) is the fastest measured small-T shape;
+    // larger prefill chunks keep the original heuristic below.
+    if (rows <= 8) { return 6; }
+    if (rows <= 16) { return 5; }
     const int cbs = (nt + kW5 - 1) / kW5;
     const int c128 = cbs * ((rows + 127) / 128), c64 = cbs * ((rows + 63) / 64);
     auto load = [&](int ctas, float pair, float single) {
@@ -1159,6 +1170,10 @@ void launch_pf_bits(const PfArgs& a, int tiling, cudaStream_t stream) {
     switch (tiling) {
         case 0: launch_pf<BITS, 64, 8, 2>(a, stream); break;
         case 1: launch_pf<BITS, 128, 8, 1>(a, stream); break;
+        case 3: launch_pf<BITS, 32, 8, 2>(a, stream); break;
+        case 4: launch_pf<BITS, 32, 4, 2>(a, stream); break;
+        case 5: launch_pf<BITS, 16, 8, 2>(a, stream); break;
+        case 6: launch_pf<BITS, 8, 8, 2>(a, stream); break;
         default: launch_pf<BITS, 128, 4, 2>(a, stream); break;
     }
 }
