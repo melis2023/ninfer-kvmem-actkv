@@ -200,9 +200,13 @@ auto mtp_decode_batch_body(MtpBatchContext& state, std::int32_t batch_size,
                 Tensor next_hidden_batch = next_hidden.view(
                     {dimension(state.execution.parameters.model.config().text.hidden_size), 1,
                      batch_size});
+                if (trace) { mtp_trace::step_record(2 * step, state.execution.device.stream); }
                 card.mtp_forward_decode_batch(previous_batch, hidden_batch, position, rope, valid,
                                               mtp_rows, envelopes.ar[step], next_hidden_batch);
+                if (trace) { mtp_trace::propose_record(2 * step, state.execution.device.stream); }
                 card.mtp_propose_batch(next_hidden, proposal_logits, next);
+                if (trace) { mtp_trace::propose_record(2 * step + 1, state.execution.device.stream); }
+                if (trace) { mtp_trace::step_record(2 * step + 1, state.execution.device.stream); }
                 CUDA_CHECK(cudaMemcpyAsync(ar_hidden.data, next_hidden.data, ar_hidden.bytes(),
                                            cudaMemcpyDeviceToDevice,
                                            state.execution.device.stream));
