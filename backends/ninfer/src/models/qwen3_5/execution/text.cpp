@@ -5,6 +5,7 @@
 #include "models/qwen3_5/execution/linear.h"
 #include "models/qwen3_5/execution/ffn.h"
 #include "models/qwen3_5/execution/mtp.h"
+#include "models/qwen3_5/execution/token_dump.h"
 #include "models/qwen3_5/execution/workspace.h"
 
 #include "core/nvtx.h"
@@ -789,8 +790,39 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
                         : dimension(parameters_.model.resources().public_token_count),
                     ctx_.stream);
         if (proposal_head_ids_ != nullptr) {
+            static const bool dump_proposal = [] {
+                const char* v = std::getenv("NINFER_MTP_TRACE");
+                return v != nullptr && v[0] == '2';
+            }();
+            static int dump_round = 0;
+            const bool dump_this = dump_proposal && ++dump_round <= 3;
+            if (dump_this) {
+                std::vector<std::int32_t> host(static_cast<std::size_t>(T));
+                CUDA_CHECK(cudaMemcpyAsync(host.data(), proposal_tokens.data,
+                                           host.size() * sizeof(std::int32_t),
+                                           cudaMemcpyDeviceToHost, ctx_.stream));
+                CUDA_CHECK(cudaStreamSynchronize(ctx_.stream));
+                std::fprintf(stderr, "PROPOSAL raw argmax round=%d tokens=%s\n", dump_round,
+                             [&] {
+                                 std::string out;
+                                 for (const auto id : host) { out += std::to_string(id) + ","; }
+                                 return out;
+                             }().c_str());
+            }
             ops::proposal_remap_token_ids(proposal_tokens, proposal_head_ids_, proposal_head_n_,
                                           ctx_.stream);
+            if (dump_this) {
+                std::vector<std::int32_t> host(static_cast<std::size_t>(T));
+                CUDA_CHECK(cudaMemcpyAsync(host.data(), proposal_tokens.data,
+                                           host.size() * sizeof(std::int32_t),
+                                           cudaMemcpyDeviceToHost, ctx_.stream));
+                CUDA_CHECK(cudaStreamSynchronize(ctx_.stream));
+                std::fprintf(stderr, "PROPOSAL remapped tokens=%s\n", [&] {
+                    std::string out;
+                    for (const auto id : host) { out += std::to_string(id) + ","; }
+                    return out;
+                }().c_str());
+            }
         }
     } else if (mtp_->output_head.weight.qdata != nullptr) {
         Tensor output_logits = fp32_proposal_logits(mtp_->output_head)
@@ -799,6 +831,19 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
         project(hidden, mtp_->output_head, output_logits, work_, ctx_.stream);
         ops::argmax(output_logits, proposal_tokens,
                     dimension(parameters_.model.resources().public_token_count), ctx_.stream);
+        if (token_dump_enabled()) {
+            cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+            cudaStreamIsCapturing(ctx_.stream, &status);
+            if (status == cudaStreamCaptureStatusNone) {
+                static TokenDump dump;
+                std::vector<std::int32_t> host(static_cast<std::size_t>(T));
+                CUDA_CHECK(cudaMemcpyAsync(host.data(), proposal_tokens.data,
+                                           host.size() * sizeof(std::int32_t),
+                                           cudaMemcpyDeviceToHost, ctx_.stream));
+                CUDA_CHECK(cudaStreamSynchronize(ctx_.stream));
+                dump.add(host.data(), host.size());
+            }
+        }
     } else {
         // A banded coded target has no single MTP head; the MTP block shares the target's head.
         Tensor output_logits = target_logits_dtype(*lm_head_) == DType::FP32
@@ -807,6 +852,19 @@ void TextContext::proposal_argmax(const Tensor& hidden, Tensor& logits, Tensor& 
         project(hidden, *lm_head_, output_logits, work_, ctx_.stream);
         ops::argmax(output_logits, proposal_tokens,
                     dimension(parameters_.model.resources().public_token_count), ctx_.stream);
+        if (token_dump_enabled()) {
+            cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+            cudaStreamIsCapturing(ctx_.stream, &status);
+            if (status == cudaStreamCaptureStatusNone) {
+                static TokenDump dump;
+                std::vector<std::int32_t> host(static_cast<std::size_t>(T));
+                CUDA_CHECK(cudaMemcpyAsync(host.data(), proposal_tokens.data,
+                                           host.size() * sizeof(std::int32_t),
+                                           cudaMemcpyDeviceToHost, ctx_.stream));
+                CUDA_CHECK(cudaStreamSynchronize(ctx_.stream));
+                dump.add(host.data(), host.size());
+            }
+        }
     }
 }
 

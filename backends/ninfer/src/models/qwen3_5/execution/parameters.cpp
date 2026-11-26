@@ -826,6 +826,8 @@ Parameters::Parameters(const Model& source) : model(source) {
         proposal =
             ProposalParameters{prepare.head(w.proposal->head), std::nullopt, w.proposal->rows};
         if (w.proposal->token_ids) { proposal->token_ids = prepare.tensor(*w.proposal->token_ids); }
+        std::fprintf(stderr, "PROPOSAL head rows=%u ids=%s\n", w.proposal->rows,
+                     w.proposal->token_ids ? "yes" : "no");
     }
     dspine = model.dspine();
 }
