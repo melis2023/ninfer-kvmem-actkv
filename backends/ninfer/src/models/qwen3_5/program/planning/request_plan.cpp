@@ -269,7 +269,8 @@ KVEntitlementShape ProgramImpl::kv_entitlement_shape() const noexcept {
         .capacity = capacity,
         .draft_window = draft_window,
         .backend = speculative_backend,
-        .backend_kv = backend_kv_cache() != nullptr};
+        .backend_kv = backend_kv_cache() != nullptr,
+        .hot_ring = state_images->target_hot() != nullptr};
 }
 
 std::uint32_t ProgramImpl::concurrent_output_budget(std::uint32_t prompt_tokens) const noexcept {

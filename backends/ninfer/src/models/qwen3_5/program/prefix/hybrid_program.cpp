@@ -929,7 +929,10 @@ StartResult ProgramImpl::hybrid_activate(HybridMaterializationTransaction& trans
             speculative_backend == SpeculativeBackend::Mtp
                 ? std::min(capacity, n + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
             : speculative_backend == SpeculativeBackend::DFlash && backend_kv_cache() ? n
-                                                                                     : 0U;
+            : speculative_backend == SpeculativeBackend::DSpine && backend_kv_cache() &&
+                    state_images->target_hot() == nullptr
+                ? n
+                : 0U;
         ensure_sequence_kv_mapped(sequence, n, backend_materialized);
         request.grammar              = quote.grammar;
         request.suppressed_tool_open = quote.suppressed_tool_open;

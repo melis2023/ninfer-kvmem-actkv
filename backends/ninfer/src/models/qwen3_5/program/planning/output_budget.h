@@ -22,8 +22,11 @@ struct KVEntitlementShape {
     std::uint32_t draft_window       = 0;
     SpeculativeBackend backend       = SpeculativeBackend::None;
     // DFlash only allocates a Backend KV pool when the drafter has full-attention
-    // layers. DSpine is all-sliding, so its Backend entitlement must stay zero.
+    // layers. DSpine is all-sliding only while the FP16 hot ring exists: with the ring
+    // its Backend entitlement stays zero, without one the Backend pool carries the KV
+    // and gets a normal entitlement.
     bool backend_kv                  = false;
+    bool hot_ring                    = false;
 };
 
 [[nodiscard]] constexpr std::uint32_t kv_pages_for_tokens(std::uint32_t tokens) noexcept {
@@ -42,6 +45,10 @@ kv_page_entitlement(const KVEntitlementShape& shape, std::uint32_t prompt_tokens
         out.backend_pages = kv_pages_for_tokens(static_cast<std::uint32_t>(std::min<std::uint64_t>(
             shape.capacity, static_cast<std::uint64_t>(reserved) + shape.draft_window - 1ULL)));
     } else if (shape.backend == SpeculativeBackend::DFlash && shape.backend_kv) {
+        out.backend_pages = kv_pages_for_tokens(reserved);
+    } else if (shape.backend == SpeculativeBackend::DSpine && shape.backend_kv &&
+               !shape.hot_ring) {
+        // Ringless DSpine keeps the whole history in the Backend pool, like DFlash.
         out.backend_pages = kv_pages_for_tokens(reserved);
     }
     return out;

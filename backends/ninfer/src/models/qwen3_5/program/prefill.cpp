@@ -746,6 +746,9 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                            prompt_tokens + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
             : speculative_backend == SpeculativeBackend::DFlash && backend_kv_cache()
                   ? prompt_tokens
+              : speculative_backend == SpeculativeBackend::DSpine &&
+                      backend_kv_cache() && state_images->target_hot() == nullptr
+                  ? prompt_tokens
                   : 0U;
         if (!kvmem_window_tokens) {
             ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized);
