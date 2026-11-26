@@ -35,7 +35,7 @@ cd /d "%BIN%"
   "%MODEL%" ^
   --model-id ninfer-nariq-27b --host 127.0.0.1 --port 18200 ^
   --draft-model "%DRAFT%" ^
-  --spec dflash2 --draft-tokens 7 ^
+  --spec dflash2 --draft-tokens 6 ^
   --max-context 262144 --max-concurrency 1 ^
   --prefill-chunk 256 ^
   --kvmem-budget 32000 --kvmem-gen-reserve 2048 --kvmem-host-mib 12288 ^
