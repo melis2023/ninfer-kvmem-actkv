@@ -239,16 +239,14 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         throw std::invalid_argument("linear workspace: invalid token interval");
     }
 
-    // A coded weight rotates activations in FP32: rotated activation plane, the coded product, and
-    // two logical-order scratch planes, all `max_tokens` wide.
+    // A coded weight rotates activations in FP32: the rotated plane, the coded product's two
+    // logical-order scratch planes, the split-K partials, the prologue fragment plane and scales
+    // all `max_tokens` wide. One formula serves the planner and the runtime.
     if (is_coded(qtype)) {
         if (output_rows <= 0 || input_rows <= 0) {
             throw std::invalid_argument("linear workspace: coded rows and columns must be positive");
         }
-        const std::int64_t wider = std::max(output_rows, input_rows);
-        const std::int64_t floats =
-            (static_cast<std::int64_t>(output_rows) + input_rows + 2 * wider) * max_tokens;
-        return static_cast<std::size_t>(floats) * sizeof(float);
+        return trellis_coded_workspace_bytes(output_rows, input_rows, max_tokens);
     }
 
     if (is_gguf(qtype)) {

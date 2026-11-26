@@ -190,36 +190,36 @@ namespace {
 std::size_t round256(std::size_t bytes) { return (bytes + 255) / 256 * 256; }
 } // namespace
 
-std::size_t trellis_linear_workspace_bytes(const Weight& w, std::int32_t max_tokens) {
-    validate_weight(w);
-    if (max_tokens <= 0) {
-        throw std::invalid_argument("trellis workspace: token count must be positive");
+std::size_t trellis_coded_workspace_bytes(std::int32_t n, std::int32_t k,
+                                          std::int32_t max_tokens) {
+    if (n <= 0 || k <= 0 || max_tokens <= 0) {
+        throw std::invalid_argument("trellis workspace: shape must be positive");
     }
-    const std::int64_t wider = w.k > w.n ? w.k : w.n;
-    // The single-token route also needs kDecodeSplits [N] accumulation planes.
-    const std::int64_t split_floats =
-        static_cast<std::int64_t>(detail::trellis::kDecodeSplits) * w.n;
+    const std::int64_t tok    = max_tokens;
+    const std::int64_t wider  = k > n ? k : n;
     // Prefill prologue scratch: fp16 B-fragment plane padded to 8-token groups (one 128-block per
     // group holds 1024 halves) + per-token 2^-e row scales.
-    const std::int64_t groups = (max_tokens + 7) / 8;
-    const std::int64_t xf_halves = static_cast<std::int64_t>(w.k / 128) * groups * 1024;
-    const std::int64_t xs_floats = max_tokens;
+    const std::int64_t groups = (tok + 7) / 8;
+    const std::int64_t xf_half = static_cast<std::int64_t>(k / 128) * groups * 1024;
+    // Splits only run for windows of at most eight tokens, so that plane stops growing there.
+    const std::int64_t pf_tok = tok < 8 ? tok : 8;
     // Every arena plane is 256-byte aligned, so round each plane's size up independently; the
     // packed raw byte count otherwise under-reserves and the last alloc throws bad_alloc.
-    const std::int64_t tok = max_tokens;
-    const std::size_t xa = round256(static_cast<std::size_t>(w.k * tok) * sizeof(float));
-    const std::size_t yr = round256(static_cast<std::size_t>(w.n * tok) * sizeof(float));
-    const std::size_t tmp = round256(static_cast<std::size_t>(wider * tok) * sizeof(float));
-    const std::size_t split = round256(static_cast<std::size_t>(split_floats) * sizeof(float));
-    // The small-T MMA may split K across up to kPfMaxSplits CTAs, one FP32 [N,T] plane each.
-    // Splits only run for windows of at most eight tokens, so the capacity stops growing there.
-    const std::int64_t pf_tok = tok < 8 ? tok : 8;
-    const std::size_t pf_split =
-        round256(static_cast<std::size_t>(detail::trellis::kPfMaxSplits) * w.n * pf_tok *
-                 sizeof(float));
-    const std::size_t xs = round256(static_cast<std::size_t>(xs_floats) * sizeof(float));
-    const std::size_t xf = round256(static_cast<std::size_t>(xf_halves) * sizeof(std::uint16_t));
+    const std::size_t xa       = round256(static_cast<std::size_t>(static_cast<std::int64_t>(k) * tok * 4));
+    const std::size_t yr       = round256(static_cast<std::size_t>(static_cast<std::int64_t>(n) * tok * 4));
+    const std::size_t tmp      = round256(static_cast<std::size_t>(wider * tok * 4));
+    const std::size_t split    = round256(static_cast<std::size_t>(
+        static_cast<std::int64_t>(detail::trellis::kDecodeSplits) * n * 4));
+    const std::size_t pf_split = round256(static_cast<std::size_t>(
+        static_cast<std::int64_t>(detail::trellis::kPfMaxSplits) * n * pf_tok * 4));
+    const std::size_t xs       = round256(static_cast<std::size_t>(tok * 4));
+    const std::size_t xf       = round256(static_cast<std::size_t>(xf_half * 2));
     return xa + yr + tmp + tmp + split + pf_split + xs + xf;
+}
+
+std::size_t trellis_linear_workspace_bytes(const Weight& w, std::int32_t max_tokens) {
+    validate_weight(w);
+    return trellis_coded_workspace_bytes(w.n, w.k, max_tokens);
 }
 
 void trellis_linear(const Tensor& x, const Weight& w, Tensor& y, std::int32_t max_tokens,

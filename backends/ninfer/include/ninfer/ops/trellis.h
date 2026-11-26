@@ -51,6 +51,14 @@ void trellis_linear(const Tensor& x, const Weight& w, Tensor& y, std::int32_t ma
 [[nodiscard]] std::size_t trellis_linear_workspace_bytes(const Weight& w, std::int32_t max_tokens);
 
 /**
+ * The same capacity for a shape without a Weight handle. Plans that only know the qtype, rows and
+ * columns size every coded projection from this; it covers the rotated plane, the product planes,
+ * the single-token split-K partials, the small-T split planes, xs and xf alike.
+ */
+[[nodiscard]] std::size_t trellis_coded_workspace_bytes(std::int32_t n, std::int32_t k,
+                                                        std::int32_t max_tokens);
+
+/**
  * Op: trellis_embedding
  *
  * Decodes the coded rows `ids[t]` of a coded table and restores them to the primal basis:
