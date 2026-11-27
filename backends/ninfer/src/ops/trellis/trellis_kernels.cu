@@ -1206,9 +1206,11 @@ int pick_pf_tiling(int rows, int nt, int sms) {
         if (value >= 0 && value <= 11) { return value; }
     }
     // Verify windows are a handful of tokens: the 64/128-token prefill tiles waste most of their
-    // shared-memory stage. Up to the sixteen-token verify width the whole window fits one TT tile,
-    // so the coded stream is read once and the K-split fills the grid; larger prefill chunks keep
+    // shared-memory stage. Split the tile by window width: MTP and DFlash2 verify 5-8 rows, where
+    // the TT=8/CPS=5 shape measured fastest (60.5/69.5 tok/s against 56-58/65.9 on TT=16), while a
+    // fifteen-token DSpine window reads the coded stream once on TT=16. Larger prefill chunks keep
     // the original heuristic below.
+    if (rows <= 8) { return 10; }
     if (rows <= 16) { return 5; }
     const int cbs = (nt + kW5 - 1) / kW5;
     const int c128 = cbs * ((rows + 127) / 128), c64 = cbs * ((rows + 63) / 64);
