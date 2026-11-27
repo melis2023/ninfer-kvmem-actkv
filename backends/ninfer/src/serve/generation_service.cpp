@@ -239,6 +239,29 @@ void check_preparation_control(Clock::time_point deadline,
     }
 }
 
+// Length of the prefix that holds only whole UTF-8 sequences. A byte-level tokenizer can split
+// one character across deltas; forwarding the halves makes clients that decode each chunk on its
+// own (no stream-mode decoder) render U+FFFD, which the DFlash reasoning streams showed.
+std::size_t utf8_complete_prefix(std::string_view text) {
+    const std::size_t size = text.size();
+    std::size_t index = size;
+    std::size_t continuation = 0;
+    while (index > 0 && continuation < 3 &&
+           (static_cast<unsigned char>(text[index - 1]) & 0xC0) == 0x80) {
+        --index;
+        ++continuation;
+    }
+    if (index == 0) { return size; }
+    const unsigned char lead = static_cast<unsigned char>(text[index - 1]);
+    std::size_t need = 0;
+    if (lead >= 0xF0) { need = 4; }
+    else if (lead >= 0xE0) { need = 3; }
+    else if (lead >= 0xC0) { need = 2; }
+    else { return size; }
+    const std::size_t have = size - (index - 1);
+    return have >= need ? size : index - 1;
+}
+
 class ServiceOutputSink final : public ninfer::OutputSink {
 public:
     explicit ServiceOutputSink(const StreamSink& sink, const PreparedRequest& prepared)
@@ -278,19 +301,44 @@ public:
             if (phase_ != phase) { phase_ = phase; monitor_({{"phase", phase}}); }
         }
         if (delta.channel == ninfer::OutputChannel::Reasoning) {
-            if (!delta.text.empty() && sink_->on_reasoning) { sink_->on_reasoning(delta.text); }
+            if (!delta.text.empty()) { append_reasoning(delta.text); }
             return;
         }
         if (delta.text.empty() && delta.logprobs.empty()) { return; }
+        if (!delta.text.empty()) {
+            pending_content_ += delta.text;
+            const std::size_t ready = utf8_complete_prefix(pending_content_);
+            if (ready != 0) {
+                std::string piece = pending_content_.substr(0, ready);
+                pending_content_.erase(0, ready);
+                // Logprobs describe this delta's token; only hand them over with the whole delta.
+                const auto logprobs = ready == delta.text.size()
+                                          ? delta.logprobs
+                                          : std::span<const ninfer::TokenLogprob>{};
+                if (sink_->on_content) { sink_->on_content(piece, logprobs); }
+                return;
+            }
+        }
         if (sink_->on_content) { sink_->on_content(delta.text, delta.logprobs); }
     }
 
 private:
+    void append_reasoning(const std::string& text) {
+        pending_reasoning_ += text;
+        const std::size_t ready = utf8_complete_prefix(pending_reasoning_);
+        if (ready == 0) { return; }
+        std::string piece = pending_reasoning_.substr(0, ready);
+        pending_reasoning_.erase(0, ready);
+        if (sink_->on_reasoning) { sink_->on_reasoning(piece); }
+    }
+
     const StreamSink* sink_ = nullptr;
     std::function<void(const nlohmann::json&)> monitor_;
     int prompt_ = 0, cached_ = 0;
     kvmem::monitor_rate_window rate_;
     std::string phase_;
+    std::string pending_reasoning_;
+    std::string pending_content_;
 };
 
 } // namespace
