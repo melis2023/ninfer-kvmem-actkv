@@ -38,7 +38,8 @@ cd /d "%BIN%"
 
 "%EXE%" ^
   "%MODEL%" ^
-  --model-id ninfer-nariq-27b --host 127.0.0.1 --port 18200 ^
+  --model-id ninfer-27b ^
+ --host 127.0.0.1 --port 18200 ^
   --draft-model "%DRAFT%" ^
   --spec dflash2 --draft-tokens 6 ^
   --max-context 262144 --max-concurrency 1 ^
