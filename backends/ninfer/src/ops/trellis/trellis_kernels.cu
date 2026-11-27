@@ -410,8 +410,7 @@ __device__ __forceinline__ void trellis_decode_exact(const std::uint32_t (&w)[2 
 
 // Prologue: one CTA per token. Folds s16 into the activation, per-token 2^e scale, stores the
 // fp16 B-fragment plane. Input xa is FP32 [K, T] (pre/pin and the column side already applied).
-__global__ void trellis_prologue_f32_kernel(const float* __restrict__ xa, int K, int T,
-                                             const float* __restrict__ s16, __half* __restrict__ xf,
+__global__ void trellis_prologue_f32_kernel(const float* __restrict__ xa, int K, int T,                                             const float* __restrict__ s16, __half* __restrict__ xf,
                                              float* __restrict__ xs, int groups) {
     __shared__ float wmax[kW5];
     const int t = blockIdx.x, warp = threadIdx.x / 32, lane = threadIdx.x % 32, nb = K / 128;
@@ -449,6 +448,54 @@ __global__ void trellis_prologue_f32_kernel(const float* __restrict__ xa, int K,
         for (int i = 0; i < 4; ++i) {
             const int k = lane + 32 * i;
             base[blk * cstep + (k / 16) * 128 + frag_pos(k % 16)] = __float2half_rn(ldexpf(v[i], e));
+        }
+    }
+}
+
+// INT8 prologue (ported from nari-llama.cpp PR #5): the same per-row 2^e scale shifted to 2^(e-7)
+// so the row max lands in [64, 128), packed as [k32-block][group][token][32 int8] so a lane's two
+// B words of one m16n8k32 step are adjacent.
+__global__ void trellis_prologue_i8_kernel(const float* __restrict__ xa, int K, int T,
+                                            const float* __restrict__ s16, std::int8_t* __restrict__ xf8,
+                                            float* __restrict__ xs, int groups) {
+    __shared__ float wmax[kW5];
+    const int t = blockIdx.x, warp = threadIdx.x / 32, lane = threadIdx.x % 32, nb = K / 128;
+    const float* xr = xa + static_cast<std::int64_t>(t) * K;
+    float mx = 0.f;
+    for (int blk = warp; blk < nb; blk += kW5) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int k = 128 * blk + lane + 32 * i;
+            mx = fmaxf(mx, fabsf(xr[k] * s16[k / 16]));
+        }
+    }
+#pragma unroll
+    for (int o = 16; o; o /= 2) mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, o));
+    if (lane == 0) wmax[warp] = mx;
+    __syncthreads();
+    mx = wmax[0];
+#pragma unroll
+    for (int w = 1; w < kW5; ++w) mx = fmaxf(mx, wmax[w]);
+    int x2 = 0;
+    frexpf(mx > 0.f && mx <= 3.0e38f ? mx : 1.f, &x2);
+    const int e = 14 - x2;
+    if (threadIdx.x == 0) xs[t] = ldexpf(1.f, -e);
+    std::int8_t* base = xf8 + static_cast<size_t>(t / 8) * 1024 + (t % 8) * 32;
+    const size_t cstep = static_cast<size_t>(groups) * 1024;
+    for (int blk = warp; blk < nb; blk += kW5) {
+        float v[4];
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int k = 128 * blk + lane + 32 * i;
+            v[i] = xr[k] * s16[k / 16];
+        }
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int k = lane + 32 * i;
+            int q = __float2int_rn(ldexpf(v[i], e - 7));
+            q = q < -127 ? -127 : (q > 127 ? 127 : q);
+            base[blk * cstep + (k / 32) * 256 + ((k % 16) / 4) * 8 + ((k % 32) / 16) * 4 + (k % 4)] =
+                static_cast<std::int8_t>(q);
         }
     }
 }
@@ -783,6 +830,100 @@ __global__ void
             if (n0 + 9 < N) { yr[n0 + 9 + static_cast<std::int64_t>(N) * r8] = d[tt][3]; }
         }
     }
+}
+
+// INT8 prefill (ported from nari-llama.cpp PR #5 by felix021, Apache-2.0). The trellis grid is
+// integer (v = sum of four 6-bit digits - 126), so the weights decode to signed int8 exactly;
+// activations quantize per row with 2^(e-7). m16n8k32 accumulates int32 and the epilogue
+// multiplies by 2^7 against the fp16 route (which carries 4v and a 0.25 factor).
+__device__ __forceinline__ std::uint32_t pack4i8(int a, int b, int c, int d) {
+    return static_cast<std::uint32_t>(a & 0xFF) | (static_cast<std::uint32_t>(b & 0xFF) << 8) |
+           (static_cast<std::uint32_t>(c & 0xFF) << 16) |
+           (static_cast<std::uint32_t>(d & 0xFF) << 24);
+}
+
+__device__ __forceinline__ void mma_i8(int (&d)[4], const std::uint32_t (&a)[4], std::uint32_t b0,
+                                       std::uint32_t b1) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    asm volatile(
+        "mma.sync.aligned.m16n8k32.row.col.satfinite.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, "
+        "{%8,%9}, {%0,%1,%2,%3};"
+        : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+#endif
+}
+
+// The exact integer grid value v in [-126, 126]: dp4a sums the four 6-bit digits times 4 in
+// its accumulator, so `>> 2` gives the digit sum and `- 126` moves the grid's zero point.
+__device__ __forceinline__ int v_int_of(std::uint32_t state) {
+    return (static_cast<int>(h_grid(state)) - 0x6400) >> 2 - 126;
+}
+
+// One CTA = kThreads/32 warps x one 16-column J tile, 8 tokens (one B group) per blockIdx.y.
+template <int BITS>
+__global__ void
+    tile_product_i8_kernel(const std::uint32_t* codes, const std::int8_t* xf8,
+                           const float* s16, float* yr, int K, int N, int T,
+                           int kt_total, int groups) {
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int J = static_cast<int>(blockIdx.x) * (kThreads / 32) + warp;
+    if (J * 16 >= N) { return; }
+    const int gq = lane & 3, gn = lane >> 2;
+    const int t0 = static_cast<int>(blockIdx.y) * 8;
+    const int g = t0 / 8;
+    constexpr int nw = 8 * BITS;
+    constexpr int total = 256 * BITS;
+    // The four states a lane needs from one source span (5*BITS + 16 <= 31 bits for BITS <= 3)
+    // fit a single 32-bit window, so both A registers decode in place with no shuffles.
+    int dl[2], dh[2], ds[2];
+#pragma unroll
+    for (int side = 0; side < 2; ++side) {
+        const int src = (lane & ~3) | ((2 * gq + side) & 3);
+        const int end = ((8 * src + (gq >= 2 ? 2 : 0) + 6) * BITS) % total;
+        dh[side] = ((end - 32 + total) >> 5) % nw;
+        dl[side] = (dh[side] + 1) % nw;
+        ds[side] = 32 - (end & 31);
+    }
+    int acc[4] = {0, 0, 0, 0};
+    const std::int8_t* xg = xf8 + static_cast<size_t>(g) * 1024;
+    for (int kt = 0; kt + 1 < kt_total; kt += 2) {
+        const std::uint32_t* tw = codes + (static_cast<std::int64_t>(J) * kt_total + kt) * nw;
+        std::uint32_t ap[4];
+#pragma unroll
+        for (int d = 0; d < 2; ++d) {
+            int lo[4], hi[4];
+#pragma unroll
+            for (int side = 0; side < 2; ++side) {
+                const std::uint32_t r = __funnelshift_rc(tw[d * nw + dl[side]], tw[d * nw + dh[side]],
+                                                         ds[side]);
+                lo[2 * side]     = v_int_of(low16<5 * BITS>(r));
+                lo[2 * side + 1] = v_int_of(low16<4 * BITS>(r));
+                hi[2 * side]     = v_int_of(low16<BITS>(r));
+                hi[2 * side + 1] = v_int_of(low16<0>(r));
+            }
+            ap[2 * d]     = pack4i8(lo[0], lo[1], lo[2], lo[3]);
+            ap[2 * d + 1] = pack4i8(hi[0], hi[1], hi[2], hi[3]);
+        }
+        // B: the 8x32 block lays this lane's 8 int8 at row (lane / 4) and the k pair
+        // (lane % 4), matching the prologue's [k32][group][token][32] byte order.
+        const std::int8_t* bp = xg + (kt / 2) * 256 + gn * 32 + (lane & 3) * 8;
+        const std::uint32_t b0 = *reinterpret_cast<const std::uint32_t*>(bp);
+        const std::uint32_t b1 = *reinterpret_cast<const std::uint32_t*>(bp + 4);
+        mma_i8(acc, ap, b0, b1);
+    }
+    // C: row g|g+8 = n columns (warp*16 + g), col 2q|2q+1 = tokens. The int8 activation
+    // carries 2^(e-7), so 2^7 restores the fp16 route's value (s16 already folded in).
+    const int n0 = 16 * J + gn;
+    const int t = t0 + 2 * gq;
+    const float i8_scale = 128.f;
+    const auto store = [&](int n, int token, int value) {
+        if (n < N && token < T) { yr[n + static_cast<std::int64_t>(N) * token] = value * i8_scale; }
+    };
+    store(n0, t, acc[0]);
+    store(n0, t + 1, acc[1]);
+    store(n0 + 8, t, acc[2]);
+    store(n0 + 8, t + 1, acc[3]);
 }
 
 // Single-token route. One token gives only N/16 warps, which cannot fill the GPU (the largest
@@ -1367,6 +1508,37 @@ void tile_product(const float* xa, const Weight& w, float* yr, float* partials, 
         return v != nullptr && v[0] != '\0' && v[0] != '0';
     }();
     const int bits = bits_of(w.qtype);
+
+    static const bool i8_enabled = [] {
+        const char* v = std::getenv("NINFER_TRELLIS_I8");
+        return v != nullptr && v[0] != '\0' && v[0] != '0';
+    }();
+
+    // INT8 prefill (PR #5): the integer grid lets m16n8k32 run at twice the fp16 tensor rate.
+    // Bits above three still need the shuffle repack, so they stay on the fp16 route.
+    if (!force_simt && !old_mma && i8_enabled && tokens > 64 && w.k % 128 == 0 && bits <= 3) {
+        const int groups = (tokens + 7) / 8;
+        trellis_prologue_i8_kernel<<<tokens, 256, 0, stream>>>(
+            xa, w.k, tokens, s16, reinterpret_cast<std::int8_t*>(xf), xs, groups);
+        const unsigned nx =
+            static_cast<unsigned>((w.n / 16 + kThreads / 32 - 1) / (kThreads / 32));
+        const unsigned ny = static_cast<unsigned>((tokens + 7) / 8);
+        const dim3 grid(nx, ny);
+        switch (bits) {
+#define LAUNCH_I8(B)                                                                    \
+    case B:                                                                            \
+        tile_product_i8_kernel<B><<<grid, kThreads, 0, stream>>>(                      \
+            codes, reinterpret_cast<const std::int8_t*>(xf), s16, yr, w.k, w.n, tokens, \
+            kt_total, groups);                                                         \
+        break
+            LAUNCH_I8(1);
+            LAUNCH_I8(2);
+            LAUNCH_I8(3);
+#undef LAUNCH_I8
+        default: break;
+        }
+        return;
+    }
 
     if (!force_simt && !old_mma && (tokens > 1 || trellis_pf_decode_enabled()) && w.k % 128 == 0) {
         const int groups = (tokens + 7) / 8;
