@@ -14,7 +14,7 @@ REM is set explicitly because the serve default (15) widens the verify window in
 REM repetitive/code generations and loses more on verify than it gains on drafts.
 REM Capacity: 65,536 KV tokens int8 (3.33 GiB). For 128K+ contexts use
 REM start-nariq-long.bat (KVMem, CUDA Graphs off, ~38-44 tok/s).
-set "MODEL=I:\model\MTP-splice-vision.ninfer"
+set "MODEL=I:\model\NariQ-MTP-q4vis.ninfer"
 
 if not exist "%EXE%" (
     echo ERROR: worker missing: "%EXE%"

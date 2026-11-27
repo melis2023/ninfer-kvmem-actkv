@@ -15,7 +15,7 @@ REM Budget on a 16 GB card: weights 9.74 GiB + DSpine drafter 1.06 GiB + 64K int
 REM 3.44 GiB + ring 0.30 GiB sits within a few hundred MiB of the device limit. If the
 REM decode collapses to single digits with host near 100 percent, drop --draft-tokens
 REM to 8 (halves the verify workspace) or --kv-capacity to 32768.
-set "MODEL=I:\model\MTP-sl-p131k.ninfer"
+set "MODEL=I:\model\NariQ-MTP-q4vis.ninfer"
 set "DRAFT=I:\model\dflash2\Qwen3.8-27B-DSpine-b16-Q4_K_M.gguf"
 
 if not exist "%EXE%" (

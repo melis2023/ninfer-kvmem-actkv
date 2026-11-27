@@ -13,7 +13,7 @@ REM the D: copy sits on the 4 TB HDD and loads the 9.74 GiB artifact at ~190 MB/
 REM For coded Trellis weights the engine auto-avoids the CUDA-graph/state-slot fault:
 REM with KVMem it turns graphs off, otherwise it drops the device/host context cache.
 REM No manual --no-cuda-graph / --no-prefix-reuse needed.
-set "MODEL=I:\model\MTP-splice-vision.ninfer"
+set "MODEL=I:\model\NariQ-MTP-q4vis.ninfer"
 
 if not exist "%EXE%" (
     echo ERROR: worker missing: "%EXE%"

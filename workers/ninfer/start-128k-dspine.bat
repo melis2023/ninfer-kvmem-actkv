@@ -8,7 +8,7 @@ set "BIN=%~dp0"
 set "EXE=%BIN%ninfer-serve.exe"
 
 REM model
-set "MODEL=I:\model\MTP-sl-p131k.ninfer"
+set "MODEL=I:\model\NariQ-MTP-q4vis.ninfer"
 set "DRAFT=I:\model\dflash2\Qwen3.8-27B-DSpine-b16-Q4_K_M.gguf"
 
 if not exist "%EXE%" (

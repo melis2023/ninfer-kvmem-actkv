@@ -19,7 +19,7 @@ REM so a 5-token window idles 69 percent of it. A full tile lifts the HTML bench
 REM 53 to 84 tok/s and the 8K recall decode from 54 to 93 tok/s; the acceptance rate
 REM falls (63 to 42 percent on HTML) but the amortised weight decode wins. MTP is the
 REM opposite - its serial drafter pays for every extra token - so it stays at 4.
-set "MODEL=I:\model\MTP-sl-p131k.ninfer"
+set "MODEL=I:\model\NariQ-MTP-q4vis.ninfer"
 set "DRAFT=I:\model\dflash2\Qwen3.8-27B-DSpine-b16-Q4_K_M.gguf"
 
 if not exist "%EXE%" (

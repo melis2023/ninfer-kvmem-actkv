@@ -10,7 +10,7 @@ set "EXE=%BIN%ninfer-serve.exe"
 REM DFlash2 drafter adds ~1 GiB on top of the 9.74 GiB weights, so the KVMem
 REM device budget drops from 65536 to 32000 (KV 34,048 tokens with the reserve,
 REM free 2.07 GiB). CUDA Graphs stay off for DFlash2 by design.
-set "MODEL=I:\model\MTP-splice-vision.ninfer"
+set "MODEL=I:\model\NariQ-MTP-q4vis.ninfer"
 set "DRAFT=I:\model\dflash2\Qwen3.8-27B-DFlash2-Q4_K_M.gguf"
 
 if not exist "%EXE%" (

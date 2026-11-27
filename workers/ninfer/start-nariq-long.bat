@@ -11,7 +11,7 @@ REM Long-context profile: KVMem B=65536 covers 220K strict recall (validated:
 REM ORCHID=493817; COLOR=COBALT at 220K, 128K decode 57.3 tok/s). KVMem's paging
 REM window disables CUDA Graphs (correctness: illegal state-slot access during
 REM replay), so decode is ~38-44 tok/s - use start-nariq.bat for daily work.
-set "MODEL=I:\model\MTP-splice-vision.ninfer"
+set "MODEL=I:\model\NariQ-MTP-q4vis.ninfer"
 
 if not exist "%EXE%" (
     echo ERROR: worker missing: "%EXE%"

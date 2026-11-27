@@ -15,7 +15,7 @@ REM --draft-tokens 6 (seven verify rows) lands on the TT=8/CPS=4 coded tile:
 REM 65.6 tok/s on the 2048-token HTML bench and 64.4 at 8K, against 49 for the
 REM old TT=16 window. Draft 5 loses (62.1): the acceptance gain does not cover
 REM the shorter window.
-set "MODEL=I:\model\MTP-sl-p131k.ninfer"
+set "MODEL=I:\model\NariQ-MTP-q4vis.ninfer"
 set "DRAFT=I:\model\dflash2\Qwen3.8-27B-DFlash2-Q4_K_M.gguf"
 
 if not exist "%EXE%" (
@@ -42,13 +42,14 @@ cd /d "%BIN%"
  --host 127.0.0.1 --port 18200 ^
   --draft-model "%DRAFT%" ^
   --spec dflash2 --draft-tokens 6 ^
-  --max-context 262144 --max-concurrency 1 ^
+  --max-context 262144 ^
   --prefill-chunk 256 ^
-  --kvmem-budget 32000 --kvmem-gen-reserve 2048 --kvmem-host-mib 12288 ^
-  --kvmem-lrfu --kvmem-keep ^
-  --ngram-draft-tokens 15 --ngram-min-match 12 ^
-  --kv-dtype int8 --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
-  --default-reasoning-effort xhigh
+  --kvmem-budget 36834 --kvmem-gen-reserve 2048 --kvmem-host-mib 12288 ^
+   --kvmem-keep ^
+  --ngram-draft-tokens 15 ^
+  --kv-dtype rk8v4 --temperature 1.0 --top-p 0.95 --top-k 20 --min-p 0.0 ^
+  --default-reasoning-effort xhigh ^
+  --vision --vision-residency cpu --vision-max-merged 256
 
 set "RC=%ERRORLEVEL%"
 echo.
